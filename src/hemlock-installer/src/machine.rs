@@ -66,8 +66,15 @@ impl MachineConf {
         if let Some(platform) = self.values.get("onie_platform") {
             return Ok(platform.clone());
         }
-        let machine = self.values.get("onie_machine").ok_or(MachineError::NoPlatform)?;
-        let arch = self.values.get("onie_arch").map(String::as_str).unwrap_or("x86_64");
+        let machine = self
+            .values
+            .get("onie_machine")
+            .ok_or(MachineError::NoPlatform)?;
+        let arch = self
+            .values
+            .get("onie_arch")
+            .map(String::as_str)
+            .unwrap_or("x86_64");
         let rev = self
             .values
             .get("onie_machine_rev")
@@ -108,7 +115,8 @@ onie_version=2019.05
 
     #[test]
     fn assembles_platform_from_parts() {
-        let conf = MachineConf::parse("onie_machine=acme_sw48\nonie_arch=x86_64\nonie_machine_rev=2\n");
+        let conf =
+            MachineConf::parse("onie_machine=acme_sw48\nonie_arch=x86_64\nonie_machine_rev=2\n");
         assert_eq!(conf.platform().unwrap(), "x86_64-acme_sw48-r2");
     }
 

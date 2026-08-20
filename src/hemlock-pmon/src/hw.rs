@@ -147,7 +147,7 @@ fn parse_sfp_eeprom(bytes: &[u8]) -> TransceiverInfo {
             .unwrap_or_default()
     }
     let form_factor = match bytes.first() {
-        Some(0x03) => "SFP",   // SFP/SFP+ per SFF-8024 identifier
+        Some(0x03) => "SFP", // SFP/SFP+ per SFF-8024 identifier
         Some(0x0c | 0x0d | 0x11) => "QSFP",
         _ => "?",
     };

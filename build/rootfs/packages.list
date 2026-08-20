@@ -1,0 +1,27 @@
+# Debian 13 (trixie) package set for the Hemlock rootfs (debootstrap
+# --include list; one package per line, comments allowed).
+systemd
+systemd-sysv
+systemd-timesyncd
+udev
+kmod
+dbus
+linux-image-amd64
+initramfs-tools
+grub-pc
+openssh-server
+sudo
+ca-certificates
+curl
+less
+vim-tiny
+# networking basics (FRR arrives in a later phase)
+iproute2
+ethtool
+iputils-ping
+tcpdump
+# platform access
+i2c-tools
+lm-sensors
+pciutils
+usbutils

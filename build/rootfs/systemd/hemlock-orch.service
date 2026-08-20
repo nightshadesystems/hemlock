@@ -1,0 +1,15 @@
+[Unit]
+Description=Hemlock orchestration daemon (phase-1 stub)
+After=hemlock-syncd.service
+Wants=hemlock-syncd.service
+
+[Service]
+Type=exec
+ExecStart=/usr/sbin/hemlock-orch
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=hemlock
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

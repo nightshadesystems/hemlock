@@ -7,7 +7,9 @@ use std::io;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
@@ -74,7 +76,11 @@ pub fn select_disk(disks: &[Disk], platform_id: &str) -> Result<Option<Disk>> {
                 })
                 .collect();
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title("Install target"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Install target"),
+                )
                 .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("> ");
             frame.render_stateful_widget(list, chunks[1], &mut state);

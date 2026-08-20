@@ -125,10 +125,7 @@ async fn main() -> Result<()> {
     router_serve(listen, router).await
 }
 
-async fn router_serve(
-    listen: IpcEndpoint,
-    router: tonic::transport::server::Router,
-) -> Result<()> {
+async fn router_serve(listen: IpcEndpoint, router: tonic::transport::server::Router) -> Result<()> {
     listen
         .serve(router, async {
             let _ = tokio::signal::ctrl_c().await;

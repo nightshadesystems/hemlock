@@ -5,7 +5,7 @@ use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 
 fn speed_str(mbps: u32) -> String {
-    if mbps >= 1000 && mbps.is_multiple_of(1000) {
+    if mbps >= 1000 && mbps % 1000 == 0 {
         format!("{}G", mbps / 1000)
     } else {
         format!("{mbps}M")
@@ -38,8 +38,8 @@ pub async fn interfaces(endpoint: IpcEndpoint) -> Result<()> {
         .ports;
 
     println!(
-        "{:<12} {:>5} {:>6} {:>5} {:>4}  {}",
-        "Interface", "Index", "Speed", "Admin", "Oper", "Description"
+        "{:<12} {:>5} {:>6} {:>5} {:>4}  Description",
+        "Interface", "Index", "Speed", "Admin", "Oper"
     );
     for p in ports {
         println!(
@@ -129,8 +129,8 @@ pub async fn transceivers(endpoint: IpcEndpoint) -> Result<()> {
         .transceivers;
 
     println!(
-        "{:<12} {:<8} {:<6} {:<16} {:<16} {}",
-        "Port", "Present", "Type", "Vendor", "Part", "Serial"
+        "{:<12} {:<8} {:<6} {:<16} {:<16} Serial",
+        "Port", "Present", "Type", "Vendor", "Part"
     );
     for x in xcvrs {
         println!(

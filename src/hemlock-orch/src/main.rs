@@ -48,8 +48,7 @@ async fn main() -> Result<()> {
     };
     info!(%listen, "hemlock-orch (stub) serving gRPC");
 
-    let router =
-        tonic::transport::Server::builder().add_service(OrchServer::new(OrchService));
+    let router = tonic::transport::Server::builder().add_service(OrchServer::new(OrchService));
     listen
         .serve(router, async {
             let _ = tokio::signal::ctrl_c().await;

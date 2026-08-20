@@ -15,8 +15,7 @@ fn main() {
 fn generate_bindings() {
     use std::path::PathBuf;
 
-    let version =
-        std::env::var("HEMLOCK_SAI_HEADERS").unwrap_or_else(|_| String::from("v1.7.1"));
+    let version = std::env::var("HEMLOCK_SAI_HEADERS").unwrap_or_else(|_| String::from("v1.7.1"));
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let inc = manifest_dir
         .join("../../vendor/sai-headers")

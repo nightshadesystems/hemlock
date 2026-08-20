@@ -121,13 +121,9 @@ async fn main() {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Show { command } => match command {
-            ShowCommand::Interfaces => {
-                show::interfaces(endpoint(&cli.syncd, Daemon::Syncd)?).await
-            }
+            ShowCommand::Interfaces => show::interfaces(endpoint(&cli.syncd, Daemon::Syncd)?).await,
             ShowCommand::Switch => show::switch(endpoint(&cli.syncd, Daemon::Syncd)?).await,
-            ShowCommand::Environment => {
-                show::environment(endpoint(&cli.pmon, Daemon::Pmon)?).await
-            }
+            ShowCommand::Environment => show::environment(endpoint(&cli.pmon, Daemon::Pmon)?).await,
             ShowCommand::Transceivers => {
                 show::transceivers(endpoint(&cli.pmon, Daemon::Pmon)?).await
             }

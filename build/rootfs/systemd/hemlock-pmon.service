@@ -1,0 +1,14 @@
+[Unit]
+Description=Hemlock platform monitoring daemon
+After=local-fs.target
+
+[Service]
+Type=exec
+ExecStart=/usr/sbin/hemlock-pmon --platform /hemlock/platform --platforms-dir /hemlock
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=hemlock
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

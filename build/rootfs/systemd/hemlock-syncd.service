@@ -1,0 +1,18 @@
+[Unit]
+Description=Hemlock SAI sync daemon
+# The platform overlay is placed at install time; kernel BDE modules are
+# loaded via the manifest's [kernel] required_modules by an ExecStartPre
+# helper in a later phase.
+After=local-fs.target
+Before=hemlock-mgmtd.service hemlock-orch.service
+
+[Service]
+Type=exec
+ExecStart=/usr/sbin/hemlock-syncd --platform /hemlock/platform --platforms-dir /hemlock
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=hemlock
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

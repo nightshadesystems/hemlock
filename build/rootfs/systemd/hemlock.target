@@ -1,0 +1,7 @@
+[Unit]
+Description=Hemlock network operating system
+Wants=hemlock-syncd.service hemlock-pmon.service hemlock-mgmtd.service hemlock-orch.service
+After=multi-user.target
+
+[Install]
+WantedBy=multi-user.target

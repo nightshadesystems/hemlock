@@ -75,9 +75,12 @@ impl Engine {
 
     /// Apply the delta between running and `new_text` through syncd, then
     /// persist `new_text` as running. Returns the applied changes.
-    async fn apply_and_persist(&mut self, new_text: &str, comment: &str) -> Result<Vec<PortChange>> {
-        let running_intents = Self::parse_intents(&self.store.running()?)
-            .unwrap_or_default();
+    async fn apply_and_persist(
+        &mut self,
+        new_text: &str,
+        comment: &str,
+    ) -> Result<Vec<PortChange>> {
+        let running_intents = Self::parse_intents(&self.store.running()?).unwrap_or_default();
         let wanted_intents = Self::parse_intents(new_text)?;
         let changes = intents::diff(&running_intents, &wanted_intents);
 
@@ -177,9 +180,10 @@ impl pb::mgmt_server::Mgmt for MgmtService {
         }
 
         let candidate = engine.store.candidate().map_err(internal)?;
-        engine.validate(&candidate).await.map_err(|e| {
-            Status::failed_precondition(format!("candidate invalid: {e:#}"))
-        })?;
+        engine
+            .validate(&candidate)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("candidate invalid: {e:#}")))?;
 
         let pre_commit_running = engine.store.running().map_err(internal)?;
         let changes = engine

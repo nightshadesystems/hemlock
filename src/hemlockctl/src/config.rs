@@ -4,7 +4,9 @@ use anyhow::{bail, Context, Result};
 use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 
-async fn client(endpoint: IpcEndpoint) -> Result<pb::mgmt_client::MgmtClient<tonic::transport::Channel>> {
+async fn client(
+    endpoint: IpcEndpoint,
+) -> Result<pb::mgmt_client::MgmtClient<tonic::transport::Channel>> {
     let channel = endpoint.connect().await.context("connecting to mgmtd")?;
     Ok(pb::mgmt_client::MgmtClient::new(channel))
 }
@@ -85,7 +87,10 @@ pub async fn rollback(endpoint: IpcEndpoint, revisions_back: u32) -> Result<()> 
         })
         .await?
         .into_inner();
-    println!("rolled back {revisions_back} revision(s) (commit {})", response.commit_id);
+    println!(
+        "rolled back {revisions_back} revision(s) (commit {})",
+        response.commit_id
+    );
     for change in &response.applied_changes {
         println!("  {change}");
     }
@@ -103,9 +108,12 @@ pub async fn rollbacks(endpoint: IpcEndpoint) -> Result<()> {
         println!("no rollback points");
         return Ok(());
     }
-    println!("{:<4} {:<25} {}", "N", "Committed", "Comment");
+    println!("{:<4} {:<25} Comment", "N", "Committed");
     for e in entries {
-        println!("{:<4} {:<25} {}", e.revisions_back, e.committed_at, e.comment);
+        println!(
+            "{:<4} {:<25} {}",
+            e.revisions_back, e.committed_at, e.comment
+        );
     }
     Ok(())
 }

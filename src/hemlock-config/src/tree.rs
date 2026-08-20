@@ -56,9 +56,7 @@ impl ConfigTree {
     /// Value of a single-valued leaf among `items`.
     pub fn leaf_value<'a>(items: &'a [Item], name: &str) -> Option<&'a str> {
         items.iter().find_map(|item| match item {
-            Item::Leaf { name: n, values } if n == name => {
-                values.first().map(String::as_str)
-            }
+            Item::Leaf { name: n, values } if n == name => values.first().map(String::as_str),
             _ => None,
         })
     }

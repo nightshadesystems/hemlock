@@ -158,10 +158,7 @@ impl VendorSai {
             check("sai_api_initialize", api_initialize(0, &*services))?;
 
             let api_query: libloading::Symbol<
-                unsafe extern "C" fn(
-                    ffi::sai_api_t::Type,
-                    *mut *mut c_void,
-                ) -> ffi::sai_status_t,
+                unsafe extern "C" fn(ffi::sai_api_t::Type, *mut *mut c_void) -> ffi::sai_status_t,
             > = library
                 .get(b"sai_api_query\0")
                 .map_err(|e| SaiError::Load(format!("sai_api_query: {e}")))?;
@@ -229,9 +226,8 @@ impl SaiBackend for VendorSai {
             Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_SWITCH_PROFILE_ID);
         profile_attr.value.u32 = 0;
 
-        let mut notify_attr = Self::zeroed_attr(
-            ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY,
-        );
+        let mut notify_attr =
+            Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY);
         let notify_cb: unsafe extern "C" fn(u32, *const ffi::sai_port_oper_status_notification_t) =
             on_port_state_change;
         notify_attr.value.ptr = notify_cb as *mut c_void;
@@ -261,7 +257,9 @@ impl SaiBackend for VendorSai {
         let get_switch_attr = unsafe {
             (*self.switch_api)
                 .get_switch_attribute
-                .ok_or(SaiError::Other("switch api lacks get_switch_attribute".into()))?
+                .ok_or(SaiError::Other(
+                    "switch api lacks get_switch_attribute".into(),
+                ))?
         };
         let get_port_attr = unsafe {
             (*self.port_api)
@@ -271,8 +269,7 @@ impl SaiBackend for VendorSai {
 
         // How many ports did config.bcm produce?
         let count = {
-            let mut attr =
-                Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_NUMBER);
+            let mut attr = Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_NUMBER);
             // SAFETY: single-attr get.
             unsafe {
                 check("get(PORT_NUMBER)", get_switch_attr(switch, 1, &mut attr))?;
@@ -296,8 +293,7 @@ impl SaiBackend for VendorSai {
         let mut ports = Vec::with_capacity(oids.len());
         for oid in oids {
             let mut lanes: Vec<u32> = vec![0; 8];
-            let mut lane_attr =
-                Self::zeroed_attr(ffi::sai_port_attr_t::SAI_PORT_ATTR_HW_LANE_LIST);
+            let mut lane_attr = Self::zeroed_attr(ffi::sai_port_attr_t::SAI_PORT_ATTR_HW_LANE_LIST);
             lane_attr.value.u32list.count = lanes.len() as u32;
             lane_attr.value.u32list.list = lanes.as_mut_ptr();
 

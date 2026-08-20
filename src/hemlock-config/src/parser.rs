@@ -162,7 +162,10 @@ interfaces {
     #[test]
     fn empty_config_is_empty_tree() {
         assert_eq!(parse("").unwrap(), ConfigTree::default());
-        assert_eq!(parse("  # only a comment\n").unwrap(), ConfigTree::default());
+        assert_eq!(
+            parse("  # only a comment\n").unwrap(),
+            ConfigTree::default()
+        );
     }
 
     #[test]
