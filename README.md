@@ -32,7 +32,7 @@ via ONIE self-extracting images built per platform.
 
 | Path | Contents |
 |---|---|
-| [crates/](crates/) | The Rust workspace: daemons (`syncd`, `orch`, `pmon`, `mgmtd`), libraries (`common`, `platform`, `sai`, `config`), the `hemlockctl` CLI, and the ONIE installer |
+| [src/](src/) | The Rust workspace: daemons (`syncd`, `orch`, `pmon`, `mgmtd`), libraries (`common`, `platform`, `sai`, `config`), the `hemlockctl` CLI, and the ONIE installer |
 | [platforms/](platforms/) | Per-platform manifests + data; start at [platforms/_template/](platforms/_template/) |
 | [vendor/](vendor/) | Pinned OCP SAI headers (committed) and vendor blob staging (never committed) |
 | [build/](build/) | Rootfs package set, systemd units, ONIE image assembly |

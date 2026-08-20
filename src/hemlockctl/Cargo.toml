@@ -1,0 +1,22 @@
+[package]
+name = "hemlockctl"
+description = "Operator CLI for Hemlock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hemlock-common = { workspace = true }
+hemlock-platform = { workspace = true }
+hemlock-config = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

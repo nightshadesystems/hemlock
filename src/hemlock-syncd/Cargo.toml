@@ -1,0 +1,28 @@
+[package]
+name = "hemlock-syncd"
+description = "SAI sync daemon: owns the ASIC via a SaiBackend, serves gRPC to orch/mgmtd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Compile the vendor SAI backend (Linux + libclang; see hemlock-sai).
+real-sai = ["hemlock-sai/real-sai"]
+
+[dependencies]
+hemlock-common = { workspace = true }
+hemlock-platform = { workspace = true }
+hemlock-sai = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

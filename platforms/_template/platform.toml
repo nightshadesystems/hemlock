@@ -1,0 +1,202 @@
+# ============================================================================
+# Hemlock platform manifest — TEMPLATE
+#
+# Copy this directory to platforms/<your-platform-id>/ and edit every field.
+# A platform is *data*: if your board uses existing driver primitives, this
+# file (plus vendor data files) is all you write — zero Rust changes.
+#
+# Validate as you go:   hemlockctl platform lint platforms/<your-platform-id>
+# Full walkthrough:     docs/porting-guide.md
+#
+# The values below describe a fictional 48x1G + 4x10G board ("ACME SW48")
+# so the template itself parses and lints.
+# ============================================================================
+
+# Manifest schema version. Always 1 for now; bump only when the schema
+# changes incompatibly.
+schema_version = 1
+
+[platform]
+# Stable identifier. Lowercase [a-z0-9-]; must equal the directory name.
+id = "acme-sw48"
+# The ONIE machine string, exactly as it appears in the installer
+# environment's /etc/machine.conf (onie_machine=...). The Hemlock installer
+# refuses to install onto a mismatched machine unless --force is given.
+onie_machine = "x86_64-acme_sw48-r0"
+vendor = "ACME"
+model = "SW48 example switch"
+# ASIC family selects hemlock-syncd's init strategy. Known: "broadcom-xgs".
+asic_family = "broadcom-xgs"
+# Concrete ASIC name, informational + used by the build pipeline.
+asic = "helix4"
+
+[sai]
+# Vendor SAI package name (Debian package providing libsai).
+package = "libsaibcm"
+# Abstract per-platform version pin, resolved to a concrete vendor blob by
+# the build pipeline. Pinning is PER PLATFORM, never global: e.g. Helix4
+# boards need a SONiC 202205-era build, Trident3 boards a current one.
+version_pin = "3.7.x-helix4"
+# Absolute path of the vendor library inside the installed image. syncd
+# dlopens exactly this path.
+libsai_path = "/usr/lib/libsai.so.1"
+# ASIC init config, relative to this directory. Placed by
+# vendor/fetch-vendor.sh; never committed to git.
+config_bcm = "config.bcm"
+# Additional vendor data files (LED microcode, post-init SOC scripts...).
+# Relative paths, fetched alongside config.bcm.
+extra_files = ["led_proc.soc"]
+
+[kernel]
+# Kernel modules that must be loaded before syncd starts. For Broadcom
+# platforms this is at least the BDE pair, whose ABI must match the pinned
+# SAI's SDK — which is why the image is assembled per platform.
+required_modules = ["linux-kernel-bde", "linux-user-bde"]
+
+# ----------------------------------------------------------------------------
+# Ports.
+#
+# Describe runs of similar ports as [[ports.group]]; each group expands to
+# `count = len(lanes) / lanes_per_port` ports where port i gets:
+#     name  = "{prefix}{name_start + i}"
+#     index = index_start + i            (1-based front-panel index)
+#     alias = "{alias_prefix}{index}"    (optional)
+#     lanes = the i-th chunk of `lanes`  (lanes_per_port wide)
+#
+# The lane list is explicit — copy it from the vendor port map or SONiC's
+# port_config.ini — because real boards swap lanes in hardware and a formula
+# would silently get this wrong.
+#
+# Irregular one-off ports can be listed as [[ports.port]] with the same
+# fields spelled out individually.
+# ----------------------------------------------------------------------------
+
+# 48x1G bank.
+[[ports.group]]
+prefix = "Ethernet"
+name_start = 0        # first name is Ethernet0
+index_start = 1       # front-panel port 1
+speed_mbps = 1000
+autoneg = true
+alias_prefix = "etp"  # alias etp1..etp48
+# lanes_per_port = 1  # (default)
+lanes = [
+     1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12,
+    13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+    37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+]
+
+# 4x10G SFP+ uplinks.
+[[ports.group]]
+prefix = "Ethernet"
+name_start = 48
+index_start = 49
+speed_mbps = 10000
+autoneg = false
+alias_prefix = "etp"
+lanes = [53, 54, 55, 56]
+# Breakout capability declaration (consumed in a later phase), e.g. a
+# 40G port splittable into 4x10G:
+# breakout = ["4x10G"]
+
+# Example of an explicit single port (delete if unused):
+# [[ports.port]]
+# name = "Ethernet52"
+# index = 53
+# speed_mbps = 1000
+# lanes = [49]
+# alias = "etp53"
+
+# ----------------------------------------------------------------------------
+# Hardware: i2c topology, thermal, PSUs, transceivers — everything
+# hemlock-pmon needs, as data. Mirror your board's platform init sequence
+# (for SONiC-supported boards, the platform-modules init script is the
+# authoritative reference).
+# ----------------------------------------------------------------------------
+
+[hardware.i2c]
+# Name prefix of the root SMBus adapter. Matched by name because kernel bus
+# numbers for PCI SMBus adapters can vary between boots.
+root_adapter = "SMBus iSMT adapter"
+
+# Muxes, in instantiation order. parent_bus is "root" or a numeric child
+# bus created by an earlier mux. child_bus_base is the first kernel bus
+# number the mux's channels will claim (deterministic given the order).
+[[hardware.i2c.mux]]
+name = "main-mux"
+driver = "pca9548"
+parent_bus = "root"
+address = 0x70
+child_bus_base = 2
+channels = 8
+
+# Devices to bind, by kernel driver name.
+[[hardware.i2c.device]]
+driver = "24lc64t"
+bus = 2
+address = 0x50
+purpose = "syseeprom"
+
+[[hardware.i2c.device]]
+driver = "emc2305"
+bus = 3
+address = 0x4d
+purpose = "fan-controller"
+
+[[hardware.i2c.device]]
+driver = "max6699"
+bus = 4
+address = 0x1a
+purpose = "board-thermal"
+
+# Thermal sensors pmon polls. `hwmon` is the sysfs device identity
+# (<bus>-<addr>), `input` the channel within it. warn/crit drive alarms.
+[[hardware.thermal.sensor]]
+name = "board-inlet"
+hwmon = "4-001a"
+input = "temp1"
+warn_c = 55.0
+crit_c = 65.0
+
+# Fans: tach input + pwm output channels on the fan controller.
+[[hardware.thermal.fan]]
+name = "FAN-1"
+hwmon = "3-004d"
+tach = "fan1"
+pwm = "pwm1"
+
+# Fan curve: linear interpolation between points, driven by one sensor.
+# Below the first point fans hold its pwm; above the last, 100%.
+[hardware.thermal.fan_control]
+sensor = "board-inlet"
+interval_secs = 5
+
+[[hardware.thermal.fan_control.curve]]
+temp_c = 30.0
+pwm_percent = 40
+
+[[hardware.thermal.fan_control.curve]]
+temp_c = 50.0
+pwm_percent = 100
+
+# Power supplies (pmbus-style drivers).
+[[hardware.psu]]
+name = "PSU-1"
+bus = 5
+address = 0x5a
+driver = "dps200"
+eeprom_address = 0x52   # optional FRU eeprom on the same bus
+
+# Transceiver EEPROM access per pluggable port.
+# driver: optoe1 (QSFP) or optoe2 (SFP/SFP+).
+[[hardware.transceiver]]
+port = "Ethernet48"
+bus = 6
+driver = "optoe2"
+
+[hardware.quirks]
+# "generic" = fully described by this manifest. Boards with CPLD reset/LED
+# behavior that can't be data register a named PlatformQuirks impl in
+# hemlock-platform::quirks and select it here.
+driver = "generic"

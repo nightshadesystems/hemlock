@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/hemlock-common",
-    "crates/hemlock-platform",
-    "crates/hemlock-sai",
-    "crates/hemlock-syncd",
-    "crates/hemlock-orch",
-    "crates/hemlock-pmon",
-    "crates/hemlock-config",
-    "crates/hemlock-mgmtd",
-    "crates/hemlockctl",
-    "crates/hemlock-installer",
+    "src/hemlock-common",
+    "src/hemlock-platform",
+    "src/hemlock-sai",
+    "src/hemlock-syncd",
+    "src/hemlock-orch",
+    "src/hemlock-pmon",
+    "src/hemlock-config",
+    "src/hemlock-mgmtd",
+    "src/hemlockctl",
+    "src/hemlock-installer",
 ]
 
 [workspace.package]
@@ -23,14 +23,14 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates
-hemlock-common = { path = "crates/hemlock-common" }
-hemlock-platform = { path = "crates/hemlock-platform" }
-hemlock-sai = { path = "crates/hemlock-sai" }
-hemlock-config = { path = "crates/hemlock-config" }
+hemlock-common = { path = "src/hemlock-common" }
+hemlock-platform = { path = "src/hemlock-platform" }
+hemlock-sai = { path = "src/hemlock-sai" }
+hemlock-config = { path = "src/hemlock-config" }
 
 # Async runtime + IPC
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic = "0.12"
 tonic-build = "0.12"
 prost = "0.13"
@@ -60,6 +60,7 @@ bindgen = "0.71"
 
 # Misc
 tempfile = "3"
+chrono = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "deny"        # overridden (allowed) only inside hemlock-sai's FFI layer

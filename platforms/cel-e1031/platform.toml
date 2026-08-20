@@ -1,0 +1,268 @@
+# Celestica E1031 — Hemlock platform manifest
+#
+# Sources (SONiC 202211 branch, sonic-buildimage):
+#   device/celestica/x86_64-cel_e1031-r0/                 (port map, sensors, fans)
+#   platform/broadcom/sonic-platform-modules-cel/haliburton/  (i2c topology)
+# Data referenced, not code ported.
+
+schema_version = 1
+
+[platform]
+id = "cel-e1031"
+onie_machine = "x86_64-cel_e1031-r0"
+vendor = "Celestica"
+# SONiC codename "Haliburton" (Seastone is the DX010).
+model = "E1031 (Haliburton)"
+asic_family = "broadcom-xgs"
+asic = "helix4"
+
+[sai]
+package = "libsaibcm"
+# Helix4 was dropped from newer Broadcom SAI releases; this platform is
+# pinned to the SONiC 202205/202211-era build (SDK 6.5.x lineage). The
+# build pipeline resolves this abstract pin to a concrete vendor .deb.
+version_pin = "3.7.x-helix4"
+libsai_path = "/usr/lib/libsai.so.1"
+# Vendor data files live next to this manifest but are never committed;
+# vendor/fetch-vendor.sh places them (both exist in public sonic-buildimage).
+config_bcm = "helix4-e1031-48x1G+4x10G.config.bcm"
+extra_files = ["sai_postinit_cmd.soc"]
+
+[kernel]
+required_modules = [
+    # Broadcom BDE pair; must match the pinned SAI's SDK ABI.
+    "linux-kernel-bde",
+    "linux-user-bde",
+    # Celestica platform modules (sonic-platform-modules-cel/haliburton).
+    "smc",          # e1031.smc CPLD: SFP presence, LEDs
+    "hlx_gpio_ich", # Rangeley GPIO
+    "dps200",       # PSU pmbus driver
+    "optoe",        # transceiver EEPROMs
+]
+
+# ---------------------------------------------------------------------------
+# Ports: 48x1G copper + 4x10G SFP+ front panel.
+#
+# Lane numbers come straight from SONiC port_config.ini. The 1G bank is
+# pair-swapped in hardware (port 1 is lane 2, port 2 is lane 1, ...), and
+# the SFP+ bank is swapped too (54,53,56,55).
+#
+# Not modeled: the three non-front-panel ports in the reference port map
+# (lane 49 @1G and two 4-lane 21G links); they are internal and unused
+# until we know what the vendor config wires them to.
+# ---------------------------------------------------------------------------
+
+[[ports.group]]
+prefix = "Ethernet"
+name_start = 0
+index_start = 1
+speed_mbps = 1000
+autoneg = true
+alias_prefix = "etp"
+lanes = [
+     2,  1,  4,  3,  6,  5,  8,  7, 10,  9, 12, 11,
+    14, 13, 16, 15, 18, 17, 20, 19, 22, 21, 24, 23,
+    26, 25, 28, 27, 30, 29, 32, 31, 34, 33, 36, 35,
+    38, 37, 40, 39, 42, 41, 44, 43, 46, 45, 48, 47,
+]
+
+[[ports.group]]
+prefix = "Ethernet"
+name_start = 48
+index_start = 49
+speed_mbps = 10000
+autoneg = false
+alias_prefix = "etp"
+lanes = [54, 53, 56, 55]
+
+# ---------------------------------------------------------------------------
+# I2C topology (from platform-modules-haliburton init):
+#
+#   iSMT root adapter (bus number varies per boot; matched by name)
+#   ├── pca9548 @0x73 "cpu-extender"      -> buses 2-9
+#   │     bus 2: syseeprom, bus 3: CPU-board max6699
+#   └── on bus 8:
+#       ├── pca9541 @0x71 "master-selector" -> buses 10-17
+#       │     bus 11: main-board max6699, 12/13: PSUs, 14-17: SFP+
+#       └── pca9548 @0x72 "main-extender"   -> buses 18-25
+#             bus 23: emc2305 fan controller
+# ---------------------------------------------------------------------------
+
+[hardware.i2c]
+root_adapter = "SMBus iSMT adapter"
+
+[[hardware.i2c.mux]]
+name = "cpu-extender"
+driver = "pca9548"
+parent_bus = "root"
+address = 0x73
+child_bus_base = 2
+channels = 8
+
+# Physically a PCA9541 2:1 master selector; SONiC binds it as pca9548 and
+# so do we, which yields the 10-17 child bus numbering below.
+[[hardware.i2c.mux]]
+name = "master-selector"
+driver = "pca9548"
+parent_bus = 8
+address = 0x71
+child_bus_base = 10
+channels = 8
+
+[[hardware.i2c.mux]]
+name = "main-extender"
+driver = "pca9548"
+parent_bus = 8
+address = 0x72
+child_bus_base = 18
+channels = 8
+
+[[hardware.i2c.device]]
+driver = "24lc64t"
+bus = 2
+address = 0x50
+purpose = "syseeprom"
+
+[[hardware.i2c.device]]
+driver = "max6699"
+bus = 3
+address = 0x1a
+purpose = "cpu-board-thermal"
+
+[[hardware.i2c.device]]
+driver = "max6699"
+bus = 11
+address = 0x1a
+purpose = "main-board-thermal"
+
+[[hardware.i2c.device]]
+driver = "emc2305"
+bus = 23
+address = 0x4d
+purpose = "fan-controller"
+
+# ---------------------------------------------------------------------------
+# Thermal: warn thresholds are the sensors.conf maxima; crit values follow
+# the Helix4 shutdown sensors (85C) with headroom on the ambient sensors.
+# ---------------------------------------------------------------------------
+
+[[hardware.thermal.sensor]]
+name = "rear-inlet-ambient"
+hwmon = "11-001a"
+input = "temp1"
+warn_c = 55.0
+crit_c = 65.0
+
+[[hardware.thermal.sensor]]
+name = "rear-helix-shutdown"
+hwmon = "11-001a"
+input = "temp2"
+warn_c = 85.0
+crit_c = 90.0
+
+[[hardware.thermal.sensor]]
+name = "front-inlet-ambient-right"
+hwmon = "11-001a"
+input = "temp3"
+warn_c = 55.0
+crit_c = 65.0
+
+[[hardware.thermal.sensor]]
+name = "front-helix-shutdown"
+hwmon = "11-001a"
+input = "temp4"
+warn_c = 85.0
+crit_c = 90.0
+
+[[hardware.thermal.sensor]]
+name = "front-inlet-ambient-left"
+hwmon = "11-001a"
+input = "temp5"
+warn_c = 55.0
+crit_c = 65.0
+
+[[hardware.thermal.sensor]]
+name = "cpu-board-1"
+hwmon = "3-001a"
+input = "temp2"
+warn_c = 90.0
+crit_c = 95.0
+
+[[hardware.thermal.sensor]]
+name = "cpu-board-2"
+hwmon = "3-001a"
+input = "temp3"
+warn_c = 90.0
+crit_c = 95.0
+
+# Fan names follow the chassis labels; note the tach/pwm channels are not
+# in label order (fan4 drives the "FAN-1" slot).
+[[hardware.thermal.fan]]
+name = "FAN-1"
+hwmon = "23-004d"
+tach = "fan4"
+pwm = "pwm4"
+
+[[hardware.thermal.fan]]
+name = "FAN-2"
+hwmon = "23-004d"
+tach = "fan2"
+pwm = "pwm2"
+
+[[hardware.thermal.fan]]
+name = "FAN-3"
+hwmon = "23-004d"
+tach = "fan1"
+pwm = "pwm1"
+
+# From the SONiC F2B fancontrol config: 29C -> PWM 102/255 (40%),
+# 46C -> PWM 255 (100%), linear in between, sampled every 2s.
+[hardware.thermal.fan_control]
+sensor = "front-inlet-ambient-right"
+interval_secs = 2
+
+[[hardware.thermal.fan_control.curve]]
+temp_c = 29.0
+pwm_percent = 40
+
+[[hardware.thermal.fan_control.curve]]
+temp_c = 46.0
+pwm_percent = 100
+
+[[hardware.psu]]
+name = "PSU-1"
+bus = 12
+address = 0x5a
+driver = "dps200"
+eeprom_address = 0x52
+
+[[hardware.psu]]
+name = "PSU-2"
+bus = 13
+address = 0x5b
+driver = "dps200"
+eeprom_address = 0x53
+
+# SFP+ cages, one EEPROM bus each (optoe2 = SFP-style, 2-wire addr 0x50).
+[[hardware.transceiver]]
+port = "Ethernet48"
+bus = 14
+driver = "optoe2"
+
+[[hardware.transceiver]]
+port = "Ethernet49"
+bus = 15
+driver = "optoe2"
+
+[[hardware.transceiver]]
+port = "Ethernet50"
+bus = 16
+driver = "optoe2"
+
+[[hardware.transceiver]]
+port = "Ethernet51"
+bus = 17
+driver = "optoe2"
+
+[hardware.quirks]
+driver = "generic"
