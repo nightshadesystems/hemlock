@@ -606,12 +606,11 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
- "hemlock-common",
- "hemlock-platform",
  "ratatui",
- "serde",
- "tokio",
+ "tempfile",
+ "thiserror",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
