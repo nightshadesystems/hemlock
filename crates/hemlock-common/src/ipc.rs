@@ -116,8 +116,8 @@ impl IpcEndpoint {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(HemlockError::io(path, e)),
                 }
-                let listener = tokio::net::UnixListener::bind(path)
-                    .map_err(|e| HemlockError::io(path, e))?;
+                let listener =
+                    tokio::net::UnixListener::bind(path).map_err(|e| HemlockError::io(path, e))?;
                 let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
                 router
                     .serve_with_incoming_shutdown(incoming, shutdown)
@@ -169,13 +169,16 @@ impl IpcEndpoint {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_endpoint_forms() {
         assert_eq!(
-            "unix:/run/hemlock/syncd.sock".parse::<IpcEndpoint>().unwrap(),
+            "unix:/run/hemlock/syncd.sock"
+                .parse::<IpcEndpoint>()
+                .unwrap(),
             IpcEndpoint::Unix(PathBuf::from("/run/hemlock/syncd.sock"))
         );
         assert_eq!(
