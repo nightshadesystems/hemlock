@@ -1,0 +1,31 @@
+[package]
+name = "hemlock-sai"
+description = "SAI FFI bindings (bindgen) and the safe wrapper layer, plus a pure-Rust mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["mock-sai"]
+# Pure-Rust mock backend; no vendor library, no libclang, no Linux required.
+mock-sai = []
+# Real vendor backend: bindgen over the vendored SAI headers + dlopen of
+# libsai.so at runtime. Requires libclang at build time; Linux only at runtime.
+real-sai = ["dep:libloading", "dep:bindgen"]
+
+[dependencies]
+hemlock-common = { workspace = true }
+hemlock-platform = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+libloading = { workspace = true, optional = true }
+
+[build-dependencies]
+bindgen = { workspace = true, optional = true }
+
+[lints]
+workspace = true

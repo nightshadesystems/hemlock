@@ -1,0 +1,15 @@
+// hemlock-orch: netlink/FRR -> SAI orchestration. Phase 1 is a seam stub;
+// L3/VLAN/LAG/EVPN services will extend this file.
+syntax = "proto3";
+package hemlock.v1;
+
+service Orch {
+  rpc GetStatus(GetOrchStatusRequest) returns (OrchStatus);
+}
+
+message GetOrchStatusRequest {}
+
+message OrchStatus {
+  bool running = 1;
+  string detail = 2;
+}

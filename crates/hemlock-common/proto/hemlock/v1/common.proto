@@ -1,0 +1,16 @@
+// Shared enums and messages used across Hemlock daemon APIs.
+syntax = "proto3";
+package hemlock.v1;
+
+enum AdminState {
+  ADMIN_STATE_UNSPECIFIED = 0;
+  ADMIN_STATE_UP = 1;
+  ADMIN_STATE_DOWN = 2;
+}
+
+enum OperStatus {
+  OPER_STATUS_UNSPECIFIED = 0;
+  OPER_STATUS_UP = 1;
+  OPER_STATUS_DOWN = 2;
+  OPER_STATUS_UNKNOWN = 3;
+}

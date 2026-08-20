@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hemlock-common",
+    "crates/hemlock-platform",
+    "crates/hemlock-sai",
+    "crates/hemlock-syncd",
+    "crates/hemlock-orch",
+    "crates/hemlock-pmon",
+    "crates/hemlock-config",
+    "crates/hemlock-mgmtd",
+    "crates/hemlockctl",
+    "crates/hemlock-installer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/nightshadesystems/hemlock"
+authors = ["Nightshade Systems"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+hemlock-common = { path = "crates/hemlock-common" }
+hemlock-platform = { path = "crates/hemlock-platform" }
+hemlock-sai = { path = "crates/hemlock-sai" }
+hemlock-config = { path = "crates/hemlock-config" }
+
+# Async runtime + IPC
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+protoc-bin-vendored = "3"
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# Errors + logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI / TUI
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+
+# FFI (hemlock-sai only)
+libloading = "0.8"
+bindgen = "0.71"
+
+# Misc
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"        # overridden (allowed) only inside hemlock-sai's FFI layer
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

@@ -1,0 +1,59 @@
+// hemlock-syncd: the only process that owns the ASIC. Serves switch and
+// port state to mgmtd/orch/hemlockctl and applies their intents via SAI.
+syntax = "proto3";
+package hemlock.v1;
+
+import "hemlock/v1/common.proto";
+
+service Syncd {
+  rpc GetSwitchInfo(GetSwitchInfoRequest) returns (SwitchInfo);
+  rpc ListPorts(ListPortsRequest) returns (ListPortsResponse);
+  rpc SetPortAttrs(SetPortAttrsRequest) returns (SetPortAttrsResponse);
+  // Server-streaming feed of port oper-status changes (SAI notifications).
+  rpc WatchPortEvents(WatchPortEventsRequest) returns (stream PortEvent);
+}
+
+message GetSwitchInfoRequest {}
+
+message SwitchInfo {
+  string platform_id = 1;
+  // "mock" or "vendor:<libsai path>"
+  string backend = 2;
+  uint64 switch_oid = 3;
+  uint32 port_count = 4;
+}
+
+message ListPortsRequest {}
+
+message ListPortsResponse {
+  repeated Port ports = 1;
+}
+
+message Port {
+  string name = 1;          // e.g. "Ethernet1"
+  uint32 index = 2;         // front-panel index from the platform manifest
+  repeated uint32 lanes = 3;
+  uint32 speed_mbps = 4;
+  AdminState admin_state = 5;
+  OperStatus oper_status = 6;
+  string description = 7;
+  uint64 sai_oid = 8;
+}
+
+message SetPortAttrsRequest {
+  string name = 1;
+  // Only fields that are present are applied.
+  optional AdminState admin_state = 2;
+  optional string description = 3;
+}
+
+message SetPortAttrsResponse {
+  Port port = 1;
+}
+
+message WatchPortEventsRequest {}
+
+message PortEvent {
+  string name = 1;
+  OperStatus oper_status = 2;
+}

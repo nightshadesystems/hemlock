@@ -1,0 +1,74 @@
+// hemlock-mgmtd: the commit engine. Owns candidate/running config,
+// the rollback ring, and commit-confirm.
+syntax = "proto3";
+package hemlock.v1;
+
+service Mgmt {
+  rpc GetConfig(GetConfigRequest) returns (ConfigText);
+  rpc SetCandidate(ConfigText) returns (SetCandidateResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc ConfirmCommit(ConfirmCommitRequest) returns (ConfirmCommitResponse);
+  // Load rollback N into the candidate; follow with Commit to activate.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  rpc ListRollbacks(ListRollbacksRequest) returns (ListRollbacksResponse);
+  rpc Discard(DiscardRequest) returns (DiscardResponse);
+}
+
+enum ConfigSource {
+  CONFIG_SOURCE_UNSPECIFIED = 0;
+  CONFIG_SOURCE_RUNNING = 1;
+  CONFIG_SOURCE_CANDIDATE = 2;
+}
+
+message GetConfigRequest {
+  ConfigSource source = 1;
+}
+
+message ConfigText {
+  string text = 1;
+}
+
+message SetCandidateResponse {
+  bool valid = 1;
+  repeated string errors = 2;
+}
+
+message CommitRequest {
+  string comment = 1;
+  // Non-zero enables commit-confirm: auto-rollback unless ConfirmCommit
+  // arrives within this many seconds.
+  uint32 confirm_timeout_secs = 2;
+}
+
+message CommitResponse {
+  uint64 commit_id = 1;
+  repeated string applied_changes = 2;
+}
+
+message ConfirmCommitRequest {}
+message ConfirmCommitResponse {
+  bool was_pending = 1;
+}
+
+message RollbackRequest {
+  uint32 revisions_back = 1;  // 1 = previous running config
+}
+
+message RollbackResponse {
+  string loaded_text = 1;
+}
+
+message ListRollbacksRequest {}
+
+message ListRollbacksResponse {
+  repeated RollbackEntry entries = 1;
+}
+
+message RollbackEntry {
+  uint32 revisions_back = 1;
+  string committed_at = 2;   // RFC 3339
+  string comment = 3;
+}
+
+message DiscardRequest {}
+message DiscardResponse {}

@@ -1,0 +1,51 @@
+// hemlock-pmon: platform environment monitoring (fans, thermal, PSU, SFP).
+syntax = "proto3";
+package hemlock.v1;
+
+service Pmon {
+  rpc GetEnvironment(GetEnvironmentRequest) returns (Environment);
+  rpc ListTransceivers(ListTransceiversRequest) returns (ListTransceiversResponse);
+}
+
+message GetEnvironmentRequest {}
+
+message Environment {
+  repeated TemperatureSensor temperatures = 1;
+  repeated Fan fans = 2;
+  repeated Psu psus = 3;
+}
+
+message TemperatureSensor {
+  string name = 1;
+  double celsius = 2;
+  double warn_celsius = 3;
+  double crit_celsius = 4;
+}
+
+message Fan {
+  string name = 1;
+  uint32 rpm = 2;
+  uint32 pwm_percent = 3;
+  bool ok = 4;
+}
+
+message Psu {
+  string name = 1;
+  bool present = 2;
+  bool ok = 3;
+}
+
+message ListTransceiversRequest {}
+
+message ListTransceiversResponse {
+  repeated Transceiver transceivers = 1;
+}
+
+message Transceiver {
+  string port = 1;          // front-panel port name, e.g. "Ethernet49"
+  bool present = 2;
+  string form_factor = 3;   // "SFP", "SFP+", ...
+  string vendor = 4;
+  string part_number = 5;
+  string serial = 6;
+}

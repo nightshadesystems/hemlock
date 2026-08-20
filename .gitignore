@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+
+# Vendor blobs are never committed (see vendor/sai/README.md)
+vendor/sai/*
+!vendor/sai/README.md
+!vendor/sai/.gitkeep
+platforms/**/config.bcm
+platforms/**/*.soc
+platforms/**/*.deb
+
+# Build outputs
+/build/out/
+*.bin
+*.squashfs
+
+# Local state from dev runs
+/.hemlock-state/

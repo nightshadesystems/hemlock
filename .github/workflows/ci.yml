@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show # installs the rust-toolchain.toml pin
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      # The real-sai backend must always *compile* against the vendored
+      # headers, even though it can only run on hardware with a vendor blob.
+      - run: cargo build -p hemlock-sai --features real-sai
+      # Definition-of-done gates
+      - run: cargo run -p hemlockctl -- platform lint platforms/cel-e1031
+        if: hashFiles('platforms/cel-e1031/platform.toml') != ''

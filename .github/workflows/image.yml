@@ -1,0 +1,24 @@
+name: Image build (skeleton)
+
+# ONIE image assembly skeleton. Uses a dummy rootfs in CI (debootstrap of a
+# full Debian rootfs is a release-pipeline concern); validates that the
+# self-extracting .bin structure is installable.
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Platform id under platforms/"
+        default: "cel-e1031"
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y squashfs-tools
+      - run: ./build/mkimage.sh "${{ inputs.platform || 'cel-e1031' }}" --dummy-rootfs
+      - run: ./build/verify-image.sh build/out/hemlock-*-"${{ inputs.platform || 'cel-e1031' }}".bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hemlock-image-${{ inputs.platform || 'cel-e1031' }}
+          path: build/out/*.bin
