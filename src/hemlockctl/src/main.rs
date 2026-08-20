@@ -12,7 +12,7 @@ mod platform;
 mod show;
 
 #[derive(Parser)]
-#[command(name = "hemlockctl", version, about = "Hemlock operator CLI")]
+#[command(name = "hemlockctl", version = hemlock_common::VERSION, about = "Hemlock operator CLI")]
 struct Cli {
     /// Override the syncd endpoint (unix:/path or tcp:host:port).
     #[arg(long, global = true)]

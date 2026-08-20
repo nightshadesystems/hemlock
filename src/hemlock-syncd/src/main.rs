@@ -22,7 +22,7 @@ use hemlock_sai::SaiBackend;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "hemlock-syncd", version, about)]
+#[command(name = "hemlock-syncd", version = hemlock_common::VERSION, about)]
 struct Args {
     /// Platform id (under --platforms-dir) or a platform directory path.
     #[arg(long)]

@@ -82,7 +82,7 @@ unsafe extern "C" fn on_port_state_change(
     for item in items {
         let _ = tx.send(SaiEvent::PortOperStatus {
             port: PortId(item.port_id),
-            up: item.port_state == ffi::sai_port_oper_status_t::SAI_PORT_OPER_STATUS_UP,
+            up: item.port_state == ffi::_sai_port_oper_status_t::SAI_PORT_OPER_STATUS_UP,
         });
     }
 }
@@ -140,7 +140,7 @@ impl VendorSai {
         let library = unsafe { libloading::Library::new(&init.libsai_path) }
             .map_err(|e| SaiError::Load(format!("{}: {e}", init.libsai_path.display())))?;
 
-        let mut services = Box::new(ffi::sai_service_method_table_t {
+        let services = Box::new(ffi::sai_service_method_table_t {
             profile_get_value: Some(profile_get_value),
             profile_get_next_value: Some(profile_get_next_value),
         });
@@ -158,7 +158,7 @@ impl VendorSai {
             check("sai_api_initialize", api_initialize(0, &*services))?;
 
             let api_query: libloading::Symbol<
-                unsafe extern "C" fn(ffi::sai_api_t::Type, *mut *mut c_void) -> ffi::sai_status_t,
+                unsafe extern "C" fn(ffi::sai_api_t, *mut *mut c_void) -> ffi::sai_status_t,
             > = library
                 .get(b"sai_api_query\0")
                 .map_err(|e| SaiError::Load(format!("sai_api_query: {e}")))?;
@@ -166,12 +166,12 @@ impl VendorSai {
             let mut switch_api: *mut c_void = std::ptr::null_mut();
             check(
                 "sai_api_query(SWITCH)",
-                api_query(ffi::sai_api_t::SAI_API_SWITCH, &mut switch_api),
+                api_query(ffi::_sai_api_t::SAI_API_SWITCH, &mut switch_api),
             )?;
             let mut port_api: *mut c_void = std::ptr::null_mut();
             check(
                 "sai_api_query(PORT)",
-                api_query(ffi::sai_api_t::SAI_API_PORT, &mut port_api),
+                api_query(ffi::_sai_api_t::SAI_API_PORT, &mut port_api),
             )?;
             (
                 switch_api as *mut ffi::sai_switch_api_t,
@@ -219,15 +219,15 @@ impl SaiBackend for VendorSai {
             return Err(SaiError::Other("switch already created".into()));
         }
 
-        let mut init_attr = Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_INIT_SWITCH);
+        let mut init_attr = Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_INIT_SWITCH);
         init_attr.value.booldata = true;
 
         let mut profile_attr =
-            Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_SWITCH_PROFILE_ID);
-        profile_attr.value.u32 = 0;
+            Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_SWITCH_PROFILE_ID);
+        profile_attr.value.u32_ = 0;
 
         let mut notify_attr =
-            Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY);
+            Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY);
         let notify_cb: unsafe extern "C" fn(u32, *const ffi::sai_port_oper_status_notification_t) =
             on_port_state_change;
         notify_attr.value.ptr = notify_cb as *mut c_void;
@@ -269,18 +269,18 @@ impl SaiBackend for VendorSai {
 
         // How many ports did config.bcm produce?
         let count = {
-            let mut attr = Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_NUMBER);
+            let mut attr = Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_NUMBER);
             // SAFETY: single-attr get.
             unsafe {
                 check("get(PORT_NUMBER)", get_switch_attr(switch, 1, &mut attr))?;
-                attr.value.u32
+                attr.value.u32_
             }
         };
 
         // Fetch their OIDs.
         let mut oids: Vec<ffi::sai_object_id_t> = vec![0; count as usize];
         {
-            let mut attr = Self::zeroed_attr(ffi::sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_LIST);
+            let mut attr = Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_PORT_LIST);
             attr.value.objlist.count = count;
             attr.value.objlist.list = oids.as_mut_ptr();
             // SAFETY: list buffer sized to `count`, alive across the call.
@@ -293,13 +293,14 @@ impl SaiBackend for VendorSai {
         let mut ports = Vec::with_capacity(oids.len());
         for oid in oids {
             let mut lanes: Vec<u32> = vec![0; 8];
-            let mut lane_attr = Self::zeroed_attr(ffi::sai_port_attr_t::SAI_PORT_ATTR_HW_LANE_LIST);
+            let mut lane_attr =
+                Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_HW_LANE_LIST);
             lane_attr.value.u32list.count = lanes.len() as u32;
             lane_attr.value.u32list.list = lanes.as_mut_ptr();
 
-            let speed_attr = Self::zeroed_attr(ffi::sai_port_attr_t::SAI_PORT_ATTR_SPEED);
-            let admin_attr = Self::zeroed_attr(ffi::sai_port_attr_t::SAI_PORT_ATTR_ADMIN_STATE);
-            let oper_attr = Self::zeroed_attr(ffi::sai_port_attr_t::SAI_PORT_ATTR_OPER_STATUS);
+            let speed_attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_SPEED);
+            let admin_attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_ADMIN_STATE);
+            let oper_attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_OPER_STATUS);
 
             let mut attrs = [lane_attr, speed_attr, admin_attr, oper_attr];
             // SAFETY: attr array + lane buffer valid across the call; union
@@ -313,10 +314,10 @@ impl SaiBackend for VendorSai {
                 ports.push(SaiPort {
                     id: PortId(oid),
                     lanes,
-                    speed_mbps: attrs[1].value.u32,
+                    speed_mbps: attrs[1].value.u32_,
                     admin_up: attrs[2].value.booldata,
                     oper_up: attrs[3].value.s32
-                        == ffi::sai_port_oper_status_t::SAI_PORT_OPER_STATUS_UP as i32,
+                        == ffi::_sai_port_oper_status_t::SAI_PORT_OPER_STATUS_UP as i32,
                 });
             }
         }
@@ -325,7 +326,7 @@ impl SaiBackend for VendorSai {
 
     fn set_port_admin_state(&mut self, port: PortId, up: bool) -> Result<(), SaiError> {
         self.switch_oid()?;
-        let mut attr = Self::zeroed_attr(ffi::sai_port_attr_t::SAI_PORT_ATTR_ADMIN_STATE);
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_ADMIN_STATE);
         attr.value.booldata = up;
         // SAFETY: valid port api table; attr outlives the call.
         unsafe {

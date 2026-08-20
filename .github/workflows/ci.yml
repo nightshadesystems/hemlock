@@ -34,7 +34,8 @@ jobs:
       - run: cargo test --workspace
       # The real-sai backend must always *compile* against the vendored
       # headers, even though it can only run on hardware with a vendor blob.
-      - run: cargo build -p hemlock-sai --features real-sai
+      - run: cargo clippy -p hemlock-sai --features real-sai --all-targets -- -D warnings
+      - run: cargo build -p hemlock-syncd --features real-sai
       # Definition-of-done gates
       - run: cargo run -p hemlockctl -- platform lint platforms/cel-e1031
         if: hashFiles('platforms/cel-e1031/platform.toml') != ''

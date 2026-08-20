@@ -28,9 +28,22 @@ fn generate_bindings() {
     );
     println!("cargo:rerun-if-changed={}", inc.display());
 
-    let bindings = bindgen::Builder::default()
+    // When cross-targeting (see --target below), libclang does not add its
+    // own builtin headers (stdint.h, stddef.h, ...); locate them via clang.
+    let builtin_include = clang_builtin_include();
+
+    let mut builder = bindgen::Builder::default();
+    if let Some(dir) = &builtin_include {
+        builder = builder.clang_arg(format!("-isystem{dir}"));
+    }
+    let bindings = builder
         .header(manifest_dir.join("wrapper.h").display().to_string())
         .clang_arg(format!("-I{}", inc.display()))
+        // libsai is a Linux library; generate Linux-ABI bindings regardless
+        // of the build host so output is identical everywhere.
+        .clang_arg("--target=x86_64-unknown-linux-gnu")
+        // Shim legacy <sys/types.h>; see compat/sys/types.h.
+        .clang_arg(format!("-I{}", manifest_dir.join("compat").display()))
         .allowlist_function("sai_.*")
         .allowlist_type("sai_.*")
         .allowlist_var("SAI_.*")
@@ -43,4 +56,34 @@ fn generate_bindings() {
     bindings
         .write_to_file(out.join("sai_bindings.rs"))
         .expect("write sai_bindings.rs");
+}
+
+#[cfg(feature = "real-sai")]
+fn clang_builtin_include() -> Option<String> {
+    // Prefer a clang next to libclang (LIBCLANG_PATH), then PATH.
+    let candidates: Vec<std::path::PathBuf> = std::env::var_os("LIBCLANG_PATH")
+        .map(|dir| {
+            let dir = std::path::PathBuf::from(dir);
+            vec![dir.join("clang.exe"), dir.join("clang")]
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .chain([std::path::PathBuf::from("clang")])
+        .collect();
+    for clang in candidates {
+        let Ok(output) = std::process::Command::new(&clang)
+            .arg("--print-resource-dir")
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let include = std::path::Path::new(&resource_dir).join("include");
+            if include.is_dir() {
+                return Some(include.display().to_string());
+            }
+        }
+    }
+    None
 }

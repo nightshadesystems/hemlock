@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "hemlock-mgmtd", version, about)]
+#[command(name = "hemlock-mgmtd", version = hemlock_common::VERSION, about)]
 struct Args {
     /// State directory (running/candidate/rollback ring).
     #[arg(long, default_value_os_t = default_state_dir())]

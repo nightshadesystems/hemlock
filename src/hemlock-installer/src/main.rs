@@ -20,7 +20,7 @@ use install::InstallPlan;
 use machine::MachineConf;
 
 #[derive(Parser)]
-#[command(name = "hemlock-installer", version, about)]
+#[command(name = "hemlock-installer", version = env!("HEMLOCK_VERSION"), about)]
 struct Args {
     /// Payload directory (rootfs.squashfs, platform/, boot/). The
     /// self-extractor passes this automatically.

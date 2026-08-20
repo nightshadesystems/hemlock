@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "hemlock-orch", version, about)]
+#[command(name = "hemlock-orch", version = hemlock_common::VERSION, about)]
 struct Args {
     /// gRPC endpoint to serve (unix:/path or tcp:host:port).
     #[arg(long)]

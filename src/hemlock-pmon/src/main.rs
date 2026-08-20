@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use hw::HwBackend;
 
 #[derive(Parser)]
-#[command(name = "hemlock-pmon", version, about)]
+#[command(name = "hemlock-pmon", version = hemlock_common::VERSION, about)]
 struct Args {
     /// Platform id (under --platforms-dir) or a platform directory path.
     #[arg(long)]

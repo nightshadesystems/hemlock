@@ -20,7 +20,7 @@ PLATFORM="${1:-}"
 shift
 
 DUMMY=0
-VERSION="0.1.0-dev"
+VERSION=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --dummy-rootfs) DUMMY=1 ;;
@@ -31,6 +31,9 @@ while [ $# -gt 0 ]; do
 done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Single source of truth for versioning: the top-level VERSION file.
+[ -n "$VERSION" ] || VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+[ -n "$VERSION" ] || die "empty VERSION file at $ROOT/VERSION"
 PDIR="$ROOT/platforms/$PLATFORM"
 [ -f "$PDIR/platform.toml" ] || die "no platform.toml in $PDIR"
 
