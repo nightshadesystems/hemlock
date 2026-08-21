@@ -20,6 +20,9 @@ iproute2
 ethtool
 iputils-ping
 tcpdump
+# vendor SAI runtime dependencies (libsaibcm: Depends libstdc++6, libyaml-0-2)
+libstdc++6
+libyaml-0-2
 # platform access
 i2c-tools
 lm-sensors

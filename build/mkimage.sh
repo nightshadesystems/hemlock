@@ -71,7 +71,8 @@ else
     command -v mksquashfs >/dev/null || die "squashfs-tools not installed"
 
     # The vendor SAI blob must exist for a real image.
-    SAI_DEB="$(ls "$ROOT"/vendor/sai/libsaibcm*"$SAI_PIN"*.deb 2>/dev/null | head -1 || true)"
+    # Exact-name glob: libsaibcm-dev_* must never match here.
+    SAI_DEB="$(ls "$ROOT"/vendor/sai/libsaibcm_"$SAI_PIN"_*.deb 2>/dev/null | head -1 || true)"
     [ -n "$SAI_DEB" ] || die \
         "no libsaibcm .deb matching pin '$SAI_PIN' in vendor/sai/ — see vendor/sai/README.md
  (CI and development never need this: use --dummy-rootfs or mock-sai)"
