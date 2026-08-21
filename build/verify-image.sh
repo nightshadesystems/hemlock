@@ -46,10 +46,13 @@ if command -v unsquashfs >/dev/null && unsquashfs -s "$WORK/rootfs.squashfs" >/d
          && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'etc/update-motd.d/10-hemlock-status' \
          && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'usr/bin/hemlock-motd'"
     # Without the BDE pair syncd cannot drive the ASIC on real hardware
-    # (and deliberately refuses to mock when one is present).
-    check "rootfs carries the BDE kernel modules" \
-        "unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'updates/hemlock/linux-kernel-bde.ko' \
-         && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'updates/hemlock/linux-user-bde.ko'"
+    # (and deliberately refuses to mock when one is present). Dummy images
+    # (placeholder kernel) never build modules; skip those.
+    if ! head -c5 "$WORK/boot/vmlinuz" | grep -q dummy; then
+        check "rootfs carries the BDE kernel modules" \
+            "unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'updates/hemlock/linux-kernel-bde.ko' \
+             && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'updates/hemlock/linux-user-bde.ko'"
+    fi
 fi
 check "installer binary present"           "[ -s '$WORK/hemlock-installer' ]"
 check "installer is executable"            "[ -x '$WORK/hemlock-installer' ]"
