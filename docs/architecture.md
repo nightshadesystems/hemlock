@@ -210,6 +210,27 @@ commit.
   commits it (the underlying RPCs are separate, so a future interactive
   mode can load-then-inspect).
 
+## The operator CLI
+
+`hemlockctl` with no arguments is the interactive CLI (and, on a switch,
+the operator's login shell). Arista EOS-style syntax with Nightshade
+prompts: `user@hostname>` in operational mode, `user@hostname#` in
+configuration mode (`root@hemlock` by default — the image sets hostname
+`hemlock`). `configure`/`conf` enters config mode, `bash` drops to Linux,
+unique command prefixes are accepted (`sh int status`).
+
+Config-mode commands (`interface <name>` → `description`, `shutdown`,
+`no shutdown`) edit the mgmtd *candidate* via the config tree; nothing
+touches the ASIC until `commit` (or `commit confirmed <secs>` for
+auto-rollback). `show interfaces status` renders the EOS-style summary
+(Status = connected/notconnect/disabled; Type comes from the manifest's
+per-port `media` field). Subcommand form (`hemlockctl show interfaces
+status`, `hemlockctl commit`, ...) drives the same daemons for scripting.
+
+At startup mgmtd replays the persisted running config onto syncd (with
+retry), so a restart of either daemon — or the whole box — converges the
+ASIC to the running config.
+
 ## Image and installer
 
 `build/mkimage.sh <platform>` produces `hemlock-<version>-<platform>.bin`:

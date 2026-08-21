@@ -53,6 +53,7 @@ pub struct PortDef {
     pub speed_mbps: u32,
     pub alias: Option<String>,
     pub autoneg: bool,
+    pub media: Option<String>,
     pub breakout: Vec<String>,
 }
 
@@ -168,6 +169,7 @@ fn expand_ports(manifest: &Manifest) -> Result<Vec<PortDef>, PlatformError> {
                 speed_mbps: group.speed_mbps,
                 alias: group.alias_prefix.as_ref().map(|p| format!("{p}{index}")),
                 autoneg: group.autoneg,
+                media: group.media.clone(),
                 breakout: group.breakout.clone(),
             });
         }
@@ -181,6 +183,7 @@ fn expand_ports(manifest: &Manifest) -> Result<Vec<PortDef>, PlatformError> {
             speed_mbps: entry.speed_mbps,
             alias: entry.alias.clone(),
             autoneg: entry.autoneg,
+            media: entry.media.clone(),
             breakout: entry.breakout.clone(),
         });
     }

@@ -55,6 +55,66 @@ pub async fn interfaces(endpoint: IpcEndpoint) -> Result<()> {
     Ok(())
 }
 
+/// EOS-style `show interfaces status` summary table.
+pub async fn interfaces_status(endpoint: IpcEndpoint) -> Result<()> {
+    let channel = endpoint.connect().await.context("connecting to syncd")?;
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    let mut ports = client
+        .list_ports(pb::ListPortsRequest {})
+        .await?
+        .into_inner()
+        .ports;
+    ports.sort_by_key(|p| p.index);
+
+    println!(
+        "{:<12} {:<29} {:<12} {:<8} {:<6} {:<6} {:<15} {:<5} Encapsulation",
+        "Port", "Name", "Status", "Vlan", "Duplex", "Speed", "Type", "Flags"
+    );
+    for p in &ports {
+        let admin_up = p.admin_state == pb::AdminState::Up as i32;
+        let oper_up = p.oper_status == pb::OperStatus::Up as i32;
+        let mut name = p.description.clone();
+        if name.len() > 29 {
+            name.truncate(26);
+            name.push_str("...");
+        }
+        // Phase 1 has no VLAN objects yet (every port sits in the default
+        // VLAN) and no flags/encapsulation state.
+        println!(
+            "{:<12} {:<29} {:<12} {:<8} {:<6} {:<6} {:<15}",
+            p.name,
+            name,
+            crate::cli::status_word(admin_up, oper_up),
+            "1",
+            "full",
+            speed_str(p.speed_mbps),
+            p.media,
+        );
+    }
+    Ok(())
+}
+
+/// Software + platform summary. Daemon state is best-effort: `show
+/// version` must work even when syncd is down.
+pub async fn version(endpoint: IpcEndpoint) {
+    println!("Hemlock  {}", hemlock_common::VERSION);
+    match endpoint.connect().await {
+        Ok(channel) => {
+            let mut client = pb::syncd_client::SyncdClient::new(channel);
+            match client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
+                Ok(info) => {
+                    let info = info.into_inner();
+                    println!("Platform:  {}", info.platform_id);
+                    println!("Backend:   {}", info.backend);
+                    println!("Ports:     {}", info.port_count);
+                }
+                Err(e) => println!("(syncd unavailable: {})", e.message()),
+            }
+        }
+        Err(_) => println!("(syncd not running)"),
+    }
+}
+
 pub async fn switch(endpoint: IpcEndpoint) -> Result<()> {
     let channel = endpoint.connect().await.context("connecting to syncd")?;
     let mut client = pb::syncd_client::SyncdClient::new(channel);

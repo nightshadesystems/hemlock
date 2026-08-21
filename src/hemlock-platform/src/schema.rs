@@ -108,6 +108,10 @@ pub struct PortGroup {
     pub alias_prefix: Option<String>,
     #[serde(default)]
     pub autoneg: bool,
+    /// Physical media, as shown in `show interfaces status` Type column
+    /// (e.g. `1000BASE-T`, `SFP+`, `QSFP28`).
+    #[serde(default)]
+    pub media: Option<String>,
     /// Supported breakout modes, e.g. `["4x10G"]`. Empty = no breakout.
     #[serde(default)]
     pub breakout: Vec<String>,
@@ -125,6 +129,8 @@ pub struct PortEntry {
     pub alias: Option<String>,
     #[serde(default)]
     pub autoneg: bool,
+    #[serde(default)]
+    pub media: Option<String>,
     #[serde(default)]
     pub breakout: Vec<String>,
 }

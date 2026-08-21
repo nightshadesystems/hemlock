@@ -102,6 +102,10 @@ else
     rm -f "$ROOTFS/tmp/$(basename "$SAI_DEB")"
 fi
 
+# Identity defaults: hostname "hemlock" (the CLI prompt is user@hostname).
+echo hemlock > "$ROOTFS/etc/hostname"
+grep -q "hemlock" "$ROOTFS/etc/hosts" 2>/dev/null     || echo "127.0.1.1 hemlock" >> "$ROOTFS/etc/hosts"
+
 # --- 2. Squash it -----------------------------------------------------------
 if command -v mksquashfs >/dev/null; then
     mksquashfs "$ROOTFS" "$PAYLOAD/rootfs.squashfs" -comp xz -noappend -quiet

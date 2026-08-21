@@ -35,6 +35,7 @@ impl SyncdService {
             } as i32,
             description: port.description.clone(),
             sai_oid: port.sai_id.0,
+            media: port.def.media.clone().unwrap_or_default(),
         }
     }
 }

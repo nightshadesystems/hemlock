@@ -66,6 +66,7 @@ index_start = 1
 speed_mbps = 1000
 autoneg = true
 alias_prefix = "etp"
+media = "1000BASE-T"
 lanes = [
      2,  1,  4,  3,  6,  5,  8,  7, 10,  9, 12, 11,
     14, 13, 16, 15, 18, 17, 20, 19, 22, 21, 24, 23,
@@ -80,6 +81,7 @@ index_start = 49
 speed_mbps = 10000
 autoneg = false
 alias_prefix = "etp"
+media = "SFP+"
 lanes = [54, 53, 56, 55]
 
 # ---------------------------------------------------------------------------

@@ -116,6 +116,42 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Re-apply the full running config to syncd. Needed at startup:
+    /// syncd boots ports to defaults, so the persisted running config must
+    /// be replayed onto it (a restart of either daemon converges).
+    pub async fn replay_running(&self) -> Result<usize> {
+        let running = Self::parse_intents(&self.store.running()?)?;
+        if running.is_empty() {
+            return Ok(0);
+        }
+        let mut client = self.syncd_client().await?;
+        let mut applied = 0;
+        for (name, intent) in &running {
+            let request = pb::SetPortAttrsRequest {
+                name: name.clone(),
+                admin_state: intent.admin_up.map(|up| {
+                    if up {
+                        pb::AdminState::Up as i32
+                    } else {
+                        pb::AdminState::Down as i32
+                    }
+                }),
+                description: intent.description.clone(),
+            };
+            if request.admin_state.is_none() && request.description.is_none() {
+                continue;
+            }
+            client
+                .set_port_attrs(request)
+                .await
+                .with_context(|| format!("replaying config for {name}"))?;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+}
+
 pub struct MgmtService {
     engine: SharedEngine,
 }

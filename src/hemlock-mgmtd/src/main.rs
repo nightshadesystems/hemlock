@@ -58,6 +58,31 @@ async fn main() -> Result<()> {
 
     let engine = Arc::new(Mutex::new(service::Engine::new(store, syncd)));
 
+    // Replay the persisted running config onto syncd (which boots with
+    // default port state). Retry until syncd is up — daemon start order is
+    // not guaranteed.
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_millis(500);
+            loop {
+                let result = { engine.lock().await.replay_running().await };
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        info!(interfaces = n, "running config replayed to syncd");
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "cannot replay running config yet; retrying");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(std::time::Duration::from_secs(10));
+                    }
+                }
+            }
+        });
+    }
+
     let listen: IpcEndpoint = match &args.listen {
         Some(s) => s.parse()?,
         None => Daemon::Mgmtd.default_endpoint(),

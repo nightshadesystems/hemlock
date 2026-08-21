@@ -7,6 +7,7 @@
 use clap::{Parser, Subcommand};
 use hemlock_common::ipc::{Daemon, IpcEndpoint};
 
+mod cli;
 mod config;
 mod platform;
 mod show;
@@ -26,8 +27,10 @@ struct Cli {
     #[arg(long, global = true)]
     mgmtd: Option<String>,
 
+    /// With no subcommand, hemlockctl starts the interactive CLI
+    /// (operational mode).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -75,8 +78,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ShowCommand {
-    /// Front-panel interfaces from syncd.
-    Interfaces,
+    /// Front-panel interfaces from syncd. Add `status` for the EOS-style
+    /// summary table.
+    Interfaces {
+        #[arg(value_parser = ["status"])]
+        mode: Option<String>,
+    },
     /// Switch/ASIC summary from syncd.
     Switch,
     /// Fans, temperatures, PSUs from pmon.
@@ -119,9 +126,23 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
+    let Some(command) = cli.command else {
+        // No subcommand: interactive CLI (operational mode).
+        return cli::run(cli::Endpoints {
+            syncd: endpoint(&cli.syncd, Daemon::Syncd)?,
+            pmon: endpoint(&cli.pmon, Daemon::Pmon)?,
+            mgmtd: endpoint(&cli.mgmtd, Daemon::Mgmtd)?,
+        })
+        .await;
+    };
+    match command {
         Command::Show { command } => match command {
-            ShowCommand::Interfaces => show::interfaces(endpoint(&cli.syncd, Daemon::Syncd)?).await,
+            ShowCommand::Interfaces { mode } => match mode.as_deref() {
+                Some("status") => {
+                    show::interfaces_status(endpoint(&cli.syncd, Daemon::Syncd)?).await
+                }
+                _ => show::interfaces(endpoint(&cli.syncd, Daemon::Syncd)?).await,
+            },
             ShowCommand::Switch => show::switch(endpoint(&cli.syncd, Daemon::Syncd)?).await,
             ShowCommand::Environment => show::environment(endpoint(&cli.pmon, Daemon::Pmon)?).await,
             ShowCommand::Transceivers => {

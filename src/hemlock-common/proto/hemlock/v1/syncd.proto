@@ -38,6 +38,9 @@ message Port {
   OperStatus oper_status = 6;
   string description = 7;
   uint64 sai_oid = 8;
+  // Physical media for display (from the platform manifest), e.g.
+  // "1000BASE-T", "SFP+".
+  string media = 9;
 }
 
 message SetPortAttrsRequest {

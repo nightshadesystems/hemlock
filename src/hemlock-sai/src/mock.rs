@@ -115,6 +115,7 @@ mod tests {
                 speed_mbps: 1000,
                 alias: None,
                 autoneg: false,
+                media: None,
                 breakout: vec![],
             })
             .collect()

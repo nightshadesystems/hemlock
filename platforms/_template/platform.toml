@@ -90,6 +90,7 @@ index_start = 1       # front-panel port 1
 speed_mbps = 1000
 autoneg = true
 alias_prefix = "etp"  # alias etp1..etp48
+media = "1000BASE-T"  # shown in `show interfaces status` Type column
 # lanes_per_port = 1  # (default)
 lanes = [
      1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12,
@@ -106,6 +107,7 @@ index_start = 49
 speed_mbps = 10000
 autoneg = false
 alias_prefix = "etp"
+media = "SFP+"
 lanes = [53, 54, 55, 56]
 # Breakout capability declaration (consumed in a later phase), e.g. a
 # 40G port splittable into 4x10G:

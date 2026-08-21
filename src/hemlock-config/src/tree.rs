@@ -71,6 +71,65 @@ impl ConfigTree {
     }
 }
 
+impl ConfigTree {
+    /// Mutable access to a top-level block's children, creating the block
+    /// if absent (appended at the end, keys empty when created).
+    pub fn block_mut(&mut self, name: &str) -> &mut Vec<Item> {
+        Self::ensure_block(&mut self.items, name, &[])
+    }
+
+    /// Mutable children of the block `name key...` among `items`, creating
+    /// it (appended) if absent.
+    pub fn ensure_block<'a>(
+        items: &'a mut Vec<Item>,
+        name: &str,
+        keys: &[&str],
+    ) -> &'a mut Vec<Item> {
+        let position = items.iter().position(|item| match item {
+            Item::Block {
+                name: n, keys: k, ..
+            } => n == name && k.iter().map(String::as_str).eq(keys.iter().copied()),
+            _ => false,
+        });
+        let index = match position {
+            Some(index) => index,
+            None => {
+                items.push(Item::Block {
+                    name: name.to_string(),
+                    keys: keys.iter().map(|k| k.to_string()).collect(),
+                    children: Vec::new(),
+                });
+                items.len() - 1
+            }
+        };
+        match &mut items[index] {
+            Item::Block { children, .. } => children,
+            Item::Leaf { .. } => unreachable!("position matched a Block"),
+        }
+    }
+
+    /// Set (replace or insert) a leaf `name values...;` among `items`.
+    pub fn set_leaf(items: &mut Vec<Item>, name: &str, values: Vec<String>) {
+        for item in items.iter_mut() {
+            if let Item::Leaf { name: n, values: v } = item {
+                if n == name {
+                    *v = values;
+                    return;
+                }
+            }
+        }
+        items.push(Item::Leaf {
+            name: name.to_string(),
+            values,
+        });
+    }
+
+    /// Remove every leaf named `name` among `items`.
+    pub fn remove_leaf(items: &mut Vec<Item>, name: &str) {
+        items.retain(|item| !matches!(item, Item::Leaf { name: n, .. } if n == name));
+    }
+}
+
 fn block_in<'a>(items: &'a [Item], name: &str) -> Option<(&'a [String], &'a [Item])> {
     items.iter().find_map(|item| match item {
         Item::Block {
@@ -160,6 +219,46 @@ mod tests {
             text,
             "system {\n    hostname sw1;\n}\ninterfaces {\n    ethernet Ethernet0 {\n        description \"uplink to core\";\n    }\n}\n"
         );
+    }
+
+    #[test]
+    fn mutation_creates_and_updates() {
+        let mut tree = ConfigTree::default();
+        {
+            let interfaces = tree.block_mut("interfaces");
+            let eth = ConfigTree::ensure_block(interfaces, "ethernet", &["Ethernet5"]);
+            ConfigTree::set_leaf(eth, "description", vec!["uplink".into()]);
+            ConfigTree::set_leaf(eth, "admin-state", vec!["disabled".into()]);
+            // Overwrite an existing leaf in place.
+            ConfigTree::set_leaf(eth, "description", vec!["core uplink".into()]);
+        }
+        let (_, interfaces) = tree.block("interfaces").unwrap();
+        let (keys, eth) = ConfigTree::blocks_named(interfaces, "ethernet")
+            .next()
+            .unwrap();
+        assert_eq!(keys, ["Ethernet5"]);
+        assert_eq!(
+            ConfigTree::leaf_value(eth, "description"),
+            Some("core uplink")
+        );
+        assert_eq!(ConfigTree::leaf_value(eth, "admin-state"), Some("disabled"));
+
+        // ensure_block with the same key must not duplicate.
+        let interfaces = tree.block_mut("interfaces");
+        ConfigTree::ensure_block(interfaces, "ethernet", &["Ethernet5"]);
+        assert_eq!(ConfigTree::blocks_named(interfaces, "ethernet").count(), 1);
+
+        // remove_leaf drops it; round-trips through text.
+        let eth = ConfigTree::ensure_block(interfaces, "ethernet", &["Ethernet5"]);
+        ConfigTree::remove_leaf(eth, "admin-state");
+        let text = tree.to_text();
+        let reparsed = crate::parse(&text).unwrap();
+        assert_eq!(reparsed, tree);
+        let (_, interfaces) = reparsed.block("interfaces").unwrap();
+        let (_, eth) = ConfigTree::blocks_named(interfaces, "ethernet")
+            .next()
+            .unwrap();
+        assert_eq!(ConfigTree::leaf_value(eth, "admin-state"), None);
     }
 
     #[test]

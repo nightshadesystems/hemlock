@@ -17,6 +17,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }
+rustyline = { workspace = true }
 
 [lints]
 workspace = true

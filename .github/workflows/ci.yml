@@ -39,3 +39,13 @@ jobs:
       # Definition-of-done gates
       - run: cargo run -p hemlockctl -- platform lint platforms/cel-e1031
         if: hashFiles('platforms/cel-e1031/platform.toml') != ''
+
+  image-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y squashfs-tools
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: bash build/mkimage.sh cel-e1031 --dummy-rootfs
+      - run: bash build/verify-image.sh build/out/hemlock-*-cel-e1031.bin
