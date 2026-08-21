@@ -11,6 +11,15 @@
    are installed and the initrd regenerated so boot can interpret
    `hemlock.rootfs=`: loop-mount the squashfs from the flash partition,
    overlay `/hemlock/persist` on top, and expose the flash at `/host`.
+   The rootfs is branded as Hemlock (os-release/issue carry the Hemlock
+   version, never "Debian GNU/Linux"), gets the default operator account
+   `admin` / `Hemlock123!` (sudo; root stays locked), and the dynamic
+   MOTD: [rootfs/update-motd.d/](rootfs/update-motd.d/) scripts rendered
+   by pam_motd on every login (banner + `hemlockctl motd` live status),
+   with the stock Debian motd removed. `hemlock-motd` previews it without
+   logging in; `test-motd.sh` shellchecks the scripts, diffs the banner
+   byte-for-byte against [tests/motd/banner.txt](tests/motd/banner.txt),
+   and proves the status script exits 0 with every data source missing.
 2. **squashfs** — the rootfs, compressed.
 3. **payload** — squashfs + platform overlay (`platform.toml`, config.bcm,
    identity markers) + boot assets + the `hemlock-installer` binary.

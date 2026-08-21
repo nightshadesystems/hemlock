@@ -1,0 +1,8 @@
+#!/bin/sh
+# hemlock-motd — preview the dynamic MOTD without logging in.
+#
+# Runs the same scripts pam_motd runs at login (run-parts over
+# /etc/update-motd.d), but on a terminal, so the banner comes out
+# colorized. An alternate directory may be given for testing.
+
+exec run-parts --lsbsysinit "${1:-/etc/update-motd.d}"

@@ -1,0 +1,17 @@
+#!/bin/sh
+# 10-hemlock-status — live system/switch status for the dynamic MOTD.
+#
+# All data gathering lives in `hemlockctl motd` (Rust): it queries syncd
+# and pmon concurrently with short per-source timeouts, degrades to fewer
+# fields when a source is missing, and always exits 0. This wrapper only
+# hard-caps login latency and guarantees a clean exit even if hemlockctl
+# is absent or wedged.
+#
+# HEMLOCK_PLATFORM_DIR overrides the platform overlay location (tests).
+
+platform_dir="${HEMLOCK_PLATFORM_DIR:-/hemlock/platform}"
+
+if command -v hemlockctl >/dev/null 2>&1; then
+    timeout 1 hemlockctl motd --platform-dir "$platform_dir" 2>/dev/null
+fi
+exit 0

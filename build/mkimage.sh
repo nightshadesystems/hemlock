@@ -59,11 +59,6 @@ mkdir -p "$PAYLOAD" "$ROOTFS" "$OUT"
 if [ "$DUMMY" = 1 ]; then
     log "building DUMMY rootfs (layout test only)"
     mkdir -p "$ROOTFS/etc" "$ROOTFS/usr/lib/hemlock" "$ROOTFS/boot"
-    cat > "$ROOTFS/etc/os-release" <<EOF
-NAME="Hemlock"
-VERSION="$VERSION (dummy)"
-ID=hemlock
-EOF
     echo "dummy-kernel" > "$ROOTFS/boot/vmlinuz"
     echo "dummy-initrd" > "$ROOTFS/boot/initrd.img"
 else
@@ -111,11 +106,51 @@ else
     install -D -m 755 "$ROOT/build/rootfs/initramfs/hemlock-local-bottom" \
         "$ROOTFS/etc/initramfs-tools/scripts/local-bottom/hemlock"
     chroot "$ROOTFS" update-initramfs -u -k all || die "update-initramfs failed"
+
+    # Default operator account. debootstrap leaves root locked (no
+    # password at all), so without this the booted system is a brick at
+    # the login prompt. Root stays locked; admin has full sudo.
+    log "creating default operator account (admin)"
+    chroot "$ROOTFS" useradd -m -s /bin/bash -G sudo admin
+    echo 'admin:Hemlock123!' | chroot "$ROOTFS" chpasswd
 fi
 
 # Identity defaults: hostname "hemlock" (the CLI prompt is user@hostname).
 echo hemlock > "$ROOTFS/etc/hostname"
 grep -q "hemlock" "$ROOTFS/etc/hosts" 2>/dev/null     || echo "127.0.1.1 hemlock" >> "$ROOTFS/etc/hosts"
+
+# Hemlock branding: everything user-facing says Hemlock + version, not
+# "Debian GNU/Linux". VERSION_CODENAME keeps the Debian base codename —
+# tooling (and the MOTD) reads it from here.
+cat > "$ROOTFS/etc/os-release" <<EOF
+NAME="Hemlock"
+VERSION="$VERSION (trixie)"
+VERSION_ID="$VERSION"
+VERSION_CODENAME=trixie
+ID=hemlock
+ID_LIKE=debian
+PRETTY_NAME="Hemlock NOS v$VERSION"
+HOME_URL="https://github.com/nightshadesystems/hemlock"
+EOF
+printf 'Hemlock NOS v%s \\n \\l\n\n' "$VERSION" > "$ROOTFS/etc/issue"
+printf 'Hemlock NOS v%s\n' "$VERSION" > "$ROOTFS/etc/issue.net"
+
+# --- Dynamic MOTD -----------------------------------------------------------
+# Debian's update-motd.d mechanism: pam_motd runs these on every login and
+# renders the output into /run/motd.dynamic. 00 is the static banner, 10
+# the live status (a thin wrapper over `hemlockctl motd`); hemlock-motd
+# previews the whole thing without logging in. The stock Debian pieces
+# (10-uname, the /etc/motd license blurb) are removed so only Hemlock
+# content shows.
+install -D -m 755 "$ROOT/build/rootfs/update-motd.d/00-hemlock-banner" \
+    "$ROOTFS/etc/update-motd.d/00-hemlock-banner"
+install -D -m 755 "$ROOT/build/rootfs/update-motd.d/10-hemlock-status" \
+    "$ROOTFS/etc/update-motd.d/10-hemlock-status"
+install -D -m 755 "$ROOT/build/rootfs/bin/hemlock-motd" "$ROOTFS/usr/bin/hemlock-motd"
+rm -f "$ROOTFS/etc/update-motd.d/10-uname" "$ROOTFS/etc/motd"
+# pam_motd renders update-motd.d; sshd must not print a motd of its own.
+install -d "$ROOTFS/etc/ssh/sshd_config.d"
+printf 'PrintMotd no\n' > "$ROOTFS/etc/ssh/sshd_config.d/10-hemlock-motd.conf"
 
 # --- 2. Squash it -----------------------------------------------------------
 if command -v mksquashfs >/dev/null; then

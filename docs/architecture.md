@@ -215,8 +215,8 @@ commit.
 `hemlockctl` with no arguments is the interactive CLI (and, on a switch,
 the operator's login shell). Arista EOS-style syntax with Nightshade
 prompts: `user@hostname>` in operational mode, `user@hostname#` in
-configuration mode (`root@hemlock` by default — the image sets hostname
-`hemlock`). `configure`/`conf` enters config mode, `bash` drops to Linux,
+configuration mode (`admin@hemlock` by default — the image sets hostname
+`hemlock` and creates the `admin` operator account; root stays locked). `configure`/`conf` enters config mode, `bash` drops to Linux,
 unique command prefixes are accepted (`sh int status`).
 
 Config-mode commands (`interface <name>` → `description`, `shutdown`,
@@ -237,7 +237,14 @@ ASIC to the running config.
 
 1. debootstrap a Debian 13 rootfs (`build/rootfs/packages.list`), install
    the Hemlock daemons + systemd units, and the platform's pinned vendor
-   SAI `.deb` from `vendor/sai/` (hard failure with pointers if absent);
+   SAI `.deb` from `vendor/sai/` (hard failure with pointers if absent).
+   The rootfs is branded as Hemlock (os-release, issue) with the default
+   operator account `admin` / `Hemlock123!` (sudo; root locked), and gets
+   the dynamic MOTD: `/etc/update-motd.d/00-hemlock-banner` (static art)
+   and `10-hemlock-status` (a wrapper over `hemlockctl motd`, which polls
+   syncd/pmon with short timeouts and degrades field-by-field). The stock
+   Debian motd content is removed; `hemlock-motd` previews the result
+   without logging in;
 2. squashfs the rootfs;
 3. assemble the payload: squashfs + platform overlay (`platform.toml`,
    config.bcm, identity markers) + boot assets (GRUB config rendered with

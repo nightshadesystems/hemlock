@@ -1,0 +1,49 @@
+#!/bin/sh
+# 00-hemlock-banner — static Hemlock banner for the dynamic MOTD.
+#
+# The plain output must stay byte-identical to build/tests/motd/banner.txt
+# (build/test-motd.sh diffs them). Color is applied only when stdout is a
+# terminal: pam_motd renders update-motd.d through a pipe into
+# /run/motd.dynamic, so login sessions always get the plain text and only
+# an interactive `hemlock-motd` preview gets ANSI color.
+# HEMLOCK_MOTD_COLOR=1 forces color, =0 forces plain (used by tests).
+
+banner() {
+cat <<'EOF'
+      .:*:.  .  .:*:.
+  .:*:.  \   |   /  .:*:.       _   _ _____ __  __ _     ___   ____ _  __
+ .   `-.  \  |  /  .-'   .     | | | | ____|  \/  | |   / _ \ / ___| |/ /
+.:*:.----(  @  )----.:*:.      | |_| |  _| | |\/| | |  | | | | |   | ' /
+ .   .-'  /  |  \  `-.   .     |  _  | |___| |  | | |__| |_| | |___| . \
+  .:*:.  /   |   \  .:*:.      |_| |_|_____|_|  |_|_____\___/ \____|_|\_\
+      .:*:.  .  .:*:.                       ~ conium maculatum ~
+EOF
+}
+
+case "${HEMLOCK_MOTD_COLOR:-auto}" in
+1) color=1 ;;
+0) color=0 ;;
+*) if [ -t 1 ]; then color=1; else color=0; fi ;;
+esac
+
+if [ "$color" = 0 ]; then
+    banner
+    exit 0
+fi
+
+# Base everything green, then re-tint: flower clusters and the blossom
+# center bright white, the tagline dim. The art itself never appears in a
+# sed expression, so its backslashes are only ever inside the quoted
+# heredoc above.
+esc=$(printf '\033')
+grn="${esc}[32m"
+wht="${esc}[97m"
+dim="${esc}[2m"
+off="${esc}[0m"
+banner | sed \
+    -e "s/^/${grn}/" \
+    -e "s/\$/${off}/" \
+    -e "s/\.:\*:\./${wht}&${grn}/g" \
+    -e "s/ @ /${wht}&${grn}/" \
+    -e "s/~ conium maculatum ~/${dim}&/"
+exit 0

@@ -744,6 +744,7 @@ dependencies = [
  "hemlock-config",
  "hemlock-platform",
  "rustyline",
+ "tempfile",
  "tokio",
  "tonic",
  "tracing",

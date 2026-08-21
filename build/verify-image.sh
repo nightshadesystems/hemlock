@@ -38,6 +38,14 @@ check "payload is a valid gzip tarball" \
 tail -n +"$ARCHIVE_LINE" "$IMAGE" | gzip -dc | tar -xf - -C "$WORK"
 
 check "rootfs.squashfs present"            "[ -s '$WORK/rootfs.squashfs' ]"
+# The dynamic MOTD must land in the rootfs (skipped for the dummy tar
+# fallback, which unsquashfs cannot list).
+if command -v unsquashfs >/dev/null && unsquashfs -s "$WORK/rootfs.squashfs" >/dev/null 2>&1; then
+    check "rootfs carries the hemlock MOTD scripts" \
+        "unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'etc/update-motd.d/00-hemlock-banner' \
+         && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'etc/update-motd.d/10-hemlock-status' \
+         && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'usr/bin/hemlock-motd'"
+fi
 check "installer binary present"           "[ -s '$WORK/hemlock-installer' ]"
 check "installer is executable"            "[ -x '$WORK/hemlock-installer' ]"
 # ONIE has no glibc dynamic loader: an ELF installer must be static.

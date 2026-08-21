@@ -52,6 +52,16 @@ jobs:
             exit 1
           fi
 
+  motd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p hemlockctl
+      - run: bash build/test-motd.sh --hemlockctl target/debug/hemlockctl
+
   image-smoke:
     runs-on: ubuntu-latest
     steps:

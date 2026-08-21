@@ -9,6 +9,7 @@ use hemlock_common::ipc::{Daemon, IpcEndpoint};
 
 mod cli;
 mod config;
+mod motd;
 mod platform;
 mod show;
 
@@ -45,6 +46,16 @@ enum Command {
     Platform {
         #[command(subcommand)]
         command: PlatformCommand,
+    },
+
+    /// Print the login MOTD status block (backs /etc/update-motd.d/).
+    ///
+    /// Prints whatever data sources are reachable and always exits 0, so
+    /// a dead daemon degrades the MOTD instead of breaking logins.
+    Motd {
+        /// Platform overlay directory holding platform.toml.
+        #[arg(long, default_value = "/hemlock/platform")]
+        platform_dir: String,
     },
 
     /// Load a config file into the candidate.
@@ -156,6 +167,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 platforms_dir,
             } => platform::lint(&platforms_dir, &platform),
         },
+        Command::Motd { platform_dir } => {
+            motd::run(
+                endpoint(&cli.syncd, Daemon::Syncd)?,
+                endpoint(&cli.pmon, Daemon::Pmon)?,
+                &platform_dir,
+            )
+            .await
+        }
         Command::Load { file } => config::load(endpoint(&cli.mgmtd, Daemon::Mgmtd)?, &file).await,
         Command::Candidate => config::candidate(endpoint(&cli.mgmtd, Daemon::Mgmtd)?).await,
         Command::Commit { comment, confirm } => {
