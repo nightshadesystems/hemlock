@@ -8,3 +8,5 @@ case $1 in
 esac
 . /usr/share/initramfs-tools/hook-functions
 manual_add_modules squashfs overlay loop
+# klibc's mount has no -o loop; the boot script drives losetup itself.
+copy_exec /sbin/losetup /sbin

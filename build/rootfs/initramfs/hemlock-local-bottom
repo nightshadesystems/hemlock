@@ -37,7 +37,12 @@ mount -n -o move "${rootmnt}" "$FLASH" \
 
 [ -f "$FLASH$HEMLOCK_ROOTFS" ] \
     || panic "hemlock: $HEMLOCK_ROOTFS missing on the HEMLOCK partition"
-mount -t squashfs -o ro,loop "$FLASH$HEMLOCK_ROOTFS" "$RO" \
+# klibc's mount cannot set up loop devices (-o loop is passed through to
+# the kernel and rejected); do it by hand.
+LOOP="$(losetup -f)" || panic "hemlock: no free loop device"
+losetup "$LOOP" "$FLASH$HEMLOCK_ROOTFS" \
+    || panic "hemlock: losetup failed for $HEMLOCK_ROOTFS"
+mount -t squashfs -o ro "$LOOP" "$RO" \
     || panic "hemlock: cannot mount $HEMLOCK_ROOTFS"
 
 PERSIST="$FLASH/hemlock/persist"
