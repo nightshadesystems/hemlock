@@ -48,19 +48,26 @@ link_into_common "$ARCH_HDRS/include/config"             "$COMMON/include/config
 
 # --- Kernel API compat shims ------------------------------------------------
 # Kernel 6.8 renamed MAX_ORDER to MAX_PAGE_ORDER (and 6.4 had already
-# turned the old exclusive bound into an inclusive one, hence the +1).
-# The 202305 saibcm-modules tree predates both and derives its DMA
-# allocation cap from MAX_ORDER in linux_dma.c. Shim only when the target
-# kernel's headers no longer define MAX_ORDER, so builds against older
-# kernels stay byte-identical; the #ifndef keeps the edit idempotent and
-# harmless either way.
-if ! grep -qs "define MAX_ORDER" "$COMMON/include/linux/mmzone.h"; then
+# turned the old exclusive bound into an inclusive one). The 202305
+# saibcm-modules tree predates both: linux_dma.c sizes its DMA
+# allocation cap as (MAX_ORDER - 1 + PAGE_SHIFT), which on 6.8+ is
+# exactly (MAX_PAGE_ORDER + PAGE_SHIFT) — rewrite the expression rather
+# than inserting a define, so preprocessor branches cannot hide it.
+# Applied only when the target kernel's headers no longer define
+# MAX_ORDER (exact-name match: 6.8+ still defines MAX_ORDER_NR_PAGES,
+# which a substring check would mistake for MAX_ORDER itself), so builds
+# against older kernels stay byte-identical.
+if ! grep -Eqs "#define[[:space:]]+MAX_ORDER([[:space:]]|$)" "$COMMON/include/linux/mmzone.h"; then
     DMA_C="$SRC/systems/bde/linux/kernel/linux_dma.c"
-    if [ -f "$DMA_C" ] && ! grep -q "MAX_PAGE_ORDER + 1" "$DMA_C"; then
-        log "shimming MAX_ORDER -> MAX_PAGE_ORDER + 1 in linux_dma.c (kernel >= 6.8)"
-        sed -i '0,/#define DMA_MAX_ALLOC_SIZE/s//#ifndef MAX_ORDER\n#define MAX_ORDER (MAX_PAGE_ORDER + 1)\n#endif\n#define DMA_MAX_ALLOC_SIZE/' "$DMA_C"
-        grep -q "MAX_PAGE_ORDER + 1" "$DMA_C" \
-            || die "MAX_ORDER shim did not apply — linux_dma.c layout changed upstream"
+    if [ -f "$DMA_C" ]; then
+        if grep -q "MAX_ORDER - 1 + PAGE_SHIFT" "$DMA_C"; then
+            log "shimming MAX_ORDER -> MAX_PAGE_ORDER in linux_dma.c (kernel >= 6.8)"
+            sed -i 's/(MAX_ORDER - 1 + PAGE_SHIFT)/(MAX_PAGE_ORDER + PAGE_SHIFT)/g' "$DMA_C"
+        fi
+        # MAX_PAGE_ORDER does not contain "MAX_ORDER" as a substring, so
+        # any hit here is a genuine leftover use the sed did not cover.
+        ! grep -q "MAX_ORDER" "$DMA_C" \
+            || die "linux_dma.c still references MAX_ORDER after shimming — new upstream use site, extend the shim"
     fi
 fi
 
