@@ -244,7 +244,9 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("Operational commands:");
             println!("  show interfaces [status|transceiver]   port state");
             println!("  show environment                       fans / temps / PSUs");
-            println!("  show running-config                    active configuration");
+            println!(
+                "  show configuration                     running configuration (config/conf ok)"
+            );
             println!("  show version                           software / platform");
             println!("  configure | conf                       enter configuration mode");
             println!("  bash                                   drop to the Linux shell");
@@ -255,13 +257,32 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
     }
 }
 
+/// Platform overlay directory for manifest-driven display (management
+/// port name); overridable for tests and dev hosts.
+fn platform_dir() -> String {
+    std::env::var("HEMLOCK_PLATFORM_DIR").unwrap_or_else(|_| "/hemlock/platform".into())
+}
+
 async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), String> {
-    const TOPICS: &[&str] = &["interfaces", "environment", "running-config", "version"];
+    // "config" and "conf" are explicit aliases for "configuration". Being
+    // list members (not just prefixes) they also make shorter stubs like
+    // `show c` ambiguous — deliberately: only the spelled-out aliases work.
+    const TOPICS: &[&str] = &[
+        "interfaces",
+        "environment",
+        "configuration",
+        "config",
+        "conf",
+        "version",
+    ];
+    const USAGE: &str = "show <interfaces|environment|configuration|version>";
     let Some(first) = words.first() else {
-        return Err(
-            "% Incomplete command: show <interfaces|environment|running-config|version>".into(),
-        );
+        return Err(format!("% Incomplete command: {USAGE}"));
     };
+    if matches!(*first, "?" | "help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let run = async {
         match resolve(first, TOPICS)? {
             "interfaces" => match words.get(1) {
@@ -281,7 +302,13 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "environment" => show::environment(endpoints.pmon.clone())
                 .await
                 .map_err(fmt_err),
-            "running-config" => show::config(endpoints.mgmtd.clone()).await.map_err(fmt_err),
+            "configuration" | "config" | "conf" => show::configuration(
+                endpoints.syncd.clone(),
+                endpoints.mgmtd.clone(),
+                &platform_dir(),
+            )
+            .await
+            .map_err(fmt_err),
             "version" => {
                 show::version(endpoints.syncd.clone()).await;
                 Ok(())
@@ -596,6 +623,26 @@ mod tests {
         assert_eq!(resolve("conf", words).unwrap(), "conf"); // exact beats prefix
         assert!(resolve("c", words).is_err()); // ambiguous: configure/conf
         assert!(resolve("zz", words).is_err());
+    }
+
+    #[test]
+    fn show_topic_aliases_are_explicit_not_prefixes() {
+        // Mirrors show_command's TOPICS: config/conf are deliberate
+        // aliases, while bare stubs like "c" stay ambiguous errors.
+        let topics = &[
+            "interfaces",
+            "environment",
+            "configuration",
+            "config",
+            "conf",
+            "version",
+        ];
+        assert_eq!(resolve("configuration", topics).unwrap(), "configuration");
+        assert_eq!(resolve("config", topics).unwrap(), "config");
+        assert_eq!(resolve("conf", topics).unwrap(), "conf");
+        assert!(resolve("c", topics).is_err());
+        assert!(resolve("co", topics).is_err());
+        assert!(resolve("con", topics).is_err());
     }
 
     #[test]

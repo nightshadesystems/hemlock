@@ -54,6 +54,16 @@ unsafe extern "C" fn profile_get_next_value(
     let Some(profile) = PROFILE.get() else {
         return -1;
     };
+    // SAI contract: a NULL `value` restarts enumeration (Broadcom's SAI
+    // really does call this with NULLs during init — writing through
+    // them was a boot-time segfault on the E1031).
+    if value.is_null() {
+        PROFILE_ITER.store(0, Ordering::SeqCst);
+        return 0;
+    }
+    if variable.is_null() {
+        return -1;
+    }
     let idx = PROFILE_ITER.fetch_add(1, Ordering::SeqCst);
     match profile.get(idx) {
         Some((key, val)) => {
@@ -354,6 +364,41 @@ impl SaiBackend for VendorSai {
 
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>> {
         self.events_rx.take()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Broadcom's SAI calls profile_get_next_value with NULL pointers to
+    /// restart enumeration; that must never be a write through NULL.
+    #[test]
+    fn profile_iteration_survives_null_restart() {
+        let _ = PROFILE.set(vec![(
+            CString::new("SAI_INIT_CONFIG_FILE").unwrap(),
+            CString::new("/hemlock/platform/config.bcm").unwrap(),
+        )]);
+
+        // NULL value = restart request: must not crash, must return 0.
+        let restart =
+            unsafe { profile_get_next_value(0, std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert_eq!(restart, 0);
+
+        // Full enumeration afterwards yields the entry, then end-of-list.
+        let mut var: *const c_char = std::ptr::null();
+        let mut val: *const c_char = std::ptr::null();
+        assert_eq!(unsafe { profile_get_next_value(0, &mut var, &mut val) }, 0);
+        assert!(!var.is_null() && !val.is_null());
+        assert_eq!(unsafe { profile_get_next_value(0, &mut var, &mut val) }, -1);
+
+        // NULL variable with non-NULL value is refused, not written through.
+        let mut val2: *const c_char = std::ptr::null();
+        assert_eq!(
+            unsafe { profile_get_next_value(0, std::ptr::null_mut(), &mut val2) },
+            -1
+        );
     }
 }
 

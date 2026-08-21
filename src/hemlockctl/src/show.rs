@@ -206,8 +206,19 @@ pub async fn transceivers(endpoint: IpcEndpoint) -> Result<()> {
     Ok(())
 }
 
-pub async fn config(endpoint: IpcEndpoint) -> Result<()> {
-    let channel = endpoint.connect().await.context("connecting to mgmtd")?;
+/// `show configuration` — the running configuration merged with the full
+/// interface inventory, so every stock port (and the management port from
+/// the platform manifest) renders in curly-brace form even before it has
+/// ever been explicitly configured. Unconfigured leaves are filled from
+/// live state.
+pub async fn configuration(
+    syncd: IpcEndpoint,
+    mgmtd: IpcEndpoint,
+    platform_dir: &str,
+) -> Result<()> {
+    use hemlock_config::ConfigTree;
+
+    let channel = mgmtd.connect().await.context("connecting to mgmtd")?;
     let mut client = pb::mgmt_client::MgmtClient::new(channel);
     let text = client
         .get_config(pb::GetConfigRequest {
@@ -216,6 +227,62 @@ pub async fn config(endpoint: IpcEndpoint) -> Result<()> {
         .await?
         .into_inner()
         .text;
-    print!("{text}");
+    let mut tree = hemlock_config::parse(&text)
+        .map_err(|e| anyhow::anyhow!("running config unparsable: {e}"))?;
+
+    let channel = syncd.connect().await.context("connecting to syncd")?;
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    let mut ports = client
+        .list_ports(pb::ListPortsRequest {})
+        .await?
+        .into_inner()
+        .ports;
+    ports.sort_by_key(|p| p.index);
+
+    {
+        let interfaces = tree.block_mut("interfaces");
+        for p in &ports {
+            let eth = ConfigTree::ensure_block(interfaces, "ethernet", &[p.name.as_str()]);
+            if ConfigTree::leaf_value(eth, "admin-state").is_none() {
+                let admin = if p.admin_state == pb::AdminState::Up as i32 {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                ConfigTree::set_leaf(eth, "admin-state", vec![admin.into()]);
+            }
+            if !p.description.is_empty() && ConfigTree::leaf_value(eth, "description").is_none() {
+                ConfigTree::set_leaf(eth, "description", vec![p.description.clone()]);
+            }
+        }
+
+        // Management port: an OS netdev named by the manifest, not an ASIC
+        // port. Skipped quietly when no manifest is present (dev hosts).
+        if let Ok(platform) = hemlock_platform::Platform::find("/", platform_dir) {
+            if let Some(mgmt) = &platform.manifest.management {
+                let block =
+                    ConfigTree::ensure_block(interfaces, "management", &[mgmt.interface.as_str()]);
+                if ConfigTree::leaf_value(block, "admin-state").is_none() {
+                    if let Some(up) = os_netdev_is_up(&mgmt.os_device) {
+                        ConfigTree::set_leaf(
+                            block,
+                            "admin-state",
+                            vec![if up { "enabled" } else { "disabled" }.into()],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    print!("{}", tree.to_text());
     Ok(())
+}
+
+/// Admin state of a Linux netdev (IFF_UP), from sysfs. `None` when the
+/// device (or sysfs) is unavailable.
+fn os_netdev_is_up(dev: &str) -> Option<bool> {
+    let flags = std::fs::read_to_string(format!("/sys/class/net/{dev}/flags")).ok()?;
+    let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).ok()?;
+    Some(flags & 0x1 != 0)
 }

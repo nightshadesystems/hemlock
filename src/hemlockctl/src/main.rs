@@ -109,8 +109,12 @@ enum ShowCommand {
     Environment,
     /// Transceiver inventory from pmon.
     Transceivers,
-    /// The running configuration from mgmtd.
-    Config,
+    /// The running configuration (merged with the interface inventory).
+    Config {
+        /// Platform overlay directory holding platform.toml.
+        #[arg(long, default_value = "/hemlock/platform")]
+        platform_dir: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -175,7 +179,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             ShowCommand::Transceivers => {
                 show::transceivers(endpoint(&cli.pmon, Daemon::Pmon)?).await
             }
-            ShowCommand::Config => show::config(endpoint(&cli.mgmtd, Daemon::Mgmtd)?).await,
+            ShowCommand::Config { platform_dir } => {
+                show::configuration(
+                    endpoint(&cli.syncd, Daemon::Syncd)?,
+                    endpoint(&cli.mgmtd, Daemon::Mgmtd)?,
+                    &platform_dir,
+                )
+                .await
+            }
         },
         Command::Platform { command } => match command {
             PlatformCommand::Lint {

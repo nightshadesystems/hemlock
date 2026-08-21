@@ -18,6 +18,11 @@
    `platforms/<platform>/kmod/`), installed to `/lib/modules/<kver>/updates/
    hemlock/`, and the build fails if any required module would not be
    loadable — an image that cannot drive the hardware never ships.
+   The rootfs is then slimmed for the E1031's 2GB of RAM (ONIE stages
+   the payload in tmpfs at install time): apt caches scrubbed, docs/man/
+   locales dropped (copyright files kept), kernel module trees a switch
+   cannot use pruned, and the kernel + initrd stripped from the squashfs
+   since GRUB loads them from the flash partition copy in `payload/boot`.
    The rootfs is branded as Hemlock (os-release/issue carry the Hemlock
    version, never "Debian GNU/Linux"), gets the default operator account
    `admin` / `Hemlock123!` (sudo; root stays locked) whose login shell

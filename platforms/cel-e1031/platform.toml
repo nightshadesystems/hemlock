@@ -40,12 +40,26 @@ required_modules = [
     # Broadcom BDE pair; must match the pinned SAI's SDK ABI.
     "linux-kernel-bde",
     "linux-user-bde",
-    # Celestica platform modules (sonic-platform-modules-cel/haliburton).
+    # Celestica platform modules (platforms/cel-e1031/kmod/).
     "smc",          # e1031.smc CPLD: SFP presence, LEDs
     "hlx_gpio_ich", # Rangeley GPIO
     "dps200",       # PSU pmbus driver
     "optoe",        # transceiver EEPROMs
+    "mc24lc64t",    # system EEPROM (i2c device "24lc64t")
+    "emc2305",      # fan controller (haliburton build overrides in-kernel)
+    # In-kernel drivers the i2c topology depends on. Without the root
+    # SMBus adapter (Rangeley iSMT) pmon's bring-up fails before it can
+    # instantiate anything.
+    "i2c-ismt",         # root adapter: "SMBus iSMT adapter"
+    "i2c-i801",         # companion SMBus controller
+    "i2c-mux-pca954x",  # pca9548 mux/extender driver
+    "max6697",          # max6699 thermal sensors
 ]
+
+# Out-of-band management port (OS netdev, not an ASIC port).
+[management]
+interface = "Management1"
+os_device = "eth0"
 
 # ---------------------------------------------------------------------------
 # Ports: 48x1G copper + 4x10G SFP+ front panel.
@@ -61,7 +75,8 @@ required_modules = [
 
 [[ports.group]]
 prefix = "Ethernet"
-name_start = 0
+# 1-based front-panel naming (Ethernet1..52), matching the faceplate.
+name_start = 1
 index_start = 1
 speed_mbps = 1000
 autoneg = true
@@ -76,7 +91,7 @@ lanes = [
 
 [[ports.group]]
 prefix = "Ethernet"
-name_start = 48
+name_start = 49
 index_start = 49
 speed_mbps = 10000
 autoneg = false

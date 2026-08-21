@@ -51,7 +51,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "help",
         ],
         (CliMode::Operational, ["show"]) => {
-            &["interfaces", "environment", "running-config", "version"]
+            &["interfaces", "environment", "configuration", "version"]
         }
         (CliMode::Operational, ["show", "interfaces"]) => &["status", "transceiver"],
         (CliMode::Config, []) => &[

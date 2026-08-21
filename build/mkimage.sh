@@ -140,6 +140,25 @@ else
         cp "$KMOD_TMP/$name/"*.ko "$MODDEST/"
     done
 
+    # Kernel module trees a fixed-function switch can never use. The
+    # image must stay small: ONIE stages the whole payload in tmpfs, so
+    # every MB is RAM at install time on a 2GB box.
+    KMODTREE="$ROOTFS/lib/modules/$KVER/kernel"
+    rm -rf "$KMODTREE/sound" \
+           "$KMODTREE/drivers/gpu" \
+           "$KMODTREE/drivers/media" \
+           "$KMODTREE/drivers/staging" \
+           "$KMODTREE/drivers/infiniband" \
+           "$KMODTREE/drivers/net/wireless" \
+           "$KMODTREE/drivers/net/wwan" \
+           "$KMODTREE/drivers/net/can" \
+           "$KMODTREE/drivers/bluetooth" \
+           "$KMODTREE/drivers/isdn" \
+           "$KMODTREE/net/bluetooth" \
+           "$KMODTREE/net/wireless" \
+           "$KMODTREE/net/mac80211" \
+           "$KMODTREE/net/can"
+
     chroot "$ROOTFS" depmod "$KVER"
     missing=""
     for module in $(sed -n '/^required_modules[[:space:]]*=/,/\]/p' "$PDIR/platform.toml" \
@@ -151,10 +170,22 @@ else
         "required kernel modules not loadable in the image:$missing
  (sources: vendor/sai/saibcm-modules via fetch-vendor.sh, platforms/$PLATFORM/kmod/)"
 
-    # Drop the toolchain again; it has no business on a switch.
+    # Drop the toolchain again; it has no business on a switch. Then
+    # scrub the apt caches the toolchain install left behind — the
+    # downloaded .debs and package lists alone are worth hundreds of MB
+    # of image.
     chroot "$ROOTFS" apt-get -qq purge -y "linux-headers-$KVER" build-essential bc || true
     chroot "$ROOTFS" apt-get -qq autoremove --purge -y || true
+    chroot "$ROOTFS" apt-get clean
+    rm -rf "$ROOTFS/var/lib/apt/lists"/* "$ROOTFS/var/cache/apt"/*
     rm -rf "$KMOD_TMP"
+
+    # Docs, man pages, and translations an appliance never renders.
+    # Debian copyright files stay (licensing).
+    find "$ROOTFS/usr/share/doc" -type f ! -name copyright -delete 2>/dev/null || true
+    find "$ROOTFS/usr/share/doc" -type d -empty -delete 2>/dev/null || true
+    rm -rf "$ROOTFS/usr/share/man" "$ROOTFS/usr/share/info" \
+           "$ROOTFS/usr/share/lintian" "$ROOTFS/usr/share/locale"/*
 
     # Boot hand-off: the stock initramfs cannot interpret hemlock.rootfs=.
     # Install the hemlock hook + local-bottom script and regenerate the
@@ -230,29 +261,11 @@ rm -f "$ROOTFS/etc/update-motd.d/10-uname" "$ROOTFS/etc/motd"
 install -d "$ROOTFS/etc/ssh/sshd_config.d"
 printf 'PrintMotd no\n' > "$ROOTFS/etc/ssh/sshd_config.d/10-hemlock-motd.conf"
 
-# --- 2. Squash it -----------------------------------------------------------
-if command -v mksquashfs >/dev/null; then
-    mksquashfs "$ROOTFS" "$PAYLOAD/rootfs.squashfs" -comp xz -noappend -quiet
-else
-    [ "$DUMMY" = 1 ] || die "squashfs-tools not installed"
-    log "WARNING: mksquashfs unavailable; dummy payload uses a tar instead"
-    tar -C "$ROOTFS" -czf "$PAYLOAD/rootfs.squashfs" .
-fi
-
-# --- 3. Platform overlay ----------------------------------------------------
-mkdir -p "$PAYLOAD/platform"
-cp "$PDIR/platform.toml" "$PAYLOAD/platform/"
-echo "$ONIE_MACHINE" > "$PAYLOAD/platform/onie-machine"
-echo "$PLATFORM" > "$PAYLOAD/platform/platform-id"
-# Vendor data files ride along when present (real builds require them above).
-for f in "$PDIR"/*; do
-    case "$(basename "$f")" in
-    platform.toml|README.md) ;;
-    *) [ -f "$f" ] && cp "$f" "$PAYLOAD/platform/" ;;
-    esac
-done
-
-# --- 4. Boot assets ---------------------------------------------------------
+# --- 2. Boot assets ---------------------------------------------------------
+# Copied out of the rootfs BEFORE squashing: GRUB loads kernel + initrd
+# from the flash partition (payload/boot), so keeping copies inside the
+# squashfs would ship them twice — and pre-compressed artifacts gain
+# nothing from squashfs xz, so it is a full-size waste.
 mkdir -p "$PAYLOAD/boot"
 CONSOLE_DEV=0; CONSOLE_SPEED=115200
 [ -f "$PDIR/boot.env" ] && . "$PDIR/boot.env"
@@ -264,6 +277,30 @@ cp "$ROOTFS/boot/vmlinuz"* "$PAYLOAD/boot/vmlinuz" 2>/dev/null \
     || echo dummy > "$PAYLOAD/boot/vmlinuz"
 cp "$ROOTFS/boot/initrd.img"* "$PAYLOAD/boot/initrd.img" 2>/dev/null \
     || echo dummy > "$PAYLOAD/boot/initrd.img"
+rm -f "$ROOTFS"/boot/vmlinuz* "$ROOTFS"/boot/initrd.img* \
+      "$ROOTFS"/boot/System.map* "$ROOTFS"/boot/config-*
+
+# --- 3. Squash it -----------------------------------------------------------
+if command -v mksquashfs >/dev/null; then
+    mksquashfs "$ROOTFS" "$PAYLOAD/rootfs.squashfs" -comp xz -noappend -quiet
+else
+    [ "$DUMMY" = 1 ] || die "squashfs-tools not installed"
+    log "WARNING: mksquashfs unavailable; dummy payload uses a tar instead"
+    tar -C "$ROOTFS" -czf "$PAYLOAD/rootfs.squashfs" .
+fi
+
+# --- 4. Platform overlay ----------------------------------------------------
+mkdir -p "$PAYLOAD/platform"
+cp "$PDIR/platform.toml" "$PAYLOAD/platform/"
+echo "$ONIE_MACHINE" > "$PAYLOAD/platform/onie-machine"
+echo "$PLATFORM" > "$PAYLOAD/platform/platform-id"
+# Vendor data files ride along when present (real builds require them above).
+for f in "$PDIR"/*; do
+    case "$(basename "$f")" in
+    platform.toml|README.md) ;;
+    *) [ -f "$f" ] && cp "$f" "$PAYLOAD/platform/" ;;
+    esac
+done
 
 # --- 5. Installer binary ----------------------------------------------------
 # ONIE's runtime is BusyBox with no glibc dynamic loader, so the installer

@@ -21,6 +21,20 @@ pub struct Manifest {
     pub ports: PortsSection,
     #[serde(default)]
     pub hardware: HardwareSection,
+    /// The out-of-band management port, when the board has one.
+    #[serde(default)]
+    pub management: Option<ManagementSection>,
+}
+
+/// Out-of-band management port: how the CLI names it and which OS netdev
+/// backs it (management networking is OS-level, not ASIC-level).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementSection {
+    /// CLI-facing name, e.g. `Management1`.
+    pub interface: String,
+    /// Linux netdev behind it, e.g. `eth0`.
+    pub os_device: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
