@@ -54,6 +54,15 @@ pub struct SaiSection {
     /// Additional vendor data files (LED microcode etc.), relative paths.
     #[serde(default)]
     pub extra_files: Vec<PathBuf>,
+    /// Which vendored SAI header set (directory under `vendor/sai-headers/`)
+    /// matches this SAI build's API. The image build selects it via
+    /// `HEMLOCK_SAI_HEADERS` when compiling syncd for this platform.
+    #[serde(default)]
+    pub api_headers: Option<String>,
+    /// Extra SAI profile key/values handed to the vendor library
+    /// (`SAI_INIT_CONFIG_FILE` is always injected automatically).
+    #[serde(default)]
+    pub profile: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -148,6 +157,10 @@ pub struct I2cSection {
     /// bus number can vary between boots, so it is matched by name).
     #[serde(default)]
     pub root_adapter: Option<String>,
+    /// Raw i2c writes performed before any mux is instantiated (some boards
+    /// need a wake-up/select write to a mux before the kernel driver binds).
+    #[serde(default, rename = "pre_write")]
+    pub pre_writes: Vec<I2cWrite>,
     #[serde(default, rename = "mux")]
     pub muxes: Vec<I2cMux>,
     #[serde(default, rename = "device")]
@@ -161,6 +174,18 @@ pub struct I2cSection {
 pub enum BusRef {
     Number(u32),
     Named(String), // "root"
+}
+
+/// One raw write, executed with i2cset-style block semantics.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct I2cWrite {
+    pub bus: BusRef,
+    pub address: u32,
+    /// Bytes written: first byte is the register, the rest block data.
+    pub data: Vec<u32>,
+    /// Why this write exists — shown in logs.
+    pub purpose: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

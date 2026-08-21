@@ -44,6 +44,7 @@ manifest_value() {
 }
 ONIE_MACHINE="$(manifest_value onie_machine)"
 SAI_PIN="$(manifest_value version_pin)"
+SAI_HEADERS="$(manifest_value api_headers)"
 CONFIG_BCM="$(manifest_value config_bcm)"
 [ -n "$ONIE_MACHINE" ] || die "cannot read onie_machine from $PDIR/platform.toml"
 

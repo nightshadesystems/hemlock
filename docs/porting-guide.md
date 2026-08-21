@@ -61,7 +61,8 @@ operator passes `--force`).
 ```toml
 [sai]
 package = "libsaibcm"
-version_pin = "8.x-td3"               # abstract pin, per platform
+version_pin = "8.4.50.0"              # exact vendor version, per platform
+api_headers = "v1.11.0"               # SAI API of that build (its -dev pkg)
 libsai_path = "/usr/lib/libsai.so.1"
 config_bcm = "td3-acme-sw48.config.bcm"
 extra_files = ["sai_postinit_cmd.soc"]
@@ -74,8 +75,8 @@ Rules that keep multi-platform fleets sane:
 
 - **The pin is per platform.** Never "upgrade the SAI" globally; a new
   platform with a newer SAI simply pins it, and older boards keep theirs.
-  (This is why the E1031 can stay on its 202211-era Helix4 build forever
-  while a Questone 2A ships something current.)
+  A board only moves pins when its new blob has been inspected (chip
+  support, API version) and tested.
 - The BDE kernel modules in `required_modules` must come from the same SDK
   lineage as the pinned SAI — bundle them per image, never share.
 - If the newer SAI's *API* differs enough that the vendored headers won't
@@ -84,8 +85,13 @@ Rules that keep multi-platform fleets sane:
   upgrade an existing header directory in place.
 - Vendor files (`config.bcm`, `.soc`) live next to `platform.toml` but are
   **gitignored**; add a fetch recipe for your platform to
-  `vendor/fetch-vendor.sh` (public sonic-buildimage data can be downloaded;
-  the `libsaibcm` .deb is documented in `vendor/sai/README.md`).
+  `vendor/fetch-vendor.sh`. All of it is publicly downloadable: platform
+  data from sonic-buildimage, the `libsaibcm` .deb from the SONiC package
+  server (`packages.trafficmanager.net`), and the GPL BDE kernel-module
+  source (`saibcm-modules`) from sonic-buildimage. Before pinning a SAI
+  version, inspect the .deb for your ASIC (`strings libsai.so | grep
+  BCM<chip>`) and read its `-dev` package's `saiversion.h` to set
+  `api_headers`.
 
 ## 4. The port table: `[ports]`
 
@@ -232,9 +238,8 @@ Real image, on a Debian host with debootstrap/squashfs-tools and the
 vendor blobs staged:
 
 ```console
-$ vendor/fetch-vendor.sh acme-sw48          # platform data files
-$ cp .../libsaibcm_8.x-td3_amd64.deb vendor/sai/
-$ build/mkimage.sh acme-sw48 --version 0.1.0
+$ vendor/fetch-vendor.sh acme-sw48   # SAI deb + data files + kmod source
+$ build/mkimage.sh acme-sw48         # builds BDE kmods in the chroot too
 ```
 
 ## 9. Install on the box

@@ -33,10 +33,15 @@ asic = "helix4"
 [sai]
 # Vendor SAI package name (Debian package providing libsai).
 package = "libsaibcm"
-# Abstract per-platform version pin, resolved to a concrete vendor blob by
-# the build pipeline. Pinning is PER PLATFORM, never global: e.g. Helix4
-# boards need a SONiC 202205-era build, Trident3 boards a current one.
-version_pin = "3.7.x-helix4"
+# Per-platform version pin: the exact vendor package version this board
+# ships with, resolved to a .deb by vendor/fetch-vendor.sh (the SONiC
+# public package server hosts these). Pinning is PER PLATFORM, never
+# global — different boards may ride different SAI eras.
+version_pin = "8.4.50.0"
+# The SAI API version that build implements — selects which header set
+# under vendor/sai-headers/ bindgen uses for this platform's image. Get it
+# from saiversion.h in the matching libsaibcm-dev package.
+api_headers = "v1.11.0"
 # Absolute path of the vendor library inside the installed image. syncd
 # dlopens exactly this path.
 libsai_path = "/usr/lib/libsai.so.1"
@@ -46,6 +51,12 @@ config_bcm = "config.bcm"
 # Additional vendor data files (LED microcode, post-init SOC scripts...).
 # Relative paths, fetched alongside config.bcm.
 extra_files = ["led_proc.soc"]
+
+# Extra SAI profile key/values handed to the vendor library at init
+# (mirror your board's SONiC sai.profile; SAI_INIT_CONFIG_FILE is
+# injected automatically).
+# [sai.profile]
+# SAI_NUM_ECMP_MEMBERS = "64"
 
 [kernel]
 # Kernel modules that must be loaded before syncd starts. For Broadcom
@@ -119,6 +130,15 @@ lanes = [53, 54, 55, 56]
 # Name prefix of the root SMBus adapter. Matched by name because kernel bus
 # numbers for PCI SMBus adapters can vary between boots.
 root_adapter = "SMBus iSMT adapter"
+
+# Raw i2c writes before mux instantiation, for boards whose muxes need a
+# wake/select poke before the kernel driver binds (check your platform's
+# init script for bare i2cset calls):
+# [[hardware.i2c.pre_write]]
+# bus = "root"
+# address = 0x70
+# data = [0x10, 0x00, 0x01]
+# purpose = "wake main mux"
 
 # Muxes, in instantiation order. parent_bus is "root" or a numeric child
 # bus created by an earlier mux. child_bus_base is the first kernel bus

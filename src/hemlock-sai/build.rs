@@ -2,7 +2,7 @@
 //!
 //! The header set is a build-time selection so each platform image can pin
 //! its own SAI API era: HEMLOCK_SAI_HEADERS names a directory under
-//! vendor/sai-headers/ (default v1.7.1, the Helix4-era API).
+//! vendor/sai-headers/ (default v1.11.0, matching the SONiC 202305-era libsaibcm 8.4.x builds).
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -15,12 +15,10 @@ fn main() {
 fn generate_bindings() {
     use std::path::PathBuf;
 
-    let version = std::env::var("HEMLOCK_SAI_HEADERS").unwrap_or_else(|_| String::from("v1.7.1"));
+    let version = std::env::var("HEMLOCK_SAI_HEADERS").unwrap_or_else(|_| String::from("v1.11.0"));
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let inc = manifest_dir
-        .join("../../vendor/sai-headers")
-        .join(&version)
-        .join("inc");
+    let headers_root = manifest_dir.join("../../vendor/sai-headers").join(&version);
+    let inc = headers_root.join("inc");
     assert!(
         inc.is_dir(),
         "SAI headers not found at {} (HEMLOCK_SAI_HEADERS={version})",
@@ -39,6 +37,8 @@ fn generate_bindings() {
     let bindings = builder
         .header(manifest_dir.join("wrapper.h").display().to_string())
         .clang_arg(format!("-I{}", inc.display()))
+        // saiextensions.h pulls in the experimental headers.
+        .clang_arg(format!("-I{}", headers_root.join("experimental").display()))
         // libsai is a Linux library; generate Linux-ABI bindings regardless
         // of the build host so output is identical everywhere.
         .clang_arg("--target=x86_64-unknown-linux-gnu")

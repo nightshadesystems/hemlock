@@ -97,6 +97,16 @@ async fn main() -> Result<()> {
     let backend: Arc<dyn HwBackend> = if args.mock {
         Arc::new(hw::MockBackend::new(35.0))
     } else {
+        // Real hardware: load platform kernel modules and instantiate the
+        // manifest's i2c topology (idempotent across restarts).
+        hemlock_platform::sysinit::load_kernel_modules(&platform.manifest.kernel)?;
+        let report = hemlock_platform::sysinit::Sysfs::real()
+            .instantiate_i2c(&platform.manifest.hardware.i2c)?;
+        info!(
+            created = report.created.len(),
+            already_present = report.already_present.len(),
+            "i2c topology ready"
+        );
         Arc::new(hw::SysfsBackend)
     };
     info!(

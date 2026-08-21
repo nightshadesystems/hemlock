@@ -36,6 +36,11 @@ struct Args {
     #[arg(long)]
     mock: bool,
 
+    /// Bring-up shakeout: create the switch, print the port table, exit.
+    /// No gRPC server; works with both backends.
+    #[arg(long)]
+    probe: bool,
+
     /// gRPC endpoint to serve (unix:/path or tcp:host:port).
     #[arg(long)]
     listen: Option<String>,
@@ -68,6 +73,13 @@ async fn main() -> Result<()> {
         "switch created, ports up"
     );
 
+    if args.probe {
+        // Let initial oper-status notifications drain into the port table.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        print_probe_report(&handle);
+        return Ok(());
+    }
+
     let listen: IpcEndpoint = match &args.listen {
         Some(s) => s.parse()?,
         None => Daemon::Syncd.default_endpoint(),
@@ -94,9 +106,23 @@ fn build_backend(platform: &Platform, mock: bool) -> Result<Box<dyn SaiBackend>>
 
     #[cfg(feature = "real-sai")]
     {
+        // Real hardware prerequisites: kernel modules (BDE pair + platform
+        // modules) and their device nodes. Idempotent across restarts.
+        hemlock_platform::sysinit::load_kernel_modules(&platform.manifest.kernel)?;
+        if platform.manifest.platform.asic_family == "broadcom-xgs" {
+            hemlock_platform::sysinit::ensure_bde_dev_nodes()?;
+        }
+
         let init = hemlock_sai::SwitchInit {
             libsai_path: platform.manifest.sai.libsai_path.clone(),
             config_bcm_path: platform.config_bcm_path(),
+            profile: platform
+                .manifest
+                .sai
+                .profile
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
         if !init.config_bcm_path.exists() {
             bail!(
@@ -113,6 +139,42 @@ fn build_backend(platform: &Platform, mock: bool) -> Result<Box<dyn SaiBackend>>
         bail!(
             "this hemlock-syncd was built without the real-sai feature; \
              only --mock is available"
+        );
+    }
+}
+
+/// `--probe`: dump the correlated port table for hardware shakeout.
+fn print_probe_report(handle: &actor::SaiHandle) {
+    println!("platform:   {}", handle.platform_id);
+    println!("backend:    {}", handle.backend_name);
+    println!("switch oid: {:#x}", handle.switch.oid);
+    let Ok(table) = handle.ports.read() else {
+        println!("(port table unavailable)");
+        return;
+    };
+    let mut ports: Vec<_> = table.values().collect();
+    ports.sort_by_key(|p| p.def.index);
+    println!(
+        "{:<12} {:>5} {:>8} {:<14} {:>5} {:>4}  SAI OID",
+        "Port", "Index", "Speed", "Lanes", "Admin", "Oper"
+    );
+    for port in ports {
+        let lanes = port
+            .def
+            .lanes
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{:<12} {:>5} {:>8} {:<14} {:>5} {:>4}  {}",
+            port.def.name,
+            port.def.index,
+            format!("{}M", port.def.speed_mbps),
+            lanes,
+            if port.admin_up { "up" } else { "down" },
+            if port.oper_up { "up" } else { "down" },
+            port.sai_id,
         );
     }
 }

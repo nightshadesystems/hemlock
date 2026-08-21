@@ -5,7 +5,7 @@
 vendor/sai/*
 !vendor/sai/README.md
 !vendor/sai/.gitkeep
-platforms/**/config.bcm
+platforms/**/*.bcm
 platforms/**/*.soc
 platforms/**/*.deb
 

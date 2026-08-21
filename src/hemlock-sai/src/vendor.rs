@@ -122,10 +122,21 @@ impl VendorSai {
             ));
         }
 
-        let profile = vec![(
+        let mut profile = vec![(
             CString::new("SAI_INIT_CONFIG_FILE").expect("static key"),
             path_to_cstring(&init.config_bcm_path)?,
         )];
+        for (key, value) in &init.profile {
+            profile.push((
+                CString::new(key.as_str())
+                    .map_err(|_| SaiError::Other(format!("NUL in profile key {key:?}")))?,
+                CString::new(value.as_str())
+                    .map_err(|_| SaiError::Other(format!("NUL in profile value for {key:?}")))?,
+            ));
+        }
+        for (key, value) in &profile {
+            tracing::info!(key = ?key, value = ?value, "SAI profile entry");
+        }
         PROFILE
             .set(profile)
             .map_err(|_| SaiError::Other("SAI profile already initialized".into()))?;
@@ -235,6 +246,7 @@ impl SaiBackend for VendorSai {
         let attrs = [init_attr, profile_attr, notify_attr];
         let mut oid: ffi::sai_object_id_t = 0;
 
+        tracing::info!("creating SAI switch (this can take a while on real hardware)");
         // SAFETY: switch_api comes from a successful sai_api_query; the
         // attr array outlives the call.
         unsafe {
@@ -247,6 +259,7 @@ impl SaiBackend for VendorSai {
             )?;
         }
         self.switch_oid = Some(oid);
+        tracing::info!(oid = format_args!("{oid:#x}"), "SAI switch created");
         Ok(SwitchInfo { oid })
     }
 
@@ -276,6 +289,8 @@ impl SaiBackend for VendorSai {
                 attr.value.u32_
             }
         };
+
+        tracing::info!(count, "ASIC reports active ports");
 
         // Fetch their OIDs.
         let mut oids: Vec<ffi::sai_object_id_t> = vec![0; count as usize];

@@ -8,6 +8,7 @@
 pub mod lint;
 pub mod quirks;
 pub mod schema;
+pub mod sysinit;
 
 use std::path::{Path, PathBuf};
 

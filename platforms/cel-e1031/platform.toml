@@ -18,15 +18,22 @@ asic = "helix4"
 
 [sai]
 package = "libsaibcm"
-# Helix4 was dropped from newer Broadcom SAI releases; this platform is
-# pinned to the SONiC 202205/202211-era build (SDK 6.5.x lineage). The
-# build pipeline resolves this abstract pin to a concrete vendor .deb.
-version_pin = "3.7.x-helix4"
+# SONiC 202305's Broadcom XGS build (SDK 6.5.27). Verified to retain the
+# full Helix4 family (BCM56340/42/44/45/46). Downloaded from the public
+# SONiC package server by vendor/fetch-vendor.sh.
+version_pin = "8.4.50.0"
+# SAI API version implemented by that build (from its -dev headers);
+# selects the vendored header set bindgen compiles against.
+api_headers = "v1.11.0"
 libsai_path = "/usr/lib/libsai.so.1"
 # Vendor data files live next to this manifest but are never committed;
 # vendor/fetch-vendor.sh places them (both exist in public sonic-buildimage).
 config_bcm = "helix4-e1031-48x1G+4x10G.config.bcm"
 extra_files = ["sai_postinit_cmd.soc"]
+
+# Extra SAI profile entries, mirroring SONiC's sai.profile for this hwsku.
+[sai.profile]
+SAI_NUM_ECMP_MEMBERS = "64"
 
 [kernel]
 required_modules = [
@@ -90,6 +97,14 @@ lanes = [54, 53, 56, 55]
 
 [hardware.i2c]
 root_adapter = "SMBus iSMT adapter"
+
+# The CPU-board extender needs a wake write before the pca9548 driver can
+# bind (from the SONiC haliburton init: `i2cset -y $bus 0x73 0x10 0x00 0x01 i`).
+[[hardware.i2c.pre_write]]
+bus = "root"
+address = 0x73
+data = [0x10, 0x00, 0x01]
+purpose = "wake cpu-extender mux"
 
 [[hardware.i2c.mux]]
 name = "cpu-extender"

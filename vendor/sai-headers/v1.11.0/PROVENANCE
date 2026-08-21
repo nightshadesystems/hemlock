@@ -1,0 +1,4 @@
+Extracted verbatim from libsaibcm-dev_8.4.50.0_amd64.deb
+(https://packages.trafficmanager.net/public/sai/sai-broadcom/SAI_8.4.0_GA/8.4.50.0/xgs/)
+SAI API version: 1.11.0 (saiversion.h). License: Apache-2.0 (OCP SAI).
+These are the exact headers the libsaibcm 8.4.50.0 blob was built against.

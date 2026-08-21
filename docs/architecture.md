@@ -17,11 +17,12 @@ four daemons, the configuration model, and the image/installer pipeline.
    and a `config.bcm` path resolved from the manifest and knows nothing else
    about the board.
 3. **SAI version pinning is per-platform, never global.** Each manifest pins
-   its vendor SAI package (`sai.version_pin`); the build pipeline bundles
-   the matching blob into that platform's image. This exists because real
-   fleets straddle SAI eras: the Celestica E1031's Helix4 was dropped from
-   newer SAI releases and needs a SONiC 202205/202211-era build, while a
-   Trident3 platform wants a current one.
+   its vendor SAI package (`sai.version_pin`) and the matching API header
+   set (`sai.api_headers`); the build pipeline bundles the right blob and
+   compiles syncd against the right headers per platform image. Real
+   fleets straddle SAI eras, so nothing about a SAI version is ever a
+   workspace-wide decision. (The E1031 currently rides `libsaibcm
+   8.4.50.0` / SAI API v1.11.0 — inspected to still carry Helix4.)
 4. **Rust everywhere; unsafe nowhere but the FFI.** `unsafe` is denied
    workspace-wide and allowed only inside `hemlock-sai`'s FFI modules.
    Everything above the FFI boundary builds and tests against a pure-Rust
@@ -130,12 +131,14 @@ the platform port table. Links follow admin state and emit the same
 notifications the vendor library would, so syncd/mgmtd behavior — including
 commit-confirm auto-rollback — is exercised end-to-end without hardware.
 
-**Vendor backend** (`real-sai` feature): bindgen over the OCP SAI headers
-vendored at a pinned commit under `vendor/sai-headers/<version>/`, plus
-`libloading` to dlopen the manifest's `libsai_path` at runtime. The header
-*API* version is a build-time selection (`HEMLOCK_SAI_HEADERS`, default
-`v1.7.1` — the Helix4-era API); platforms pinning a newer SAI add a new
-header directory rather than upgrading the old one. The SAI profile
+**Vendor backend** (`real-sai` feature): bindgen over SAI headers vendored
+under `vendor/sai-headers/<version>/` (extracted from the pinned build's
+own `-dev` package, so they are ABI-exact), plus `libloading` to dlopen
+the manifest's `libsai_path` at runtime. The header *API* version is a
+build-time selection (`HEMLOCK_SAI_HEADERS`, default `v1.11.0`); platforms
+pinning a different SAI add a new header directory rather than upgrading
+an existing one. Bindings always generate for `x86_64-unknown-linux-gnu`
+so output is identical on every build host. The SAI profile
 (`SAI_INIT_CONFIG_FILE` → config.bcm) is served through the standard
 profile callbacks; port oper-status callbacks are forwarded into a tokio
 channel. Building `real-sai` needs libclang (CI compiles it on every push

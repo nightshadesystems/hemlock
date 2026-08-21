@@ -27,7 +27,7 @@ pub enum SaiError {
     #[error("SAI library load failed: {0}")]
     Load(String),
 
-    #[error("SAI {call} failed with status {status}")]
+    #[error("SAI {call} failed with status {status} ({})", status_name(*.status))]
     Status { call: &'static str, status: i32 },
 
     #[error("switch not created yet")]
@@ -59,6 +59,78 @@ pub struct SwitchInit {
     /// ASIC init config handed to the vendor library via the SAI profile
     /// (`SAI_INIT_CONFIG_FILE`).
     pub config_bcm_path: PathBuf,
+    /// Extra SAI profile key/values (`[sai.profile]` in the manifest),
+    /// e.g. `SAI_NUM_ECMP_MEMBERS`.
+    pub profile: Vec<(String, String)>,
+}
+
+/// Human name for a SAI status code, per saistatus.h (`SAI_STATUS_CODE(x)`
+/// is `-(x)`; attribute-indexed families encode the attr index in the low
+/// 16 bits). For log/error readability during hardware bring-up.
+pub fn status_name(status: i32) -> String {
+    if status == 0 {
+        return "SUCCESS".into();
+    }
+    let magnitude = -(status as i64);
+    if !(1..=0x0005_FFFF).contains(&magnitude) {
+        return format!("unknown status {status:#x}");
+    }
+    const SIMPLE: [&str; 0x18] = [
+        "FAILURE",
+        "NOT_SUPPORTED",
+        "NO_MEMORY",
+        "INSUFFICIENT_RESOURCES",
+        "INVALID_PARAMETER",
+        "ITEM_ALREADY_EXISTS",
+        "ITEM_NOT_FOUND",
+        "BUFFER_OVERFLOW",
+        "INVALID_PORT_NUMBER",
+        "INVALID_PORT_MEMBER",
+        "INVALID_VLAN_ID",
+        "UNINITIALIZED",
+        "TABLE_FULL",
+        "MANDATORY_ATTRIBUTE_MISSING",
+        "NOT_IMPLEMENTED",
+        "ADDR_NOT_FOUND",
+        "OBJECT_IN_USE",
+        "INVALID_OBJECT_TYPE",
+        "INVALID_OBJECT_ID",
+        "INVALID_NV_STORAGE",
+        "NV_STORAGE_FULL",
+        "SW_UPGRADE_VERSION_MISMATCH",
+        "NOT_EXECUTED",
+        "STAGE_MISMATCH",
+    ];
+    let family = magnitude >> 16;
+    let index = magnitude & 0xFFFF;
+    match family {
+        0 => SIMPLE
+            .get(magnitude as usize - 1)
+            .map(|name| (*name).to_string())
+            .unwrap_or_else(|| format!("unknown status {status:#x}")),
+        1 => format!("INVALID_ATTRIBUTE_{index}"),
+        2 => format!("INVALID_ATTR_VALUE_{index}"),
+        3 => format!("ATTR_NOT_IMPLEMENTED_{index}"),
+        4 => format!("UNKNOWN_ATTRIBUTE_{index}"),
+        5 => format!("ATTR_NOT_SUPPORTED_{index}"),
+        _ => format!("unknown status {status:#x}"),
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    #[test]
+    fn decodes_statuses() {
+        use super::status_name;
+        assert_eq!(status_name(0), "SUCCESS");
+        assert_eq!(status_name(-1), "FAILURE");
+        assert_eq!(status_name(-3), "NO_MEMORY");
+        assert_eq!(status_name(-0x18), "STAGE_MISMATCH");
+        assert_eq!(status_name(-0x0001_0000), "INVALID_ATTRIBUTE_0");
+        assert_eq!(status_name(-0x0001_0002), "INVALID_ATTRIBUTE_2");
+        assert_eq!(status_name(-0x0005_0001), "ATTR_NOT_SUPPORTED_1");
+        assert!(status_name(-0x0100_0000).starts_with("unknown"));
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
