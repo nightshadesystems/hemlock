@@ -47,8 +47,10 @@ mount -t squashfs -o ro "$LOOP" "$RO" \
 
 PERSIST="$FLASH/hemlock/persist"
 mkdir -p "$PERSIST/rw" "$PERSIST/work"
-mount -t overlay overlay \
-    -o "lowerdir=$RO,upperdir=$PERSIST/rw,workdir=$PERSIST/work" "${rootmnt}" \
+# klibc mount is strict POSIX: all options must precede the device name.
+mount -t overlay \
+    -o "lowerdir=$RO,upperdir=$PERSIST/rw,workdir=$PERSIST/work" \
+    overlay "${rootmnt}" \
     || panic "hemlock: overlay mount failed"
 
 # Keep the flash partition reachable in the running system.

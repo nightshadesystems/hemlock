@@ -20,7 +20,10 @@
 
 `--dummy-rootfs` skips debootstrap and vendor blobs entirely, producing a
 structurally valid image for CI; `verify-image.sh` checks the layout without
-executing anything. Per-platform console settings come from an optional
+executing anything. `boot-test.sh <image.bin>` boots a full image's
+kernel+initrd+squashfs in QEMU against an installer-shaped disk (no root
+needed) and passes only if a login prompt appears — run it before flashing
+hardware; CI runs it on every full image build. Per-platform console settings come from an optional
 `platforms/<id>/boot.env` (`CONSOLE_DEV`, `CONSOLE_SPEED`).
 
 Real builds need: Debian host, `debootstrap`, `squashfs-tools`, a Rust

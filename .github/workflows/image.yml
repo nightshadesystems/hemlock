@@ -65,6 +65,14 @@ jobs:
       - name: Verify image structure
         run: bash build/verify-image.sh build/out/hemlock-*-"${{ inputs.platform }}".bin
 
+      - name: Boot test (QEMU)
+        if: inputs.mode == 'full'
+        # Boots the image's kernel+initrd+squashfs and requires a login
+        # prompt — catches initramfs hand-off regressions before hardware.
+        run: |
+          sudo apt-get install -y qemu-system-x86
+          bash build/boot-test.sh build/out/hemlock-*-"${{ inputs.platform }}".bin --timeout 600
+
       - uses: actions/upload-artifact@v4
         with:
           name: hemlock-image-${{ inputs.platform }}-${{ inputs.mode }}
