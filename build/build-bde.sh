@@ -71,6 +71,18 @@ if ! grep -Eqs "#define[[:space:]]+MAX_ORDER([[:space:]]|$)" "$COMMON/include/li
     fi
 fi
 
+# ksal.c picks its SAL_YIELD implementation with "#ifdef
+# MAX_USER_RT_PRIO", a macro kernels dropped in 5.13 — sending the build
+# down a 2.4-era branch that uses the long-removed SCHED_YIELD. Every
+# kernel this script supports has yield(); force that branch. (On old
+# kernels that still defined MAX_USER_RT_PRIO the yield() branch was
+# chosen anyway, so this is behavior-preserving.)
+KSAL_C="$SRC/systems/linux/kernel/modules/shared/ksal.c"
+if [ -f "$KSAL_C" ] && grep -q '#ifdef MAX_USER_RT_PRIO' "$KSAL_C"; then
+    log "shimming SAL_YIELD to yield() in ksal.c"
+    sed -i 's|#ifdef MAX_USER_RT_PRIO|#if 1 /* hemlock shim: MAX_USER_RT_PRIO removed in 5.13; yield() always exists */|' "$KSAL_C"
+fi
+
 log "building BDE modules for $KVER"
 # The SDK build spews thousands of benign kernel-header warnings that bury
 # the one diagnostic that matters, so capture everything and surface only
