@@ -36,6 +36,8 @@ check() {
     fi
 }
 
+# Referenced inside eval'd check strings, which shellcheck cannot see into.
+# shellcheck disable=SC2034
 esc=$(printf '\033')
 
 # --- shellcheck -------------------------------------------------------------
@@ -78,6 +80,8 @@ if [ -n "$HEMLOCKCTL" ]; then
         PATH="$ctl_dir:$PATH" HEMLOCK_PLATFORM_DIR="$ROOT/platforms/cel-e1031" \
             /bin/sh "$MOTD_DIR/10-hemlock-status"
     }
+    # out is read inside the eval'd check strings below.
+    # shellcheck disable=SC2034
     out="$(run_status)" || { echo "FAIL  status: nonzero exit with daemons down"; fail=1; out=""; }
     check "status: version line present"    "echo \"\$out\" | grep -q '^Hemlock NOS v'"
     check "status: platform line rendered from manifest" \

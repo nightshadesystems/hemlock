@@ -36,6 +36,12 @@ struct Args {
     #[arg(long)]
     mock: bool,
 
+    /// Use the mock backend when no Broadcom ASIC is visible on PCI
+    /// (QEMU, bench machines); the vendor backend otherwise. The systemd
+    /// unit runs with this so one image boots everywhere.
+    #[arg(long, conflicts_with = "mock")]
+    auto_mock: bool,
+
     /// Bring-up shakeout: create the switch, print the port table, exit.
     /// No gRPC server; works with both backends.
     #[arg(long)]
@@ -59,7 +65,7 @@ async fn main() -> Result<()> {
         "platform manifest loaded"
     );
 
-    let backend = build_backend(&platform, args.mock)?;
+    let backend = build_backend(&platform, args.mock, args.auto_mock)?;
 
     let quirks = platform.quirks()?;
     quirks.pre_asic_init(&platform)?;
@@ -97,7 +103,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_backend(platform: &Platform, mock: bool) -> Result<Box<dyn SaiBackend>> {
+fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box<dyn SaiBackend>> {
+    let mock = mock
+        || (auto_mock && {
+            let no_asic = !hemlock_platform::sysinit::broadcom_asic_present();
+            if no_asic {
+                tracing::warn!(
+                    "--auto-mock: no Broadcom PCI device visible; using the mock SAI backend"
+                );
+            }
+            no_asic
+        })
+        // A build without the vendor library can only ever mock.
+        || (auto_mock && cfg!(not(feature = "real-sai")));
     if mock {
         return Ok(Box::new(hemlock_sai::mock::MockSai::new(
             platform.ports.clone(),

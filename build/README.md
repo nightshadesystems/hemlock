@@ -13,7 +13,11 @@
    overlay `/hemlock/persist` on top, and expose the flash at `/host`.
    The rootfs is branded as Hemlock (os-release/issue carry the Hemlock
    version, never "Debian GNU/Linux"), gets the default operator account
-   `admin` / `Hemlock123!` (sudo; root stays locked), and the dynamic
+   `admin` / `Hemlock123!` (sudo; root stays locked) whose login shell
+   is `hemlockctl` — logging in lands straight in the network CLI, and
+   `bash` inside it drops to Linux. The banner is also rendered into
+   `/etc/issue` (backslashes doubled for agetty) so it shows at the
+   console before login, and the dynamic
    MOTD: [rootfs/update-motd.d/](rootfs/update-motd.d/) scripts rendered
    by pam_motd on every login (banner + `hemlockctl motd` live status),
    with the stock Debian motd removed. `hemlock-motd` previews it without

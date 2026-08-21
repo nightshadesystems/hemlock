@@ -21,14 +21,18 @@
 //! edits build the mgmtd *candidate*; nothing touches the ASIC until
 //! `commit` (with `commit confirmed <secs>` for auto-rollback safety).
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 use hemlock_config::ConfigTree;
 use rustyline::error::ReadlineError;
 
+use crate::complete::{self, CliHelper, CliMode};
 use crate::show;
 
+#[derive(Clone)]
 pub struct Endpoints {
     pub syncd: IpcEndpoint,
     pub pmon: IpcEndpoint,
@@ -77,11 +81,55 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
         .unwrap_or_else(|_| "root".into());
     let hostname = read_hostname();
 
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let helper_state = Arc::new(Mutex::new(complete::State {
+        mode: CliMode::Operational,
+        ports: Vec::new(),
+    }));
+    let mut rl: rustyline::Editor<CliHelper, rustyline::history::DefaultHistory> =
+        rustyline::Editor::new()?;
+    rl.set_helper(Some(CliHelper {
+        state: helper_state.clone(),
+    }));
+
+    // Keep the completer's interface-name cache fresh from syncd; a dead
+    // or restarting syncd just means stale/no port completion, never an
+    // error at the prompt.
+    {
+        let state = helper_state.clone();
+        let syncd = endpoints.syncd.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(channel) = syncd.connect().await {
+                    let mut client = pb::syncd_client::SyncdClient::new(channel);
+                    if let Ok(response) = client.list_ports(pb::ListPortsRequest {}).await {
+                        let mut names: Vec<String> = response
+                            .into_inner()
+                            .ports
+                            .into_iter()
+                            .map(|p| p.name)
+                            .collect();
+                        names.sort();
+                        if let Ok(mut state) = state.lock() {
+                            state.ports = names;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+    }
+
     let mut mode = Mode::Operational;
 
     println!("Hemlock {} — type ? for help", hemlock_common::VERSION);
     loop {
+        if let Ok(mut state) = helper_state.lock() {
+            state.mode = match &mode {
+                Mode::Operational => CliMode::Operational,
+                Mode::Config => CliMode::Config,
+                Mode::ConfigIf(_) => CliMode::ConfigIf,
+            };
+        }
         let prompt = match &mode {
             Mode::Operational => format!("{user}@{hostname}> "),
             Mode::Config => format!("{user}@{hostname}# "),
@@ -146,15 +194,31 @@ fn stay(mode: Mode) -> Step {
     Ok(Some(mode))
 }
 
-fn fail(err: impl std::fmt::Display) -> Step {
-    Err(format!("% {err:#}"))
+fn fail(err: anyhow::Error) -> Step {
+    Err(fmt_err(err))
+}
+
+/// Render an error, translating a raw gRPC connect failure into the
+/// operator-facing truth: the daemon is down. The socket path in the IPC
+/// error identifies which one.
+fn fmt_err(err: anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    if text.contains("ipc failure") {
+        for daemon in ["syncd", "pmon", "mgmtd"] {
+            if text.contains(&format!("/{daemon}.sock")) {
+                return format!("% cannot reach {daemon} (is hemlock-{daemon}.service running?)");
+            }
+        }
+    }
+    format!("% {text}")
 }
 
 async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
+    // No separate "conf" entry: it is a unique prefix of "configure", so
+    // `conf`, `conf t`, even `c` all resolve without an ambiguity error.
     const COMMANDS: &[&str] = &[
         "show",
         "configure",
-        "conf",
         "bash",
         "exit",
         "quit",
@@ -167,7 +231,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             show_command(endpoints, &words[1..]).await?;
             stay(Mode::Operational)
         }
-        "configure" | "conf" => {
+        "configure" => {
             // Accept the EOS-habitual `configure terminal` / `conf t`.
             stay(Mode::Config)
         }
@@ -203,23 +267,21 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "interfaces" => match words.get(1) {
                 None => show::interfaces(endpoints.syncd.clone())
                     .await
-                    .map_err(|e| format!("% {e:#}")),
+                    .map_err(fmt_err),
                 Some(sub) => match resolve(sub, &["status", "transceiver"])? {
                     "status" => show::interfaces_status(endpoints.syncd.clone())
                         .await
-                        .map_err(|e| format!("% {e:#}")),
+                        .map_err(fmt_err),
                     "transceiver" => show::transceivers(endpoints.pmon.clone())
                         .await
-                        .map_err(|e| format!("% {e:#}")),
+                        .map_err(fmt_err),
                     _ => unreachable!(),
                 },
             },
             "environment" => show::environment(endpoints.pmon.clone())
                 .await
-                .map_err(|e| format!("% {e:#}")),
-            "running-config" => show::config(endpoints.mgmtd.clone())
-                .await
-                .map_err(|e| format!("% {e:#}")),
+                .map_err(fmt_err),
+            "running-config" => show::config(endpoints.mgmtd.clone()).await.map_err(fmt_err),
             "version" => {
                 show::version(endpoints.syncd.clone()).await;
                 Ok(())
@@ -249,9 +311,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
                 return Err("% Usage: interface <name>  (e.g. interface Ethernet0)".into());
             };
             // Validate against syncd so typos surface immediately.
-            let known = list_port_names(endpoints)
-                .await
-                .map_err(|e| format!("% {e:#}"))?;
+            let known = list_port_names(endpoints).await.map_err(fmt_err)?;
             let name = match known.iter().find(|n| n.as_str() == *name) {
                 Some(name) => name.clone(),
                 None => {
@@ -501,10 +561,17 @@ async fn discard(endpoints: &Endpoints) -> Result<()> {
 
 fn spawn_shell() {
     #[cfg(unix)]
-    let (program, args): (String, Vec<&str>) = (
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()),
-        vec!["-l"],
-    );
+    let (program, args): (String, Vec<&str>) = {
+        // On a switch hemlockctl IS the login shell, so $SHELL points
+        // back at us; spawning it would just nest another CLI.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let shell = if shell.ends_with("hemlockctl") {
+            "/bin/bash".into()
+        } else {
+            shell
+        };
+        (shell, vec!["-l"])
+    };
     #[cfg(not(unix))]
     let (program, args): (String, Vec<&str>) = ("powershell".into(), vec![]);
 

@@ -238,8 +238,11 @@ ASIC to the running config.
 1. debootstrap a Debian 13 rootfs (`build/rootfs/packages.list`), install
    the Hemlock daemons + systemd units, and the platform's pinned vendor
    SAI `.deb` from `vendor/sai/` (hard failure with pointers if absent).
-   The rootfs is branded as Hemlock (os-release, issue) with the default
-   operator account `admin` / `Hemlock123!` (sudo; root locked), and gets
+   The rootfs is branded as Hemlock (os-release, issue — the banner also
+   renders into `/etc/issue` so it shows at the console before login)
+   with the default operator account `admin` / `Hemlock123!` (sudo; root
+   locked; login shell `hemlockctl`, so a login lands straight in the
+   CLI's operational mode), and gets
    the dynamic MOTD: `/etc/update-motd.d/00-hemlock-banner` (static art)
    and `10-hemlock-status` (a wrapper over `hemlockctl motd`, which polls
    syncd/pmon with short timeouts and degrades field-by-field). The stock
@@ -265,7 +268,10 @@ Boot hand-off: GRUB passes `hemlock.rootfs=/hemlock/rootfs.squashfs`; the
 hemlock initramfs script (`build/rootfs/initramfs/`, run at local-bottom)
 loop-mounts that squashfs read-only, overlays `/hemlock/persist` from the
 flash partition as the writable upper layer, and leaves the flash mounted
-at `/host` in the running system. Wiping `/hemlock/persist` is a factory
+at `/host` in the running system. The rootfs carries a `/hemlock ->
+host/hemlock` symlink, so units and tools address the platform overlay and
+persist dir by the stable `/hemlock/...` paths regardless of where the
+flash lands. Wiping `/hemlock/persist` is a factory
 reset; the squashfs is never modified in place.
 
 ## Phase-1 boundaries and seams

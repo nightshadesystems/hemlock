@@ -4,7 +4,10 @@ After=local-fs.target
 
 [Service]
 Type=exec
-ExecStart=/usr/sbin/hemlock-pmon --platform /hemlock/platform --platforms-dir /hemlock
+# --auto-mock: fall back to the mock hardware backend when platform
+# bring-up fails (no i2c topology under QEMU); real hardware still gets
+# sysfs and hard failures surface in the journal as warnings.
+ExecStart=/usr/sbin/hemlock-pmon --platform /hemlock/platform --platforms-dir /hemlock --auto-mock
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=hemlock

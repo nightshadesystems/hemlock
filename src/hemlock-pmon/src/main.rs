@@ -40,6 +40,12 @@ struct Args {
     #[arg(long)]
     mock: bool,
 
+    /// Fall back to the mock backend when real hardware bring-up fails
+    /// (kernel modules or i2c topology missing — QEMU, bench machines).
+    /// The systemd unit runs with this so one image boots everywhere.
+    #[arg(long, conflicts_with = "mock")]
+    auto_mock: bool,
+
     /// gRPC endpoint to serve (unix:/path or tcp:host:port).
     #[arg(long)]
     listen: Option<String>,
@@ -97,17 +103,14 @@ async fn main() -> Result<()> {
     let backend: Arc<dyn HwBackend> = if args.mock {
         Arc::new(hw::MockBackend::new(35.0))
     } else {
-        // Real hardware: load platform kernel modules and instantiate the
-        // manifest's i2c topology (idempotent across restarts).
-        hemlock_platform::sysinit::load_kernel_modules(&platform.manifest.kernel)?;
-        let report = hemlock_platform::sysinit::Sysfs::real()
-            .instantiate_i2c(&platform.manifest.hardware.i2c)?;
-        info!(
-            created = report.created.len(),
-            already_present = report.already_present.len(),
-            "i2c topology ready"
-        );
-        Arc::new(hw::SysfsBackend)
+        match real_hw_init(&platform) {
+            Ok(backend) => backend,
+            Err(err) if args.auto_mock => {
+                warn!(%err, "--auto-mock: hardware bring-up failed; using the mock backend");
+                Arc::new(hw::MockBackend::new(35.0))
+            }
+            Err(err) => return Err(err),
+        }
     };
     info!(
         platform = %platform.manifest.platform.id,
@@ -133,6 +136,20 @@ async fn main() -> Result<()> {
     let router = tonic::transport::Server::builder()
         .add_service(PmonServer::new(service::PmonService::new(env)));
     router_serve(listen, router).await
+}
+
+/// Real hardware: load platform kernel modules and instantiate the
+/// manifest's i2c topology (idempotent across restarts).
+fn real_hw_init(platform: &Platform) -> Result<Arc<dyn HwBackend>> {
+    hemlock_platform::sysinit::load_kernel_modules(&platform.manifest.kernel)?;
+    let report = hemlock_platform::sysinit::Sysfs::real()
+        .instantiate_i2c(&platform.manifest.hardware.i2c)?;
+    info!(
+        created = report.created.len(),
+        already_present = report.already_present.len(),
+        "i2c topology ready"
+    );
+    Ok(Arc::new(hw::SysfsBackend))
 }
 
 async fn router_serve(listen: IpcEndpoint, router: tonic::transport::server::Router) -> Result<()> {

@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use hemlock_common::ipc::{Daemon, IpcEndpoint};
 
 mod cli;
+mod complete;
 mod config;
 mod motd;
 mod platform;
@@ -27,6 +28,13 @@ struct Cli {
     /// Override the mgmtd endpoint.
     #[arg(long, global = true)]
     mgmtd: Option<String>,
+
+    /// Run a POSIX shell command and exit. hemlockctl is the operator
+    /// account's login shell; sshd invokes remote commands and the sftp
+    /// subsystem as `<shell> -c <command>`, so this keeps `ssh host cmd`
+    /// and scp/sftp working.
+    #[arg(short = 'c', value_name = "COMMAND", hide = true)]
+    shell_command: Option<String>,
 
     /// With no subcommand, hemlockctl starts the interactive CLI
     /// (operational mode).
@@ -137,6 +145,14 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    if let Some(shell_command) = &cli.shell_command {
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(shell_command)
+            .status()
+            .map_err(|e| anyhow::anyhow!("running /bin/sh: {e}"))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
     let Some(command) = cli.command else {
         // No subcommand: interactive CLI (operational mode).
         return cli::run(cli::Endpoints {

@@ -147,7 +147,11 @@ fn platform_summary(dir: &Path) -> Option<String> {
 /// "broadcom-xgs"/"helix4" → "BCM Helix4"; unknown families pass the
 /// prettified ASIC name through unprefixed.
 fn asic_label(family: &str, asic: &str) -> String {
-    let pretty = asic.split('-').map(capitalize).collect::<Vec<_>>().join("-");
+    let pretty = asic
+        .split('-')
+        .map(capitalize)
+        .collect::<Vec<_>>()
+        .join("-");
     if family.starts_with("broadcom") {
         format!("BCM {pretty}")
     } else {
@@ -167,7 +171,12 @@ fn uptime() -> Option<String> {
     let text = std::fs::read_to_string("/proc/uptime").ok()?;
     let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
     let mins = (secs / 60.0) as u64;
-    Some(format!("{}d {}h {}m", mins / 1440, (mins % 1440) / 60, mins % 60))
+    Some(format!(
+        "{}d {}h {}m",
+        mins / 1440,
+        (mins % 1440) / 60,
+        mins % 60
+    ))
 }
 
 fn load_average() -> Option<String> {

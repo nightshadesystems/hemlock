@@ -110,10 +110,22 @@ else
     # Default operator account. debootstrap leaves root locked (no
     # password at all), so without this the booted system is a brick at
     # the login prompt. Root stays locked; admin has full sudo.
+    #
+    # The login shell is hemlockctl: logging in lands straight in the
+    # network CLI (operational mode), like EOS/JunOS. `bash` inside the
+    # CLI drops to Linux; `hemlockctl -c` keeps ssh remote commands and
+    # the sftp subsystem working.
     log "creating default operator account (admin)"
-    chroot "$ROOTFS" useradd -m -s /bin/bash -G sudo admin
+    echo /usr/bin/hemlockctl >> "$ROOTFS/etc/shells"
+    chroot "$ROOTFS" useradd -m -s /usr/bin/hemlockctl -G sudo admin
     echo 'admin:Hemlock123!' | chroot "$ROOTFS" chpasswd
 fi
+
+# Runtime path contract: the initramfs mounts the flash partition (which
+# holds hemlock/{platform,persist,rootfs.squashfs}) at /host. Everything
+# in the running system — units, hemlockctl, the MOTD — addresses it as
+# /hemlock via this symlink.
+ln -sfn host/hemlock "$ROOTFS/hemlock"
 
 # Identity defaults: hostname "hemlock" (the CLI prompt is user@hostname).
 echo hemlock > "$ROOTFS/etc/hostname"
@@ -132,7 +144,14 @@ ID_LIKE=debian
 PRETTY_NAME="Hemlock NOS v$VERSION"
 HOME_URL="https://github.com/nightshadesystems/hemlock"
 EOF
-printf 'Hemlock NOS v%s \\n \\l\n\n' "$VERSION" > "$ROOTFS/etc/issue"
+# Pre-login console banner: the MOTD art plus a version/hostname/tty
+# line. agetty interprets backslash escapes in /etc/issue (\n = hostname,
+# \l = tty, unknown ones are mangled), so the art's own backslashes must
+# be doubled.
+{
+    HEMLOCK_MOTD_COLOR=0 sh "$ROOT/build/rootfs/update-motd.d/00-hemlock-banner" | sed 's/\\/\\\\/g'
+    printf '\nHemlock NOS v%s \\n \\l\n\n' "$VERSION"
+} > "$ROOTFS/etc/issue"
 printf 'Hemlock NOS v%s\n' "$VERSION" > "$ROOTFS/etc/issue.net"
 
 # --- Dynamic MOTD -----------------------------------------------------------

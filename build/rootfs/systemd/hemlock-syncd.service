@@ -8,7 +8,10 @@ Before=hemlock-mgmtd.service hemlock-orch.service
 
 [Service]
 Type=exec
-ExecStart=/usr/sbin/hemlock-syncd --platform /hemlock/platform --platforms-dir /hemlock
+# --auto-mock: fall back to the mock SAI backend when no Broadcom ASIC is
+# visible on PCI (QEMU boot tests, bench machines); real hardware still
+# gets the vendor backend and hard failures.
+ExecStart=/usr/sbin/hemlock-syncd --platform /hemlock/platform --platforms-dir /hemlock --auto-mock
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=hemlock

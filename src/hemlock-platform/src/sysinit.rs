@@ -37,6 +37,22 @@ pub enum SysinitError {
     },
 }
 
+/// Whether a Broadcom (PCI vendor 0x14e4) device is visible on the PCI
+/// bus. The cheapest "is the switch ASIC actually in this box" probe:
+/// used by `--auto-mock` to pick the mock backend under QEMU or on bench
+/// machines without touching kernel modules. A Broadcom NIC also matches,
+/// but the boxes Hemlock targets pair those with a Broadcom ASIC anyway.
+pub fn broadcom_asic_present() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_to_string(entry.path().join("vendor"))
+            .map(|v| v.trim() == "0x14e4")
+            .unwrap_or(false)
+    })
+}
+
 /// Load every module in `[kernel] required_modules`. `modprobe` is
 /// idempotent, so this is safe on every daemon start.
 pub fn load_kernel_modules(kernel: &KernelSection) -> Result<(), SysinitError> {
