@@ -46,6 +46,24 @@ link_into_common "$ARCH_HDRS/include/config"             "$COMMON/include/config
     && link_into_common "$ARCH_HDRS/arch/x86/module.lds" "$COMMON/arch/x86/module.lds"
 [ -f "$COMMON/Module.symvers" ] || cp "$ARCH_HDRS/Module.symvers" "$COMMON/Module.symvers"
 
+# --- Kernel API compat shims ------------------------------------------------
+# Kernel 6.8 renamed MAX_ORDER to MAX_PAGE_ORDER (and 6.4 had already
+# turned the old exclusive bound into an inclusive one, hence the +1).
+# The 202305 saibcm-modules tree predates both and derives its DMA
+# allocation cap from MAX_ORDER in linux_dma.c. Shim only when the target
+# kernel's headers no longer define MAX_ORDER, so builds against older
+# kernels stay byte-identical; the #ifndef keeps the edit idempotent and
+# harmless either way.
+if ! grep -qs "define MAX_ORDER" "$COMMON/include/linux/mmzone.h"; then
+    DMA_C="$SRC/systems/bde/linux/kernel/linux_dma.c"
+    if [ -f "$DMA_C" ] && ! grep -q "MAX_PAGE_ORDER + 1" "$DMA_C"; then
+        log "shimming MAX_ORDER -> MAX_PAGE_ORDER + 1 in linux_dma.c (kernel >= 6.8)"
+        sed -i '0,/#define DMA_MAX_ALLOC_SIZE/s//#ifndef MAX_ORDER\n#define MAX_ORDER (MAX_PAGE_ORDER + 1)\n#endif\n#define DMA_MAX_ALLOC_SIZE/' "$DMA_C"
+        grep -q "MAX_PAGE_ORDER + 1" "$DMA_C" \
+            || die "MAX_ORDER shim did not apply — linux_dma.c layout changed upstream"
+    fi
+fi
+
 log "building BDE modules for $KVER"
 SDK="$(realpath "$SRC")" LINUX_UAPI_SPLIT=1 DEBIAN_LINUX_HEADER=1 BUILD_KNET_CB=1 \
     KERNDIR="$COMMON" \
