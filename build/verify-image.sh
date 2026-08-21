@@ -40,6 +40,10 @@ tail -n +"$ARCHIVE_LINE" "$IMAGE" | gzip -dc | tar -xf - -C "$WORK"
 check "rootfs.squashfs present"            "[ -s '$WORK/rootfs.squashfs' ]"
 check "installer binary present"           "[ -s '$WORK/hemlock-installer' ]"
 check "installer is executable"            "[ -x '$WORK/hemlock-installer' ]"
+# ONIE has no glibc dynamic loader: an ELF installer must be static.
+# (Dummy images may carry a shell stub instead, which is exempt.)
+check "installer needs no dynamic loader" \
+    "! head -c4 '$WORK/hemlock-installer' | grep -aq 'ELF' || ! grep -aq 'ld-linux' '$WORK/hemlock-installer'"
 check "platform manifest present"          "[ -s '$WORK/platform/platform.toml' ]"
 check "platform identity markers present" \
     "[ -s '$WORK/platform/onie-machine' ] && [ -s '$WORK/platform/platform-id' ]"

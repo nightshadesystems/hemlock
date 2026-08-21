@@ -143,12 +143,18 @@ cp "$ROOTFS/boot/initrd.img"* "$PAYLOAD/boot/initrd.img" 2>/dev/null \
     || echo dummy > "$PAYLOAD/boot/initrd.img"
 
 # --- 5. Installer binary ----------------------------------------------------
+# ONIE's runtime is BusyBox with no glibc dynamic loader, so the installer
+# must be statically linked: build it for the musl target.
+INSTALLER_TARGET="x86_64-unknown-linux-musl"
 if [ "$DUMMY" = 1 ] && ! command -v cargo >/dev/null; then
     log "WARNING: cargo unavailable; dummy payload gets a stub installer"
     printf '#!/bin/sh\necho hemlock-installer stub\n' > "$PAYLOAD/hemlock-installer"
 else
-    (cd "$ROOT" && cargo build --release -p hemlock-installer)
-    cp "$ROOT/target/release/hemlock-installer" "$PAYLOAD/hemlock-installer"
+    if command -v rustup >/dev/null; then
+        rustup target add "$INSTALLER_TARGET" >/dev/null
+    fi
+    (cd "$ROOT" && cargo build --release -p hemlock-installer --target "$INSTALLER_TARGET")
+    cp "$ROOT/target/$INSTALLER_TARGET/release/hemlock-installer" "$PAYLOAD/hemlock-installer"
 fi
 chmod +x "$PAYLOAD/hemlock-installer"
 

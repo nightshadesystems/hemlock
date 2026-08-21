@@ -21,5 +21,7 @@ executing anything. Per-platform console settings come from an optional
 `platforms/<id>/boot.env` (`CONSOLE_DEV`, `CONSOLE_SPEED`).
 
 Real builds need: Debian host, `debootstrap`, `squashfs-tools`, a Rust
-toolchain with libclang (for `real-sai`), and the vendor blobs staged per
-[vendor/sai/README.md](../vendor/sai/README.md).
+toolchain with libclang (for `real-sai`) plus the
+`x86_64-unknown-linux-musl` target (the installer must be statically
+linked — ONIE's BusyBox runtime has no glibc dynamic loader), and the
+vendor blobs staged per [vendor/sai/README.md](../vendor/sai/README.md).
