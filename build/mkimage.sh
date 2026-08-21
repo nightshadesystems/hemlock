@@ -101,6 +101,16 @@ else
     cp "$SAI_DEB" "$ROOTFS/tmp/"
     chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$SAI_DEB")" || die "vendor SAI install failed"
     rm -f "$ROOTFS/tmp/$(basename "$SAI_DEB")"
+
+    # Boot hand-off: the stock initramfs cannot interpret hemlock.rootfs=.
+    # Install the hemlock hook + local-bottom script and regenerate the
+    # initrd so it loop-mounts the squashfs and overlays /hemlock/persist.
+    log "installing hemlock initramfs scripts, regenerating initrd"
+    install -D -m 755 "$ROOT/build/rootfs/initramfs/hemlock-hook" \
+        "$ROOTFS/etc/initramfs-tools/hooks/hemlock"
+    install -D -m 755 "$ROOT/build/rootfs/initramfs/hemlock-local-bottom" \
+        "$ROOTFS/etc/initramfs-tools/scripts/local-bottom/hemlock"
+    chroot "$ROOTFS" update-initramfs -u -k all || die "update-initramfs failed"
 fi
 
 # Identity defaults: hostname "hemlock" (the CLI prompt is user@hostname).

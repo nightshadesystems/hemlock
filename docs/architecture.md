@@ -254,6 +254,13 @@ to install unless ONIE's `machine.conf` platform matches the image's
 root), copies the image + platform overlay, and installs GRUB. `--dry-run`
 prints every command instead of running it.
 
+Boot hand-off: GRUB passes `hemlock.rootfs=/hemlock/rootfs.squashfs`; the
+hemlock initramfs script (`build/rootfs/initramfs/`, run at local-bottom)
+loop-mounts that squashfs read-only, overlays `/hemlock/persist` from the
+flash partition as the writable upper layer, and leaves the flash mounted
+at `/host` in the running system. Wiping `/hemlock/persist` is a factory
+reset; the squashfs is never modified in place.
+
 ## Phase-1 boundaries and seams
 
 Explicitly out of scope in phase 1: FRR integration, L3/routing

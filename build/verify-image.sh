@@ -49,6 +49,14 @@ check "platform identity markers present" \
     "[ -s '$WORK/platform/onie-machine' ] && [ -s '$WORK/platform/platform-id' ]"
 check "boot assets present" \
     "[ -s '$WORK/boot/grub.cfg' ] && [ -s '$WORK/boot/vmlinuz' ] && [ -s '$WORK/boot/initrd.img' ]"
+# A real initrd must carry the hemlock squashfs/overlay boot script, or the
+# system boots the raw flash partition and finds no /sbin/init. Dummy
+# images ship a placeholder initrd; skip the check for those.
+if command -v lsinitramfs >/dev/null \
+    && ! head -c5 "$WORK/boot/initrd.img" | grep -q dummy; then
+    check "initrd contains hemlock boot script" \
+        "lsinitramfs '$WORK/boot/initrd.img' | grep -q 'scripts/local-bottom/hemlock'"
+fi
 
 MACHINE="$(cat "$WORK/platform/onie-machine" 2>/dev/null || true)"
 check "onie-machine marker matches image header" \

@@ -1,0 +1,51 @@
+#!/bin/sh
+# initramfs-tools local-bottom script: turn the raw HEMLOCK flash partition
+# (which the initramfs just mounted at ${rootmnt}) into the real root.
+#
+# Layout after this script:
+#   ${rootmnt}        overlay: squashfs (ro lower) + /hemlock/persist (rw upper)
+#   ${rootmnt}/host   the flash partition itself (squashfs image, persist, boot)
+#   /run/hemlock/ro   the squashfs mount (moves into the root with /run)
+#
+# Driven by hemlock.rootfs=<path-on-flash> on the kernel command line; a
+# kernel booted without it falls through to a plain root mount.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in
+    prereqs) prereqs; exit 0 ;;
+esac
+. /scripts/functions
+
+HEMLOCK_ROOTFS=
+for x in $(cat /proc/cmdline); do
+    case $x in
+        hemlock.rootfs=*) HEMLOCK_ROOTFS="${x#hemlock.rootfs=}" ;;
+    esac
+done
+[ -n "$HEMLOCK_ROOTFS" ] || exit 0
+
+modprobe loop 2>/dev/null || true
+modprobe squashfs 2>/dev/null || true
+modprobe overlay 2>/dev/null || true
+
+FLASH=/run/hemlock/flash
+RO=/run/hemlock/ro
+mkdir -p "$FLASH" "$RO"
+
+mount -n -o move "${rootmnt}" "$FLASH" \
+    || panic "hemlock: cannot move flash mount aside"
+
+[ -f "$FLASH$HEMLOCK_ROOTFS" ] \
+    || panic "hemlock: $HEMLOCK_ROOTFS missing on the HEMLOCK partition"
+mount -t squashfs -o ro,loop "$FLASH$HEMLOCK_ROOTFS" "$RO" \
+    || panic "hemlock: cannot mount $HEMLOCK_ROOTFS"
+
+PERSIST="$FLASH/hemlock/persist"
+mkdir -p "$PERSIST/rw" "$PERSIST/work"
+mount -t overlay overlay \
+    -o "lowerdir=$RO,upperdir=$PERSIST/rw,workdir=$PERSIST/work" "${rootmnt}" \
+    || panic "hemlock: overlay mount failed"
+
+# Keep the flash partition reachable in the running system.
+mkdir -p "${rootmnt}/host"
+mount -n -o move "$FLASH" "${rootmnt}/host"

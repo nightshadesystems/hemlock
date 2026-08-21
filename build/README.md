@@ -7,7 +7,10 @@
    [rootfs/packages.list](rootfs/packages.list), install the Hemlock
    daemons + [systemd units](rootfs/systemd/), and the platform's pinned
    vendor SAI `.deb` from `vendor/sai/` (per-platform pin from the
-   manifest — never global).
+   manifest — never global). The [initramfs scripts](rootfs/initramfs/)
+   are installed and the initrd regenerated so boot can interpret
+   `hemlock.rootfs=`: loop-mount the squashfs from the flash partition,
+   overlay `/hemlock/persist` on top, and expose the flash at `/host`.
 2. **squashfs** — the rootfs, compressed.
 3. **payload** — squashfs + platform overlay (`platform.toml`, config.bcm,
    identity markers) + boot assets + the `hemlock-installer` binary.
