@@ -40,9 +40,11 @@ struct Args {
     #[arg(long)]
     mock: bool,
 
-    /// Fall back to the mock backend when real hardware bring-up fails
-    /// (kernel modules or i2c topology missing — QEMU, bench machines).
-    /// The systemd unit runs with this so one image boots everywhere.
+    /// Use the mock backend when no Broadcom ASIC is visible on PCI
+    /// (QEMU, bench machines). On a switch the real path is taken and
+    /// bring-up failures stay fatal: mock environment data must never
+    /// masquerade as a healthy switch. The systemd unit runs with this
+    /// so one image boots everywhere.
     #[arg(long, conflicts_with = "mock")]
     auto_mock: bool,
 
@@ -102,15 +104,13 @@ async fn main() -> Result<()> {
 
     let backend: Arc<dyn HwBackend> = if args.mock {
         Arc::new(hw::MockBackend::new(35.0))
+    } else if args.auto_mock && !hemlock_platform::sysinit::broadcom_asic_present() {
+        warn!("--auto-mock: no Broadcom PCI device visible; using the mock hardware backend");
+        Arc::new(hw::MockBackend::new(35.0))
     } else {
-        match real_hw_init(&platform) {
-            Ok(backend) => backend,
-            Err(err) if args.auto_mock => {
-                warn!(%err, "--auto-mock: hardware bring-up failed; using the mock backend");
-                Arc::new(hw::MockBackend::new(35.0))
-            }
-            Err(err) => return Err(err),
-        }
+        // Real switch: bring-up failures are fatal and crash-loop loudly
+        // in the journal rather than degrade to fake sensor data.
+        real_hw_init(&platform)?
     };
     info!(
         platform = %platform.manifest.platform.id,

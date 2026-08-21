@@ -45,6 +45,11 @@ if command -v unsquashfs >/dev/null && unsquashfs -s "$WORK/rootfs.squashfs" >/d
         "unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'etc/update-motd.d/00-hemlock-banner' \
          && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'etc/update-motd.d/10-hemlock-status' \
          && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'usr/bin/hemlock-motd'"
+    # Without the BDE pair syncd cannot drive the ASIC on real hardware
+    # (and deliberately refuses to mock when one is present).
+    check "rootfs carries the BDE kernel modules" \
+        "unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'updates/hemlock/linux-kernel-bde.ko' \
+         && unsquashfs -l '$WORK/rootfs.squashfs' 2>/dev/null | grep -q 'updates/hemlock/linux-user-bde.ko'"
 fi
 check "installer binary present"           "[ -s '$WORK/hemlock-installer' ]"
 check "installer is executable"            "[ -x '$WORK/hemlock-installer' ]"

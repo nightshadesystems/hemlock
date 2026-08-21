@@ -11,6 +11,13 @@
    are installed and the initrd regenerated so boot can interpret
    `hemlock.rootfs=`: loop-mount the squashfs from the flash partition,
    overlay `/hemlock/persist` on top, and expose the flash at `/host`.
+   The manifest's `[kernel] required_modules` (BDE pair + platform
+   drivers) are built inside the chroot against the image kernel from the
+   sources staged by `vendor/fetch-vendor.sh` (`vendor/sai/saibcm-modules`
+   via [build-bde.sh](build-bde.sh), plus the kbuild dirs under
+   `vendor/kmod/<platform>/`), installed to `/lib/modules/<kver>/updates/
+   hemlock/`, and the build fails if any required module would not be
+   loadable — an image that cannot drive the hardware never ships.
    The rootfs is branded as Hemlock (os-release/issue carry the Hemlock
    version, never "Debian GNU/Linux"), gets the default operator account
    `admin` / `Hemlock123!` (sudo; root stays locked) whose login shell

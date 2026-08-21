@@ -104,6 +104,10 @@ async fn main() -> Result<()> {
 }
 
 fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box<dyn SaiBackend>> {
+    // --auto-mock only ever mocks when the ASIC is demonstrably absent.
+    // With the ASIC present, every failure (missing modules, missing
+    // real-sai feature, SAI init) stays fatal — mock ports on a real
+    // switch would look healthy while forwarding nothing.
     let mock = mock
         || (auto_mock && {
             let no_asic = !hemlock_platform::sysinit::broadcom_asic_present();
@@ -113,9 +117,7 @@ fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box
                 );
             }
             no_asic
-        })
-        // A build without the vendor library can only ever mock.
-        || (auto_mock && cfg!(not(feature = "real-sai")));
+        });
     if mock {
         return Ok(Box::new(hemlock_sai::mock::MockSai::new(
             platform.ports.clone(),

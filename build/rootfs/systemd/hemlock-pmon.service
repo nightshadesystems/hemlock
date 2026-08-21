@@ -4,9 +4,9 @@ After=local-fs.target
 
 [Service]
 Type=exec
-# --auto-mock: fall back to the mock hardware backend when platform
-# bring-up fails (no i2c topology under QEMU); real hardware still gets
-# sysfs and hard failures surface in the journal as warnings.
+# --auto-mock: mock hardware backend only when no Broadcom ASIC is on the
+# PCI bus (QEMU boot tests, bench machines). On a switch the sysfs path is
+# taken and bring-up failures stay fatal — never mock data on real iron.
 ExecStart=/usr/sbin/hemlock-pmon --platform /hemlock/platform --platforms-dir /hemlock --auto-mock
 Restart=on-failure
 RestartSec=5

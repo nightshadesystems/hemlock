@@ -238,6 +238,13 @@ ASIC to the running config.
 1. debootstrap a Debian 13 rootfs (`build/rootfs/packages.list`), install
    the Hemlock daemons + systemd units, and the platform's pinned vendor
    SAI `.deb` from `vendor/sai/` (hard failure with pointers if absent).
+   The manifest's `[kernel] required_modules` are compiled in the chroot
+   against the image kernel (BDE pair from `vendor/sai/saibcm-modules`
+   via `build/build-bde.sh`; platform drivers from `vendor/kmod/`), and
+   the build refuses to ship an image where any required module is not
+   loadable. syncd/pmon run with `--auto-mock`: mock backends only when
+   no Broadcom ASIC is on PCI (QEMU); with the ASIC present, bring-up
+   failures are fatal so mock data never impersonates real hardware.
    The rootfs is branded as Hemlock (os-release, issue — the banner also
    renders into `/etc/issue` so it shows at the console before login)
    with the default operator account `admin` / `Hemlock123!` (sudo; root

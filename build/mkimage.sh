@@ -97,6 +97,63 @@ else
     chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$SAI_DEB")" || die "vendor SAI install failed"
     rm -f "$ROOTFS/tmp/$(basename "$SAI_DEB")"
 
+    # --- Kernel modules (BDE + platform drivers) ---------------------------
+    # The manifest's [kernel] required_modules must be loadable in the
+    # image or syncd/pmon fail on real hardware (deliberately: no mock
+    # fallback when the ASIC is present — mock data must never look like
+    # a healthy switch). Build the staged GPL sources inside the chroot so
+    # headers match the image kernel exactly, and refuse to ship an image
+    # where any required module would not resolve.
+    KVER="$(ls "$ROOTFS/lib/modules" | head -1)"
+    [ -n "$KVER" ] || die "no kernel in rootfs (linux-image-amd64 missing?)"
+    BDE_SRC="$ROOT/vendor/sai/saibcm-modules"
+    [ -d "$BDE_SRC" ] || die \
+        "vendor/sai/saibcm-modules missing — run vendor/fetch-vendor.sh $PLATFORM"
+
+    log "building kernel modules for $KVER (BDE + platform drivers)"
+    export DEBIAN_FRONTEND=noninteractive
+    chroot "$ROOTFS" apt-get -qq update
+    chroot "$ROOTFS" apt-get -qq install --no-install-recommends -y \
+        "linux-headers-$KVER" build-essential bc \
+        || die "installing kernel build deps in the chroot failed"
+
+    KMOD_TMP="$ROOTFS/tmp/kmod"
+    MODDEST="$ROOTFS/lib/modules/$KVER/updates/hemlock"
+    mkdir -p "$KMOD_TMP" "$MODDEST"
+
+    cp -r "$BDE_SRC" "$KMOD_TMP/saibcm-modules"
+    install -m 755 "$ROOT/build/build-bde.sh" "$KMOD_TMP/build-bde.sh"
+    chroot "$ROOTFS" /tmp/kmod/build-bde.sh /tmp/kmod/saibcm-modules "$KVER" /tmp/kmod/bde-out \
+        || die "BDE module build failed"
+    cp "$KMOD_TMP/bde-out/"*.ko "$MODDEST/"
+
+    # Platform driver kbuild dirs staged by vendor/fetch-vendor.sh.
+    for src in "$ROOT/vendor/kmod/$PLATFORM"/*/; do
+        [ -f "$src/Makefile" ] || continue
+        name="$(basename "$src")"
+        rm -rf "$KMOD_TMP/$name"
+        cp -r "$src" "$KMOD_TMP/$name"
+        chroot "$ROOTFS" make -C "/lib/modules/$KVER/build" "M=/tmp/kmod/$name" modules \
+            || die "platform module build failed: $name"
+        cp "$KMOD_TMP/$name/"*.ko "$MODDEST/"
+    done
+
+    chroot "$ROOTFS" depmod "$KVER"
+    missing=""
+    for module in $(sed -n '/^required_modules[[:space:]]*=/,/\]/p' "$PDIR/platform.toml" \
+                    | sed -n 's/.*"\([^"]*\)".*/\1/p'); do
+        chroot "$ROOTFS" modinfo -k "$KVER" "$module" >/dev/null 2>&1 \
+            || missing="$missing $module"
+    done
+    [ -z "$missing" ] || die \
+        "required kernel modules not loadable in the image:$missing
+ (staged sources: vendor/sai/saibcm-modules, vendor/kmod/$PLATFORM — see vendor/fetch-vendor.sh)"
+
+    # Drop the toolchain again; it has no business on a switch.
+    chroot "$ROOTFS" apt-get -qq purge -y "linux-headers-$KVER" build-essential bc || true
+    chroot "$ROOTFS" apt-get -qq autoremove --purge -y || true
+    rm -rf "$KMOD_TMP"
+
     # Boot hand-off: the stock initramfs cannot interpret hemlock.rootfs=.
     # Install the hemlock hook + local-bottom script and regenerate the
     # initrd so it loop-mounts the squashfs and overlays /hemlock/persist.

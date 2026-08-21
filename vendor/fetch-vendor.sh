@@ -78,11 +78,37 @@ cel-e1031)
     fetch_sonic_subdir "$SONIC_BRANCH" "platform/broadcom/saibcm-modules" \
         "$SAIDIR/saibcm-modules"
 
+    # 4. Platform driver source (GPL), staged as kbuild dirs under
+    #    vendor/kmod/<platform>/ — mkimage.sh builds every dir with a
+    #    Makefile there against the image kernel. smc/hlx_gpio_ich (plus
+    #    emc2305 fan + mc24lc64t eeprom) come from the maintained
+    #    haliburton tree; dps200 was dropped upstream after 201911 so it
+    #    rides in from that branch; optoe comes from its OCP upstream.
+    KMOD="$ROOT/vendor/kmod/$PLATFORM"
+    mkdir -p "$KMOD"
+    fetch_sonic_subdir "$SONIC_BRANCH" \
+        "platform/broadcom/sonic-platform-modules-cel/haliburton/modules" \
+        "$KMOD/haliburton"
+    RAW201911="https://raw.githubusercontent.com/sonic-net/sonic-buildimage/201911/platform/broadcom/sonic-platform-modules-cel/haliburton/modules"
+    fetch "$RAW201911/dps200.c" "$KMOD/haliburton/dps200.c"
+    fetch "$RAW201911/pmbus.h"  "$KMOD/haliburton/pmbus.h"
+    # Deterministic kbuild Makefile over the merged file set (the fetched
+    # one predates the dps200 merge).
+    printf 'obj-m := smc.o hlx_gpio_ich.o emc2305.o mc24lc64t.o dps200.o\n' \
+        > "$KMOD/haliburton/Makefile"
+    mkdir -p "$KMOD/optoe"
+    fetch "https://raw.githubusercontent.com/opencomputeproject/oom/master/optoe/optoe.c" \
+        "$KMOD/optoe/optoe.c"
+    printf 'obj-m := optoe.o\n' > "$KMOD/optoe/Makefile"
+
     echo
     echo "All vendor artifacts for $PLATFORM are in place:"
-    echo "  SAI blob:   vendor/sai/libsaibcm_${PIN}_amd64.deb"
-    echo "  data files: platforms/$PLATFORM/"
-    echo "  kmod src:   vendor/sai/saibcm-modules/ (built by build/build-bde.sh)"
+    echo "  SAI blob:      vendor/sai/libsaibcm_${PIN}_amd64.deb"
+    echo "  data files:    platforms/$PLATFORM/"
+    echo "  BDE kmod src:  vendor/sai/saibcm-modules/"
+    echo "  platform kmod: vendor/kmod/$PLATFORM/"
+    echo "  (mkimage.sh builds both module sets into the image and fails"
+    echo "   if any [kernel] required_modules would not be loadable)"
     ;;
 *)
     echo "error: no fetch recipe for $PLATFORM (add one to this script)" >&2
