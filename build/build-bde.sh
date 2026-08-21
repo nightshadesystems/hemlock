@@ -83,6 +83,54 @@ if [ -f "$KSAL_C" ] && grep -q '#ifdef MAX_USER_RT_PRIO' "$KSAL_C"; then
     sed -i 's|#ifdef MAX_USER_RT_PRIO|#if 1 /* hemlock shim: MAX_USER_RT_PRIO removed in 5.13; yield() always exists */|' "$KSAL_C"
 fi
 
+# bcm-knet.c predates several 6.2..6.12 kernel API changes. Rewrite the
+# affected call sites, each only when the target kernel's headers show
+# the new API, so builds against older kernels stay byte-identical.
+# Exact-string rewrites use perl \Q..\E (perl-base is Debian-essential,
+# present even in a minbase chroot).
+KNET_C="$SRC/systems/linux/kernel/modules/bcm-knet/bcm-knet.c"
+if [ -f "$KNET_C" ]; then
+    # strlcpy was removed in 6.8; strscpy (4.3+) is a drop-in at these
+    # sites (return values unused).
+    if ! grep -q "strlcpy" "$COMMON/include/linux/string.h"; then
+        log "shimming bcm-knet.c: strlcpy -> strscpy"
+        perl -i -pe 's/\bstrlcpy\(/strscpy(/g' "$KNET_C"
+        ! grep -q "strlcpy" "$KNET_C" || die "strlcpy left in bcm-knet.c after shimming"
+    fi
+    # 6.11 changed ethtool_ops.get_ts_info to take kernel_ethtool_ts_info
+    # (same member names, so the body needs no edits).
+    if grep -q "struct kernel_ethtool_ts_info" "$COMMON/include/linux/ethtool.h"; then
+        log "shimming bcm-knet.c: ethtool_ts_info -> kernel_ethtool_ts_info"
+        perl -i -pe 's/\Qstruct ethtool_ts_info\E/struct kernel_ethtool_ts_info/g' "$KNET_C"
+    fi
+    # The legacy pci_set_dma_mask wrapper is gone; call dma_set_mask.
+    # bcm-knet.c never includes dma-mapping.h itself (the old wrapper
+    # arrived via an SDK header chain), so add the include too — implicit
+    # declarations are hard errors.
+    if ! grep -q "pci_set_dma_mask" "$COMMON/include/linux/pci.h"; then
+        log "shimming bcm-knet.c: pci_set_dma_mask -> dma_set_mask"
+        perl -i -pe 's/\Qpci_set_dma_mask(sinfo->pdev, 0xffffffff)\E/dma_set_mask(&sinfo->pdev->dev, 0xffffffff)/' "$KNET_C"
+        grep -q "linux/dma-mapping.h" "$KNET_C" || perl -i -pe \
+            's{\Q#include <linux/etherdevice.h>\E}{#include <linux/etherdevice.h>\n#include <linux/dma-mapping.h>}' \
+            "$KNET_C"
+        ! grep -q "pci_set_dma_mask" "$KNET_C" || die "pci_set_dma_mask left in bcm-knet.c after shimming"
+    fi
+    # netif_napi_add lost its weight parameter in 6.1; the explicit-weight
+    # variant exists since 5.19. (The 4-arg macro at the top of the file
+    # is inside a dead <2.6.24 branch and stays untouched.)
+    if grep -q "netif_napi_add_weight" "$COMMON/include/linux/netdevice.h"; then
+        log "shimming bcm-knet.c: netif_napi_add -> netif_napi_add_weight"
+        perl -i -pe 's/\Qnetif_napi_add(dev, &sinfo->napi, bkn_poll, napi_weight);\E/netif_napi_add_weight(dev, &sinfo->napi, bkn_poll, napi_weight);/' "$KNET_C"
+    fi
+    # dev->dev_addr is const since 5.17 and mirrored in a lookup tree —
+    # direct memcpy writes are wrong even where they only warn.
+    if grep -q "eth_hw_addr_set" "$COMMON/include/linux/etherdevice.h"; then
+        log "shimming bcm-knet.c: dev_addr writes -> eth_hw_addr_set"
+        perl -i -pe 's/\Qmemcpy(dev->dev_addr, ((struct sockaddr *)addr)->sa_data, dev->addr_len);\E/eth_hw_addr_set(dev, (const u8 *)((struct sockaddr *)addr)->sa_data);/' "$KNET_C"
+        perl -i -pe 's/\Qmemcpy(dev->dev_addr, mac, 6);\E/eth_hw_addr_set(dev, mac);/' "$KNET_C"
+    fi
+fi
+
 log "building BDE modules for $KVER"
 # The SDK build spews thousands of benign kernel-header warnings that bury
 # the one diagnostic that matters, so capture everything and surface only
