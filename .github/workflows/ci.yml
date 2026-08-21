@@ -39,6 +39,18 @@ jobs:
       # Definition-of-done gates
       - run: cargo run -p hemlockctl -- platform lint platforms/cel-e1031
         if: hashFiles('platforms/cel-e1031/platform.toml') != ''
+      # The image workflow's platform dropdown must list every platform
+      # (GitHub choice inputs are static YAML; keep them in sync here).
+      - name: Check image-workflow platform dropdown
+        run: |
+          actual=$(ls -d platforms/*/ | xargs -n1 basename | grep -v '^_' | sort)
+          listed=$(awk '/^        options:$/{flag=1;next} /^        default:/{flag=0} flag {sub(/^ *- */,""); print}' .github/workflows/image.yml | sort)
+          if [ "$actual" != "$listed" ]; then
+            echo "::error::platform dropdown in image.yml is out of sync with platforms/"
+            echo "platforms/:  $actual"
+            echo "dropdown:    $listed"
+            exit 1
+          fi
 
   image-smoke:
     runs-on: ubuntu-latest

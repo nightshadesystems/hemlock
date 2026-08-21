@@ -11,12 +11,17 @@ name: Image build
 on:
   workflow_dispatch:
     inputs:
+      # Dropdown of supported platforms. GitHub requires this list to be
+      # static YAML; CI fails if it drifts from the platforms/ directory
+      # (see the platform-dropdown check in ci.yml).
       platform:
-        description: "Platform id under platforms/"
-        type: string
-        default: "cel-e1031"
+        description: "Platform ID"
+        type: choice
+        options:
+          - cel-e1031
+        default: cel-e1031
       mode:
-        description: "Image mode"
+        description: "Image Mode"
         type: choice
         options: [full, dummy]
         default: full
@@ -41,7 +46,7 @@ jobs:
 
       - name: Fetch vendor artifacts
         if: inputs.mode == 'full'
-        run: vendor/fetch-vendor.sh "${{ inputs.platform }}"
+        run: sh vendor/fetch-vendor.sh "${{ inputs.platform }}"
 
       - name: Build image (full)
         if: inputs.mode == 'full'
