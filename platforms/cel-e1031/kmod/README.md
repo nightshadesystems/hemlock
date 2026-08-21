@@ -15,6 +15,7 @@ the same set in a Debian trixie container.
 | `haliburton/dps200.c` | sonic-buildimage `201911` (dropped upstream after that branch) | DPS-200 PSU pmbus driver |
 | `haliburton/pmbus.h` | Linux `v6.12`, `drivers/hwmon/pmbus/pmbus.h` | replaces the 2019 copy dps200.c shipped with |
 | `optoe/optoe.c` | opencomputeproject/oom, `optoe/` | transceiver EEPROM access (built with `-DLATEST_KERNEL`) |
+| `kernel-backports/i2c-mux-pca954x.c`, `max6697.c` | Linux `v6.12` (in-tree drivers) | Debian's amd64 kernel config leaves `CONFIG_I2C_MUX_PCA954x` and `CONFIG_SENSORS_MAX6697` unset, so the stock drivers the i2c topology needs are built out-of-tree, byte-identical to upstream |
 
 ## Local port (Debian 13 / kernel 6.12)
 

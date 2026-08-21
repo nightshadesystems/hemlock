@@ -26,11 +26,13 @@ docker info >/dev/null 2>&1 || die "docker daemon not running"
 log "compile-testing kernel modules for $PLATFORM against Debian trixie headers"
 MSYS_NO_PATHCONV=1 docker run --rm -v "$ROOT:/hemlock" -w /hemlock debian:trixie bash -euo pipefail -c '
     export DEBIAN_FRONTEND=noninteractive
-    echo "kmod-smoke: installing toolchain + trixie kernel headers"
+    echo "kmod-smoke: installing toolchain + trixie kernel (headers + image)"
     apt-get -qq update
+    # linux-image too (not just headers): the loadability gate below needs
+    # the real module set and modules.builtin, exactly like the image chroot.
     apt-get -qq install --no-install-recommends -y \
-        build-essential bc git ca-certificates curl perl-modules \
-        linux-headers-amd64 >/dev/null
+        build-essential bc git ca-certificates curl perl-modules kmod \
+        linux-headers-amd64 linux-image-amd64 >/dev/null
     KVER="$(ls /lib/modules | head -1)"
     echo "kmod-smoke: kernel $KVER"
 
@@ -62,5 +64,23 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$ROOT:/hemlock" -w /hemlock debian:trixie
 
     echo "kmod-smoke: all modules compiled:"
     ls -1 /tmp/bde-out/*.ko /tmp/*/[a-z]*.ko 2>/dev/null | sort -u | sed "s/^/  /"
+
+    # Same loadability gate as mkimage.sh: install everything we built,
+    # then prove every manifest required_modules entry resolves (builtins
+    # count — hence modprobe --dry-run, not modinfo).
+    install -D -t "/lib/modules/$KVER/updates/hemlock" \
+        /tmp/bde-out/*.ko /tmp/*/[a-z]*.ko 2>/dev/null || true
+    depmod "$KVER"
+    missing=""
+    for module in $(sed -n "/^required_modules[[:space:]]*=/,/]/p" \
+                        "platforms/'"$PLATFORM"'/platform.toml" \
+                    | sed -n "s/^[[:space:]]*\"\([^\"]*\)\".*/\1/p"); do
+        modprobe -S "$KVER" --dry-run --quiet "$module" || missing="$missing $module"
+    done
+    if [ -n "$missing" ]; then
+        echo "kmod-smoke: FAIL — required modules not loadable:$missing" >&2
+        exit 1
+    fi
+    echo "kmod-smoke: every [kernel] required_modules entry is loadable"
 '
-log "PASS — module set compiles against trixie"
+log "PASS — module set compiles and loads against trixie"

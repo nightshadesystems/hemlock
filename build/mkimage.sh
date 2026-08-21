@@ -160,10 +160,14 @@ else
            "$KMODTREE/net/can"
 
     chroot "$ROOTFS" depmod "$KVER"
+    # Entry lines start with whitespace+quote; capturing the FIRST quoted
+    # string keeps quoted words in trailing comments out of the list.
+    # modprobe --dry-run (not modinfo) so drivers Debian builds into the
+    # kernel image count as loadable too.
     missing=""
     for module in $(sed -n '/^required_modules[[:space:]]*=/,/\]/p' "$PDIR/platform.toml" \
-                    | sed -n 's/.*"\([^"]*\)".*/\1/p'); do
-        chroot "$ROOTFS" modinfo -k "$KVER" "$module" >/dev/null 2>&1 \
+                    | sed -n 's/^[[:space:]]*"\([^"]*\)".*/\1/p'); do
+        chroot "$ROOTFS" modprobe -S "$KVER" --dry-run --quiet "$module" \
             || missing="$missing $module"
     done
     [ -z "$missing" ] || die \
