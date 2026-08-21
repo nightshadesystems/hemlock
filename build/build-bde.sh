@@ -72,10 +72,19 @@ if ! grep -Eqs "#define[[:space:]]+MAX_ORDER([[:space:]]|$)" "$COMMON/include/li
 fi
 
 log "building BDE modules for $KVER"
-SDK="$(realpath "$SRC")" LINUX_UAPI_SPLIT=1 DEBIAN_LINUX_HEADER=1 BUILD_KNET_CB=1 \
+# The SDK build spews thousands of benign kernel-header warnings that bury
+# the one diagnostic that matters, so capture everything and surface only
+# the error context on failure.
+BUILD_LOG="$SRC/hemlock-build.log"
+if ! SDK="$(realpath "$SRC")" LINUX_UAPI_SPLIT=1 DEBIAN_LINUX_HEADER=1 BUILD_KNET_CB=1 \
     KERNDIR="$COMMON" \
     KERNEL_SRC="$ARCH_HDRS" \
-    make -C "$SRC/systems/linux/user/x86-smp_generic_64-2_6"
+    make -C "$SRC/systems/linux/user/x86-smp_generic_64-2_6" > "$BUILD_LOG" 2>&1
+then
+    echo "build-bde: compile FAILED — diagnostics:" >&2
+    grep -E -B3 -A8 " error:" "$BUILD_LOG" >&2 || tail -n 60 "$BUILD_LOG" >&2
+    die "kernel module build failed for $KVER (full log: $BUILD_LOG)"
+fi
 
 mkdir -p "$DEST"
 FOUND=0
