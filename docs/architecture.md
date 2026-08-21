@@ -240,7 +240,8 @@ ASIC to the running config.
    SAI `.deb` from `vendor/sai/` (hard failure with pointers if absent).
    The manifest's `[kernel] required_modules` are compiled in the chroot
    against the image kernel (BDE pair from `vendor/sai/saibcm-modules`
-   via `build/build-bde.sh`; platform drivers from `vendor/kmod/`), and
+   via `build/build-bde.sh`; platform drivers committed and ported under
+   `platforms/<id>/kmod/`), and
    the build refuses to ship an image where any required module is not
    loadable. syncd/pmon run with `--auto-mock`: mock backends only when
    no Broadcom ASIC is on PCI (QEMU); with the ASIC present, bring-up

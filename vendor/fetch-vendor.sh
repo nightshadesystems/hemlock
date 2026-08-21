@@ -11,7 +11,12 @@
 # Nothing fetched here is ever committed to git.
 set -eu
 
-PLATFORM="${1:?usage: fetch-vendor.sh <platform-id>}"
+PLATFORM="${1:?usage: fetch-vendor.sh <platform-id> [--kmod-only]}"
+# --kmod-only: fetch only the kernel-module sources (BDE + platform
+# drivers), skipping the SAI blobs and ASIC data files. Enough for
+# build/kmod-smoke.sh to compile-test modules without vendor binaries.
+KMOD_ONLY=0
+[ "${2:-}" = "--kmod-only" ] && KMOD_ONLY=1
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PDIR="$ROOT/platforms/$PLATFORM"
 SAIDIR="$ROOT/vendor/sai"
@@ -63,50 +68,33 @@ cel-e1031)
     PIN="$(manifest_value version_pin)"
     SONIC_BRANCH="202305"   # the branch that ships this SAI pin
 
-    # 1. Vendor SAI blob (+ dev headers for reference/debug).
-    URL="$(sai_deb_url "$PIN")"
-    fetch "$URL/libsaibcm_${PIN}_amd64.deb"     "$SAIDIR/libsaibcm_${PIN}_amd64.deb"
-    fetch "$URL/libsaibcm-dev_${PIN}_amd64.deb" "$SAIDIR/libsaibcm-dev_${PIN}_amd64.deb"
+    if [ "$KMOD_ONLY" = 0 ]; then
+        # 1. Vendor SAI blob (+ dev headers for reference/debug).
+        URL="$(sai_deb_url "$PIN")"
+        fetch "$URL/libsaibcm_${PIN}_amd64.deb"     "$SAIDIR/libsaibcm_${PIN}_amd64.deb"
+        fetch "$URL/libsaibcm-dev_${PIN}_amd64.deb" "$SAIDIR/libsaibcm-dev_${PIN}_amd64.deb"
 
-    # 2. Platform data files.
-    BASE="https://raw.githubusercontent.com/sonic-net/sonic-buildimage/$SONIC_BRANCH/device/celestica/x86_64-cel_e1031-r0/Celestica-E1031-T48S4"
-    fetch "$BASE/helix4-e1031-48x1G%2B4x10G.config.bcm" \
-          "$PDIR/helix4-e1031-48x1G+4x10G.config.bcm"
-    fetch "$BASE/sai_postinit_cmd.soc" "$PDIR/sai_postinit_cmd.soc"
+        # 2. Platform data files.
+        BASE="https://raw.githubusercontent.com/sonic-net/sonic-buildimage/$SONIC_BRANCH/device/celestica/x86_64-cel_e1031-r0/Celestica-E1031-T48S4"
+        fetch "$BASE/helix4-e1031-48x1G%2B4x10G.config.bcm" \
+              "$PDIR/helix4-e1031-48x1G+4x10G.config.bcm"
+        fetch "$BASE/sai_postinit_cmd.soc" "$PDIR/sai_postinit_cmd.soc"
+    fi
 
     # 3. Kernel module source (GPL), matched to the SAI's SDK lineage.
     fetch_sonic_subdir "$SONIC_BRANCH" "platform/broadcom/saibcm-modules" \
         "$SAIDIR/saibcm-modules"
 
-    # 4. Platform driver source (GPL), staged as kbuild dirs under
-    #    vendor/kmod/<platform>/ — mkimage.sh builds every dir with a
-    #    Makefile there against the image kernel. smc/hlx_gpio_ich (plus
-    #    emc2305 fan + mc24lc64t eeprom) come from the maintained
-    #    haliburton tree; dps200 was dropped upstream after 201911 so it
-    #    rides in from that branch; optoe comes from its OCP upstream.
-    KMOD="$ROOT/vendor/kmod/$PLATFORM"
-    mkdir -p "$KMOD"
-    fetch_sonic_subdir "$SONIC_BRANCH" \
-        "platform/broadcom/sonic-platform-modules-cel/haliburton/modules" \
-        "$KMOD/haliburton"
-    RAW201911="https://raw.githubusercontent.com/sonic-net/sonic-buildimage/201911/platform/broadcom/sonic-platform-modules-cel/haliburton/modules"
-    fetch "$RAW201911/dps200.c" "$KMOD/haliburton/dps200.c"
-    fetch "$RAW201911/pmbus.h"  "$KMOD/haliburton/pmbus.h"
-    # Deterministic kbuild Makefile over the merged file set (the fetched
-    # one predates the dps200 merge).
-    printf 'obj-m := smc.o hlx_gpio_ich.o emc2305.o mc24lc64t.o dps200.o\n' \
-        > "$KMOD/haliburton/Makefile"
-    mkdir -p "$KMOD/optoe"
-    fetch "https://raw.githubusercontent.com/opencomputeproject/oom/master/optoe/optoe.c" \
-        "$KMOD/optoe/optoe.c"
-    printf 'obj-m := optoe.o\n' > "$KMOD/optoe/Makefile"
+    # Platform driver sources are NOT fetched: they are committed, ported
+    # to the image kernel, under platforms/$PLATFORM/kmod/ (see the
+    # README there for upstream provenance).
 
     echo
     echo "All vendor artifacts for $PLATFORM are in place:"
     echo "  SAI blob:      vendor/sai/libsaibcm_${PIN}_amd64.deb"
     echo "  data files:    platforms/$PLATFORM/"
     echo "  BDE kmod src:  vendor/sai/saibcm-modules/"
-    echo "  platform kmod: vendor/kmod/$PLATFORM/"
+    echo "  platform kmod: platforms/$PLATFORM/kmod/ (committed, not fetched)"
     echo "  (mkimage.sh builds both module sets into the image and fails"
     echo "   if any [kernel] required_modules would not be loadable)"
     ;;

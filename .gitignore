@@ -17,5 +17,3 @@ platforms/**/*.deb
 # Local state from dev runs
 /.hemlock-state/
 
-# Platform kernel-module source staged by vendor/fetch-vendor.sh
-vendor/kmod/

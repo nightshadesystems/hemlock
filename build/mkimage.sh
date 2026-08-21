@@ -127,8 +127,10 @@ else
         || die "BDE module build failed"
     cp "$KMOD_TMP/bde-out/"*.ko "$MODDEST/"
 
-    # Platform driver kbuild dirs staged by vendor/fetch-vendor.sh.
-    for src in "$ROOT/vendor/kmod/$PLATFORM"/*/; do
+    # Platform driver kbuild dirs committed under <platform>/kmod/
+    # (upstream GPL sources ported to the image kernel; see the README
+    # there for provenance).
+    for src in "$PDIR/kmod"/*/; do
         [ -f "$src/Makefile" ] || continue
         name="$(basename "$src")"
         rm -rf "$KMOD_TMP/$name"
@@ -147,7 +149,7 @@ else
     done
     [ -z "$missing" ] || die \
         "required kernel modules not loadable in the image:$missing
- (staged sources: vendor/sai/saibcm-modules, vendor/kmod/$PLATFORM — see vendor/fetch-vendor.sh)"
+ (sources: vendor/sai/saibcm-modules via fetch-vendor.sh, platforms/$PLATFORM/kmod/)"
 
     # Drop the toolchain again; it has no business on a switch.
     chroot "$ROOTFS" apt-get -qq purge -y "linux-headers-$KVER" build-essential bc || true

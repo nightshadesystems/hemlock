@@ -15,7 +15,7 @@
    drivers) are built inside the chroot against the image kernel from the
    sources staged by `vendor/fetch-vendor.sh` (`vendor/sai/saibcm-modules`
    via [build-bde.sh](build-bde.sh), plus the kbuild dirs under
-   `vendor/kmod/<platform>/`), installed to `/lib/modules/<kver>/updates/
+   `platforms/<platform>/kmod/`), installed to `/lib/modules/<kver>/updates/
    hemlock/`, and the build fails if any required module would not be
    loadable — an image that cannot drive the hardware never ships.
    The rootfs is branded as Hemlock (os-release/issue carry the Hemlock
