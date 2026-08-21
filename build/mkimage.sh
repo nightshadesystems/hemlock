@@ -209,9 +209,13 @@ else
     # network CLI (operational mode), like EOS/JunOS. `bash` inside the
     # CLI drops to Linux; `hemlockctl -c` keeps ssh remote commands and
     # the sftp subsystem working.
+    # The hemlock group grants connect access to the daemon sockets under
+    # /run/hemlock (daemons chgrp+0660 them at bind time); every operator
+    # account needs it or the CLI cannot reach the daemons.
     log "creating default operator account (admin)"
+    chroot "$ROOTFS" groupadd --system hemlock
     echo /usr/bin/hemlockctl >> "$ROOTFS/etc/shells"
-    chroot "$ROOTFS" useradd -m -s /usr/bin/hemlockctl -G sudo admin
+    chroot "$ROOTFS" useradd -m -s /usr/bin/hemlockctl -G sudo,hemlock admin
     echo 'admin:Hemlock123!' | chroot "$ROOTFS" chpasswd
 fi
 
@@ -220,6 +224,12 @@ fi
 # in the running system — units, hemlockctl, the MOTD — addresses it as
 # /hemlock via this symlink.
 ln -sfn host/hemlock "$ROOTFS/hemlock"
+
+# Broadcom's SAI hardcodes SONiC's hwsku directory when it looks for
+# optional rc scripts (sai_postinit_cmd.soc et al); point it at the
+# platform overlay so those files are found without a SONiC layout.
+install -d "$ROOTFS/usr/share/sonic"
+ln -sfn /hemlock/platform "$ROOTFS/usr/share/sonic/hwsku"
 
 # Identity defaults: hostname "hemlock" (the CLI prompt is user@hostname).
 echo hemlock > "$ROOTFS/etc/hostname"

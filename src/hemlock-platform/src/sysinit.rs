@@ -53,12 +53,18 @@ pub fn broadcom_asic_present() -> bool {
     })
 }
 
-/// Load every module in `[kernel] required_modules`. `modprobe` is
-/// idempotent, so this is safe on every daemon start.
+/// Load every module in `[kernel] required_modules`, with any
+/// `[kernel.module_args]` parameters. `modprobe` is idempotent (params
+/// are ignored on an already-loaded module), so this is safe on every
+/// daemon start.
 pub fn load_kernel_modules(kernel: &KernelSection) -> Result<(), SysinitError> {
     for module in &kernel.required_modules {
-        let output = std::process::Command::new("modprobe")
-            .arg(module)
+        let mut command = std::process::Command::new("modprobe");
+        command.arg(module);
+        if let Some(args) = kernel.module_args.get(module) {
+            command.args(args.split_whitespace());
+        }
+        let output = command
             .output()
             .map_err(|source| SysinitError::Spawn {
                 command: format!("modprobe {module}"),
@@ -76,12 +82,16 @@ pub fn load_kernel_modules(kernel: &KernelSection) -> Result<(), SysinitError> {
     Ok(())
 }
 
-/// The Broadcom BDE modules register char majors but do not create device
-/// nodes themselves; create them the way SONiC's start scripts do.
+/// The Broadcom BDE/KNET modules register char majors but do not create
+/// device nodes themselves; create them the way SONiC's start scripts do
+/// (majors from the vendor opennsl-modules init script). Without the KNET
+/// pair, soc_knet_init fails and SAI create_switch aborts NOT_SUPPORTED.
 pub fn ensure_bde_dev_nodes() -> Result<(), SysinitError> {
     for (node, major) in [
         ("/dev/linux-kernel-bde", 127u32),
         ("/dev/linux-user-bde", 126u32),
+        ("/dev/linux-bcm-knet", 122u32),
+        ("/dev/linux-knet-cb", 121u32),
     ] {
         if Path::new(node).exists() {
             continue;

@@ -199,13 +199,19 @@ fn fail(err: anyhow::Error) -> Step {
 }
 
 /// Render an error, translating a raw gRPC connect failure into the
-/// operator-facing truth: the daemon is down. The socket path in the IPC
-/// error identifies which one.
+/// operator-facing truth. The socket path in the IPC error identifies
+/// which daemon; the cause separates "daemon down" from "socket exists
+/// but this account may not open it" (not in the hemlock group).
 fn fmt_err(err: anyhow::Error) -> String {
     let text = format!("{err:#}");
     if text.contains("ipc failure") {
         for daemon in ["syncd", "pmon", "mgmtd"] {
             if text.contains(&format!("/{daemon}.sock")) {
+                if text.contains("Permission denied") {
+                    return format!(
+                        "% no permission on the {daemon} socket (is this account in the hemlock group?)"
+                    );
+                }
                 return format!("% cannot reach {daemon} (is hemlock-{daemon}.service running?)");
             }
         }

@@ -60,9 +60,23 @@ extra_files = ["led_proc.soc"]
 
 [kernel]
 # Kernel modules that must be loaded before syncd starts. For Broadcom
-# platforms this is at least the BDE pair, whose ABI must match the pinned
-# SAI's SDK — which is why the image is assembled per platform.
-required_modules = ["linux-kernel-bde", "linux-user-bde"]
+# platforms this is at least the BDE pair plus KNET (psample first:
+# linux-knet-cb links against it) — without KNET, SAI create_switch
+# fails NOT_SUPPORTED. Module ABI must match the pinned SAI's SDK —
+# which is why the image is assembled per platform. Names only here;
+# modprobe parameters go in [kernel.module_args].
+required_modules = [
+    "linux-kernel-bde",
+    "linux-user-bde",
+    "psample",
+    "linux-bcm-knet",
+    "linux-knet-cb",
+]
+
+# modprobe parameters per module (vendor opennsl init script defaults).
+[kernel.module_args]
+linux-kernel-bde = "dmasize=32M maxpayload=128 usemsi=0"
+linux-bcm-knet = "use_rx_skb=1 rx_buffer_size=9238 default_mtu=9100"
 
 # ----------------------------------------------------------------------------
 # Ports.

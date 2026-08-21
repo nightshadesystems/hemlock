@@ -68,7 +68,14 @@ config_bcm = "td3-acme-sw48.config.bcm"
 extra_files = ["sai_postinit_cmd.soc"]
 
 [kernel]
-required_modules = ["linux-kernel-bde", "linux-user-bde"]
+required_modules = [
+    "linux-kernel-bde", "linux-user-bde",       # BDE pair
+    "psample", "linux-bcm-knet", "linux-knet-cb", # KNET (hostif netdevs)
+]
+
+[kernel.module_args]
+linux-kernel-bde = "dmasize=32M maxpayload=128 usemsi=0"
+linux-bcm-knet = "use_rx_skb=1 rx_buffer_size=9238 default_mtu=9100"
 ```
 
 Rules that keep multi-platform fleets sane:

@@ -40,6 +40,12 @@ required_modules = [
     # Broadcom BDE pair; must match the pinned SAI's SDK ABI.
     "linux-kernel-bde",
     "linux-user-bde",
+    # KNET: host interfaces as netdevs. Without it soc_knet_init fails
+    # and SAI create_switch aborts (NOT_SUPPORTED). psample first —
+    # linux-knet-cb's sFlow callback links against it.
+    "psample",
+    "linux-bcm-knet",
+    "linux-knet-cb",
     # Celestica platform modules (platforms/cel-e1031/kmod/).
     "smc",          # e1031.smc CPLD: SFP presence, LEDs
     "hlx_gpio_ich", # Rangeley GPIO
@@ -55,6 +61,12 @@ required_modules = [
     "i2c-mux-pca954x",  # pca9548 mux/extender driver
     "max6697",          # max6699 thermal sensors
 ]
+
+# modprobe parameters, mirroring the vendor opennsl-modules init script
+# (its defaults for this platform; debug flags omitted).
+[kernel.module_args]
+linux-kernel-bde = "dmasize=32M maxpayload=128 usemsi=0"
+linux-bcm-knet = "use_rx_skb=1 rx_buffer_size=9238 default_mtu=9100"
 
 # Out-of-band management port (OS netdev, not an ASIC port).
 [management]

@@ -87,6 +87,54 @@ impl Daemon {
     }
 }
 
+/// tonic's transport error Displays as just "transport error"; the
+/// actionable part (ECONNREFUSED vs EACCES vs ENOENT) is the deepest
+/// source in its chain.
+fn root_cause(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut deepest = err;
+    while let Some(source) = deepest.source() {
+        deepest = source;
+    }
+    deepest.to_string()
+}
+
+/// A unix connect() needs write permission on the socket inode, but the
+/// daemons run as root and `UnixListener::bind` leaves the socket at
+/// umask defaults (0755) — operator accounts get EACCES. Hand the socket
+/// to the `hemlock` group (created at image build; operator accounts
+/// belong to it) with group rw. Without the group (dev machines) the
+/// socket stays owner-only, which covers same-user development.
+#[cfg(unix)]
+fn grant_operator_access(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let gid = hemlock_gid();
+    if let Some(gid) = gid {
+        if let Err(e) = std::os::unix::fs::chown(path, None, Some(gid)) {
+            tracing::warn!(path = %path.display(), error = %e, "chgrp hemlock on socket failed");
+        }
+    }
+    let mode = if gid.is_some() { 0o660 } else { 0o600 };
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        tracing::warn!(path = %path.display(), error = %e, "chmod on socket failed");
+    }
+}
+
+/// The gid of the `hemlock` group, straight from /etc/group (avoids a
+/// libc dependency for one getgrnam call).
+#[cfg(unix)]
+fn hemlock_gid() -> Option<u32> {
+    let groups = std::fs::read_to_string("/etc/group").ok()?;
+    groups.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next()? != "hemlock" {
+            return None;
+        }
+        let _password = fields.next()?;
+        fields.next()?.trim().parse().ok()
+    })
+}
+
 impl IpcEndpoint {
     /// Serve a tonic router on this endpoint until `shutdown` resolves.
     pub async fn serve(
@@ -118,6 +166,7 @@ impl IpcEndpoint {
                 }
                 let listener =
                     tokio::net::UnixListener::bind(path).map_err(|e| HemlockError::io(path, e))?;
+                grant_operator_access(path);
                 let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
                 router
                     .serve_with_incoming_shutdown(incoming, shutdown)
@@ -141,7 +190,7 @@ impl IpcEndpoint {
                     .map_err(|e| HemlockError::Ipc(e.to_string()))?
                     .connect()
                     .await
-                    .map_err(|e| HemlockError::Ipc(format!("connect {self}: {e}")))
+                    .map_err(|e| HemlockError::Ipc(format!("connect {self}: {}", root_cause(&e))))
             }
             #[cfg(unix)]
             IpcEndpoint::Unix(path) => {
@@ -157,7 +206,7 @@ impl IpcEndpoint {
                         }
                     }))
                     .await
-                    .map_err(|e| HemlockError::Ipc(format!("connect {self}: {e}")))
+                    .map_err(|e| HemlockError::Ipc(format!("connect {self}: {}", root_cause(&e))))
             }
             #[cfg(not(unix))]
             IpcEndpoint::Unix(path) => Err(HemlockError::Ipc(format!(

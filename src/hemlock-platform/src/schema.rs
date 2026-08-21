@@ -83,8 +83,14 @@ pub struct SaiSection {
 #[serde(deny_unknown_fields)]
 pub struct KernelSection {
     /// Kernel modules the pinned SAI expects (e.g. the Broadcom BDE pair).
+    /// Plain module names only — parameters go in `module_args` (the image
+    /// build's loadability gate feeds these strings to modprobe verbatim).
     #[serde(default)]
     pub required_modules: Vec<String>,
+    /// Whitespace-separated `key=value` modprobe parameters per module,
+    /// mirroring the vendor init script (e.g. linux-kernel-bde dmasize).
+    #[serde(default)]
+    pub module_args: std::collections::BTreeMap<String, String>,
 }
 
 /// Port table. Regular boards describe ports in arithmetic *groups*; oddball
