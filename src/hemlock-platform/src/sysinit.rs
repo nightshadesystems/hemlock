@@ -64,12 +64,10 @@ pub fn load_kernel_modules(kernel: &KernelSection) -> Result<(), SysinitError> {
         if let Some(args) = kernel.module_args.get(module) {
             command.args(args.split_whitespace());
         }
-        let output = command
-            .output()
-            .map_err(|source| SysinitError::Spawn {
-                command: format!("modprobe {module}"),
-                source,
-            })?;
+        let output = command.output().map_err(|source| SysinitError::Spawn {
+            command: format!("modprobe {module}"),
+            source,
+        })?;
         if output.status.success() {
             debug!(%module, "kernel module loaded");
         } else {
@@ -516,7 +514,7 @@ mod tests {
 
     #[test]
     fn base_mac_prefers_syseeprom_then_falls_back_to_netdev() {
-        let manifest: Manifest = toml::from_str(&format!(
+        let manifest: Manifest = toml::from_str(
             r#"
 schema_version = 1
 [platform]
@@ -544,8 +542,8 @@ name = "Ethernet1"
 index = 1
 speed_mbps = 1000
 lanes = [1]
-"#
-        ))
+"#,
+        )
         .unwrap();
 
         let dir = tempfile::tempdir().unwrap();

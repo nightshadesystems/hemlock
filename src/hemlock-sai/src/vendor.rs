@@ -378,6 +378,27 @@ impl SaiBackend for VendorSai {
     }
 }
 
+impl Drop for VendorSai {
+    fn drop(&mut self) {
+        // Best-effort orderly shutdown; the process is usually going down.
+        // SAFETY: symbols resolved from the still-loaded library.
+        unsafe {
+            if let Some(oid) = self.switch_oid {
+                if let Some(remove) = (*self.switch_api).remove_switch {
+                    let _ = remove(oid);
+                }
+            }
+            if let Ok(uninit) = self
+                .library
+                .get::<unsafe extern "C" fn() -> ffi::sai_status_t>(b"sai_api_uninitialize\0")
+            {
+                let _ = uninit();
+            }
+        }
+        INSTANCE_LIVE.store(false, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -410,26 +431,5 @@ mod tests {
             unsafe { profile_get_next_value(0, std::ptr::null_mut(), &mut val2) },
             -1
         );
-    }
-}
-
-impl Drop for VendorSai {
-    fn drop(&mut self) {
-        // Best-effort orderly shutdown; the process is usually going down.
-        // SAFETY: symbols resolved from the still-loaded library.
-        unsafe {
-            if let Some(oid) = self.switch_oid {
-                if let Some(remove) = (*self.switch_api).remove_switch {
-                    let _ = remove(oid);
-                }
-            }
-            if let Ok(uninit) = self
-                .library
-                .get::<unsafe extern "C" fn() -> ffi::sai_status_t>(b"sai_api_uninitialize\0")
-            {
-                let _ = uninit();
-            }
-        }
-        INSTANCE_LIVE.store(false, Ordering::SeqCst);
     }
 }
