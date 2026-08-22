@@ -85,6 +85,13 @@ os_device = "eth0"
 # until we know what the vendor config wires them to.
 # ---------------------------------------------------------------------------
 
+# Egress queues per front-panel port (Helix4, as modeled in phase 1):
+# 8 unicast + 1 multicast, shown as UC0..UC7 + MC0 in
+# `show interfaces counters queue`.
+[ports]
+uc_queues = 8
+mc_queues = 1
+
 [[ports.group]]
 prefix = "Ethernet"
 # 1-based front-panel naming (Ethernet1..52), matching the faceplate.
@@ -94,6 +101,9 @@ speed_mbps = 1000
 autoneg = true
 alias_prefix = "etp"
 media = "1000BASE-T"
+# External gigabit PHYs on the copper bank.
+phy_model = "HLK-PHY-BCM54282"
+supported_modes = ["10M/half", "10M/full", "100M/half", "100M/full", "1G/full", "auto"]
 lanes = [
      2,  1,  4,  3,  6,  5,  8,  7, 10,  9, 12, 11,
     14, 13, 16, 15, 18, 17, 20, 19, 22, 21, 24, 23,
@@ -109,6 +119,7 @@ speed_mbps = 10000
 autoneg = false
 alias_prefix = "etp"
 media = "SFP+"
+supported_modes = ["1G/full", "10G/full", "auto"]
 lanes = [54, 53, 56, 55]
 
 # ---------------------------------------------------------------------------
@@ -288,23 +299,25 @@ driver = "dps200"
 eeprom_address = 0x53
 
 # SFP+ cages, one EEPROM bus each (optoe2 = SFP-style, 2-wire addr 0x50).
+# Ports follow the 1-based faceplate naming: the uplinks are
+# Ethernet49-52 (an earlier revision listed the stale 0-based names).
 [[hardware.transceiver]]
-port = "Ethernet48"
+port = "Ethernet49"
 bus = 14
 driver = "optoe2"
 
 [[hardware.transceiver]]
-port = "Ethernet49"
+port = "Ethernet50"
 bus = 15
 driver = "optoe2"
 
 [[hardware.transceiver]]
-port = "Ethernet50"
+port = "Ethernet51"
 bus = 16
 driver = "optoe2"
 
 [[hardware.transceiver]]
-port = "Ethernet51"
+port = "Ethernet52"
 bus = 17
 driver = "optoe2"
 

@@ -1,0 +1,6 @@
+Port    Auto-Negotiation                              Local Advertisement
+        Mode         Status                           Speed/Duplex        Pause
+Et1     802.3        success                          10M/half 10M/full   None
+                                                      100M/half 100M/full
+                                                      1G/full
+Et49    off          n/a                              n/a                 n/a

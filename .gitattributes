@@ -2,3 +2,5 @@
 *.sh text eol=lf
 *.png binary
 *.bin binary
+# Golden reference outputs are compared byte-for-byte; never rewrite EOLs.
+src/hemlockctl/tests/golden/* text eol=lf

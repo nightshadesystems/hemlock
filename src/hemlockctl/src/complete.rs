@@ -35,6 +35,57 @@ pub struct CliHelper {
 /// Sentinel in the word tables meaning "an interface name goes here".
 const PORT: &str = "\0port";
 
+/// The `show interfaces` subcommand words (the interface argument is
+/// optional and completes separately via [`PORT`]).
+const INTERFACES_SUBCOMMANDS: &[&str] = &[
+    "description",
+    "status",
+    "counters",
+    "transceiver",
+    "capabilities",
+    "flowcontrol",
+    "negotiation",
+    "phy",
+    "mac",
+    "switchport",
+    "trunk",
+    "vlans",
+];
+
+const INTERFACES_START: &[&str] = &[
+    PORT,
+    "description",
+    "status",
+    "counters",
+    "transceiver",
+    "capabilities",
+    "flowcontrol",
+    "negotiation",
+    "phy",
+    "mac",
+    "switchport",
+    "trunk",
+    "vlans",
+];
+
+/// Completion below `show interfaces`, with the optional leading
+/// interface argument already normalized to [`PORT`].
+fn interfaces_words(path: &[&str]) -> &'static [&'static str] {
+    let (had_port, rest) = match path.split_first() {
+        Some((&PORT, rest)) => (true, rest),
+        _ => (false, path),
+    };
+    match rest {
+        [] if had_port => INTERFACES_SUBCOMMANDS,
+        [] => INTERFACES_START,
+        ["status"] => &["connected", "notconnect", "errdisabled", "inactive"],
+        ["counters"] => &["errors", "discards", "rates", "queue", "bins"],
+        ["transceiver"] => &["detail", "properties", "eeprom"],
+        ["negotiation" | "phy" | "mac"] => &["detail"],
+        _ => &[],
+    }
+}
+
 /// The words that may follow the canonical `path` in `mode`. Empty means
 /// nothing completable (free text, or the command is complete).
 fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
@@ -51,7 +102,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, ["show"]) => {
             &["interfaces", "environment", "configuration", "version"]
         }
-        (CliMode::Operational, ["show", "interfaces"]) => &["status", "transceiver"],
+        (CliMode::Operational, ["show", "interfaces", rest @ ..]) => interfaces_words(rest),
         (CliMode::Config, []) => &[
             "set", "delete", "show", "commit", "rollback", "discard", "exit", "help",
         ],
@@ -132,13 +183,14 @@ pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String
     let mut path: Vec<&str> = Vec::with_capacity(tokens.len());
     for token in tokens {
         let level = next_words(mode, &path);
+        // Where an interface name may appear it canonicalizes to the
+        // sentinel (so deeper levels key off "a port was given", not its
+        // spelling); a level offering both PORT and keywords tries the
+        // port first, then the keywords.
         let resolved = if level.contains(&PORT) {
-            // An interface name (aliases like Eth1 included): canonicalize
-            // to the sentinel so deeper levels key off "a port was given",
-            // not its spelling.
             match match_port(token, ports) {
                 PortMatch::One(_) => Some(PORT),
-                _ => None,
+                _ => resolve_word(token, level.iter().copied().filter(|w| *w != PORT)),
             }
         } else {
             resolve_word(token, level.iter().copied())
@@ -219,8 +271,48 @@ mod tests {
         // `sh int<TAB>` completes as if `show int` were typed.
         let c = candidates(CliMode::Operational, &["sh"], "int", &ports());
         assert_eq!(c, vec!["interfaces".to_string()]);
+        // The interfaces level offers ports and every subcommand.
         let c = candidates(CliMode::Operational, &["sh", "int"], "", &ports());
-        assert_eq!(c, vec!["status".to_string(), "transceiver".to_string()]);
+        assert!(c.contains(&"Ethernet1".to_string()));
+        assert!(c.contains(&"status".to_string()));
+        assert!(c.contains(&"switchport".to_string()));
+        // `sh int st<TAB>` narrows to keywords.
+        let c = candidates(CliMode::Operational, &["sh", "int"], "st", &ports());
+        assert_eq!(c, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn interfaces_tree_completes_through_a_port() {
+        // A port argument leads to the subcommands (ports not re-offered).
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "interfaces", "Eth1"],
+            "",
+            &ports(),
+        );
+        assert!(c.contains(&"counters".to_string()));
+        assert!(!c.contains(&"Ethernet1".to_string()));
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "interfaces", "e0", "counters"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["errors", "discards", "rates", "queue", "bins"]);
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "interfaces", "status"],
+            "err",
+            &ports(),
+        );
+        assert_eq!(c, vec!["errdisabled".to_string()]);
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "interfaces", "negotiation"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["detail".to_string()]);
     }
 
     #[test]

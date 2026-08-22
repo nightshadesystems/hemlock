@@ -1,0 +1,8 @@
+If system temperature is too high, transceiver temperature will rise 5 C
+per 1 C rise in system temperature
+                                                    Rx Power   Tx Power
+Port       Temp (C)  Voltage (V)  Bias (mA)         (dBm)      (dBm)     Last Update
+---------- --------- ------------ ----------------- ---------- --------- -------------------
+Et49           33.45         3.28              6.42      -2.35      -1.87 0:00:04 ago
+Et50           29.11         3.30              7.01      -1.02      -0.95 0:00:04 ago
+Et51           29.87         3.29              6.88      -1.11      -0.98 0:00:04 ago

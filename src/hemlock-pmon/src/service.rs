@@ -77,8 +77,36 @@ impl pb::pmon_server::Pmon for PmonService {
                     vendor: x.info.vendor.clone(),
                     part_number: x.info.part_number.clone(),
                     serial: x.info.serial.clone(),
+                    date_code: x.info.date_code.clone(),
+                    media_type: x.info.media_type.clone(),
+                    dom: x.info.dom.map(|d| pb::DomValues {
+                        temp_c: d.temp_c,
+                        voltage_v: d.voltage_v,
+                        bias_ma: d.bias_ma,
+                        tx_dbm: d.tx_dbm,
+                        rx_dbm: d.rx_dbm,
+                    }),
+                    thresholds: x.info.thresholds.map(|t| pb::DomThresholds {
+                        temperature: Some(threshold(t.temperature)),
+                        voltage: Some(threshold(t.voltage)),
+                        bias: Some(threshold(t.bias)),
+                        tx_power: Some(threshold(t.tx_power)),
+                        rx_power: Some(threshold(t.rx_power)),
+                    }),
+                    eeprom_a0: x.info.eeprom_a0.clone(),
+                    eeprom_a2: x.info.eeprom_a2.clone(),
+                    age_secs: x.read_at.elapsed().as_secs(),
                 })
                 .collect(),
         }))
+    }
+}
+
+fn threshold(t: crate::hw::DomThresholdInfo) -> pb::DomThreshold {
+    pb::DomThreshold {
+        high_alarm: t.high_alarm,
+        high_warn: t.high_warn,
+        low_alarm: t.low_alarm,
+        low_warn: t.low_warn,
     }
 }

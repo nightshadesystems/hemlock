@@ -11,6 +11,13 @@ service Syncd {
   rpc SetPortAttrs(SetPortAttrsRequest) returns (SetPortAttrsResponse);
   // Server-streaming feed of port oper-status changes (SAI notifications).
   rpc WatchPortEvents(WatchPortEventsRequest) returns (stream PortEvent);
+  // Full interface state + counters + rates for `show interfaces ...`:
+  // ASIC ports plus the kernel-side interfaces the stats engine tracks
+  // (management port, loopback/VLAN/port-channel netdevs).
+  rpc GetInterfaces(GetInterfacesRequest) returns (GetInterfacesResponse);
+  // Set per-interface counter baselines (`clear counters`). Counters
+  // reported by GetInterfaces are relative to the last clear.
+  rpc ClearCounters(ClearCountersRequest) returns (ClearCountersResponse);
 }
 
 message GetSwitchInfoRequest {}
@@ -59,4 +66,117 @@ message WatchPortEventsRequest {}
 message PortEvent {
   string name = 1;
   OperStatus oper_status = 2;
+}
+
+message GetInterfacesRequest {
+  // Display names to fetch; empty = all tracked interfaces.
+  repeated string names = 1;
+}
+
+message GetInterfacesResponse {
+  repeated InterfaceState interfaces = 1;
+  // Platform model string for `show interfaces capabilities`,
+  // e.g. "Celestica E1031".
+  string platform_model = 2;
+}
+
+// The full hardware counter set, baselined against the last clear.
+message InterfaceCounters {
+  uint64 in_pkts = 1;
+  uint64 in_octets = 2;
+  uint64 in_ucast_pkts = 3;
+  uint64 in_mcast_pkts = 4;
+  uint64 in_bcast_pkts = 5;
+  uint64 in_discards = 6;
+  uint64 in_errors = 7;
+  uint64 in_crc_errors = 8;
+  uint64 in_alignment_errors = 9;
+  uint64 in_symbol_errors = 10;
+  uint64 in_runts = 11;
+  uint64 in_giants = 12;
+  uint64 in_pause = 13;
+  uint64 out_pkts = 14;
+  uint64 out_octets = 15;
+  uint64 out_ucast_pkts = 16;
+  uint64 out_mcast_pkts = 17;
+  uint64 out_bcast_pkts = 18;
+  uint64 out_discards = 19;
+  uint64 out_errors = 20;
+  uint64 out_pause = 21;
+  uint64 collisions = 22;
+  uint64 late_collisions = 23;
+  uint64 deferred = 24;
+}
+
+// One egress queue's stat counters (label like "UC0", "MC0").
+message QueueCounters {
+  string queue = 1;
+  uint64 pkts = 2;
+  uint64 bytes = 3;
+  uint64 dropped_pkts = 4;
+  uint64 dropped_bytes = 5;
+}
+
+// RMON frame-size distribution: the seven EOS bins
+// (64, 65-127, 128-255, 256-511, 512-1023, 1024-1522, 1523-max).
+message FrameSizeBins {
+  repeated uint64 rx = 1;
+  repeated uint64 tx = 2;
+}
+
+// Load-interval rates (EWMA), including utilization with the 20
+// bytes/frame preamble + IFG framing overhead.
+message RateStats {
+  uint32 interval_secs = 1;
+  double in_bps = 2;
+  uint64 in_pps = 3;
+  double in_util_pct = 4;
+  double out_bps = 5;
+  uint64 out_pps = 6;
+  double out_util_pct = 7;
+}
+
+message InterfaceState {
+  string name = 1;   // display name, e.g. "Ethernet1", "Management1"
+  // "ethernet" | "management" | "loopback" | "vlan" | "port-channel"
+  string kind = 2;
+  uint32 index = 3;  // front-panel index; 0 for kernel interfaces
+  AdminState admin_state = 4;
+  OperStatus oper_status = 5;
+  string mac = 6;      // colon-separated lowercase
+  string bia_mac = 7;
+  string description = 8;
+  uint32 mtu = 9;
+  uint64 speed_mbps = 10;  // 0 = unknown / unconfigured
+  string duplex = 11;      // "full" | "half" | ""
+  bool autoneg = 12;
+  repeated string ip_addresses = 13;  // CIDR
+  // Seconds in the current up/down state; unset = unknown.
+  optional uint64 seconds_since_change = 14;
+  uint64 link_changes = 15;
+  // Seconds since `clear counters`; unset = never cleared.
+  optional uint64 seconds_since_clear = 16;
+  RateStats rates = 17;
+  InterfaceCounters counters = 18;
+  repeated QueueCounters queues = 19;
+  FrameSizeBins bins = 20;
+  // Physical media for display, e.g. "1000BASE-T".
+  string media = 21;
+  // PHY model from the platform definition, e.g. "HLK-PHY-BCM54282".
+  string phy_model = 22;
+  // Supported speed/duplex modes from the platform definition,
+  // e.g. "10M/half", "1G/full", "auto".
+  repeated string supported_modes = 23;
+  string errdisable_reason = 24;
+  // Port-channel member display names.
+  repeated string members = 25;
+}
+
+message ClearCountersRequest {
+  // Display names to clear; empty = all tracked interfaces.
+  repeated string names = 1;
+}
+
+message ClearCountersResponse {
+  uint32 cleared = 1;
 }

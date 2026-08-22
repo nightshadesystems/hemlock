@@ -1,0 +1,5 @@
+Port       Untagged   Tagged
+Et1        10         None
+Et2        1          10,20,30,99
+Po1        1          10,20,30,99
+Vl10       10         None

@@ -55,6 +55,10 @@ pub struct PortDef {
     pub autoneg: bool,
     pub media: Option<String>,
     pub breakout: Vec<String>,
+    /// PHY model for `show interfaces phy`; `None` = direct serdes.
+    pub phy_model: Option<String>,
+    /// Speed/duplex modes for `show interfaces capabilities`.
+    pub supported_modes: Vec<String>,
 }
 
 /// A loaded platform: manifest + its directory + the expanded port table.
@@ -171,6 +175,8 @@ fn expand_ports(manifest: &Manifest) -> Result<Vec<PortDef>, PlatformError> {
                 autoneg: group.autoneg,
                 media: group.media.clone(),
                 breakout: group.breakout.clone(),
+                phy_model: group.phy_model.clone(),
+                supported_modes: group.supported_modes.clone(),
             });
         }
     }
@@ -185,6 +191,8 @@ fn expand_ports(manifest: &Manifest) -> Result<Vec<PortDef>, PlatformError> {
             autoneg: entry.autoneg,
             media: entry.media.clone(),
             breakout: entry.breakout.clone(),
+            phy_model: entry.phy_model.clone(),
+            supported_modes: entry.supported_modes.clone(),
         });
     }
 

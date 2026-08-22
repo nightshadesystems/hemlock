@@ -102,6 +102,13 @@ pub struct PortsSection {
     pub groups: Vec<PortGroup>,
     #[serde(default, rename = "port")]
     pub ports: Vec<PortEntry>,
+    /// Unicast egress queues per front-panel port (ASIC-dependent;
+    /// drives `show interfaces counters queue`).
+    #[serde(default = "eight")]
+    pub uc_queues: u32,
+    /// Multicast egress queues per front-panel port.
+    #[serde(default)]
+    pub mc_queues: u32,
 }
 
 /// A run of ports sharing prefix, speed, and lane count.
@@ -135,6 +142,15 @@ pub struct PortGroup {
     /// Supported breakout modes, e.g. `["4x10G"]`. Empty = no breakout.
     #[serde(default)]
     pub breakout: Vec<String>,
+    /// PHY model behind these ports, as shown in `show interfaces phy`
+    /// (e.g. `HLK-PHY-BCM54282`). Absent for direct-attach serdes ports.
+    #[serde(default)]
+    pub phy_model: Option<String>,
+    /// Supported speed/duplex modes for `show interfaces capabilities`
+    /// and negotiation advertisements, e.g. `["10M/half", "1G/full",
+    /// "auto"]`.
+    #[serde(default)]
+    pub supported_modes: Vec<String>,
 }
 
 /// A single explicitly described port.
@@ -153,10 +169,18 @@ pub struct PortEntry {
     pub media: Option<String>,
     #[serde(default)]
     pub breakout: Vec<String>,
+    #[serde(default)]
+    pub phy_model: Option<String>,
+    #[serde(default)]
+    pub supported_modes: Vec<String>,
 }
 
 fn one() -> u32 {
     1
+}
+
+fn eight() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

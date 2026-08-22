@@ -1,0 +1,10 @@
+Interface                      Status         Protocol           Description
+Et1                            up             up                 host rack3-u12 nic1
+Et2                            up             up                 trunk to lab-ap1
+Et3                            admin down     down
+Et49                           up             up                 LAG member Po1
+Et50                           up             up                 LAG member Po1
+Lo0                            up             up                 Router-ID
+Ma1                            up             up                 OOB management
+Po1                            up             up                 uplink LAG to qs-hq-spine
+Vl10                           up             up                 LAN-USERS

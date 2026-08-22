@@ -12,6 +12,10 @@ rust-version.workspace = true
 default = []
 # Compile the vendor SAI backend (Linux + libclang; see hemlock-sai).
 real-sai = ["hemlock-sai/real-sai"]
+# Kernel-interface integration tests against a real veth pair. Linux
+# only, and needs CAP_NET_ADMIN to create the pair (run as root/sudo):
+#   cargo test -p hemlock-syncd --features veth-tests
+veth-tests = []
 
 [dependencies]
 hemlock-common = { workspace = true }
@@ -23,6 +27,9 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

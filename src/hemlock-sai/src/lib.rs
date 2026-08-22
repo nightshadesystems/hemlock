@@ -161,6 +161,50 @@ pub enum SaiEvent {
     PortOperStatus { port: PortId, up: bool },
 }
 
+/// Cumulative hardware counters for one port, as the ASIC reports them
+/// (`sai_get_port_stats`). Counters a platform cannot supply stay 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PortCounters {
+    pub in_octets: u64,
+    pub in_ucast_pkts: u64,
+    pub in_mcast_pkts: u64,
+    pub in_bcast_pkts: u64,
+    pub in_discards: u64,
+    pub in_errors: u64,
+    pub in_crc_errors: u64,
+    pub in_alignment_errors: u64,
+    pub in_symbol_errors: u64,
+    pub in_runts: u64,
+    pub in_giants: u64,
+    pub in_pause: u64,
+    pub out_octets: u64,
+    pub out_ucast_pkts: u64,
+    pub out_mcast_pkts: u64,
+    pub out_bcast_pkts: u64,
+    pub out_discards: u64,
+    pub out_errors: u64,
+    pub out_pause: u64,
+    pub collisions: u64,
+    pub late_collisions: u64,
+    pub deferred: u64,
+    /// RMON frame-size bins, EOS layout:
+    /// 64 / 65-127 / 128-255 / 256-511 / 512-1023 / 1024-1522 / 1523-max.
+    pub rx_bins: [u64; 7],
+    pub tx_bins: [u64; 7],
+}
+
+/// One egress queue's stat counters. The label (UC0/MC0) is derived by
+/// syncd from `unicast` + `index` against the platform definition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueCounters {
+    pub unicast: bool,
+    pub index: u32,
+    pub pkts: u64,
+    pub bytes: u64,
+    pub dropped_pkts: u64,
+    pub dropped_bytes: u64,
+}
+
 /// The safe wrapper trait over a SAI implementation.
 ///
 /// Calls are synchronous (SAI itself is); syncd serializes access and moves
@@ -178,6 +222,15 @@ pub trait SaiBackend: Send {
     fn ports(&mut self) -> Result<Vec<SaiPort>, SaiError>;
 
     fn set_port_admin_state(&mut self, port: PortId, up: bool) -> Result<(), SaiError>;
+
+    /// Cumulative hardware counters for one port. Polled by syncd's stats
+    /// engine; must be cheap enough for a 5s all-ports sweep.
+    fn port_counters(&mut self, port: PortId) -> Result<PortCounters, SaiError>;
+
+    /// Per-egress-queue stat counters for one port. Backends without
+    /// queue stat support return an empty list; syncd renders the
+    /// platform-declared queues as zeros.
+    fn port_queue_counters(&mut self, port: PortId) -> Result<Vec<QueueCounters>, SaiError>;
 
     /// Take the notification receiver. Yields `Some` on first call only.
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>>;

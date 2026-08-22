@@ -90,6 +90,8 @@ pub struct XcvrReading {
     pub port: String,
     pub present: bool,
     pub info: hw::TransceiverInfo,
+    /// When the EEPROM was last read; serves `Last Update` in the CLI.
+    pub read_at: std::time::Instant,
 }
 
 pub type SharedEnv = Arc<RwLock<EnvState>>;
@@ -259,6 +261,7 @@ async fn xcvr_loop(platform: Arc<Platform>, backend: Arc<dyn HwBackend>, env: Sh
                 port: xcvr.port.clone(),
                 present: info.is_some(),
                 info: info.unwrap_or_default(),
+                read_at: std::time::Instant::now(),
             });
         }
         if let Ok(mut state) = env.write() {

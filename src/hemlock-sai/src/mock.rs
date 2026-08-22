@@ -10,7 +10,9 @@
 use hemlock_platform::PortDef;
 use tokio::sync::mpsc;
 
-use crate::{PortId, SaiBackend, SaiError, SaiEvent, SaiPort, SwitchInfo};
+use crate::{
+    PortCounters, PortId, QueueCounters, SaiBackend, SaiError, SaiEvent, SaiPort, SwitchInfo,
+};
 
 /// Synthetic OIDs: obviously fake, stable, and readable in logs.
 const MOCK_SWITCH_OID: u64 = 0x2100_0000_0000_0000;
@@ -96,6 +98,23 @@ impl SaiBackend for MockSai {
         Ok(())
     }
 
+    fn port_counters(&mut self, id: PortId) -> Result<PortCounters, SaiError> {
+        if !self.created {
+            return Err(SaiError::NoSwitch);
+        }
+        // The mock ASIC forwards nothing, so its counters honestly read 0.
+        self.port_mut(id)?;
+        Ok(PortCounters::default())
+    }
+
+    fn port_queue_counters(&mut self, id: PortId) -> Result<Vec<QueueCounters>, SaiError> {
+        if !self.created {
+            return Err(SaiError::NoSwitch);
+        }
+        self.port_mut(id)?;
+        Ok(Vec::new())
+    }
+
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>> {
         self.events_rx.take()
     }
@@ -117,6 +136,8 @@ mod tests {
                 autoneg: false,
                 media: None,
                 breakout: vec![],
+                phy_model: None,
+                supported_modes: vec![],
             })
             .collect()
     }

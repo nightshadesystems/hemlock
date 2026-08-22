@@ -14,7 +14,10 @@ use std::sync::OnceLock;
 
 use tokio::sync::mpsc;
 
-use crate::{ffi, PortId, SaiBackend, SaiError, SaiEvent, SaiPort, SwitchInfo, SwitchInit};
+use crate::{
+    ffi, PortCounters, PortId, QueueCounters, SaiBackend, SaiError, SaiEvent, SaiPort, SwitchInfo,
+    SwitchInit,
+};
 
 /// SAI profile key/value store handed to the vendor library. Static because
 /// the profile callbacks are plain C function pointers with no user data.
@@ -113,6 +116,7 @@ pub struct VendorSai {
     _services: Box<ffi::sai_service_method_table_t>,
     switch_api: *mut ffi::sai_switch_api_t,
     port_api: *mut ffi::sai_port_api_t,
+    queue_api: *mut ffi::sai_queue_api_t,
     switch_oid: Option<ffi::sai_object_id_t>,
     events_rx: Option<mpsc::UnboundedReceiver<SaiEvent>>,
     src_mac: Option<[u8; 6]>,
@@ -168,7 +172,7 @@ impl VendorSai {
         });
 
         // SAFETY: symbol lookup + the documented SAI bootstrap sequence.
-        let (switch_api, port_api) = unsafe {
+        let (switch_api, port_api, queue_api) = unsafe {
             let api_initialize: libloading::Symbol<
                 unsafe extern "C" fn(
                     u64,
@@ -195,9 +199,15 @@ impl VendorSai {
                 "sai_api_query(PORT)",
                 api_query(ffi::_sai_api_t::SAI_API_PORT, &mut port_api),
             )?;
+            let mut queue_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(QUEUE)",
+                api_query(ffi::_sai_api_t::SAI_API_QUEUE, &mut queue_api),
+            )?;
             (
                 switch_api as *mut ffi::sai_switch_api_t,
                 port_api as *mut ffi::sai_port_api_t,
+                queue_api as *mut ffi::sai_queue_api_t,
             )
         };
         Ok(Self {
@@ -205,6 +215,7 @@ impl VendorSai {
             _services: services,
             switch_api,
             port_api,
+            queue_api,
             switch_oid: None,
             events_rx: Some(rx),
             src_mac: init.src_mac,
@@ -371,6 +382,227 @@ impl SaiBackend for VendorSai {
                 .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
             check("set_port_attribute(ADMIN_STATE)", set(port.0, &attr))
         }
+    }
+
+    fn port_counters(&mut self, port: PortId) -> Result<PortCounters, SaiError> {
+        self.switch_oid()?;
+        use ffi::_sai_port_stat_t as stat;
+
+        // One batched sai_get_port_stats call; `IDS` order defines the
+        // meaning of each slot in `values`. EOS-vs-SAI mapping notes:
+        // - runts  <- ETHER_STATS_UNDERSIZE_PKTS
+        // - giants <- ETHER_RX_OVERSIZE_PKTS
+        // - the EOS 1024-1522 bin maps to SAI's 1024-1518 counter, and
+        //   1523-max aggregates the four SAI >=1519 counters (the ASIC
+        //   bins on 1518, EOS displays 1522; the 1519-1522 sliver lands
+        //   in 1523-max).
+        const IDS: [ffi::_sai_port_stat_t::Type; 42] = [
+            stat::SAI_PORT_STAT_IF_IN_OCTETS,
+            stat::SAI_PORT_STAT_IF_IN_UCAST_PKTS,
+            stat::SAI_PORT_STAT_IF_IN_MULTICAST_PKTS,
+            stat::SAI_PORT_STAT_IF_IN_BROADCAST_PKTS,
+            stat::SAI_PORT_STAT_IF_IN_DISCARDS,
+            stat::SAI_PORT_STAT_IF_IN_ERRORS,
+            stat::SAI_PORT_STAT_DOT3_STATS_FCS_ERRORS,
+            stat::SAI_PORT_STAT_DOT3_STATS_ALIGNMENT_ERRORS,
+            stat::SAI_PORT_STAT_DOT3_STATS_SYMBOL_ERRORS,
+            stat::SAI_PORT_STAT_ETHER_STATS_UNDERSIZE_PKTS,
+            stat::SAI_PORT_STAT_ETHER_RX_OVERSIZE_PKTS,
+            stat::SAI_PORT_STAT_PAUSE_RX_PKTS,
+            stat::SAI_PORT_STAT_IF_OUT_OCTETS,
+            stat::SAI_PORT_STAT_IF_OUT_UCAST_PKTS,
+            stat::SAI_PORT_STAT_IF_OUT_MULTICAST_PKTS,
+            stat::SAI_PORT_STAT_IF_OUT_BROADCAST_PKTS,
+            stat::SAI_PORT_STAT_IF_OUT_DISCARDS,
+            stat::SAI_PORT_STAT_IF_OUT_ERRORS,
+            stat::SAI_PORT_STAT_PAUSE_TX_PKTS,
+            stat::SAI_PORT_STAT_ETHER_STATS_COLLISIONS,
+            stat::SAI_PORT_STAT_DOT3_STATS_LATE_COLLISIONS,
+            stat::SAI_PORT_STAT_DOT3_STATS_DEFERRED_TRANSMISSIONS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_64_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_65_TO_127_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_128_TO_255_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_256_TO_511_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_512_TO_1023_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_1024_TO_1518_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_1519_TO_2047_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_2048_TO_4095_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_4096_TO_9216_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_IN_PKTS_9217_TO_16383_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_64_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_65_TO_127_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_128_TO_255_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_256_TO_511_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_512_TO_1023_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_1024_TO_1518_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_1519_TO_2047_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_2048_TO_4095_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_4096_TO_9216_OCTETS,
+            stat::SAI_PORT_STAT_ETHER_OUT_PKTS_9217_TO_16383_OCTETS,
+        ];
+
+        // SAFETY: valid port api table from sai_api_query.
+        let get_stats = unsafe {
+            (*self.port_api)
+                .get_port_stats
+                .ok_or(SaiError::Other("port api lacks get_port_stats".into()))?
+        };
+        let ids: Vec<ffi::sai_stat_id_t> = IDS.iter().map(|i| *i as ffi::sai_stat_id_t).collect();
+        let mut values = [0u64; IDS.len()];
+        // SAFETY: id and value buffers are sized identically and outlive
+        // the call.
+        let batch =
+            unsafe { get_stats(port.0, ids.len() as u32, ids.as_ptr(), values.as_mut_ptr()) };
+        if batch != 0 {
+            // Some SAI builds reject a batch containing any unsupported
+            // counter. Degrade to per-id reads: unsupported counters
+            // honestly stay 0.
+            tracing::debug!(
+                port = %port,
+                status = batch,
+                "batched get_port_stats failed; falling back to per-id reads"
+            );
+            for (id, value) in ids.iter().zip(values.iter_mut()) {
+                let mut one = 0u64;
+                // SAFETY: single-id read into a local.
+                let status = unsafe { get_stats(port.0, 1, id, &mut one) };
+                *value = if status == 0 { one } else { 0 };
+            }
+        }
+
+        let rx_1523_max = values[28] + values[29] + values[30] + values[31];
+        let tx_1523_max = values[38] + values[39] + values[40] + values[41];
+        Ok(PortCounters {
+            in_octets: values[0],
+            in_ucast_pkts: values[1],
+            in_mcast_pkts: values[2],
+            in_bcast_pkts: values[3],
+            in_discards: values[4],
+            in_errors: values[5],
+            in_crc_errors: values[6],
+            in_alignment_errors: values[7],
+            in_symbol_errors: values[8],
+            in_runts: values[9],
+            in_giants: values[10],
+            in_pause: values[11],
+            out_octets: values[12],
+            out_ucast_pkts: values[13],
+            out_mcast_pkts: values[14],
+            out_bcast_pkts: values[15],
+            out_discards: values[16],
+            out_errors: values[17],
+            out_pause: values[18],
+            collisions: values[19],
+            late_collisions: values[20],
+            deferred: values[21],
+            rx_bins: [
+                values[22],
+                values[23],
+                values[24],
+                values[25],
+                values[26],
+                values[27],
+                rx_1523_max,
+            ],
+            tx_bins: [
+                values[32],
+                values[33],
+                values[34],
+                values[35],
+                values[36],
+                values[37],
+                tx_1523_max,
+            ],
+        })
+    }
+
+    fn port_queue_counters(&mut self, port: PortId) -> Result<Vec<QueueCounters>, SaiError> {
+        self.switch_oid()?;
+
+        // SAFETY per block below: valid api tables, buffers outlive calls.
+        let get_port_attr = unsafe {
+            (*self.port_api)
+                .get_port_attribute
+                .ok_or(SaiError::Other("port api lacks get_port_attribute".into()))?
+        };
+        let get_queue_attr = unsafe {
+            (*self.queue_api)
+                .get_queue_attribute
+                .ok_or(SaiError::Other(
+                    "queue api lacks get_queue_attribute".into(),
+                ))?
+        };
+        let get_queue_stats = unsafe {
+            (*self.queue_api)
+                .get_queue_stats
+                .ok_or(SaiError::Other("queue api lacks get_queue_stats".into()))?
+        };
+
+        let count = {
+            let mut attr =
+                Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_NUMBER_OF_QUEUES);
+            // SAFETY: single-attr get.
+            unsafe {
+                check(
+                    "get(QOS_NUMBER_OF_QUEUES)",
+                    get_port_attr(port.0, 1, &mut attr),
+                )?;
+                attr.value.u32_
+            }
+        };
+        let mut queue_oids: Vec<ffi::sai_object_id_t> = vec![0; count as usize];
+        {
+            let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_QUEUE_LIST);
+            attr.value.objlist.count = count;
+            attr.value.objlist.list = queue_oids.as_mut_ptr();
+            // SAFETY: list buffer sized to `count`, alive across the call.
+            unsafe {
+                check("get(QOS_QUEUE_LIST)", get_port_attr(port.0, 1, &mut attr))?;
+                queue_oids.truncate(attr.value.objlist.count as usize);
+            }
+        }
+
+        const STAT_IDS: [ffi::sai_stat_id_t; 4] = [
+            ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_PACKETS as ffi::sai_stat_id_t,
+            ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_BYTES as ffi::sai_stat_id_t,
+            ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_DROPPED_PACKETS as ffi::sai_stat_id_t,
+            ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_DROPPED_BYTES as ffi::sai_stat_id_t,
+        ];
+
+        let mut queues = Vec::with_capacity(queue_oids.len());
+        for oid in queue_oids {
+            let type_attr = Self::zeroed_attr(ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_TYPE);
+            let index_attr = Self::zeroed_attr(ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_INDEX);
+            let mut attrs = [type_attr, index_attr];
+            let mut stats = [0u64; STAT_IDS.len()];
+            // SAFETY: attr array + stat buffers valid across the calls;
+            // union reads match the attr ids just fetched.
+            unsafe {
+                check(
+                    "get_queue_attribute",
+                    get_queue_attr(oid, attrs.len() as u32, attrs.as_mut_ptr()),
+                )?;
+                check(
+                    "get_queue_stats",
+                    get_queue_stats(
+                        oid,
+                        STAT_IDS.len() as u32,
+                        STAT_IDS.as_ptr(),
+                        stats.as_mut_ptr(),
+                    ),
+                )?;
+                queues.push(QueueCounters {
+                    unicast: attrs[0].value.s32
+                        != ffi::_sai_queue_type_t::SAI_QUEUE_TYPE_MULTICAST as i32,
+                    index: u32::from(attrs[1].value.u8_),
+                    pkts: stats[0],
+                    bytes: stats[1],
+                    dropped_pkts: stats[2],
+                    dropped_bytes: stats[3],
+                });
+            }
+        }
+        Ok(queues)
     }
 
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>> {

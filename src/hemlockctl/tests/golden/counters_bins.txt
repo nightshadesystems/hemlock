@@ -1,0 +1,17 @@
+Ethernet1
+  Received frame size distribution:
+    64 bytes:                412334981
+    65-127 bytes:           1123441233
+    128-255 bytes:           441233441
+    256-511 bytes:           123441233
+    512-1023 bytes:           88123441
+    1024-1522 bytes:        2105745912
+    1523-max bytes:                  0
+  Transmitted frame size distribution:
+    64 bytes:                212334981
+    65-127 bytes:            923441233
+    128-255 bytes:           341233441
+    256-511 bytes:           223441233
+    512-1023 bytes:          188123441
+    1024-1522 bytes:        6923158791
+    1523-max bytes:                  0

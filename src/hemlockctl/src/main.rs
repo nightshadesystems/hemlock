@@ -10,6 +10,7 @@ use hemlock_common::ipc::{Daemon, IpcEndpoint};
 mod cli;
 mod complete;
 mod config;
+mod interfaces;
 mod motd;
 mod platform;
 mod show;
@@ -97,11 +98,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ShowCommand {
-    /// Front-panel interfaces from syncd. Add `status` for the EOS-style
-    /// summary table.
+    /// The `show interfaces` family: detail blocks by default; pass a
+    /// name/range and/or a subcommand (description, status, counters
+    /// [errors|discards|rates|queue|bins], transceiver [detail|
+    /// properties|eeprom], capabilities, flowcontrol, negotiation
+    /// [detail], phy [detail], mac [detail], switchport, trunk, vlans).
+    /// Append `| json` (quoted) for the JSON data model.
     Interfaces {
-        #[arg(value_parser = ["status"])]
-        mode: Option<String>,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
     },
     /// Switch/ASIC summary from syncd.
     Switch,
@@ -168,17 +173,25 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     match command {
         Command::Show { command } => match command {
-            ShowCommand::Interfaces { mode } => match mode.as_deref() {
-                Some("status") => {
-                    show::interfaces_status(endpoint(&cli.syncd, Daemon::Syncd)?).await
-                }
-                _ => show::interfaces(endpoint(&cli.syncd, Daemon::Syncd)?).await,
-            },
+            ShowCommand::Interfaces { args } => {
+                let words: Vec<&str> = args.iter().map(String::as_str).collect();
+                interfaces::cmd::run(
+                    &endpoint(&cli.syncd, Daemon::Syncd)?,
+                    &endpoint(&cli.pmon, Daemon::Pmon)?,
+                    &words,
+                )
+                .await
+                .map_err(|message| anyhow::anyhow!("{}", message.trim_start_matches("% ")))
+            }
             ShowCommand::Switch => show::switch(endpoint(&cli.syncd, Daemon::Syncd)?).await,
             ShowCommand::Environment => show::environment(endpoint(&cli.pmon, Daemon::Pmon)?).await,
-            ShowCommand::Transceivers => {
-                show::transceivers(endpoint(&cli.pmon, Daemon::Pmon)?).await
-            }
+            ShowCommand::Transceivers => interfaces::cmd::run(
+                &endpoint(&cli.syncd, Daemon::Syncd)?,
+                &endpoint(&cli.pmon, Daemon::Pmon)?,
+                &["transceiver"],
+            )
+            .await
+            .map_err(|message| anyhow::anyhow!("{}", message.trim_start_matches("% "))),
             ShowCommand::Config { platform_dir } => {
                 show::configuration(
                     endpoint(&cli.syncd, Daemon::Syncd)?,

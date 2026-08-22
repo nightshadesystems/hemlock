@@ -728,6 +728,7 @@ dependencies = [
  "hemlock-common",
  "hemlock-platform",
  "hemlock-sai",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -739,11 +740,14 @@ name = "hemlockctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "hemlock-common",
  "hemlock-config",
  "hemlock-platform",
  "rustyline",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tonic",

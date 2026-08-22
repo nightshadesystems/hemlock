@@ -1,0 +1,21 @@
+Ethernet49
+  Transceiver Type: 10GBASE-SR
+  Vendor Name: FINISAR CORP.
+  Vendor Part Number: FTLX8574D3BCL
+  Vendor Serial Number: UWM01B7
+  Vendor Date Code: 210412
+  Temperature: 33.45 C
+    High alarm threshold:  75.00 C   High warn threshold:  70.00 C
+    Low alarm threshold:   -5.00 C   Low warn threshold:    0.00 C
+  Voltage: 3.28 V
+    High alarm threshold:   3.63 V   High warn threshold:   3.46 V
+    Low alarm threshold:    2.97 V   Low warn threshold:    3.13 V
+  Tx Bias: 6.42 mA
+    High alarm threshold:  11.80 mA  High warn threshold:  10.80 mA
+    Low alarm threshold:    4.00 mA  Low warn threshold:    5.00 mA
+  Tx Power: -1.87 dBm
+    High alarm threshold:   1.70 dBm High warn threshold:  -1.30 dBm
+    Low alarm threshold:   -9.50 dBm Low warn threshold:   -8.30 dBm
+  Rx Power: -2.35 dBm
+    High alarm threshold:   2.00 dBm High warn threshold:  -1.00 dBm
+    Low alarm threshold:  -13.10 dBm Low warn threshold:  -12.10 dBm

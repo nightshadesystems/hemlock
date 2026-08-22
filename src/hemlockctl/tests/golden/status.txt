@@ -1,0 +1,9 @@
+Port       Name                          Status       Vlan     Duplex Speed  Type            Flags Encapsulation
+Et1        host rack3-u12 nic1           connected    10       full   1G     1000BASE-T
+Et2        trunk to lab-ap1              connected    trunk    full   1G     1000BASE-T
+Et3                                      disabled     1        full   unconf 1000BASE-T
+Et49       LAG member Po1                connected    in Po1   full   10G    10GBASE-SR
+Et50       LAG member Po1                connected    in Po1   full   10G    10GBASE-SR
+Et51       spare uplink                  notconnect   1        full   unconf 10GBASE-SR
+Ma1        OOB management                connected    routed   a-full a-1G   10/100/1000
+Po1        uplink LAG to qs-hq-spine     connected    trunk    full   20G    N/A

@@ -1,0 +1,15 @@
+Port       Mode          Native vlan     Status
+Et2        trunk         1               trunking
+Po1        trunk         1               trunking
+
+Port       Vlans allowed
+Et2        10,20,30,99
+Po1        10,20,30,99
+
+Port       Vlans allowed and active in management domain
+Et2        10,20,30,99
+Po1        10,20,30,99
+
+Port       Vlans in spanning tree forwarding state
+Et2        10,20,30,99
+Po1        10,20,30,99

@@ -1,0 +1,12 @@
+Ethernet1
+  Auto-Negotiation Mode: IEEE 802.3
+  Auto-Negotiation Status: Success
+  Local Advertisement
+    Speed/Duplex: 10M/half 10M/full 100M/half 100M/full 1G/full
+    Pause: None
+  Link Partner Advertisement
+    Speed/Duplex: 10M/half 10M/full 100M/half 100M/full 1G/full
+    Pause: Symmetric
+  Resolution
+    Speed/Duplex: 1G/full
+    Pause: rx off, tx off

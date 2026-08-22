@@ -1,0 +1,7 @@
+Port         InDiscards       OutDiscards
+Et1                   0                 2
+Et2                   0                 0
+Et3                   0                 0
+Et49                  0             41234
+Et50                  0             40997
+Ma1                   0                 0

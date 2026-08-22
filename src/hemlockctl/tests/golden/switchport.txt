@@ -1,0 +1,34 @@
+Default switchport mode: access
+
+Name: Et1
+Switchport: Enabled
+Administrative Mode: static access
+Operational Mode: static access
+MAC Address Learning: enabled
+Dot1q ethertype/TPID: 0x8100 (active)
+Dot1q Source Port Filter: Disabled
+Access Mode VLAN: 10 (LAN-USERS)
+Trunking Native Mode VLAN: 1 (default)
+Administrative Native VLAN tagging: disabled
+Trunking VLANs Enabled: ALL
+Static Trunk Groups:
+Dynamic Trunk Groups:
+Source interface filtering: enabled
+
+Name: Et2
+Switchport: Enabled
+Administrative Mode: trunk
+Operational Mode: trunk
+MAC Address Learning: enabled
+Dot1q ethertype/TPID: 0x8100 (active)
+Dot1q Source Port Filter: Disabled
+Access Mode VLAN: 1 (default)
+Trunking Native Mode VLAN: 1 (default)
+Administrative Native VLAN tagging: disabled
+Trunking VLANs Enabled: 10,20,30,99
+Static Trunk Groups:
+Dynamic Trunk Groups:
+Source interface filtering: enabled
+
+Name: Ma1
+Switchport: Disabled

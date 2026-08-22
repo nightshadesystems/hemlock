@@ -1,0 +1,7 @@
+Port       Send FlowControl   Receive FlowControl    RxPause   TxPause
+           admin   oper       admin   oper
+---------  -----   -----      -----   -----          -------   -------
+Et1        off     off        off     off                  0         0
+Et2        off     off        off     off                  0         0
+Et49       desired on         desired on                  12         0
+Et50       desired on         desired on                   9         0

@@ -11,17 +11,32 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 use hemlock_platform::Platform;
-use hemlock_sai::{PortId, SaiBackend, SaiError, SaiEvent, SwitchInfo};
+use hemlock_sai::{
+    PortCounters, PortId, QueueCounters, SaiBackend, SaiError, SaiEvent, SwitchInfo,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::state::{name_for, PortState, SharedPorts, SwitchMeta};
+
+/// One port's stat sweep result.
+pub struct PortStatsSample {
+    pub name: String,
+    pub counters: PortCounters,
+    pub queues: Vec<QueueCounters>,
+}
 
 pub enum SaiCmd {
     SetAdminState {
         port: PortId,
         up: bool,
         reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    /// Batched counter sweep for the stats engine: one actor round-trip
+    /// per 5s sampling tick instead of one per port.
+    PortStats {
+        ports: Vec<(String, PortId)>,
+        reply: oneshot::Sender<Vec<PortStatsSample>>,
     },
 }
 
@@ -54,6 +69,20 @@ impl SaiHandle {
             .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
         rx.await
             .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))?
+    }
+
+    /// Sweep hardware counters for the given ports.
+    pub async fn port_stats(
+        &self,
+        ports: Vec<(String, PortId)>,
+    ) -> Result<Vec<PortStatsSample>, SaiError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SaiCmd::PortStats { ports, reply })
+            .await
+            .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
+        rx.await
+            .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))
     }
 }
 
@@ -93,6 +122,27 @@ impl SaiActor {
                         SaiCmd::SetAdminState { port, up, reply } => {
                             let result = backend.set_port_admin_state(port, up);
                             let _ = reply.send(result);
+                        }
+                        SaiCmd::PortStats { ports, reply } => {
+                            let mut samples = Vec::with_capacity(ports.len());
+                            for (name, id) in ports {
+                                let counters = match backend.port_counters(id) {
+                                    Ok(counters) => counters,
+                                    Err(e) => {
+                                        // Keep sweeping: one bad port must
+                                        // not blank every counter.
+                                        debug!(%name, error = %e, "port_counters failed");
+                                        continue;
+                                    }
+                                };
+                                let queues = backend.port_queue_counters(id).unwrap_or_default();
+                                samples.push(PortStatsSample {
+                                    name,
+                                    counters,
+                                    queues,
+                                });
+                            }
+                            let _ = reply.send(samples);
                         }
                     }
                 }

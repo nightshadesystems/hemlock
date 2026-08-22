@@ -1,0 +1,122 @@
+Ethernet1 is up, line protocol is up (connected)
+  Hardware is Ethernet, address is 2c:dd:e9:12:00:01 (bia 2c:dd:e9:12:00:01)
+  Description: host rack3-u12 nic1
+  Ethernet MTU 9214 bytes, BW 1000000 kbit
+  Full-duplex, 1Gb/s, auto negotiation: on, uni-link: n/a
+  Up 12 days, 4 hours, 33 minutes, 12 seconds
+  Loopback Mode : None
+  2 link status changes since last clear
+  Last clearing of "show interface" counters 12 days, 4:33:12 ago
+  5 minutes input rate 24.7 Mbps (2.5% with framing overhead), 4123 packets/sec
+  5 minutes output rate 96.3 Mbps (9.9% with framing overhead), 9877 packets/sec
+     4294811034 packets input, 4816030792344 bytes
+     Received 15234 broadcasts, 89127 multicast
+     0 runts, 0 giants
+     0 input errors, 0 CRC, 0 alignment, 0 symbol, 0 input discards
+     0 PAUSE input
+     8812734120 packets output, 11278449021837 bytes
+     Sent 1287 broadcasts, 44506 multicast
+     0 output errors, 0 collisions
+     0 late collision, 0 deferred, 2 output discards
+     0 PAUSE output
+
+Ethernet2 is up, line protocol is up (connected)
+  Hardware is Ethernet, address is 2c:dd:e9:12:00:02 (bia 2c:dd:e9:12:00:02)
+  Description: trunk to lab-ap1
+  Ethernet MTU 9214 bytes, BW 1000000 kbit
+  Full-duplex, 1Gb/s, auto negotiation: on, uni-link: n/a
+  Up 12 days, 4 hours, 31 minutes, 2 seconds
+  Loopback Mode : None
+  1 link status changes since last clear
+  Last clearing of "show interface" counters never
+  5 minutes input rate 3.11 Mbps (0.3% with framing overhead), 1204 packets/sec
+  5 minutes output rate 1.02 Mbps (0.1% with framing overhead), 655 packets/sec
+     102981234 packets input, 90238471234 bytes
+     Received 88123 broadcasts, 412987 multicast
+     0 runts, 0 giants
+     0 input errors, 0 CRC, 0 alignment, 0 symbol, 0 input discards
+     0 PAUSE input
+     88123911 packets output, 71234098123 bytes
+     Sent 9812 broadcasts, 128730 multicast
+     0 output errors, 0 collisions
+     0 late collision, 0 deferred, 0 output discards
+     0 PAUSE output
+
+Ethernet3 is administratively down, line protocol is down (disabled)
+  Hardware is Ethernet, address is 2c:dd:e9:12:00:03 (bia 2c:dd:e9:12:00:03)
+  Ethernet MTU 9214 bytes, BW 1000000 kbit
+  Full-duplex, Unconfigured, auto negotiation: off, uni-link: n/a
+  Down 12 days, 4 hours, 40 minutes, 51 seconds
+  Loopback Mode : None
+  0 link status changes since last clear
+  Last clearing of "show interface" counters never
+  5 minutes input rate 0 bps (0.0% with framing overhead), 0 packets/sec
+  5 minutes output rate 0 bps (0.0% with framing overhead), 0 packets/sec
+     0 packets input, 0 bytes
+     Received 0 broadcasts, 0 multicast
+     0 runts, 0 giants
+     0 input errors, 0 CRC, 0 alignment, 0 symbol, 0 input discards
+     0 PAUSE input
+     0 packets output, 0 bytes
+     Sent 0 broadcasts, 0 multicast
+     0 output errors, 0 collisions
+     0 late collision, 0 deferred, 0 output discards
+     0 PAUSE output
+
+Management1 is up, line protocol is up (connected)
+  Hardware is Ethernet, address is 2c:dd:e9:12:00:00 (bia 2c:dd:e9:12:00:00)
+  Description: OOB management
+  Internet address is 10.10.0.21/24
+  Broadcast address is 255.255.255.255
+  IP MTU 1500 bytes, BW 1000000 kbit
+  Full-duplex, 1Gb/s, auto negotiation: on, uni-link: n/a
+  Up 12 days, 4 hours, 41 minutes, 3 seconds
+  Loopback Mode : None
+  1 link status changes since last clear
+  Last clearing of "show interface" counters never
+  5 minutes input rate 12.3 kbps (0.0% with framing overhead), 14 packets/sec
+  5 minutes output rate 8.91 kbps (0.0% with framing overhead), 9 packets/sec
+     1412341 packets input, 212398123 bytes
+     Received 41234 broadcasts, 98123 multicast
+     0 runts, 0 giants
+     0 input errors, 0 CRC, 0 alignment, 0 symbol, 0 input discards
+     0 PAUSE input
+     998123 packets output, 141234123 bytes
+     Sent 12 broadcasts, 2098 multicast
+     0 output errors, 0 collisions
+     0 late collision, 0 deferred, 0 output discards
+     0 PAUSE output
+
+Loopback0 is up, line protocol is up (connected)
+  Hardware is Loopback
+  Description: Router-ID
+  Internet address is 10.255.0.11/32
+  Broadcast address is 255.255.255.255
+  IP MTU 65535 bytes
+  Up 12 days, 4 hours, 41 minutes, 10 seconds
+
+Vlan10 is up, line protocol is up (connected)
+  Hardware is Vlan, address is 2c:dd:e9:12:00:01 (bia 2c:dd:e9:12:00:01)
+  Description: LAN-USERS
+  Internet address is 10.20.10.2/24
+  Broadcast address is 255.255.255.255
+  IP MTU 1500 bytes, BW 1000000 kbit
+  Up 12 days, 4 hours, 31 minutes, 0 seconds
+
+Port-Channel1 is up, line protocol is up (connected)
+  Hardware is Port-Channel, address is 2c:dd:e9:12:00:31 (bia 2c:dd:e9:12:00:31)
+  Description: uplink LAG to qs-hq-spine
+  Ethernet MTU 9214 bytes, BW 20000000 kbit
+  Up 12 days, 3 hours, 58 minutes, 44 seconds
+  Active members in this channel: 2
+  ... Ethernet49 , Full-duplex, 10Gb/s
+  ... Ethernet50 , Full-duplex, 10Gb/s
+  Fallback mode is: off
+  5 minutes input rate 210 Mbps (1.1% with framing overhead), 24123 packets/sec
+  5 minutes output rate 189 Mbps (1.0% with framing overhead), 21877 packets/sec
+     84812734120 packets input, 101278449021837 bytes
+     Received 812 broadcasts, 991234 multicast
+     0 input errors, 0 input discards
+     78123911223 packets output, 91234098123441 bytes
+     Sent 44 broadcasts, 812734 multicast
+     0 output errors, 0 output discards

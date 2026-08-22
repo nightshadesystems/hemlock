@@ -48,7 +48,7 @@ enum Mode {
 
 /// Match `input` against a command word set, EOS-style: unique prefixes
 /// are accepted (`sh` -> `show`, `conf` -> `configure`).
-fn resolve<'a>(input: &str, words: &[&'a str]) -> Result<&'a str, String> {
+pub(crate) fn resolve<'a>(input: &str, words: &[&'a str]) -> Result<&'a str, String> {
     if let Some(exact) = words.iter().find(|w| **w == input) {
         return Ok(exact);
     }
@@ -64,15 +64,6 @@ fn resolve<'a>(input: &str, words: &[&'a str]) -> Result<&'a str, String> {
             "% Ambiguous command {input:?}: {}",
             many.join(", ")
         )),
-    }
-}
-
-/// Status word per EOS: connected / notconnect / disabled.
-pub fn status_word(admin_up: bool, oper_up: bool) -> &'static str {
-    match (admin_up, oper_up) {
-        (false, _) => "disabled",
-        (true, true) => "connected",
-        (true, false) => "notconnect",
     }
 }
 
@@ -226,7 +217,7 @@ fn fail(err: anyhow::Error) -> Step {
 /// operator-facing truth. The socket path in the IPC error identifies
 /// which daemon; the cause separates "daemon down" from "socket exists
 /// but this account may not open it" (not in the hemlock group).
-fn fmt_err(err: anyhow::Error) -> String {
+pub(crate) fn fmt_err(err: anyhow::Error) -> String {
     let text = format!("{err:#}");
     if text.contains("ipc failure") {
         for daemon in ["syncd", "pmon", "mgmtd"] {
@@ -272,7 +263,11 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
         "exit" | "quit" | "logout" => Ok(None),
         "help" | "?" => {
             println!("Operational commands:");
-            println!("  show interfaces [status|transceiver]   port state");
+            println!("  show interfaces [<name>] [<subcommand>] [| json]");
+            println!("      subcommands: description, status, counters [errors|discards|rates|");
+            println!("      queue|bins], transceiver [detail|properties|eeprom], capabilities,");
+            println!("      flowcontrol, negotiation [detail], phy [detail], mac [detail],");
+            println!("      switchport, trunk, vlans");
             println!("  show environment                       fans / temps / PSUs");
             println!(
                 "  show configuration                     running configuration (config/conf ok)"
@@ -315,20 +310,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
     }
     let run = async {
         match resolve(first, TOPICS)? {
-            "interfaces" => match words.get(1) {
-                None => show::interfaces(endpoints.syncd.clone())
-                    .await
-                    .map_err(fmt_err),
-                Some(sub) => match resolve(sub, &["status", "transceiver"])? {
-                    "status" => show::interfaces_status(endpoints.syncd.clone())
-                        .await
-                        .map_err(fmt_err),
-                    "transceiver" => show::transceivers(endpoints.pmon.clone())
-                        .await
-                        .map_err(fmt_err),
-                    _ => unreachable!(),
-                },
-            },
+            "interfaces" => {
+                crate::interfaces::cmd::run(&endpoints.syncd, &endpoints.pmon, &words[1..]).await
+            }
             "environment" => show::environment(endpoints.pmon.clone())
                 .await
                 .map_err(fmt_err),
@@ -683,13 +667,5 @@ mod tests {
         assert!(resolve("c", topics).is_err());
         assert!(resolve("co", topics).is_err());
         assert!(resolve("con", topics).is_err());
-    }
-
-    #[test]
-    fn status_words_match_eos() {
-        assert_eq!(status_word(true, true), "connected");
-        assert_eq!(status_word(true, false), "notconnect");
-        assert_eq!(status_word(false, false), "disabled");
-        assert_eq!(status_word(false, true), "disabled");
     }
 }

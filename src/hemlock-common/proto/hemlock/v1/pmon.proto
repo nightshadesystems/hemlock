@@ -48,4 +48,39 @@ message Transceiver {
   string vendor = 4;
   string part_number = 5;
   string serial = 6;
+  string date_code = 7;     // SFF-8472 vendor date code, e.g. "210412"
+  // Compliance-derived media type, e.g. "10GBASE-SR".
+  string media_type = 8;
+  // Digital diagnostics (SFF-8472 A2 page); absent when the module does
+  // not implement DOM.
+  DomValues dom = 9;
+  DomThresholds thresholds = 10;
+  // Raw EEPROM pages for `show interfaces transceiver eeprom`.
+  bytes eeprom_a0 = 11;
+  bytes eeprom_a2 = 12;
+  // Age of the cached EEPROM read ("Last Update").
+  uint64 age_secs = 13;
+}
+
+message DomValues {
+  double temp_c = 1;
+  double voltage_v = 2;
+  double bias_ma = 3;
+  double tx_dbm = 4;
+  double rx_dbm = 5;
+}
+
+message DomThreshold {
+  double high_alarm = 1;
+  double high_warn = 2;
+  double low_alarm = 3;
+  double low_warn = 4;
+}
+
+message DomThresholds {
+  DomThreshold temperature = 1;
+  DomThreshold voltage = 2;
+  DomThreshold bias = 3;
+  DomThreshold tx_power = 4;
+  DomThreshold rx_power = 5;
 }

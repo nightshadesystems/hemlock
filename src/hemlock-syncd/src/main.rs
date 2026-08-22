@@ -10,6 +10,8 @@
 //! gRPC for mgmtd/orch/hemlockctl.
 
 mod actor;
+mod ifstats;
+mod netdev;
 mod service;
 mod state;
 
@@ -86,14 +88,60 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let handle = std::sync::Arc::new(handle);
+
+    // Interface statistics: counters, rates, link history for
+    // `show interfaces ...`. Default load interval 300s (EOS parity).
+    let engine = ifstats::Engine::new(300);
+    let netdevs: service::SharedNetdevs = std::sync::Arc::default();
+    let inventory = service::Inventory {
+        platform_model: format!(
+            "{} {}",
+            platform.manifest.platform.vendor, platform.manifest.platform.model
+        ),
+        management: platform
+            .manifest
+            .management
+            .as_ref()
+            .map(|m| (m.interface.clone(), m.os_device.clone())),
+        uc_queues: platform.manifest.ports.uc_queues,
+        mc_queues: platform.manifest.ports.mc_queues,
+        mac: hemlock_platform::sysinit::Sysfs::real()
+            .base_mac(&platform.manifest)
+            .map(|b| b.map(|x| format!("{x:02x}")).join(":")),
+    };
+    tokio::spawn(collect_stats(
+        handle.clone(),
+        engine.clone(),
+        netdevs.clone(),
+        inventory.management.clone(),
+    ));
+    {
+        // Count link flaps at event granularity, not the 5s sweep.
+        let engine = engine.clone();
+        let mut events = handle.events.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        engine.note_link(&event.name, event.oper_up, std::time::Instant::now())
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     let listen: IpcEndpoint = match &args.listen {
         Some(s) => s.parse()?,
         None => Daemon::Syncd.default_endpoint(),
     };
     info!(%listen, "serving gRPC");
 
-    let router = tonic::transport::Server::builder()
-        .add_service(SyncdServer::new(service::SyncdService::new(handle)));
+    let router = tonic::transport::Server::builder().add_service(SyncdServer::new(
+        service::SyncdService::new(handle, engine, netdevs, inventory),
+    ));
     listen
         .serve(router, async {
             let _ = tokio::signal::ctrl_c().await;
@@ -176,6 +224,72 @@ fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box
             "this hemlock-syncd was built without the real-sai feature; \
              only --mock is available"
         );
+    }
+}
+
+/// The 5s stats sweep: ASIC port counters through the actor, kernel
+/// interfaces (management + display-named netdevs) from sysfs. Feeds the
+/// engine, which tracks rates, link history, and clear baselines.
+async fn collect_stats(
+    handle: std::sync::Arc<actor::SaiHandle>,
+    engine: ifstats::SharedEngine,
+    netdevs: service::SharedNetdevs,
+    management: Option<(String, String)>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let now = std::time::Instant::now();
+
+        let ports: Vec<(String, hemlock_sai::PortId)> = handle
+            .ports
+            .read()
+            .map(|table| {
+                table
+                    .iter()
+                    .map(|(name, p)| (name.clone(), p.sai_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match handle.port_stats(ports).await {
+            Ok(samples) => {
+                for sample in samples {
+                    let queues = sample
+                        .queues
+                        .iter()
+                        .map(|q| ifstats::QueueSample {
+                            label: format!("{}{}", if q.unicast { "UC" } else { "MC" }, q.index),
+                            pkts: q.pkts,
+                            bytes: q.bytes,
+                            dropped_pkts: q.dropped_pkts,
+                            dropped_bytes: q.dropped_bytes,
+                        })
+                        .collect();
+                    engine.ingest(&sample.name, sample.counters.into(), queues, now);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "port stats sweep failed"),
+        }
+        // Oper-state sync (dedup'd in note_link): seeds initial states
+        // and backstops any events lost before the subscription started.
+        if let Ok(table) = handle.ports.read() {
+            for (name, port) in table.iter() {
+                engine.note_link(name, port.oper_up, now);
+            }
+        }
+
+        let mgmt = management.as_ref().map(|(d, o)| (d.as_str(), o.as_str()));
+        let samples = netdev::sample_all(mgmt);
+        let mut map = std::collections::HashMap::new();
+        for sample in samples {
+            engine.ingest(&sample.name, sample.counters, Vec::new(), now);
+            engine.note_link(&sample.name, sample.oper_up, now);
+            map.insert(sample.name.clone(), sample);
+        }
+        if let Ok(mut shared) = netdevs.write() {
+            *shared = map;
+        }
     }
 }
 

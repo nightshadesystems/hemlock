@@ -1,0 +1,17 @@
+Current System Time: Thu Aug 20 14:02:11 2026
+Ethernet1
+  Current State
+    PHY state                                linkUp
+    Interface state                          up
+    HW resets                                1
+    Transceiver                              1000BASE-T
+    Oper speed                               1Gbps
+    Interrupt count                          4
+    Diags mode                               normalOperation
+    Model                                    HLK-PHY-BCM54282
+    Reset count                              1
+    PHY state changes                        2
+      Last change                            12 days, 4:33:12 ago
+  Speed Configuration
+    Configured speed                         auto
+    Auto-negotiation                         on

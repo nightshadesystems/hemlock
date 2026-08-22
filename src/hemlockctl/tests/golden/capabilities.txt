@@ -1,0 +1,11 @@
+Ethernet1
+  Model:          Celestica E1031
+  Type:           1000BASE-T
+  Speed/Duplex:   10M/half,10M/full,100M/half,100M/full,1G/full,auto
+  Flowcontrol:    rx-(off,on,desired),tx-(off,on,desired)
+
+Ethernet49
+  Model:          Celestica E1031
+  Type:           10GBASE-SR
+  Speed/Duplex:   1G/full,10G/full,auto
+  Flowcontrol:    rx-(off,on,desired),tx-(off,on,desired)

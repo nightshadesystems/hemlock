@@ -1,0 +1,8 @@
+Ethernet49
+  MAC address:            2c:dd:e9:12:00:31
+  MAC state:              linkUp
+  Local fault:            False
+  Remote fault:           False
+  FEC mode:               Disabled
+  FEC corrected codewords:   0
+  FEC uncorrected codewords: 0
