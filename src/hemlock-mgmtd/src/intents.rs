@@ -1,5 +1,10 @@
 //! Interface intents: the slice of the config tree mgmtd knows how to
-//! apply in phase 1 (`interfaces { ethernet <name> { ... } }`).
+//! apply in phase 1 (`interfaces { Ethernet1 { ... } }` — the interface
+//! name is the block name; the legacy `ethernet <name>` keyed form is
+//! still accepted for configs persisted before the format change).
+//!
+//! Management interfaces (`Management*`) are OS netdevs, not ASIC ports;
+//! their blocks are ignored here until an OS-side applier exists.
 //!
 //! Later phases add more intent families (vlans, lags, routing policy);
 //! each stays a pure function from config tree to typed intent, diffed
@@ -7,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use hemlock_config::ConfigTree;
+use hemlock_config::{ConfigTree, Item};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InterfaceIntent {
@@ -18,13 +23,13 @@ pub struct InterfaceIntent {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IntentError {
-    #[error("interfaces: ethernet block needs exactly one name key")]
-    BadEthernetKey,
+    #[error("interfaces: {0}")]
+    BadInterfaceBlock(String),
 
     #[error("interface {name}: admin-state must be `enabled` or `disabled`, got {value:?}")]
     BadAdminState { name: String, value: String },
 
-    #[error("interface {name}: duplicate ethernet block")]
+    #[error("interface {name}: duplicate interface block")]
     Duplicate { name: String },
 }
 
@@ -35,9 +40,33 @@ pub fn interfaces(tree: &ConfigTree) -> Result<BTreeMap<String, InterfaceIntent>
         return Ok(intents);
     };
 
-    for (keys, children) in ConfigTree::blocks_named(items, "ethernet") {
-        let [name] = keys else {
-            return Err(IntentError::BadEthernetKey);
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            continue;
+        };
+        let ifname = match (name.as_str(), keys.as_slice()) {
+            // Legacy keyed form: `ethernet <name> { ... }`.
+            ("ethernet", [key]) => key.clone(),
+            ("ethernet", _) => {
+                return Err(IntentError::BadInterfaceBlock(
+                    "ethernet block needs exactly one name key".into(),
+                ));
+            }
+            // Management interfaces are OS netdevs; not applied here.
+            ("management", _) => continue,
+            (n, []) if n.starts_with("Management") => continue,
+            // Current form: the interface name is the block name.
+            (n, []) if n.starts_with("Ethernet") => name.clone(),
+            (n, _) => {
+                return Err(IntentError::BadInterfaceBlock(format!(
+                    "unrecognized interface block {n:?}"
+                )));
+            }
         };
         let mut intent = InterfaceIntent::default();
 
@@ -47,7 +76,7 @@ pub fn interfaces(tree: &ConfigTree) -> Result<BTreeMap<String, InterfaceIntent>
                 "disabled" => Some(false),
                 other => {
                     return Err(IntentError::BadAdminState {
-                        name: name.clone(),
+                        name: ifname.clone(),
                         value: other.to_string(),
                     })
                 }
@@ -57,8 +86,8 @@ pub fn interfaces(tree: &ConfigTree) -> Result<BTreeMap<String, InterfaceIntent>
             intent.description = Some(value.to_string());
         }
 
-        if intents.insert(name.clone(), intent).is_some() {
-            return Err(IntentError::Duplicate { name: name.clone() });
+        if intents.insert(ifname.clone(), intent).is_some() {
+            return Err(IntentError::Duplicate { name: ifname });
         }
     }
     Ok(intents)
@@ -184,6 +213,29 @@ interfaces {
             }
         );
         assert_eq!(intents["Ethernet1"].admin_up, Some(true));
+    }
+
+    #[test]
+    fn extracts_name_as_block_form_and_skips_management() {
+        let intents = intents_of(
+            "interfaces {\n    Ethernet1 {\n        admin-state disabled\n        description uplink\n    }\n    Management1 {\n        admin-state enabled\n    }\n}\n",
+        );
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents["Ethernet1"],
+            InterfaceIntent {
+                admin_up: Some(false),
+                description: Some("uplink".into())
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_and_current_forms_are_equivalent() {
+        assert_eq!(
+            intents_of("interfaces { ethernet Ethernet3 { admin-state disabled; } }"),
+            intents_of("interfaces { Ethernet3 { admin-state disabled } }"),
+        );
     }
 
     #[test]

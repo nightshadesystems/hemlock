@@ -3,10 +3,13 @@
 //! Grammar:
 //! ```text
 //! config    := statement*
-//! statement := WORD WORD* ( ';' | '{' statement* '}' )
+//! statement := WORD WORD* ( EOL | ';' | '{' statement* '}' )
 //! ```
-//! The first word is the node name; the remaining words before `;` are leaf
-//! values, before `{` they are block keys.
+//! The first word is the node name; the remaining words are leaf values
+//! (before end-of-line) or block keys (before `{`). Leaves end at the end
+//! of the line; `;` is also accepted as a terminator so configs written in
+//! the older semicolon style keep parsing. A closing `}` or end of input
+//! also finishes a pending leaf, allowing `flags { fast }` on one line.
 
 use crate::lexer::{lex, LexError, Spanned, Token};
 use crate::tree::{ConfigTree, Item};
@@ -62,13 +65,17 @@ impl Parser {
         }
     }
 
-    /// Parse statements until EOF (top level) or a closing brace.
+    /// Parse statements until EOF (top level) or a closing brace. Blank
+    /// lines between statements are skipped.
     fn statements(&mut self, top_level: bool) -> Result<Vec<Item>, ParseError> {
         let mut items = Vec::new();
         loop {
             match self.peek() {
                 None if top_level => return Ok(items),
                 None => return Err(ParseError::UnexpectedEof),
+                Some(spanned) if spanned.token == Token::Newline => {
+                    self.pos += 1;
+                }
                 Some(spanned) if spanned.token == Token::RBrace => {
                     if top_level {
                         return Err(Self::unexpected(spanned, "a statement"));
@@ -93,14 +100,37 @@ impl Parser {
 
         let mut words = Vec::new();
         loop {
-            match self.next() {
+            match self.peek() {
                 Some(Spanned {
-                    token: Token::Word(word),
+                    token: Token::Word(_),
                     ..
-                }) => words.push(word),
-                Some(Spanned {
-                    token: Token::Semi, ..
                 }) => {
+                    let Some(Spanned {
+                        token: Token::Word(word),
+                        ..
+                    }) = self.next()
+                    else {
+                        unreachable!("peek said Word");
+                    };
+                    words.push(word);
+                }
+                // Leaf terminators: end of line, `;`, or — without
+                // consuming — the enclosing block's `}` / end of input.
+                Some(Spanned {
+                    token: Token::Semi | Token::Newline,
+                    ..
+                }) => {
+                    self.pos += 1;
+                    return Ok(Item::Leaf {
+                        name,
+                        values: words,
+                    });
+                }
+                Some(Spanned {
+                    token: Token::RBrace,
+                    ..
+                })
+                | None => {
                     return Ok(Item::Leaf {
                         name,
                         values: words,
@@ -110,6 +140,7 @@ impl Parser {
                     token: Token::LBrace,
                     ..
                 }) => {
+                    self.pos += 1;
                     let children = self.statements(false)?;
                     return Ok(Item::Block {
                         name,
@@ -117,8 +148,6 @@ impl Parser {
                         children,
                     });
                 }
-                Some(other) => return Err(Self::unexpected(&other, "';' or '{'")),
-                None => return Err(ParseError::UnexpectedEof),
             }
         }
     }
@@ -170,10 +199,29 @@ interfaces {
 
     #[test]
     fn round_trips_canonical_text() {
-        let source = "interfaces {\n    ethernet Ethernet0 {\n        description \"has spaces\";\n    }\n}\n";
+        let source = "interfaces {\n    ethernet Ethernet0 {\n        description \"has spaces\"\n    }\n}\n";
         let tree = parse(source).unwrap();
         assert_eq!(tree.to_text(), source);
         assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+    }
+
+    #[test]
+    fn newline_terminated_statements_parse() {
+        // The current style: no semicolons anywhere.
+        let tree = parse("system {\n    hostname sw1\n}\ninterfaces {\n    ethernet Ethernet0 {\n        admin-state enabled\n    }\n}\n").unwrap();
+        let (_, system) = tree.block("system").unwrap();
+        assert_eq!(ConfigTree::leaf_value(system, "hostname"), Some("sw1"));
+        let (_, interfaces) = tree.block("interfaces").unwrap();
+        let (_, eth) = ConfigTree::blocks_named(interfaces, "ethernet")
+            .next()
+            .unwrap();
+        assert_eq!(ConfigTree::leaf_value(eth, "admin-state"), Some("enabled"));
+
+        // Mixed styles parse identically: `;`, newline, and }-terminated.
+        assert_eq!(
+            parse("a { b 1; c 2\n d 3 }").unwrap(),
+            parse("a {\n b 1\n c 2\n d 3\n}").unwrap()
+        );
     }
 
     #[test]
@@ -192,10 +240,10 @@ interfaces {
 
     #[test]
     fn error_reports_position() {
-        let err = parse("system {\n    hostname sw1\n}\n").unwrap_err();
-        // '}' arrives while 'hostname' still wants ';' — pointed at line 3.
+        // A statement must start with a name; a bare '{' is pointed at.
+        let err = parse("system {\n    { oops }\n}\n").unwrap_err();
         match err {
-            ParseError::Unexpected { line, .. } => assert_eq!(line, 3),
+            ParseError::Unexpected { line, .. } => assert_eq!(line, 2),
             other => panic!("wrong error: {other}"),
         }
     }

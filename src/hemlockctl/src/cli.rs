@@ -1,20 +1,22 @@
 //! The Hemlock CLI: the interactive operator shell (`hemlockctl` with no
 //! arguments — and, on a switch, the login shell).
 //!
-//! Arista EOS-style syntax over Hemlock's candidate/commit engine:
+//! VyOS/Juniper-style syntax over Hemlock's candidate/commit engine:
 //!
 //! ```text
 //! root@hemlock> show interfaces status
 //! root@hemlock> configure
-//! root@hemlock# interface Ethernet0
-//! root@hemlock(config-if-Ethernet0)# description uplink to core-1
-//! root@hemlock(config-if-Ethernet0)# shutdown
-//! root@hemlock(config-if-Ethernet0)# end
+//! root@hemlock# set interfaces Ethernet1 description "uplink to core-1"
+//! root@hemlock# set interfaces Eth1 admin-state disabled
 //! root@hemlock# commit
+//! root@hemlock# exit
 //! ```
 //!
-//! `bash` drops to the Linux shell (as on EOS), so `sh` unambiguously
-//! abbreviates `show`.
+//! Interface arguments accept aliases: `Eth1`, `eth1`, `e1` all mean
+//! `Ethernet1`.
+//!
+//! `bash` drops to the Linux shell, so `sh` unambiguously abbreviates
+//! `show`.
 //!
 //! Prompts follow the Nightshade convention: `user@hostname>` in
 //! operational mode, `user@hostname#` in configuration mode. Config-mode
@@ -42,7 +44,6 @@ pub struct Endpoints {
 enum Mode {
     Operational,
     Config,
-    ConfigIf(String),
 }
 
 /// Match `input` against a command word set, EOS-style: unique prefixes
@@ -127,13 +128,11 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
             state.mode = match &mode {
                 Mode::Operational => CliMode::Operational,
                 Mode::Config => CliMode::Config,
-                Mode::ConfigIf(_) => CliMode::ConfigIf,
             };
         }
         let prompt = match &mode {
             Mode::Operational => format!("{user}@{hostname}> "),
             Mode::Config => format!("{user}@{hostname}# "),
-            Mode::ConfigIf(port) => format!("{user}@{hostname}(config-if-{port})# "),
         };
         let line = tokio::task::block_in_place(|| rl.readline(&prompt));
         let line = match line {
@@ -146,13 +145,38 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
         if trimmed.is_empty() {
             continue;
         }
+        // EOS-style contextual help: a line ending in `?` lists what may
+        // follow instead of executing (`show interfaces ?`, `show int?`).
+        // A lone `?` still reaches the mode handlers' annotated help.
+        if trimmed != "?" && trimmed.ends_with('?') {
+            let body = &trimmed[..trimmed.len() - 1];
+            let ends_mid_word = !body.is_empty() && !body.ends_with(char::is_whitespace);
+            let mut tokens: Vec<&str> = body.split_whitespace().collect();
+            let partial = if ends_mid_word {
+                tokens.pop().unwrap_or("")
+            } else {
+                ""
+            };
+            let (cli_mode, ports) = match helper_state.lock() {
+                Ok(state) => (state.mode, state.ports.clone()),
+                Err(_) => (CliMode::Operational, Vec::new()),
+            };
+            let options = complete::candidates(cli_mode, &tokens, partial, &ports);
+            if options.is_empty() {
+                println!("  <cr>");
+            } else {
+                for option in options {
+                    println!("  {option}");
+                }
+            }
+            continue;
+        }
         let _ = rl.add_history_entry(trimmed);
         let words: Vec<&str> = trimmed.split_whitespace().collect();
 
         let next = match &mode {
             Mode::Operational => operational(&endpoints, &words).await,
             Mode::Config => config(&endpoints, &words).await,
-            Mode::ConfigIf(port) => config_if(&endpoints, port.clone(), &words).await,
         };
         match next {
             Ok(Some(new_mode)) => mode = new_mode,
@@ -163,7 +187,7 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
     Ok(())
 }
 
-fn read_hostname() -> String {
+pub(crate) fn read_hostname() -> String {
     #[cfg(unix)]
     {
         for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
@@ -327,37 +351,16 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
 
 async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
     const COMMANDS: &[&str] = &[
-        "interface",
-        "show",
-        "commit",
-        "rollback",
-        "discard",
-        "abort",
-        "exit",
-        "end",
-        "help",
-        "?",
+        "set", "delete", "show", "commit", "rollback", "discard", "exit", "help", "?",
     ];
     match resolve(words[0], COMMANDS)? {
-        "interface" => {
-            let Some(name) = words.get(1) else {
-                return Err("% Usage: interface <name>  (e.g. interface Ethernet0)".into());
-            };
-            // Validate against syncd so typos surface immediately.
-            let known = list_port_names(endpoints).await.map_err(fmt_err)?;
-            let name = match known.iter().find(|n| n.as_str() == *name) {
-                Some(name) => name.clone(),
-                None => {
-                    let candidates: Vec<&String> =
-                        known.iter().filter(|n| n.starts_with(*name)).collect();
-                    match candidates.as_slice() {
-                        [only] => (*only).clone(),
-                        [] => return Err(format!("% No such interface {name:?}")),
-                        _ => return Err(format!("% Ambiguous interface {name:?}")),
-                    }
-                }
-            };
-            stay(Mode::ConfigIf(name))
+        "set" => {
+            config_edit(endpoints, &words[1..], /* delete = */ false).await?;
+            stay(Mode::Config)
+        }
+        "delete" => {
+            config_edit(endpoints, &words[1..], /* delete = */ true).await?;
+            stay(Mode::Config)
         }
         "show" => {
             // The config session's view: the candidate.
@@ -402,96 +405,119 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
                 Err(e) => fail(e),
             }
         }
-        "discard" | "abort" => match discard(endpoints).await {
+        "discard" => match discard(endpoints).await {
             Ok(()) => {
                 println!("candidate discarded");
                 stay(Mode::Config)
             }
             Err(e) => fail(e),
         },
-        "exit" | "end" => stay(Mode::Operational),
+        "exit" => stay(Mode::Operational),
         "help" | "?" => {
-            println!("Configuration commands:");
-            println!("  interface <name>          configure an interface");
+            println!("Configuration commands (edit the candidate; `commit` applies):");
+            println!("  set interfaces <port> description <text>");
+            println!("  set interfaces <port> admin-state <enabled|disabled>");
+            println!("  delete interfaces <port> [description|admin-state]");
             println!("  show                      show the candidate configuration");
             println!(
                 "  commit [confirmed <s>]    apply the candidate (auto-rollback unless confirmed)"
             );
             println!("  rollback <n>              load rollback n into the candidate");
-            println!("  discard | abort           reset candidate to running");
-            println!("  exit | end                back to operational mode");
+            println!("  discard                   reset candidate to running");
+            println!("  exit                      back to operational mode");
+            println!("Ports accept aliases: Eth1 / eth1 / e1 all mean Ethernet1.");
             stay(Mode::Config)
         }
         _ => unreachable!(),
     }
 }
 
-async fn config_if(endpoints: &Endpoints, port: String, words: &[&str]) -> Step {
-    const COMMANDS: &[&str] = &["description", "shutdown", "no", "exit", "end", "help", "?"];
-    match resolve(words[0], COMMANDS)? {
+/// Shared body of `set` and `delete`: resolve the path, canonicalize the
+/// interface name, apply the edit to the candidate.
+async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || format!("% Usage: {verb} interfaces <port> [description|admin-state ...]");
+    let Some(top) = words.first() else {
+        return Err(usage());
+    };
+    resolve(top, &["interfaces"])?;
+    let Some(raw_port) = words.get(1) else {
+        return Err(usage());
+    };
+    let known = list_port_names(endpoints).await.map_err(fmt_err)?;
+    let port = canonical_port(raw_port, &known)?;
+    let rest = &words[2..];
+
+    if rest.is_empty() {
+        return if delete {
+            // Delete the whole interface node; commit reverts the port to
+            // defaults.
+            edit_config(endpoints, |tree| {
+                let interfaces = tree.block_mut("interfaces");
+                ConfigTree::remove_block(interfaces, &port, &[]);
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            // Bare `set interfaces <port>`: create the (empty) node.
+            edit_interface(endpoints, &port, |_| {})
+                .await
+                .map_err(fmt_err)
+        };
+    }
+
+    match resolve(rest[0], &["description", "admin-state"])? {
         "description" => {
-            let text = words[1..].join(" ");
-            if text.is_empty() {
-                return Err("% Usage: description <text>".into());
-            }
-            match edit_interface(endpoints, &port, |eth| {
-                ConfigTree::set_leaf(eth, "description", vec![text.clone()]);
-            })
-            .await
-            {
-                Ok(()) => stay(Mode::ConfigIf(port)),
-                Err(e) => fail(e),
+            if delete {
+                edit_interface(endpoints, &port, |eth| {
+                    ConfigTree::remove_leaf(eth, "description");
+                })
+                .await
+            } else {
+                let text = rest[1..].join(" ");
+                if text.is_empty() {
+                    return Err(format!("% Usage: set interfaces {port} description <text>"));
+                }
+                edit_interface(endpoints, &port, |eth| {
+                    ConfigTree::set_leaf(eth, "description", vec![text]);
+                })
+                .await
             }
         }
-        "shutdown" => {
-            match edit_interface(endpoints, &port, |eth| {
-                ConfigTree::set_leaf(eth, "admin-state", vec!["disabled".into()]);
-            })
-            .await
-            {
-                Ok(()) => stay(Mode::ConfigIf(port)),
-                Err(e) => fail(e),
+        "admin-state" => {
+            if delete {
+                edit_interface(endpoints, &port, |eth| {
+                    ConfigTree::remove_leaf(eth, "admin-state");
+                })
+                .await
+            } else {
+                let Some(value) = rest.get(1) else {
+                    return Err(format!(
+                        "% Usage: set interfaces {port} admin-state <enabled|disabled>"
+                    ));
+                };
+                let value = resolve(value, &["enabled", "disabled"])?.to_string();
+                edit_interface(endpoints, &port, |eth| {
+                    ConfigTree::set_leaf(eth, "admin-state", vec![value]);
+                })
+                .await
             }
-        }
-        "no" => match words.get(1) {
-            Some(sub) => match resolve(sub, &["shutdown", "description"])? {
-                "shutdown" => {
-                    match edit_interface(endpoints, &port, |eth| {
-                        ConfigTree::set_leaf(eth, "admin-state", vec!["enabled".into()]);
-                    })
-                    .await
-                    {
-                        Ok(()) => stay(Mode::ConfigIf(port)),
-                        Err(e) => fail(e),
-                    }
-                }
-                "description" => {
-                    match edit_interface(endpoints, &port, |eth| {
-                        ConfigTree::remove_leaf(eth, "description");
-                    })
-                    .await
-                    {
-                        Ok(()) => stay(Mode::ConfigIf(port)),
-                        Err(e) => fail(e),
-                    }
-                }
-                _ => unreachable!(),
-            },
-            None => Err("% Usage: no <shutdown|description>".into()),
-        },
-        "exit" => stay(Mode::Config),
-        "end" => stay(Mode::Operational),
-        "help" | "?" => {
-            println!("Interface commands (edit the candidate; `commit` applies):");
-            println!("  description <text>    set the port description");
-            println!("  no description        clear the port description");
-            println!("  shutdown              admin-disable the port");
-            println!("  no shutdown           admin-enable the port");
-            println!("  exit                  back to configuration mode");
-            println!("  end                   back to operational mode");
-            stay(Mode::ConfigIf(port))
         }
         _ => unreachable!(),
+    }
+    .map_err(fmt_err)
+}
+
+/// Canonical interface name from user input (exact, alias like `Eth1`,
+/// or unique prefix), validated against syncd's port list.
+fn canonical_port(input: &str, known: &[String]) -> Result<String, String> {
+    match complete::match_port(input, known) {
+        complete::PortMatch::One(name) => Ok(name),
+        complete::PortMatch::NoMatch => Err(format!("% No such interface {input:?}")),
+        complete::PortMatch::Ambiguous(hits) => Err(format!(
+            "% Ambiguous interface {input:?}: {}",
+            hits.join(", ")
+        )),
     }
 }
 
@@ -528,22 +554,16 @@ async fn candidate_text(endpoints: &Endpoints) -> Result<String> {
         .text)
 }
 
-/// Fetch the candidate, apply `edit` to `interfaces { ethernet <port> }`,
-/// push it back. Each interface command round-trips so the candidate in
-/// mgmtd is always the truth.
-async fn edit_interface(
-    endpoints: &Endpoints,
-    port: &str,
-    edit: impl FnOnce(&mut Vec<hemlock_config::Item>),
-) -> Result<()> {
+/// Fetch the candidate, apply `edit` to the tree, push it back. Each
+/// config command round-trips so the candidate in mgmtd is always the
+/// truth. Legacy `ethernet <name>` blocks are normalized to the current
+/// name-as-block form on the way through.
+async fn edit_config(endpoints: &Endpoints, edit: impl FnOnce(&mut ConfigTree)) -> Result<()> {
     let text = candidate_text(endpoints).await?;
     let mut tree =
         hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("candidate unparsable: {e}"))?;
-    {
-        let interfaces = tree.block_mut("interfaces");
-        let eth = ConfigTree::ensure_block(interfaces, "ethernet", &[port]);
-        edit(eth);
-    }
+    tree.normalize_interfaces();
+    edit(&mut tree);
     let mut client = mgmt_client(endpoints).await?;
     let response = client
         .set_candidate(pb::ConfigText {
@@ -556,6 +576,20 @@ async fn edit_interface(
     } else {
         anyhow::bail!("candidate rejected: {}", response.errors.join("; "))
     }
+}
+
+/// [`edit_config`] scoped to one interface's block (`interfaces {
+/// <port> { ... } }`), creating it if absent.
+async fn edit_interface(
+    endpoints: &Endpoints,
+    port: &str,
+    edit: impl FnOnce(&mut Vec<hemlock_config::Item>),
+) -> Result<()> {
+    edit_config(endpoints, |tree| {
+        let interfaces = tree.block_mut("interfaces");
+        edit(ConfigTree::ensure_block(interfaces, port, &[]));
+    })
+    .await
 }
 
 async fn commit(endpoints: &Endpoints, confirm: Option<u32>) -> Result<()> {

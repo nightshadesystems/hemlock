@@ -14,13 +14,11 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::Helper;
 
-/// Which command tree applies; mirrors `cli::Mode` (which carries data and
-/// so cannot be shared with the completer directly).
+/// Which command tree applies; mirrors `cli::Mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliMode {
     Operational,
     Config,
-    ConfigIf,
 }
 
 /// Shared with the CLI loop: it updates `mode` on every prompt and a
@@ -55,21 +53,57 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         }
         (CliMode::Operational, ["show", "interfaces"]) => &["status", "transceiver"],
         (CliMode::Config, []) => &[
-            "interface",
-            "show",
-            "commit",
-            "rollback",
-            "discard",
-            "abort",
-            "exit",
-            "end",
-            "help",
+            "set", "delete", "show", "commit", "rollback", "discard", "exit", "help",
         ],
-        (CliMode::Config, ["interface"]) => &[PORT],
+        (CliMode::Config, ["set" | "delete"]) => &["interfaces"],
+        (CliMode::Config, ["set" | "delete", "interfaces"]) => &[PORT],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT]) => {
+            &["description", "admin-state"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "admin-state"]) => &["enabled", "disabled"],
         (CliMode::Config, ["commit"]) => &["confirmed"],
-        (CliMode::ConfigIf, []) => &["description", "shutdown", "no", "exit", "end", "help"],
-        (CliMode::ConfigIf, ["no"]) => &["shutdown", "description"],
         _ => &[],
+    }
+}
+
+/// How an interface argument matched the known port names.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PortMatch {
+    One(String),
+    NoMatch,
+    Ambiguous(Vec<String>),
+}
+
+/// Canonicalize an interface argument: an exact name, the `Eth1`/`e1`
+/// alias form (letters that case-insensitively prefix the name's letters,
+/// plus the exact port number), or a unique name prefix.
+pub fn match_port(input: &str, known: &[String]) -> PortMatch {
+    if let Some(exact) = known.iter().find(|n| n.as_str() == input) {
+        return PortMatch::One(exact.clone());
+    }
+
+    let digit_at = |s: &str| s.find(|c: char| c.is_ascii_digit()).unwrap_or(s.len());
+    let (alpha, digits) = input.split_at(digit_at(input));
+    let mut hits: Vec<&String> = Vec::new();
+    if !alpha.is_empty() && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+        hits = known
+            .iter()
+            .filter(|name| {
+                let (name_alpha, name_digits) = name.split_at(digit_at(name));
+                name_digits == digits
+                    && name_alpha
+                        .to_ascii_lowercase()
+                        .starts_with(&alpha.to_ascii_lowercase())
+            })
+            .collect();
+    }
+    if hits.is_empty() {
+        hits = known.iter().filter(|n| n.starts_with(input)).collect();
+    }
+    match hits.as_slice() {
+        [only] => PortMatch::One((*only).clone()),
+        [] => PortMatch::NoMatch,
+        many => PortMatch::Ambiguous(many.iter().map(|s| (*s).clone()).collect()),
     }
 }
 
@@ -92,15 +126,20 @@ fn resolve_word<'a>(input: &str, words: impl Iterator<Item = &'a str>) -> Option
 }
 
 /// Candidates for the word being typed: canonicalize the completed
-/// `tokens`, then filter the next level by `partial`.
-fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String]) -> Vec<String> {
+/// `tokens`, then filter the next level by `partial`. Also drives the
+/// EOS-style `?` contextual help in the CLI loop.
+pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String]) -> Vec<String> {
     let mut path: Vec<&str> = Vec::with_capacity(tokens.len());
     for token in tokens {
         let level = next_words(mode, &path);
         let resolved = if level.contains(&PORT) {
-            // An interface name: canonicalize to the sentinel so deeper
-            // levels key off "a port was given", not its spelling.
-            resolve_word(token, ports.iter().map(String::as_str)).map(|_| PORT)
+            // An interface name (aliases like Eth1 included): canonicalize
+            // to the sentinel so deeper levels key off "a port was given",
+            // not its spelling.
+            match match_port(token, ports) {
+                PortMatch::One(_) => Some(PORT),
+                _ => None,
+            }
         } else {
             resolve_word(token, level.iter().copied())
         };
@@ -186,21 +225,72 @@ mod tests {
 
     #[test]
     fn interface_names_complete_from_the_port_cache() {
-        let c = candidates(CliMode::Config, &["interface"], "Ethernet1", &ports());
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces"],
+            "Ethernet1",
+            &ports(),
+        );
         assert_eq!(c, vec!["Ethernet1".to_string(), "Ethernet10".to_string()]);
+    }
+
+    #[test]
+    fn set_path_completes_through_a_port_alias() {
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth0"],
+            "",
+            &ports(),
+        );
+        assert_eq!(
+            c,
+            vec!["description".to_string(), "admin-state".to_string()]
+        );
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "e1", "admin-state"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["enabled".to_string(), "disabled".to_string()]);
+        // delete shares the path but has no admin-state values to complete.
+        let c = candidates(
+            CliMode::Config,
+            &["delete", "interfaces", "Eth0"],
+            "",
+            &ports(),
+        );
+        assert_eq!(
+            c,
+            vec!["description".to_string(), "admin-state".to_string()]
+        );
     }
 
     #[test]
     fn broken_or_ambiguous_words_stop_completion() {
         assert!(candidates(CliMode::Operational, &["zz"], "", &ports()).is_empty());
-        // "e" is ambiguous in operational mode (exit / ... nothing else
-        // starts with e — use config mode's exit/end instead).
-        assert!(candidates(CliMode::Config, &["e"], "", &ports()).is_empty());
+        // "s" is ambiguous in config mode (set / show).
+        assert!(candidates(CliMode::Config, &["s"], "", &ports()).is_empty());
     }
 
     #[test]
-    fn config_if_no_subtree() {
-        let c = candidates(CliMode::ConfigIf, &["no"], "", &ports());
-        assert_eq!(c, vec!["shutdown".to_string(), "description".to_string()]);
+    fn port_aliases_resolve() {
+        assert_eq!(
+            match_port("Eth1", &ports()),
+            PortMatch::One("Ethernet1".into())
+        );
+        assert_eq!(
+            match_port("e10", &ports()),
+            PortMatch::One("Ethernet10".into())
+        );
+        assert_eq!(
+            match_port("ethernet0", &ports()),
+            PortMatch::One("Ethernet0".into())
+        );
+        assert_eq!(match_port("zz", &ports()), PortMatch::NoMatch);
+        assert!(matches!(
+            match_port("Ethernet", &ports()),
+            PortMatch::Ambiguous(_)
+        ));
     }
 }

@@ -8,7 +8,10 @@ pub enum Token {
     Word(String),
     LBrace,
     RBrace,
+    /// Statement terminator: newlines end leaves; `;` is accepted too so
+    /// configs written in the older semicolon style still parse.
     Semi,
+    Newline,
 }
 
 impl fmt::Display for Token {
@@ -18,6 +21,7 @@ impl fmt::Display for Token {
             Token::LBrace => write!(f, "'{{'"),
             Token::RBrace => write!(f, "'}}'"),
             Token::Semi => write!(f, "';'"),
+            Token::Newline => write!(f, "end of line"),
         }
     }
 }
@@ -69,8 +73,16 @@ pub fn lex(input: &str) -> Result<Vec<Spanned>, LexError> {
     while let Some(&ch) = chars.peek() {
         let (start_line, start_col) = (line, col);
         match ch {
-            ' ' | '\t' | '\r' | '\n' => {
+            ' ' | '\t' | '\r' => {
                 bump!();
+            }
+            '\n' => {
+                bump!();
+                tokens.push(Spanned {
+                    token: Token::Newline,
+                    line: start_line,
+                    col: start_col,
+                });
             }
             '{' => {
                 bump!();
@@ -254,8 +266,10 @@ mod tests {
         assert_eq!(
             words(input),
             vec![
+                Token::Newline,
                 Token::Word("foo".into()),
                 Token::Semi,
+                Token::Newline,
                 Token::Word("bar".into()),
                 Token::Semi
             ]
@@ -263,9 +277,22 @@ mod tests {
     }
 
     #[test]
+    fn newlines_are_tokens() {
+        assert_eq!(
+            words("a\nb"),
+            vec![
+                Token::Word("a".into()),
+                Token::Newline,
+                Token::Word("b".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn tracks_positions() {
         let tokens = lex("a {\n  b;\n}").unwrap();
-        let b = &tokens[2];
+        // a { NL b ; NL }
+        let b = &tokens[3];
         assert_eq!((b.line, b.col), (2, 3));
     }
 

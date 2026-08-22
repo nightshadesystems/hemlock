@@ -210,7 +210,7 @@ pub async fn transceivers(endpoint: IpcEndpoint) -> Result<()> {
 /// interface inventory, so every stock port (and the management port from
 /// the platform manifest) renders in curly-brace form even before it has
 /// ever been explicitly configured. Unconfigured leaves are filled from
-/// live state.
+/// live state, and a `system` block carries the hostname and login users.
 pub async fn configuration(
     syncd: IpcEndpoint,
     mgmtd: IpcEndpoint,
@@ -229,6 +229,7 @@ pub async fn configuration(
         .text;
     let mut tree = hemlock_config::parse(&text)
         .map_err(|e| anyhow::anyhow!("running config unparsable: {e}"))?;
+    tree.normalize_interfaces();
 
     let channel = syncd.connect().await.context("connecting to syncd")?;
     let mut client = pb::syncd_client::SyncdClient::new(channel);
@@ -242,7 +243,7 @@ pub async fn configuration(
     {
         let interfaces = tree.block_mut("interfaces");
         for p in &ports {
-            let eth = ConfigTree::ensure_block(interfaces, "ethernet", &[p.name.as_str()]);
+            let eth = ConfigTree::ensure_block(interfaces, p.name.as_str(), &[]);
             if ConfigTree::leaf_value(eth, "admin-state").is_none() {
                 let admin = if p.admin_state == pb::AdminState::Up as i32 {
                     "enabled"
@@ -260,8 +261,7 @@ pub async fn configuration(
         // port. Skipped quietly when no manifest is present (dev hosts).
         if let Ok(platform) = hemlock_platform::Platform::find("/", platform_dir) {
             if let Some(mgmt) = &platform.manifest.management {
-                let block =
-                    ConfigTree::ensure_block(interfaces, "management", &[mgmt.interface.as_str()]);
+                let block = ConfigTree::ensure_block(interfaces, mgmt.interface.as_str(), &[]);
                 if ConfigTree::leaf_value(block, "admin-state").is_none() {
                     if let Some(up) = os_netdev_is_up(&mgmt.os_device) {
                         ConfigTree::set_leaf(
@@ -273,10 +273,116 @@ pub async fn configuration(
                 }
             }
         }
+
+        // Deterministic display order regardless of which ports were
+        // explicitly configured first: ethernet by port number, then
+        // management.
+        sort_interface_blocks(interfaces);
     }
+
+    // System identity: hostname and login users, filled from the OS when
+    // the running config does not set them.
+    {
+        let system = tree.block_mut("system");
+        if ConfigTree::leaf_value(system, "hostname").is_none() {
+            ConfigTree::set_leaf(system, "hostname", vec![crate::cli::read_hostname()]);
+        }
+        let logins = os_login_users();
+        if !logins.is_empty() {
+            let users = ConfigTree::ensure_block(system, "users", &[]);
+            for (name, role) in logins {
+                let user = ConfigTree::ensure_block(users, "user", &[name.as_str()]);
+                if ConfigTree::leaf_value(user, "role").is_none() {
+                    ConfigTree::set_leaf(user, "role", vec![role.into()]);
+                }
+            }
+        }
+    }
+
+    // Canonical top-level order: system, interfaces, then anything else
+    // in its original order (sort is stable).
+    tree.items.sort_by_key(|item| match item.name() {
+        "system" => 0,
+        "interfaces" => 1,
+        _ => 2,
+    });
 
     print!("{}", tree.to_text());
     Ok(())
+}
+
+/// Sort an `interfaces` block for display: Ethernet ports in numeric
+/// order, Management after them, anything unrecognized last. Stable, so
+/// equal keys keep their running-config order.
+fn sort_interface_blocks(items: &mut [hemlock_config::Item]) {
+    fn key(item: &hemlock_config::Item) -> (u8, u64, String) {
+        match item {
+            hemlock_config::Item::Block { name, .. } => {
+                let rank = if name.starts_with("Ethernet") {
+                    0
+                } else if name.starts_with("Management") {
+                    1
+                } else {
+                    2
+                };
+                let number: String = name
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                (rank, number.parse().unwrap_or(u64::MAX), name.clone())
+            }
+            hemlock_config::Item::Leaf { name, .. } => (3, 0, name.clone()),
+        }
+    }
+    items.sort_by_key(key);
+}
+
+/// Human login accounts from the OS: `/etc/passwd` entries in the regular
+/// user UID range with a real shell. Role is `admin` for sudo-group
+/// members, `operator` otherwise. Empty off-switch (no /etc/passwd).
+fn os_login_users() -> Vec<(String, &'static str)> {
+    let Ok(passwd) = std::fs::read_to_string("/etc/passwd") else {
+        return Vec::new();
+    };
+    let sudoers: Vec<String> = std::fs::read_to_string("/etc/group")
+        .ok()
+        .and_then(|groups| {
+            groups.lines().find_map(|line| {
+                let mut fields = line.split(':');
+                (fields.next() == Some("sudo")).then(|| {
+                    fields
+                        .nth(2)
+                        .unwrap_or("")
+                        .split(',')
+                        .map(str::to_string)
+                        .collect()
+                })
+            })
+        })
+        .unwrap_or_default();
+
+    let mut users = Vec::new();
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        let [name, _, uid, _, _, _, shell] = fields.as_slice() else {
+            continue;
+        };
+        let Ok(uid) = uid.parse::<u32>() else {
+            continue;
+        };
+        let real_shell = !shell.ends_with("nologin") && !shell.ends_with("false");
+        if (1000..60000).contains(&uid) && real_shell {
+            let role = if sudoers.iter().any(|s| s == name) {
+                "admin"
+            } else {
+                "operator"
+            };
+            users.push((name.to_string(), role));
+        }
+    }
+    users.sort();
+    users
 }
 
 /// Admin state of a Linux netdev (IFF_UP), from sysfs. `None` when the
@@ -285,4 +391,41 @@ fn os_netdev_is_up(dev: &str) -> Option<bool> {
     let flags = std::fs::read_to_string(format!("/sys/class/net/{dev}/flags")).ok()?;
     let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).ok()?;
     Some(flags & 0x1 != 0)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_blocks_sort_numerically_with_management_last() {
+        // The shape `show configuration` produces when Ethernet33 was
+        // configured before the inventory merge appended the rest — with
+        // a legacy keyed block mixed in to prove normalization composes.
+        let mut tree = hemlock_config::parse(
+            "interfaces {\n Management1 { }\n ethernet Ethernet33 { }\n Ethernet1 { }\n Ethernet2 { }\n Ethernet10 { }\n}",
+        )
+        .unwrap();
+        tree.normalize_interfaces();
+        sort_interface_blocks(tree.block_mut("interfaces"));
+        let (_, interfaces) = tree.block("interfaces").unwrap();
+        let order: Vec<&str> = interfaces
+            .iter()
+            .filter_map(|item| match item {
+                hemlock_config::Item::Block { name, .. } => Some(name.as_str()),
+                hemlock_config::Item::Leaf { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "Ethernet1",
+                "Ethernet2",
+                "Ethernet10",
+                "Ethernet33",
+                "Management1"
+            ]
+        );
+    }
 }

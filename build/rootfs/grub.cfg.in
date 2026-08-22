@@ -8,7 +8,10 @@ set timeout=5
 
 menuentry "Hemlock @VERSION@" {
     search --no-floppy --label HEMLOCK --set root
-    linux /boot/vmlinuz console=ttyS@CONSOLE_DEV@,@CONSOLE_SPEED@n8 root=LABEL=HEMLOCK hemlock.rootfs=/hemlock/rootfs.squashfs rw
+    # net.ifnames=0: classic eth0 naming, so the manifests' [management]
+    # os_device matches (syncd also reads eth0's MAC as the switch source
+    # MAC fallback when the syseeprom is not up yet).
+    linux /boot/vmlinuz console=ttyS@CONSOLE_DEV@,@CONSOLE_SPEED@n8 root=LABEL=HEMLOCK hemlock.rootfs=/hemlock/rootfs.squashfs rw net.ifnames=0 biosdevname=0
     initrd /boot/initrd.img
 }
 

@@ -61,7 +61,8 @@ impl ConfigTree {
         })
     }
 
-    /// Render canonical text (4-space indent, quoted where needed).
+    /// Render canonical text (4-space indent, quoted where needed,
+    /// newline-terminated statements — no trailing semicolons).
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         for item in &self.items {
@@ -128,6 +129,36 @@ impl ConfigTree {
     pub fn remove_leaf(items: &mut Vec<Item>, name: &str) {
         items.retain(|item| !matches!(item, Item::Leaf { name: n, .. } if n == name));
     }
+
+    /// Remove the block `name key...` (and its whole subtree) among `items`.
+    pub fn remove_block(items: &mut Vec<Item>, name: &str, keys: &[&str]) {
+        items.retain(|item| {
+            !matches!(item, Item::Block { name: n, keys: k, .. }
+                if n == name && k.iter().map(String::as_str).eq(keys.iter().copied()))
+        });
+    }
+
+    /// Migrate the legacy `interfaces { ethernet <name> { ... } }` (and
+    /// `management <name>`) form to the current name-as-block form
+    /// (`interfaces { Ethernet1 { ... } }`), in place. Keeps configs
+    /// persisted before the format change loading cleanly.
+    pub fn normalize_interfaces(&mut self) {
+        for item in &mut self.items {
+            let Item::Block { name, children, .. } = item else {
+                continue;
+            };
+            if name != "interfaces" {
+                continue;
+            }
+            for child in children {
+                if let Item::Block { name, keys, .. } = child {
+                    if matches!(name.as_str(), "ethernet" | "management") && keys.len() == 1 {
+                        *name = keys.remove(0);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn block_in<'a>(items: &'a [Item], name: &str) -> Option<(&'a [String], &'a [Item])> {
@@ -160,7 +191,7 @@ fn render(out: &mut String, item: &Item, depth: usize) {
             for value in values {
                 let _ = write!(out, " {}", atom(value));
             }
-            out.push_str(";\n");
+            out.push('\n');
         }
         Item::Block {
             name,
@@ -217,7 +248,7 @@ mod tests {
         let text = sample().to_text();
         assert_eq!(
             text,
-            "system {\n    hostname sw1;\n}\ninterfaces {\n    ethernet Ethernet0 {\n        description \"uplink to core\";\n    }\n}\n"
+            "system {\n    hostname sw1\n}\ninterfaces {\n    ethernet Ethernet0 {\n        description \"uplink to core\"\n    }\n}\n"
         );
     }
 
@@ -259,6 +290,26 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(ConfigTree::leaf_value(eth, "admin-state"), None);
+    }
+
+    #[test]
+    fn normalizes_legacy_interface_blocks() {
+        let mut tree = crate::parse(
+            "interfaces { ethernet Ethernet1 { admin-state disabled } management Management1 { } Ethernet2 { } }",
+        )
+        .unwrap();
+        tree.normalize_interfaces();
+        let (_, interfaces) = tree.block("interfaces").unwrap();
+        let names: Vec<&str> = interfaces.iter().map(Item::name).collect();
+        assert_eq!(names, ["Ethernet1", "Management1", "Ethernet2"]);
+        let (keys, children) = ConfigTree::blocks_named(interfaces, "Ethernet1")
+            .next()
+            .unwrap();
+        assert!(keys.is_empty());
+        assert_eq!(
+            ConfigTree::leaf_value(children, "admin-state"),
+            Some("disabled")
+        );
     }
 
     #[test]
