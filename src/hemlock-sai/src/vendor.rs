@@ -115,6 +115,7 @@ pub struct VendorSai {
     port_api: *mut ffi::sai_port_api_t,
     switch_oid: Option<ffi::sai_object_id_t>,
     events_rx: Option<mpsc::UnboundedReceiver<SaiEvent>>,
+    src_mac: Option<[u8; 6]>,
     name: String,
 }
 
@@ -206,6 +207,7 @@ impl VendorSai {
             port_api,
             switch_oid: None,
             events_rx: Some(rx),
+            src_mac: init.src_mac,
             name: format!("vendor:{}", init.libsai_path.display()),
         })
     }
@@ -253,7 +255,16 @@ impl SaiBackend for VendorSai {
             on_port_state_change;
         notify_attr.value.ptr = notify_cb as *mut c_void;
 
-        let attrs = [init_attr, profile_attr, notify_attr];
+        let mut attrs = vec![init_attr, profile_attr, notify_attr];
+        if let Some(mac) = self.src_mac {
+            // Without this, Broadcom's SAI tries to discover a "local MAC
+            // address" itself and fails create_switch on boards where that
+            // lookup finds nothing (the E1031).
+            let mut mac_attr =
+                Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_SRC_MAC_ADDRESS);
+            mac_attr.value.mac = mac;
+            attrs.push(mac_attr);
+        }
         let mut oid: ffi::sai_object_id_t = 0;
 
         tracing::info!("creating SAI switch (this can take a while on real hardware)");

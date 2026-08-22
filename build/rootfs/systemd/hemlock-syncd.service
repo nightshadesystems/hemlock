@@ -17,6 +17,11 @@ Restart=on-failure
 RestartSec=5
 RuntimeDirectory=hemlock
 RuntimeDirectoryPreserve=yes
+# Broadcom's SAI SyncDB writes its files (brcm_sai_syncdb.dat, nvram/,
+# debug/) relative to the daemon's working directory; give it a real,
+# persistent state dir instead of wherever the daemon happened to start.
+StateDirectory=hemlock
+WorkingDirectory=/var/lib/hemlock
 
 [Install]
 WantedBy=multi-user.target

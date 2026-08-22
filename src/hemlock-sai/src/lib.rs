@@ -62,6 +62,12 @@ pub struct SwitchInit {
     /// Extra SAI profile key/values (`[sai.profile]` in the manifest),
     /// e.g. `SAI_NUM_ECMP_MEMBERS`.
     pub profile: Vec<(String, String)>,
+    /// Switch source MAC, passed as `SAI_SWITCH_ATTR_SRC_MAC_ADDRESS`.
+    /// Resolved by syncd from the platform (ONIE syseeprom, management
+    /// netdev). Optional in the SAI spec, but some vendor libraries have
+    /// no working fallback — Broadcom's aborts create_switch on the E1031
+    /// without it ("get local MAC address failed").
+    pub src_mac: Option<[u8; 6]>,
 }
 
 /// Human name for a SAI status code, per saistatus.h (`SAI_STATUS_CODE(x)`

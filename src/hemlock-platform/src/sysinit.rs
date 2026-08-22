@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
-use crate::schema::{BusRef, I2cSection, KernelSection};
+use crate::schema::{BusRef, I2cSection, KernelSection, Manifest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SysinitError {
@@ -114,6 +114,47 @@ pub fn ensure_bde_dev_nodes() -> Result<(), SysinitError> {
         }
     }
     Ok(())
+}
+
+/// ONIE TlvInfo EEPROM type code for the base MAC address TLV.
+const ONIE_TLV_BASE_MAC: u8 = 0x24;
+
+/// Extract the base MAC (TLV 0x24) from an ONIE TlvInfo EEPROM blob.
+/// Layout: 8-byte magic `"TlvInfo\0"`, version byte, big-endian u16 total
+/// TLV length, then `type, length, value` records.
+pub fn parse_onie_base_mac(blob: &[u8]) -> Option<[u8; 6]> {
+    if blob.len() < 11 || &blob[..8] != b"TlvInfo\0" {
+        return None;
+    }
+    let total = u16::from_be_bytes([blob[9], blob[10]]) as usize;
+    let mut rest = blob.get(11..11 + total)?;
+    while let [ty, len, value @ ..] = rest {
+        let value = value.get(..*len as usize)?;
+        if *ty == ONIE_TLV_BASE_MAC && value.len() == 6 {
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(value);
+            return Some(mac);
+        }
+        rest = &rest[2 + value.len()..];
+    }
+    None
+}
+
+/// Parse `aa:bb:cc:dd:ee:ff` (the `/sys/class/net/*/address` format).
+fn parse_mac_text(text: &str) -> Option<[u8; 6]> {
+    let mut parts = text.trim().split(':');
+    let mut mac = [0u8; 6];
+    for byte in &mut mac {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
+/// A MAC usable as the switch source address: unicast and non-zero. A
+/// blank EEPROM reads as zeros; treat that as "not found" so resolution
+/// can fall through to the next source.
+fn usable_mac(mac: [u8; 6]) -> bool {
+    mac != [0u8; 6] && mac[0] & 1 == 0
 }
 
 /// What one i2c instantiation pass did, for logs and diagnostics.
@@ -253,6 +294,43 @@ impl Sysfs {
             "i2c topology instantiated"
         );
         Ok(report)
+    }
+
+    /// The base MAC for the switch (`SAI_SWITCH_ATTR_SRC_MAC_ADDRESS`):
+    /// the ONIE syseeprom's TLV 0x24 when readable, else the management
+    /// netdev's address. Some vendor SAIs have no working fallback of
+    /// their own — Broadcom's aborts create_switch on the E1031 when the
+    /// attribute is absent — so syncd resolves one here and passes it
+    /// explicitly.
+    pub fn base_mac(&self, manifest: &Manifest) -> Option<[u8; 6]> {
+        if let Some(mac) = self
+            .syseeprom_base_mac(&manifest.hardware.i2c)
+            .filter(|&mac| usable_mac(mac))
+        {
+            return Some(mac);
+        }
+        manifest
+            .management
+            .as_ref()
+            .and_then(|mgmt| self.netdev_mac(&mgmt.os_device))
+            .filter(|&mac| usable_mac(mac))
+    }
+
+    /// Base MAC from the manifest's `syseeprom` i2c device, if that device
+    /// exists in sysfs (pmon may not have instantiated the topology yet).
+    fn syseeprom_base_mac(&self, i2c: &I2cSection) -> Option<[u8; 6]> {
+        let dev = i2c.devices.iter().find(|d| d.purpose == "syseeprom")?;
+        let path = self
+            .i2c_dev_dir()
+            .join(format!("{}-{:04x}", dev.bus, dev.address))
+            .join("eeprom");
+        parse_onie_base_mac(&std::fs::read(path).ok()?)
+    }
+
+    /// MAC of a Linux netdev, e.g. the management port.
+    fn netdev_mac(&self, dev: &str) -> Option<[u8; 6]> {
+        let path = self.root.join("sys/class/net").join(dev).join("address");
+        parse_mac_text(&std::fs::read_to_string(path).ok()?)
     }
 
     /// Raw pre-init write via i2cset (block mode, force — the target has no
@@ -405,6 +483,112 @@ mod tests {
         let report = sysfs.instantiate_i2c(&e1031_like_topology()).unwrap();
         assert!(report.created.is_empty());
         assert_eq!(report.already_present.len(), 2);
+    }
+
+    /// A minimal ONIE TlvInfo blob holding the given TLV records.
+    fn tlvinfo(records: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (ty, value) in records {
+            body.push(*ty);
+            body.push(value.len() as u8);
+            body.extend_from_slice(value);
+        }
+        let mut blob = b"TlvInfo\0".to_vec();
+        blob.push(1); // version
+        blob.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        blob.extend_from_slice(&body);
+        blob
+    }
+
+    #[test]
+    fn parses_onie_base_mac_tlv() {
+        let mac = [0x00, 0xe0, 0xec, 0x12, 0x34, 0x56];
+        let blob = tlvinfo(&[(0x21, b"E1031"), (0x24, &mac), (0x2a, &[52])]);
+        assert_eq!(parse_onie_base_mac(&blob), Some(mac));
+
+        // No 0x24 record, bad magic, and truncated records all yield None.
+        assert_eq!(parse_onie_base_mac(&tlvinfo(&[(0x21, b"E1031")])), None);
+        assert_eq!(parse_onie_base_mac(b"NotTlv\0\0"), None);
+        let mut truncated = tlvinfo(&[(0x24, &mac)]);
+        truncated.truncate(14);
+        assert_eq!(parse_onie_base_mac(&truncated), None);
+    }
+
+    #[test]
+    fn base_mac_prefers_syseeprom_then_falls_back_to_netdev() {
+        let manifest: Manifest = toml::from_str(&format!(
+            r#"
+schema_version = 1
+[platform]
+id = "test-sw"
+onie_machine = "x86_64-test_sw-r0"
+vendor = "Test"
+model = "TSW-1"
+asic_family = "broadcom-xgs"
+asic = "helix4"
+[sai]
+package = "libsaibcm"
+version_pin = "x"
+libsai_path = "/usr/lib/libsai.so.1"
+config_bcm = "config.bcm"
+[management]
+interface = "Management1"
+os_device = "eth0"
+[[hardware.i2c.device]]
+driver = "24lc64t"
+bus = 2
+address = 0x50
+purpose = "syseeprom"
+[[ports.port]]
+name = "Ethernet1"
+index = 1
+speed_mbps = 1000
+lanes = [1]
+"#
+        ))
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let sysfs = Sysfs::at(dir.path());
+
+        // Nothing in sysfs yet: no MAC at all.
+        assert_eq!(sysfs.base_mac(&manifest), None);
+
+        // Management netdev appears: its address is the fallback.
+        let netdir = dir.path().join("sys/class/net/eth0");
+        std::fs::create_dir_all(&netdir).unwrap();
+        std::fs::write(netdir.join("address"), "00:e0:ec:aa:bb:cc\n").unwrap();
+        assert_eq!(
+            sysfs.base_mac(&manifest),
+            Some([0x00, 0xe0, 0xec, 0xaa, 0xbb, 0xcc])
+        );
+
+        // Syseeprom appears: its TLV 0x24 wins over the netdev.
+        let mac = [0x00, 0xe0, 0xec, 0x12, 0x34, 0x56];
+        let eedir = dir.path().join("sys/bus/i2c/devices/2-0050");
+        std::fs::create_dir_all(&eedir).unwrap();
+        std::fs::write(eedir.join("eeprom"), tlvinfo(&[(0x24, &mac)])).unwrap();
+        assert_eq!(sysfs.base_mac(&manifest), Some(mac));
+
+        // A blank (all-zero) EEPROM MAC falls through to the netdev.
+        std::fs::write(eedir.join("eeprom"), tlvinfo(&[(0x24, &[0u8; 6])])).unwrap();
+        assert_eq!(
+            sysfs.base_mac(&manifest),
+            Some([0x00, 0xe0, 0xec, 0xaa, 0xbb, 0xcc])
+        );
+    }
+
+    #[test]
+    fn rejects_multicast_and_malformed_netdev_macs() {
+        assert!(usable_mac([0x00, 0xe0, 0xec, 1, 2, 3]));
+        assert!(!usable_mac([0u8; 6]));
+        assert!(!usable_mac([0x01, 0x00, 0x5e, 0, 0, 1]));
+        assert_eq!(parse_mac_text("00:e0:ec:aa:bb"), None);
+        assert_eq!(parse_mac_text("zz:e0:ec:aa:bb:cc"), None);
+        assert_eq!(
+            parse_mac_text(" 00:E0:EC:AA:BB:CC\n"),
+            Some([0x00, 0xe0, 0xec, 0xaa, 0xbb, 0xcc])
+        );
     }
 
     #[test]

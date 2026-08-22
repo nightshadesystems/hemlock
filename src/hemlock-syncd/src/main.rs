@@ -133,6 +133,21 @@ fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box
             hemlock_platform::sysinit::ensure_bde_dev_nodes()?;
         }
 
+        // Switch source MAC: SAI takes it as SAI_SWITCH_ATTR_SRC_MAC_ADDRESS.
+        // Broadcom's SAI has no working fallback on the E1031 (create_switch
+        // fails "get local MAC address failed"), so resolve one ourselves.
+        let src_mac = hemlock_platform::sysinit::Sysfs::real().base_mac(&platform.manifest);
+        match src_mac {
+            Some(mac) => info!(
+                mac = %mac.map(|b| format!("{b:02x}")).join(":"),
+                "switch source MAC resolved"
+            ),
+            None => tracing::warn!(
+                "no base MAC found (syseeprom TLV 0x24 or management netdev); \
+                 leaving the switch source MAC to the vendor SAI's default"
+            ),
+        }
+
         let init = hemlock_sai::SwitchInit {
             libsai_path: platform.manifest.sai.libsai_path.clone(),
             config_bcm_path: platform.config_bcm_path(),
@@ -143,6 +158,7 @@ fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            src_mac,
         };
         if !init.config_bcm_path.exists() {
             bail!(
