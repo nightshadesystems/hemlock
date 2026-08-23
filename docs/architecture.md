@@ -72,6 +72,7 @@ four daemons, the configuration model, and the image/installer pipeline.
 | `hemlock-pmon` | bin | Manifest-driven environment monitoring + fan control |
 | `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring |
 | `hemlock-orch` | bin | Phase-1 stub; future netlink/FRR → SAI orchestration |
+| `hemlock-webd` | bin | Web console: serves the exported Next.js UI (`web/`) + JSON API over HTTP/HTTPS; config-driven via `set system http`/`https` |
 | `hemlock-config` | lib | Curly-brace config language: lexer, parser, tree |
 | `hemlockctl` | bin | Operator CLI |
 | `hemlock-installer` | bin | ONIE installer: machine verification, disk TUI, GRUB |

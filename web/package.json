@@ -1,0 +1,21 @@
+{
+  "name": "hemlock-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hemlock NOS web console (static export, served by hemlock-webd)",
+  "scripts": {
+    "predev": "node scripts/copy-vendor.mjs",
+    "dev": "next dev",
+    "prebuild": "node scripts/copy-vendor.mjs",
+    "build": "next build",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@clr/icons": "13.0.2",
+    "@fontsource/archivo": "^5.2.5",
+    "@fontsource/ibm-plex-mono": "^5.2.5",
+    "next": "^15.4.6",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  }
+}

@@ -50,6 +50,12 @@ jobs:
         if: inputs.mode == 'full'
         run: sh vendor/fetch-vendor.sh "${{ inputs.platform }}"
 
+      # Built before mkimage (which runs under sudo) so npm runs as the
+      # normal user; mkimage skips its own web build when web/out exists.
+      - name: Build web console UI
+        if: inputs.mode == 'full'
+        run: cd web && npm ci --no-audit --no-fund && npm run build
+
       - name: Build image (full)
         if: inputs.mode == 'full'
         # debootstrap/chroot need root; keep the user's rustup toolchain.

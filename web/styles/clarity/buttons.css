@@ -1,0 +1,43 @@
+/* Nightshade Clarity — buttons (.btn API). Standard height 32, sm 24, radius 4, 2px stroke. */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:var(--clr-btn-height);padding:0 12px;border-radius:var(--clr-btn-border-radius);border:var(--clr-base-border-stroke) solid var(--cds-alias-interaction-action);background:transparent;color:var(--cds-alias-interaction-action);font-family:var(--cds-alias-typography-font-family);font-size:var(--clr-base-typography-font-size-button);font-weight:600;letter-spacing:0.01em;line-height:1;cursor:pointer;text-decoration:none;white-space:nowrap;vertical-align:middle;transition:background var(--ns-dur-1) var(--ns-ease-out),color var(--ns-dur-1) var(--ns-ease-out),border-color var(--ns-dur-1) var(--ns-ease-out)}
+.btn:hover{background:var(--cds-alias-interaction-action-secondary-hover);color:var(--cds-alias-interaction-action-hover);border-color:var(--cds-alias-interaction-action-hover);text-decoration:none}
+.btn:active{color:var(--cds-alias-interaction-action-active);border-color:var(--cds-alias-interaction-action-active)}
+.btn:disabled,.btn.disabled{background:var(--cds-alias-object-interaction-background-disabled);border-color:var(--cds-alias-status-disabled);color:var(--cds-alias-typography-disabled-button);cursor:not-allowed;pointer-events:none}
+.btn-primary{background:var(--cds-alias-interaction-action);border-color:var(--cds-alias-interaction-action);color:var(--cds-alias-interaction-on-action)}
+.btn-primary:hover{background:var(--cds-alias-interaction-action-hover);border-color:var(--cds-alias-interaction-action-hover);color:var(--cds-alias-interaction-on-action)}
+.btn-primary:active{background:var(--cds-alias-interaction-action-active);border-color:var(--cds-alias-interaction-action-active)}
+.btn-success{background:var(--cds-alias-status-success);border-color:var(--cds-alias-status-success);color:var(--cds-alias-interaction-on-action)}
+.btn-success:hover{background:var(--cds-alias-object-interaction-success-hover);border-color:var(--cds-alias-object-interaction-success-hover);color:var(--cds-alias-interaction-on-action)}
+.btn-warning{background:var(--cds-alias-status-warning);border-color:var(--cds-alias-status-warning);color:var(--ns-amber-1000)}
+.btn-warning:hover{background:var(--cds-alias-object-interaction-warning-hover);border-color:var(--cds-alias-object-interaction-warning-hover);color:var(--ns-amber-1000)}
+.btn-danger{background:var(--cds-alias-status-danger);border-color:var(--cds-alias-status-danger);color:#fff}
+.btn-danger:hover{background:var(--cds-alias-object-interaction-danger-hover);border-color:var(--cds-alias-object-interaction-danger-hover);color:#fff}
+.btn-neutral{background:transparent;border-color:var(--cds-alias-object-interaction-border-color);color:var(--cds-alias-typography-color-400)}
+.btn-neutral:hover{background:var(--cds-alias-object-interaction-neutral-secondary-hover);border-color:var(--cds-alias-typography-color-450);color:var(--cds-alias-typography-color-450)}
+.btn-success-outline{border-color:var(--cds-alias-status-success);color:var(--cds-alias-status-success)}
+.btn-success-outline:hover{background:var(--cds-alias-object-interaction-success-secondary-hover);color:var(--cds-alias-object-interaction-success-hover)}
+.btn-warning-outline{border-color:var(--cds-alias-status-warning);color:var(--cds-alias-status-warning)}
+.btn-warning-outline:hover{background:var(--cds-alias-object-interaction-warning-secondary-hover);color:var(--cds-alias-object-interaction-warning-hover)}
+.btn-danger-outline{border-color:var(--cds-alias-status-danger);color:var(--cds-alias-status-danger)}
+.btn-danger-outline:hover{background:var(--cds-alias-object-interaction-danger-secondary-hover);color:var(--cds-alias-object-interaction-danger-hover)}
+.btn-link{border-color:transparent;background:transparent;color:var(--cds-alias-interaction-action)}
+.btn-link:hover{background:var(--cds-alias-interaction-action-secondary-hover);border-color:transparent}
+.btn-link-neutral{border-color:transparent;background:transparent;color:var(--cds-alias-typography-color-300)}
+.btn-link-neutral:hover{background:var(--cds-alias-object-interaction-neutral-secondary-hover);border-color:transparent;color:var(--cds-alias-typography-color-450)}
+.btn-inverse{border-color:var(--ns-ink-11);color:var(--ns-ink-11);background:transparent}
+.btn-inverse:hover{background:rgba(242,243,245,0.10);color:#fff;border-color:#fff}
+.btn-sm{height:var(--clr-btn-height-sm);padding:0 8px;font-size:11px}
+.btn-block{display:flex;width:100%}
+.btn-icon{padding:0;width:var(--clr-btn-height)}
+.btn-sm.btn-icon{width:var(--clr-btn-height-sm)}
+.btn clr-icon,.btn cds-icon{width:16px;height:16px}
+/* button group */
+.btn-group{display:inline-flex}
+.btn-group .btn{border-radius:0;margin-left:calc(-1 * var(--clr-base-border-stroke))}
+.btn-group .btn:first-child{border-radius:var(--clr-btn-border-radius) 0 0 var(--clr-btn-border-radius);margin-left:0}
+.btn-group .btn:last-child{border-radius:0 var(--clr-btn-border-radius) var(--clr-btn-border-radius) 0}
+.btn-group .btn.active{background:var(--cds-alias-interaction-action);color:var(--cds-alias-interaction-on-action)}
+.btn-group .btn-primary.active{background:var(--cds-alias-interaction-action-active);border-color:var(--cds-alias-interaction-action-active)}
+/* close (modals, alerts) */
+.close{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:none;background:transparent;color:var(--cds-alias-object-interaction-color);font-size:18px;line-height:1;border-radius:var(--clr-base-border-radius-s);cursor:pointer}
+.close:hover{color:var(--cds-alias-object-interaction-color-hover);background:var(--cds-alias-object-interaction-background-hover)}

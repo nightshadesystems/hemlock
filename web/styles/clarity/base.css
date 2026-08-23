@@ -1,0 +1,29 @@
+/* Nightshade Clarity — reboot & typography roles */
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+body{margin:0;background:var(--cds-alias-object-app-background);color:var(--cds-alias-typography-color-400);font-family:var(--cds-alias-typography-font-family);font-size:var(--cds-alias-typography-body-font-size);line-height:var(--cds-alias-typography-body-line-height);font-weight:var(--cds-alias-typography-body-font-weight);letter-spacing:var(--cds-alias-typography-body-letter-spacing)}
+h1,h2,h3,h4,h5,h6{margin:0;color:var(--cds-alias-typography-color-450);font-family:var(--cds-alias-typography-header-font-family)}
+h1,.clr-headline{font-size:var(--cds-alias-typography-headline-font-size);line-height:var(--cds-alias-typography-headline-line-height);font-weight:var(--cds-alias-typography-headline-font-weight);letter-spacing:var(--cds-alias-typography-headline-letter-spacing)}
+h2,.clr-title{font-size:var(--cds-alias-typography-title-font-size);line-height:var(--cds-alias-typography-title-line-height);font-weight:var(--cds-alias-typography-title-font-weight);letter-spacing:var(--cds-alias-typography-title-letter-spacing)}
+h3,.clr-section{font-size:var(--cds-alias-typography-section-font-size);line-height:var(--cds-alias-typography-section-line-height);font-weight:var(--cds-alias-typography-section-font-weight);letter-spacing:var(--cds-alias-typography-section-letter-spacing)}
+h4,.clr-subsection{font-size:var(--cds-alias-typography-subsection-font-size);line-height:var(--cds-alias-typography-subsection-line-height);font-weight:var(--cds-alias-typography-subsection-font-weight);letter-spacing:var(--cds-alias-typography-subsection-letter-spacing)}
+h5{font-size:var(--cds-alias-typography-body-font-size);line-height:var(--cds-alias-typography-body-line-height);font-weight:500}
+h6{font-size:var(--cds-alias-typography-secondary-font-size);line-height:var(--cds-alias-typography-secondary-line-height);font-weight:500}
+.clr-display{font-size:var(--cds-alias-typography-display-font-size);line-height:var(--cds-alias-typography-display-line-height);font-weight:var(--cds-alias-typography-display-font-weight);letter-spacing:var(--cds-alias-typography-display-letter-spacing);color:var(--cds-alias-typography-color-450)}
+p{margin:0}
+.clr-secondary{font-size:var(--cds-alias-typography-secondary-font-size);line-height:var(--cds-alias-typography-secondary-line-height);letter-spacing:var(--cds-alias-typography-secondary-letter-spacing);color:var(--cds-alias-typography-color-300)}
+.clr-caption{font-size:var(--cds-alias-typography-caption-font-size);line-height:var(--cds-alias-typography-caption-line-height);letter-spacing:var(--cds-alias-typography-caption-letter-spacing);color:var(--cds-alias-typography-color-300)}
+.clr-smallcaption{font-size:var(--cds-alias-typography-smallcaption-font-size);line-height:var(--cds-alias-typography-smallcaption-line-height);letter-spacing:var(--cds-alias-typography-smallcaption-letter-spacing);font-weight:500;text-transform:uppercase;color:var(--cds-alias-typography-color-300)}
+a{color:var(--cds-alias-typography-link-color);text-decoration:none}
+a:hover{color:var(--cds-alias-typography-link-color-hover);text-decoration:underline}
+a:active{color:var(--cds-alias-typography-link-color-active)}
+code,kbd,.clr-mono{font-family:var(--cds-alias-typography-monospace-font-family);font-size:0.93em;color:var(--cds-alias-typography-color-450);background:var(--ns-input-bg);border:1px solid var(--cds-alias-object-border-subtle);border-radius:var(--clr-base-border-radius-xs);padding:1px 5px}
+pre{font-family:var(--cds-alias-typography-monospace-font-family);font-size:13px;line-height:20px;background:var(--cds-alias-object-container-background-dark);border:1px solid var(--cds-alias-object-container-border-color);border-radius:var(--clr-base-border-radius-m);padding:16px;overflow:auto}
+pre code{background:none;border:none;padding:0}
+::selection{background:var(--ns-accent-soft);color:var(--cds-alias-typography-color-450)}
+:focus-visible{outline:var(--cds-alias-object-interaction-outline);outline-offset:var(--cds-alias-object-interaction-outline-offset)}
+hr{border:none;border-top:1px solid var(--ns-divider)}
+.clr-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);border:0}
+ul.list,ol.list{margin:0;padding-left:24px}
+ul.list li,ol.list li{margin:4px 0}
+.list-unstyled{list-style:none;margin:0;padding:0}

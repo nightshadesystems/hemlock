@@ -4,9 +4,9 @@
 //! commit-confirm with auto-rollback, and the on-disk rollback ring.
 //! Intent families: interface admin-state and description (pushed to
 //! syncd) and the OS-side families — management addressing, static
-//! routes, and the SSH service (applied via `osapply`). Further families
-//! slot into `intents.rs` + `service.rs` without changing the lifecycle
-//! machinery.
+//! routes, the SSH service, and the web console (applied via
+//! `osapply`). Further families slot into `intents.rs` + `service.rs`
+//! without changing the lifecycle machinery.
 
 mod intents;
 mod osapply;

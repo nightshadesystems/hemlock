@@ -9,6 +9,7 @@ members = [
     "src/hemlock-pmon",
     "src/hemlock-config",
     "src/hemlock-mgmtd",
+    "src/hemlock-webd",
     "src/hemlockctl",
     "src/hemlock-installer",
 ]

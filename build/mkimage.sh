@@ -85,12 +85,30 @@ else
         "$ROOT"/target/release/hemlock-syncd \
         "$ROOT"/target/release/hemlock-pmon \
         "$ROOT"/target/release/hemlock-mgmtd \
-        "$ROOT"/target/release/hemlock-orch
+        "$ROOT"/target/release/hemlock-orch \
+        "$ROOT"/target/release/hemlock-webd
     install -D -t "$ROOTFS/usr/bin" "$ROOT"/target/release/hemlockctl
     install -D -m 644 -t "$ROOTFS/etc/systemd/system" "$ROOT"/build/rootfs/systemd/*.service "$ROOT"/build/rootfs/systemd/*.target
     for unit in "$ROOT"/build/rootfs/systemd/*.service; do
         chroot "$ROOTFS" systemctl enable "$(basename "$unit")" || true
     done
+    # The web console is config-driven like sshd: mgmtd enables the unit
+    # on `set system http|https` + commit and replays that at boot. An
+    # unconfigured switch must not listen on 80/443.
+    chroot "$ROOTFS" systemctl disable hemlock-webd >/dev/null 2>&1 || true
+
+    # Web console UI: the exported Next.js build, served by hemlock-webd.
+    # Built here when missing so a release build stays one command; CI
+    # builds it in its own job.
+    if [ ! -f "$ROOT/web/out/index.html" ]; then
+        command -v npm >/dev/null || die \
+            "web/out is missing and npm is not installed — build the web UI first: (cd web && npm ci && npm run build)"
+        log "building web console UI (npm)"
+        (cd "$ROOT/web" && npm ci --no-audit --no-fund && npm run build) \
+            || die "web UI build failed"
+    fi
+    mkdir -p "$ROOTFS/usr/share/hemlock"
+    cp -r "$ROOT/web/out" "$ROOTFS/usr/share/hemlock/web"
 
     log "installing vendor SAI ($SAI_DEB)"
     cp "$SAI_DEB" "$ROOTFS/tmp/"

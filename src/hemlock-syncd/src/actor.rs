@@ -219,7 +219,8 @@ impl SaiHandle {
     }
 
     pub async fn remove_vlan_rif(&self, rif: Oid) -> Result<(), SaiError> {
-        self.call(|reply| SaiCmd::RemoveVlanRif { rif, reply }).await
+        self.call(|reply| SaiCmd::RemoveVlanRif { rif, reply })
+            .await
     }
 
     pub async fn remove_router_interface(&self, port: PortId, rif: Oid) -> Result<(), SaiError> {

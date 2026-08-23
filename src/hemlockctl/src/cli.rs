@@ -238,12 +238,12 @@ pub(crate) fn fmt_err(err: anyhow::Error) -> String {
                     );
                 }
                 return match unit_active_state(daemon).as_deref() {
-                    Some("activating") => format!(
-                        "% {daemon} is still initializing — try again in a moment"
-                    ),
-                    Some("failed") => format!(
-                        "% {daemon} failed (see: journalctl -u hemlock-{daemon})"
-                    ),
+                    Some("activating") => {
+                        format!("% {daemon} is still initializing — try again in a moment")
+                    }
+                    Some("failed") => {
+                        format!("% {daemon} failed (see: journalctl -u hemlock-{daemon})")
+                    }
                     Some("inactive") => {
                         format!("% {daemon} is not running (hemlock-{daemon}.service is inactive)")
                     }
@@ -452,10 +452,12 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set vlans vlan <id> [description <text>]");
             println!("  set system ssh                                enable the SSH server");
             println!("  set system ssh authentication local           password logins (PAM)");
+            println!("  set system http                               web console over HTTP");
+            println!("  set system https                              web console over HTTPS (self-signed cert)");
             println!("  set routing static <prefix> <next-hop>        static route");
             println!("  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport ...]");
             println!("  delete vlans vlan <id> [description]");
-            println!("  delete system ssh [authentication]");
+            println!("  delete system <ssh|http|https> [authentication]");
             println!("  delete routing [static [<prefix>]]");
             println!("  show                      show the candidate configuration");
             println!(
@@ -621,7 +623,9 @@ async fn config_interfaces(
     )?;
     // Phase-1 SVIs carry an address and nothing else.
     if port.starts_with("Vlan") && subcommand != "address" {
-        return Err(format!("% {subcommand} is not supported on VLAN interfaces"));
+        return Err(format!(
+            "% {subcommand} is not supported on VLAN interfaces"
+        ));
     }
     match subcommand {
         "description" => {
@@ -893,16 +897,40 @@ fn parse_vlan_list(text: &str) -> Result<Vec<String>, String> {
     Ok(out.into_iter().map(|id| id.to_string()).collect())
 }
 
-/// `set|delete system ssh [authentication local]` — SSH is on exactly
-/// when the `system { ssh }` block exists; commit applies it.
+/// `set|delete system <ssh|http|https> ...` — each service is on
+/// exactly when its `system { <name> }` block exists; commit applies it.
+/// SSH additionally takes `authentication local`; enabling https makes
+/// webd generate a self-signed certificate on first start.
 async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
-    let usage = move || format!("% Usage: {verb} system ssh [authentication local]");
+    let usage = move || format!("% Usage: {verb} system <ssh|http|https> [authentication local]");
     let Some(first) = words.first() else {
         return Err(usage());
     };
-    resolve(first, &["ssh"])?;
+    let service = resolve(first, &["ssh", "http", "https"])?;
     let rest = &words[1..];
+
+    if matches!(service, "http" | "https") {
+        if !rest.is_empty() {
+            return Err(format!("% Usage: {verb} system {service}"));
+        }
+        let service = service.to_string();
+        return if delete {
+            edit_config(endpoints, move |tree| {
+                let system = tree.block_mut("system");
+                ConfigTree::remove_block(system, &service, &[]);
+                remove_block_if_empty(tree, "system");
+            })
+            .await
+        } else {
+            edit_config(endpoints, move |tree| {
+                let system = tree.block_mut("system");
+                ConfigTree::ensure_block(system, &service, &[]);
+            })
+            .await
+        }
+        .map_err(fmt_err);
+    }
 
     if rest.is_empty() {
         return if delete {

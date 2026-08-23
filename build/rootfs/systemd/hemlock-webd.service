@@ -1,0 +1,16 @@
+[Unit]
+Description=Hemlock web console (UI + JSON API)
+After=hemlock-mgmtd.service network.target
+Wants=hemlock-mgmtd.service
+
+[Service]
+Type=exec
+# TLS material persists across reboots (stable browser fingerprint).
+ExecStart=/usr/sbin/hemlock-webd --state-dir /hemlock/persist/web
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=hemlock
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

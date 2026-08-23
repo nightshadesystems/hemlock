@@ -1,0 +1,20 @@
+/* Nightshade Clarity — motion tokens (Clarity durations/easings verbatim). */
+:root{
+  --cds-global-animation-duration-instant:0s;
+  --cds-global-animation-duration-quickest:0.1s;
+  --cds-global-animation-duration-quicker:0.15s;
+  --cds-global-animation-duration-quick:0.2s;
+  --cds-global-animation-duration-secondary:0.3s;
+  --cds-global-animation-duration-primary:0.4s;
+  --cds-global-animation-duration-slow:0.5s;
+  --cds-global-animation-easing-primary:cubic-bezier(0,0.99,0,0.99);
+  --cds-global-animation-easing-secondary:cubic-bezier(0,1.5,0.5,1);
+  --cds-global-animation-easing-loop:cubic-bezier(0.17,0.4,0.8,0.79);
+  --cds-global-animation-easing-in-out:cubic-bezier(0.42,0.01,0.58,1);
+  --cds-global-animation-skeleton-duration:4s;
+  --cds-alias-object-skeleton-loading-gradient:linear-gradient(90deg,var(--ns-ink-1) 0%,var(--ns-ink-6) 35%,var(--ns-ink-7) 65%,var(--ns-ink-1) 100%);
+  --ns-ease-out:cubic-bezier(0.22,0.61,0.36,1);
+  --ns-dur-1:120ms;
+  --ns-dur-2:180ms;
+  --ns-dur-3:260ms;
+}

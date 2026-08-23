@@ -1,0 +1,76 @@
+/* Nightshade Clarity — typography tokens. Clarity density metrics (regular),
+   px-baked from ng-clarity _properties.density.scss. */
+:root{
+  --cds-alias-typography-font-family:"Archivo","Helvetica Neue",ui-sans-serif,system-ui,sans-serif;
+  --cds-alias-typography-header-font-family:"Archivo","Helvetica Neue",ui-sans-serif,system-ui,sans-serif;
+  --cds-alias-typography-monospace-font-family:"IBM Plex Mono",ui-monospace,Consolas,Menlo,monospace;
+  --ns-font-sans:var(--cds-alias-typography-font-family);
+  --ns-font-mono:var(--cds-alias-typography-monospace-font-family);
+  --ns-font-brand:"Archivo","Helvetica Neue",ui-sans-serif,sans-serif;
+  --ns-brand-wordmark-weight:700;
+  --ns-brand-wordmark-tracking:-0.02em;
+  --ns-brand-uppercase-weight:600;
+  --ns-brand-uppercase-tracking:0.14em;
+  --cds-alias-typography-font-weight-light:300;
+  --cds-alias-typography-font-weight-regular:400;
+  --cds-alias-typography-font-weight-medium:500;
+  --cds-alias-typography-font-weight-semibold:600;
+  --cds-alias-typography-font-weight-bold:600;
+  /* clr density font sizes (regular) */
+  --clr-base-typography-font-size-caption-small:10px;
+  --clr-base-typography-font-size-caption:11px;
+  --clr-base-typography-font-size-button:12px;
+  --clr-base-typography-font-size-inline:13px;
+  --clr-base-typography-font-size-default:14px;
+  --clr-base-typography-font-size-sub-section:16px;
+  --clr-base-typography-font-size-section:20px;
+  --clr-base-typography-font-size-title:24px;
+  --clr-base-typography-font-size-headline:32px;
+  --clr-base-typography-font-size-display:40px;
+  --clr-base-typography-line-height-12:12px;
+  --clr-base-typography-line-height-16:16px;
+  --clr-base-typography-line-height-20:20px;
+  --clr-base-typography-line-height-24:24px;
+  --clr-base-typography-line-height-32:32px;
+  --clr-base-typography-line-height-36:36px;
+  --clr-base-typography-line-height-44:44px;
+  /* alias roles: size / line-height / weight / tracking */
+  --cds-alias-typography-body-font-size:var(--clr-base-typography-font-size-default);
+  --cds-alias-typography-body-line-height:var(--clr-base-typography-line-height-20);
+  --cds-alias-typography-body-font-weight:400;
+  --cds-alias-typography-body-letter-spacing:-0.00714286em;
+  --cds-alias-typography-display-font-size:var(--clr-base-typography-font-size-display);
+  --cds-alias-typography-display-line-height:var(--clr-base-typography-line-height-44);
+  --cds-alias-typography-display-font-weight:300;
+  --cds-alias-typography-display-letter-spacing:-0.0125em;
+  --cds-alias-typography-headline-font-size:var(--clr-base-typography-font-size-headline);
+  --cds-alias-typography-headline-line-height:var(--clr-base-typography-line-height-36);
+  --cds-alias-typography-headline-font-weight:300;
+  --cds-alias-typography-headline-letter-spacing:-0.0125em;
+  --cds-alias-typography-title-font-size:var(--clr-base-typography-font-size-title);
+  --cds-alias-typography-title-line-height:var(--clr-base-typography-line-height-32);
+  --cds-alias-typography-title-font-weight:400;
+  --cds-alias-typography-title-letter-spacing:-0.00833333em;
+  --cds-alias-typography-section-font-size:var(--clr-base-typography-font-size-section);
+  --cds-alias-typography-section-line-height:var(--clr-base-typography-line-height-24);
+  --cds-alias-typography-section-font-weight:400;
+  --cds-alias-typography-section-letter-spacing:-0.01em;
+  --cds-alias-typography-subsection-font-size:var(--clr-base-typography-font-size-sub-section);
+  --cds-alias-typography-subsection-line-height:var(--clr-base-typography-line-height-24);
+  --cds-alias-typography-subsection-font-weight:500;
+  --cds-alias-typography-subsection-letter-spacing:-0.0125em;
+  --cds-alias-typography-message-font-size:var(--clr-base-typography-font-size-sub-section);
+  --cds-alias-typography-message-line-height:var(--clr-base-typography-line-height-24);
+  --cds-alias-typography-secondary-font-size:var(--clr-base-typography-font-size-inline);
+  --cds-alias-typography-secondary-line-height:var(--clr-base-typography-line-height-16);
+  --cds-alias-typography-secondary-font-weight:400;
+  --cds-alias-typography-secondary-letter-spacing:-0.007692em;
+  --cds-alias-typography-caption-font-size:var(--clr-base-typography-font-size-caption);
+  --cds-alias-typography-caption-line-height:var(--clr-base-typography-line-height-16);
+  --cds-alias-typography-caption-font-weight:400;
+  --cds-alias-typography-caption-letter-spacing:0.018182em;
+  --cds-alias-typography-smallcaption-font-size:var(--clr-base-typography-font-size-caption-small);
+  --cds-alias-typography-smallcaption-line-height:var(--clr-base-typography-line-height-12);
+  --cds-alias-typography-smallcaption-font-weight:500;
+  --cds-alias-typography-smallcaption-letter-spacing:0.05em;
+}

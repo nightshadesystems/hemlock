@@ -1,0 +1,18 @@
+/* Nightshade Clarity design system — global entry.
+   Fonts (Archivo + IBM Plex Mono) are self-hosted via @fontsource and
+   imported from app/layout.jsx, replacing the design system's Google
+   Fonts stylesheet: the console must render on an air-gapped switch. */
+@import "tokens/colors.css";
+@import "tokens/typography.css";
+@import "tokens/spacing.css";
+@import "tokens/motion.css";
+@import "clarity/base.css";
+@import "clarity/buttons.css";
+@import "clarity/forms.css";
+@import "clarity/data.css";
+@import "clarity/nav.css";
+@import "clarity/overlay.css";
+@import "clarity/emphasis.css";
+@import "clarity/progress.css";
+@import "clarity/structure.css";
+@import "app.css";

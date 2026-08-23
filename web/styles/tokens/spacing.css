@@ -1,0 +1,30 @@
+/* Nightshade Clarity — space, density, radii, borders, shadows.
+   Values baked in px from ng-clarity (base 20, regular density). */
+:root{
+  --cds-global-space-0:0; --cds-global-space-1:1px; --cds-global-space-2:2px; --cds-global-space-3:4px; --cds-global-space-4:6px; --cds-global-space-5:8px; --cds-global-space-6:12px; --cds-global-space-7:16px; --cds-global-space-8:18px; --cds-global-space-9:24px; --cds-global-space-10:32px; --cds-global-space-11:36px; --cds-global-space-12:48px; --cds-global-space-13:64px; --cds-global-space-14:72px; --cds-global-space-15:96px;
+  --cds-global-layout-width-xs:576px; --cds-global-layout-width-sm:768px; --cds-global-layout-width-md:992px; --cds-global-layout-width-lg:1200px; --cds-global-layout-width-xl:1440px;
+  /* borders */
+  --clr-base-border-stroke:2px;
+  --clr-base-border-radius-xs:2px; --clr-base-border-radius-s:4px; --clr-base-border-radius-m:8px; --clr-base-border-radius-l:12px; --clr-base-border-radius-xl:16px;
+  --cds-alias-object-border-radius-100:4px; --cds-alias-object-border-radius-200:12px; --cds-alias-object-border-radius-300:50%;
+  --cds-alias-object-border-width-100:1px; --cds-alias-object-border-width-200:2px; --cds-alias-object-border-width-300:3px; --cds-alias-object-border-width-400:4px;
+  /* offsets */
+  --clr-base-offset-0:0;
+  --clr-base-vertical-offset-2xs:2px; --clr-base-vertical-offset-xs:4px; --clr-base-vertical-offset-s:4px; --clr-base-vertical-offset-m:6px; --clr-base-vertical-offset-l:12px; --clr-base-vertical-offset-xl:16px; --clr-base-vertical-offset-2xl:24px; --clr-base-vertical-offset-3xl:48px;
+  --clr-base-horizontal-offset-2xs:2px; --clr-base-horizontal-offset-xs:4px; --clr-base-horizontal-offset-s:4px; --clr-base-horizontal-offset-m:8px; --clr-base-horizontal-offset-l:12px; --clr-base-horizontal-offset-xl:16px; --clr-base-horizontal-offset-2xl:24px; --clr-base-horizontal-offset-3xl:48px;
+  /* rows / gaps / icons */
+  --clr-base-row-height-xs:16px; --clr-base-row-height-s:24px; --clr-base-row-height-m:32px; --clr-base-row-height-l:36px; --clr-base-row-height-20:20px;
+  --clr-base-dg-row-height:32px; --clr-base-dg-compact-row-height:24px;
+  --clr-base-gap-xs:4px; --clr-base-gap-s:8px; --clr-base-gap-m:12px; --clr-base-gap-l:16px; --clr-base-gap-xl:24px; --clr-base-gap-2xl:32px;
+  --clr-base-icon-size-xs:12px; --clr-base-icon-size-s:16px; --clr-base-icon-size-m:20px; --clr-base-icon-size-l:24px; --clr-base-icon-size-xl:28px; --clr-base-icon-size-2xl:32px; --clr-base-icon-size-3xl:32px; --clr-base-icon-size-4xl:64px;
+  /* layout spaces */
+  --clr-base-layout-space-4xs:1px; --clr-base-layout-space-3xs:2px; --clr-base-layout-space-2xs:4px; --clr-base-layout-space-xs:8px; --clr-base-layout-space-s:12px; --clr-base-layout-space-m:16px; --clr-base-layout-space-l:24px; --clr-base-layout-space-xl:32px; --clr-base-layout-space-2xl:40px; --clr-base-layout-space-3xl:48px; --clr-base-layout-space-4xl:64px; --clr-base-layout-space-5xl:96px;
+  /* component metrics */
+  --clr-base-header-height:56px;
+  --clr-base-tree-node-height:32px;
+  --clr-base-progress-bar-height:12px;
+  --clr-base-spinner-s:16px; --clr-base-spinner-m:32px; --clr-base-spinner-l:64px;
+  --clr-base-spinner-stroke-s:2px; --clr-base-spinner-stroke-m:4px; --clr-base-spinner-stroke-l:6px;
+  --clr-btn-height:32px; --clr-btn-height-sm:24px; --clr-btn-border-radius:var(--clr-base-border-radius-s);
+  --clr-modal-sm-width:288px; --clr-modal-md-width:576px; --clr-modal-lg-width:864px; --clr-modal-xl-width:1152px;
+}

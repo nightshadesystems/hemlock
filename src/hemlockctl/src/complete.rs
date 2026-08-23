@@ -138,7 +138,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set" | "delete", "vlans"]) => &["vlan"],
         (CliMode::Config, ["set" | "delete", "vlans", "vlan"]) => &[NUM],
         (CliMode::Config, ["set" | "delete", "vlans", "vlan", NUM]) => &["description"],
-        (CliMode::Config, ["set" | "delete", "system"]) => &["ssh"],
+        (CliMode::Config, ["set" | "delete", "system"]) => &["ssh", "http", "https"],
         (CliMode::Config, ["set" | "delete", "system", "ssh"]) => &["authentication"],
         (CliMode::Config, ["set", "system", "ssh", "authentication"]) => &["local"],
         (CliMode::Config, ["set" | "delete", "routing"]) => &["static"],
@@ -444,7 +444,13 @@ mod tests {
     #[test]
     fn system_ssh_path_completes() {
         let c = candidates(CliMode::Config, &["set", "system"], "", &ports());
-        assert_eq!(c, vec!["ssh".to_string()]);
+        assert_eq!(
+            c,
+            vec!["ssh".to_string(), "http".to_string(), "https".to_string()]
+        );
+        // A shared prefix narrows to the web services.
+        let c = candidates(CliMode::Config, &["set", "system"], "ht", &ports());
+        assert_eq!(c, vec!["http".to_string(), "https".to_string()]);
         let c = candidates(CliMode::Config, &["set", "system", "ssh"], "", &ports());
         assert_eq!(c, vec!["authentication".to_string()]);
         let c = candidates(

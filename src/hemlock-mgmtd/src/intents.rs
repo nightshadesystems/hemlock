@@ -22,6 +22,8 @@ pub struct Intents {
     /// Management (OS netdev) interfaces, keyed by interface name.
     pub management: BTreeMap<String, MgmtIntent>,
     pub ssh: SshIntent,
+    /// Web console listeners (`system { http }` / `system { https }`).
+    pub web: WebIntent,
     /// Static routes: canonical prefix -> next hop.
     pub routes: BTreeMap<String, String>,
     /// VLANs (`vlans { vlan <id> { ... } }`), keyed by 802.1Q id.
@@ -85,6 +87,21 @@ pub struct SshIntent {
     pub auth_local: bool,
 }
 
+/// The web console: each listener is on exactly when its `system { http }`
+/// / `system { https }` block exists. hemlock-webd reads the running
+/// config itself; mgmtd only starts/stops the unit.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebIntent {
+    pub http: bool,
+    pub https: bool,
+}
+
+impl WebIntent {
+    pub fn enabled(&self) -> bool {
+        self.http || self.https
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IntentError {
     #[error("interfaces: {0}")]
@@ -125,6 +142,7 @@ pub enum IntentError {
 pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
     let mut intents = Intents {
         ssh: ssh(tree)?,
+        web: web(tree),
         routes: routes(tree)?,
         vlans: vlans(tree)?,
         ..Intents::default()
@@ -405,6 +423,18 @@ fn ssh(tree: &ConfigTree) -> Result<SshIntent, IntentError> {
     Ok(intent)
 }
 
+/// `system { http }` / `system { https }` — pure block presence.
+fn web(tree: &ConfigTree) -> WebIntent {
+    let Some((_, system)) = tree.block("system") else {
+        return WebIntent::default();
+    };
+    let block = |name: &str| ConfigTree::blocks_named(system, name).next().is_some();
+    WebIntent {
+        http: block("http"),
+        https: block("https"),
+    }
+}
+
 fn routes(tree: &ConfigTree) -> Result<BTreeMap<String, String>, IntentError> {
     let mut routes = BTreeMap::new();
     let Some((_, routing)) = tree.block("routing") else {
@@ -617,6 +647,8 @@ pub struct OsChanges {
     pub routes: Vec<RouteChange>,
     /// The full wanted SSH state, present exactly when it changed.
     pub ssh: Option<SshIntent>,
+    /// The full wanted web console state, present exactly when it changed.
+    pub web: Option<WebIntent>,
 }
 
 impl OsChanges {
@@ -626,6 +658,7 @@ impl OsChanges {
             && self.svis.is_empty()
             && self.routes.is_empty()
             && self.ssh.is_none()
+            && self.web.is_none()
     }
 
     pub fn describe(&self) -> Vec<String> {
@@ -641,6 +674,12 @@ impl OsChanges {
                 "ssh disabled".into()
             }
         });
+        let web = self.web.as_ref().map(|w| match (w.http, w.https) {
+            (true, true) => "web ui enabled (http, https)".to_string(),
+            (true, false) => "web ui enabled (http)".to_string(),
+            (false, true) => "web ui enabled (https)".to_string(),
+            (false, false) => "web ui disabled".to_string(),
+        });
         self.ports
             .iter()
             .chain(&self.svis)
@@ -648,6 +687,7 @@ impl OsChanges {
             .map(NetdevChange::describe)
             .chain(self.routes.iter().map(RouteChange::describe))
             .chain(ssh)
+            .chain(web)
             .collect()
     }
 }
@@ -792,6 +832,9 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
 
     if running.ssh != candidate.ssh {
         changes.ssh = Some(candidate.ssh.clone());
+    }
+    if running.web != candidate.web {
+        changes.web = Some(candidate.web.clone());
     }
     changes
 }
@@ -1007,9 +1050,8 @@ interfaces {
             intents.svis["Vlan1"].address.as_deref(),
             Some("10.42.10.9/24")
         );
-        let intents = intents_of(
-            "vlans { vlan 10 { } }\ninterfaces { Vlan10 { address 10.0.10.1/24 } }",
-        );
+        let intents =
+            intents_of("vlans { vlan 10 { } }\ninterfaces { Vlan10 { address 10.0.10.1/24 } }");
         assert_eq!(
             intents.svis["Vlan10"].address.as_deref(),
             Some("10.0.10.1/24")
@@ -1106,6 +1148,51 @@ interfaces {
         );
         let tree = parse("system { ssh { authentication radius } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadSsh(_))));
+    }
+
+    #[test]
+    fn extracts_web_intent() {
+        assert_eq!(intents_of("").web, WebIntent::default());
+        assert_eq!(
+            intents_of("system { http { } }").web,
+            WebIntent {
+                http: true,
+                https: false
+            }
+        );
+        assert_eq!(
+            intents_of("system { http { } https { } }").web,
+            WebIntent {
+                http: true,
+                https: true
+            }
+        );
+        assert!(intents_of("system { https { } }").web.enabled());
+        assert!(!intents_of("system { ssh { } }").web.enabled());
+    }
+
+    #[test]
+    fn diff_os_reports_web_deltas() {
+        let running = intents_of("");
+        let candidate = intents_of("system { http { } https { } }");
+        let changes = diff_os(&running, &candidate);
+        assert_eq!(
+            changes.web,
+            Some(WebIntent {
+                http: true,
+                https: true
+            })
+        );
+        assert_eq!(
+            changes.describe(),
+            vec!["web ui enabled (http, https)".to_string()]
+        );
+
+        // Unchanged -> no delta; reverting -> disabled.
+        assert!(diff_os(&candidate, &candidate).is_empty());
+        let back = diff_os(&candidate, &running);
+        assert_eq!(back.web, Some(WebIntent::default()));
+        assert_eq!(back.describe(), vec!["web ui disabled".to_string()]);
     }
 
     #[test]

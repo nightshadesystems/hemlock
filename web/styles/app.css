@@ -1,0 +1,17 @@
+/* Hemlock console — app-specific layout on top of the Clarity framework. */
+.page-header{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.page-header h2{margin-right:auto}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px}
+.stat-card .stat-value{font-family:var(--ns-font-mono);font-size:28px;line-height:32px;color:var(--cds-alias-typography-color-450)}
+.stat-card .stat-value .unit{font-size:14px;color:var(--cds-alias-typography-color-300);margin-left:4px}
+.stat-card .stat-label{font-size:12px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:var(--cds-alias-typography-color-300);margin-bottom:8px}
+.stat-card .stat-sub{font-size:12px;color:var(--cds-alias-typography-color-200);margin-top:6px}
+.mono{font-family:var(--ns-font-mono)}
+.dim{color:var(--cds-alias-typography-color-300)}
+.page-loading{display:flex;align-items:center;justify-content:center;gap:12px;padding:64px;color:var(--cds-alias-typography-color-300);font-size:13px}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start}
+.kv{display:grid;grid-template-columns:minmax(140px,40%) 1fr;font-size:13px}
+.kv>div{padding:6px 0;border-top:1px solid var(--cds-alias-object-border-subtle)}
+.kv>div:nth-child(-n+2){border-top:none}
+.kv .k{font-weight:600;color:var(--cds-alias-typography-color-450)}
+.kv .v{color:var(--cds-alias-typography-color-300)}

@@ -1,6 +1,7 @@
 //! OS-side apply for the non-ASIC intent families: management
 //! addressing (iproute2 on the manifest's os_device), static routes,
-//! and the SSH service (systemd + an sshd_config drop-in).
+//! the SSH service (systemd + an sshd_config drop-in), and the web
+//! console (hemlock-webd's systemd unit).
 //!
 //! Shell-outs to `ip` and `systemctl` follow the workspace's
 //! established access path (syncd's netdev sampling, sysinit's
@@ -16,12 +17,15 @@
 
 use tracing::warn;
 
-use crate::intents::{Intents, NetdevChange, OsChanges, RouteChange, SshIntent};
+use crate::intents::{Intents, NetdevChange, OsChanges, RouteChange, SshIntent, WebIntent};
 
 /// mgmtd's sshd drop-in (`10-hemlock-motd.conf` is the image's).
 const SSHD_DROPIN: &str = "/etc/ssh/sshd_config.d/20-hemlock.conf";
 /// Debian's openssh-server unit name.
 const SSH_UNIT: &str = "ssh";
+/// The web console daemon's unit. webd reads the running config itself
+/// (which listeners, TLS); mgmtd only decides whether it runs.
+const WEBD_UNIT: &str = "hemlock-webd";
 
 /// `authentication local`: PAM password logins against the on-box
 /// user database, pinned against other drop-ins overriding them.
@@ -84,6 +88,9 @@ impl OsApplier {
         }
         if let Some(ssh) = &changes.ssh {
             apply_ssh(ssh);
+        }
+        if let Some(web) = &changes.web {
+            apply_web(web);
         }
     }
 
@@ -150,6 +157,8 @@ impl OsApplier {
         }
         // Declarative: an absent `system { ssh }` block means disabled.
         apply_ssh(&intents.ssh);
+        // Same for the web console (`system { http }` / `{ https }`).
+        apply_web(&intents.web);
     }
 
     fn apply_management(&self, change: &NetdevChange) {
@@ -216,6 +225,18 @@ fn apply_ssh(ssh: &SshIntent) {
     } else {
         remove_dropin();
         run("systemctl", &["disable", "--now", SSH_UNIT]);
+    }
+}
+
+fn apply_web(web: &WebIntent) {
+    if web.enabled() {
+        run("systemctl", &["enable", WEBD_UNIT]);
+        // Restart (not just enable --now): a listener-set change (http
+        // added/removed alongside https) needs webd to re-read the
+        // running config. On boot replay this simply starts it.
+        run("systemctl", &["restart", WEBD_UNIT]);
+    } else {
+        run("systemctl", &["disable", "--now", WEBD_UNIT]);
     }
 }
 

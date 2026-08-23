@@ -1,0 +1,22 @@
+/* Nightshade Clarity — progress bars, spinners, skeleton */
+.progress{display:block;width:100%;height:var(--clr-base-progress-bar-height);background:var(--cds-alias-object-container-background-shade);border-radius:999px;overflow:hidden;position:relative}
+.progress>.progress-fill{display:block;height:100%;background:var(--cds-alias-interaction-action);border-radius:999px;transition:width var(--cds-global-animation-duration-secondary) var(--cds-global-animation-easing-in-out)}
+.progress.success>.progress-fill{background:var(--cds-alias-status-success)}
+.progress.warning>.progress-fill{background:var(--cds-alias-status-warning)}
+.progress.danger>.progress-fill{background:var(--cds-alias-status-danger)}
+.progress.loop>.progress-fill{width:30%;animation:clr-progress-loop 2s var(--cds-global-animation-easing-loop) infinite}
+@keyframes clr-progress-loop{0%{margin-left:-30%}100%{margin-left:100%}}
+.progress-block{display:flex;align-items:center;gap:12px}
+.progress-block .progress-label{font-size:12px;color:var(--cds-alias-typography-color-300);flex:none}
+.progress-block .progress-value{font-size:12px;font-family:var(--cds-alias-typography-monospace-font-family);color:var(--cds-alias-typography-color-450);flex:none;min-width:40px;text-align:right}
+.progress-sm{height:4px}
+/* spinner */
+.spinner{display:inline-block;width:var(--clr-base-spinner-l);height:var(--clr-base-spinner-l);border:var(--clr-base-spinner-stroke-l) solid var(--cds-alias-object-container-background-shade);border-top-color:var(--cds-alias-interaction-action);border-radius:50%;animation:clr-spin 0.8s linear infinite;flex:none}
+.spinner-md{width:var(--clr-base-spinner-m);height:var(--clr-base-spinner-m);border-width:var(--clr-base-spinner-stroke-m)}
+.spinner-sm,.spinner-inline{width:var(--clr-base-spinner-s);height:var(--clr-base-spinner-s);border-width:var(--clr-base-spinner-stroke-s)}
+.spinner-inline{vertical-align:text-bottom;margin-right:6px}
+.spinner-inverse{border-color:rgba(242,243,245,0.25);border-top-color:#fff}
+@keyframes clr-spin{to{transform:rotate(360deg)}}
+/* skeleton */
+.skeleton{display:block;border-radius:var(--clr-base-border-radius-s);background:var(--cds-alias-object-skeleton-loading-gradient);background-size:300% 100%;animation:clr-skeleton var(--cds-global-animation-skeleton-duration,4s) ease infinite;min-height:12px}
+@keyframes clr-skeleton{0%{background-position:100% 0}100%{background-position:-100% 0}}

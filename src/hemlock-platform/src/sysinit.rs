@@ -301,7 +301,10 @@ impl Sysfs {
     /// fatal — presence is reported separately. Idempotent.
     pub fn instantiate_psus(&self, psus: &[crate::schema::Psu], report: &mut I2cReport) {
         for psu in psus {
-            let label = format!("{} ({}@{}-0x{:02x})", psu.name, psu.driver, psu.bus, psu.address);
+            let label = format!(
+                "{} ({}@{}-0x{:02x})",
+                psu.name, psu.driver, psu.bus, psu.address
+            );
             if self.device_present(psu.bus, psu.address) {
                 report.already_present.push(label);
                 continue;

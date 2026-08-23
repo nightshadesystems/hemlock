@@ -1,0 +1,45 @@
+[package]
+name = "hemlock-webd"
+description = "Web console daemon: serves the exported Next.js UI and a JSON API over HTTP/HTTPS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hemlock-common = { workspace = true }
+hemlock-config = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP server (pure Rust: axum/hyper + rustls). The ring crypto provider
+# is selected explicitly — the aws-lc default needs cmake/nasm to build.
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
+# Self-signed certificate generation (`set system https`)
+rcgen = "0.14"
+
+# Session tokens
+getrandom = "0.3"
+
+# Password verification against /etc/shadow (Debian trixie defaults to
+# yescrypt; sha-crypt covers legacy $6$/$5$ hashes). Both pure Rust.
+sha-crypt = { version = "0.6", features = ["getrandom"] }
+yescrypt = "0.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

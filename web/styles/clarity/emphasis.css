@@ -1,0 +1,46 @@
+/* Nightshade Clarity — alerts, labels, badges */
+.alert{display:flex;align-items:flex-start;gap:8px;padding:8px 12px;border-radius:var(--clr-base-border-radius-s);border:1px solid;font-size:13px;line-height:18px;color:var(--cds-alias-typography-color-400)}
+.alert .alert-icon{flex:none;width:16px;height:16px;margin-top:1px}
+.alert-items{display:flex;flex-direction:column;gap:4px;flex:1;min-width:0}
+.alert-item{display:flex;align-items:flex-start;gap:8px}
+.alert-text{flex:1}
+.alert-actions{display:flex;gap:8px;flex:none}
+.alert-actions .alert-action{all:unset;cursor:pointer;font-weight:600;color:var(--cds-alias-typography-link-color);font-size:13px}
+.alert-actions .alert-action:hover{color:var(--cds-alias-typography-link-color-hover);text-decoration:underline}
+.alert .close{margin:-2px -4px 0 0}
+.alert-info{background:var(--cds-alias-status-info-tint);border-color:var(--cds-alias-status-info);}
+.alert-info .alert-icon{color:var(--cds-alias-status-info)}
+.alert-success{background:var(--cds-alias-status-success-tint);border-color:var(--cds-alias-status-success)}
+.alert-success .alert-icon{color:var(--cds-alias-status-success)}
+.alert-warning{background:var(--cds-alias-status-warning-tint);border-color:var(--cds-alias-status-warning)}
+.alert-warning .alert-icon{color:var(--cds-alias-status-warning)}
+.alert-danger{background:var(--cds-alias-status-danger-tint);border-color:var(--cds-alias-status-danger)}
+.alert-danger .alert-icon{color:var(--cds-alias-status-danger)}
+.alert-sm{padding:4px 8px;font-size:12px;line-height:16px}
+.alert-sm .alert-icon{width:14px;height:14px}
+/* app-level alerts: saturated bar, dark text, full-bleed */
+.alert-app-level{border:none;border-radius:0;justify-content:center;align-items:center;font-weight:500;padding:6px 12px}
+.alert-app-level.alert-info{background:var(--cds-alias-status-info);color:var(--ns-blue-1000)}
+.alert-app-level.alert-warning{background:var(--cds-alias-status-warning);color:var(--ns-amber-1000)}
+.alert-app-level.alert-danger{background:var(--cds-alias-status-danger);color:#fff}
+.alert-app-level.alert-success{background:var(--cds-alias-status-success);color:var(--ns-teal-1000)}
+.alert-app-level .alert-icon{color:inherit}
+.alert-app-level .btn{height:20px;font-size:10px;padding:0 8px;border-color:currentColor;color:inherit}
+/* labels (pills) */
+.label{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 8px;border-radius:999px;border:1px solid var(--cds-alias-object-border-color-tint);background:transparent;color:var(--cds-alias-typography-color-300);font-size:11px;font-weight:500;letter-spacing:0.01em;white-space:nowrap;text-decoration:none}
+a.label:hover,.label.clickable:hover{background:var(--cds-alias-object-interaction-background-hover);color:var(--cds-alias-typography-color-450);text-decoration:none;cursor:pointer}
+.label .badge{margin-right:-5px}
+.label-info{border-color:var(--cds-alias-status-info);color:var(--cds-alias-status-info)}
+.label-success{border-color:var(--cds-alias-status-success);color:var(--cds-alias-status-success)}
+.label-warning{border-color:var(--cds-alias-status-warning);color:var(--cds-alias-status-warning)}
+.label-danger{border-color:var(--cds-alias-status-danger);color:var(--cds-alias-status-danger)}
+.label-accent{border-color:var(--ns-accent-border);background:var(--ns-accent-soft);color:var(--cds-alias-interaction-action)}
+.label .label-dismiss{all:unset;cursor:pointer;font-size:12px;line-height:1;color:inherit;opacity:0.7;margin-right:-2px}
+.label .label-dismiss:hover{opacity:1}
+/* badges */
+.badge{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 5px;border-radius:8px;background:var(--cds-alias-status-neutral);color:var(--cds-alias-object-app-background);font-size:10px;font-weight:600;font-family:var(--cds-alias-typography-monospace-font-family);line-height:1;white-space:nowrap}
+.badge-info{background:var(--cds-alias-status-info);color:var(--ns-blue-1000)}
+.badge-success{background:var(--cds-alias-status-success);color:var(--ns-teal-1000)}
+.badge-warning{background:var(--cds-alias-status-warning);color:var(--ns-amber-1000)}
+.badge-danger{background:var(--cds-alias-status-danger);color:#fff}
+.badge-accent{background:var(--ns-accent);color:var(--cds-alias-interaction-on-action)}
