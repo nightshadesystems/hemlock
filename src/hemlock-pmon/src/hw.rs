@@ -75,6 +75,12 @@ pub trait HwBackend: Send + Sync {
     fn read_temp_c(&self, sensor: &ThermalSensor) -> Result<f64, HwError>;
     fn read_fan_rpm(&self, fan: &FanDef) -> Result<u32, HwError>;
     fn set_fan_pwm(&self, fan: &FanDef, percent: u32) -> Result<(), HwError>;
+    /// Tray presence from the fan's `presence_attr`; trays without
+    /// presence detect read as present.
+    fn fan_present(&self, fan: &FanDef) -> Result<bool, HwError>;
+    /// Drive the tray LED (`green` / `amber` / `off`) via the fan's
+    /// `led_attr`; a no-op when the fan has none.
+    fn set_fan_led(&self, fan: &FanDef, color: &str) -> Result<(), HwError>;
     /// (present, ok)
     fn psu_status(&self, psu: &Psu) -> Result<(bool, bool), HwError>;
     /// `None` = cage empty.
@@ -108,18 +114,24 @@ impl SysfsBackend {
 
     /// Resolve `<bus>-<addr>` + channel to the hwmon attribute file, e.g.
     /// `/sys/bus/i2c/devices/11-001a/hwmon/hwmon3/temp3_input`. The hwmonN
-    /// index varies per boot, hence the scan.
+    /// index varies per boot, hence the scan. Old-style hwmon drivers (the
+    /// haliburton emc2305 port) create their attributes directly on the
+    /// i2c device dir and register an empty hwmon node, so the device dir
+    /// itself is the fallback.
     fn hwmon_attr(device: &str, attr: &str) -> Result<String, HwError> {
-        let base = format!("/sys/bus/i2c/devices/{device}/hwmon");
-        let entries = std::fs::read_dir(&base).map_err(|source| HwError::Read {
-            path: base.clone(),
-            source,
-        })?;
-        for entry in entries.flatten() {
-            let candidate = entry.path().join(attr);
-            if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
+        let dev_dir = format!("/sys/bus/i2c/devices/{device}");
+        let base = format!("{dev_dir}/hwmon");
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join(attr);
+                if candidate.exists() {
+                    return Ok(candidate.to_string_lossy().into_owned());
+                }
             }
+        }
+        let direct = format!("{dev_dir}/{attr}");
+        if std::path::Path::new(&direct).exists() {
+            return Ok(direct);
         }
         Err(HwError::Read {
             path: format!("{base}/*/{attr}"),
@@ -149,9 +161,38 @@ impl HwBackend for SysfsBackend {
         std::fs::write(&path, &raw).map_err(|source| HwError::Write { path, source })
     }
 
+    fn fan_present(&self, fan: &FanDef) -> Result<bool, HwError> {
+        let Some(attr) = &fan.presence_attr else {
+            return Ok(true);
+        };
+        let raw = Self::read_u64(attr)?;
+        Ok((raw == 0) == fan.presence_active_low)
+    }
+
+    fn set_fan_led(&self, fan: &FanDef, color: &str) -> Result<(), HwError> {
+        let Some(attr) = &fan.led_attr else {
+            return Ok(());
+        };
+        std::fs::write(attr, color).map_err(|source| HwError::Write {
+            path: attr.clone(),
+            source,
+        })
+    }
+
     fn psu_status(&self, psu: &Psu) -> Result<(bool, bool), HwError> {
-        // pmbus driver bound => device dir exists; a readable status/power
-        // attribute means the PSU answers on the bus.
+        // Prefer the platform's dedicated presence/power-good attributes
+        // (CPLD-backed, valid even when the pmbus device never probed).
+        if let Some(prs) = &psu.presence_attr {
+            let present = Self::read_u64(prs)? != 0;
+            if !present {
+                return Ok((false, false));
+            }
+            if let Some(status) = &psu.status_attr {
+                return Ok((true, Self::read_u64(status)? != 0));
+            }
+        }
+        // Fallback: pmbus driver bound => device dir exists; a readable
+        // status/power attribute means the PSU answers on the bus.
         let dir = format!("/sys/bus/i2c/devices/{}-{:04x}", psu.bus, psu.address);
         if !std::path::Path::new(&dir).exists() {
             return Ok((false, false));
@@ -300,6 +341,7 @@ pub struct MockBackend {
     /// Simulated inlet temperature, settable for tests.
     pub temp_c: std::sync::atomic::AtomicU32, // millidegrees
     pwm: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    fan_leds: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl MockBackend {
@@ -307,11 +349,17 @@ impl MockBackend {
         Self {
             temp_c: std::sync::atomic::AtomicU32::new((temp_c * 1000.0) as u32),
             pwm: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fan_leds: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn pwm_for(&self, fan: &str) -> Option<u32> {
         self.pwm.lock().ok()?.get(fan).copied()
+    }
+
+    #[cfg(test)]
+    pub fn fan_led_for(&self, fan: &str) -> Option<String> {
+        self.fan_leds.lock().ok()?.get(fan).cloned()
     }
 }
 
@@ -333,6 +381,17 @@ impl HwBackend for MockBackend {
     fn set_fan_pwm(&self, fan: &FanDef, percent: u32) -> Result<(), HwError> {
         if let Ok(mut map) = self.pwm.lock() {
             map.insert(fan.name.clone(), percent.min(100));
+        }
+        Ok(())
+    }
+
+    fn fan_present(&self, _fan: &FanDef) -> Result<bool, HwError> {
+        Ok(true)
+    }
+
+    fn set_fan_led(&self, fan: &FanDef, color: &str) -> Result<(), HwError> {
+        if let Ok(mut map) = self.fan_leds.lock() {
+            map.insert(fan.name.clone(), color.to_string());
         }
         Ok(())
     }
@@ -403,6 +462,24 @@ pub fn mock_sfp_eeprom() -> Vec<u8> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_backend_reports_presence_and_records_led_writes() {
+        let mock = MockBackend::new(30.0);
+        let fan = FanDef {
+            name: "FAN-1".into(),
+            hwmon: "23-004d".into(),
+            tach: "fan4".into(),
+            pwm: "pwm4".into(),
+            presence_attr: None,
+            presence_active_low: false,
+            led_attr: None,
+        };
+        assert!(mock.fan_present(&fan).unwrap());
+        assert!(mock.fan_led_for("FAN-1").is_none());
+        mock.set_fan_led(&fan, "amber").unwrap();
+        assert_eq!(mock.fan_led_for("FAN-1").as_deref(), Some("amber"));
+    }
 
     #[test]
     fn sff8472_decode_reads_identity_dom_and_thresholds() {

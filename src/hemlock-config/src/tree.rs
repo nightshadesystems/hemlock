@@ -154,10 +154,16 @@ impl ConfigTree {
         });
     }
 
-    /// Migrate the legacy `interfaces { ethernet <name> { ... } }` (and
-    /// `management <name>`) form to the current name-as-block form
-    /// (`interfaces { Ethernet1 { ... } }`), in place. Keeps configs
-    /// persisted before the format change loading cleanly.
+    /// Migrate legacy interface config forms in place, so configs
+    /// persisted before a format change keep loading cleanly:
+    ///
+    /// - `interfaces { ethernet <name> { ... } }` (and `management
+    ///   <name>`) become the name-as-block form (`Ethernet1 { ... }`);
+    /// - hyphenated keywords become their spelled-out phrases
+    ///   (`no-shutdown` -> `no shutdown`, `admin-state enabled|disabled`
+    ///   -> `no shutdown`/`shutdown`, and in `switchport` blocks
+    ///   `access-vlan`/`trunk-vlans`/`native-vlan` ->
+    ///   `access vlan`/`trunk vlans`/`native vlan`).
     pub fn normalize_interfaces(&mut self) {
         for item in &mut self.items {
             let Item::Block { name, children, .. } = item else {
@@ -167,13 +173,102 @@ impl ConfigTree {
                 continue;
             }
             for child in children {
-                if let Item::Block { name, keys, .. } = child {
-                    if matches!(name.as_str(), "ethernet" | "management") && keys.len() == 1 {
-                        *name = keys.remove(0);
+                let Item::Block {
+                    name,
+                    keys,
+                    children,
+                } = child
+                else {
+                    continue;
+                };
+                if matches!(name.as_str(), "ethernet" | "management") && keys.len() == 1 {
+                    *name = keys.remove(0);
+                }
+                normalize_admin_leaves(children);
+                for sub in children {
+                    if let Item::Block {
+                        name, children: sp, ..
+                    } = sub
+                    {
+                        if name == "switchport" {
+                            normalize_switchport_leaves(sp);
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Marker phrase present? (`no shutdown` = leaf `no` whose first
+    /// value is `shutdown`.)
+    pub fn has_phrase(items: &[Item], first: &str, second: &str) -> bool {
+        Self::phrase_values(items, first, second).is_some()
+    }
+
+    /// The values after a two-word phrase leaf: for `access vlan 10`,
+    /// `phrase_values(items, "access", "vlan")` is `["10"]`.
+    pub fn phrase_values<'a>(items: &'a [Item], first: &str, second: &str) -> Option<&'a [String]> {
+        items.iter().find_map(|item| match item {
+            Item::Leaf { name, values }
+                if name == first && values.first().map(String::as_str) == Some(second) =>
+            {
+                Some(&values[1..])
+            }
+            _ => None,
+        })
+    }
+
+    /// Set (replace or insert) a phrase leaf `first second rest...`.
+    pub fn set_phrase(items: &mut Vec<Item>, first: &str, second: &str, rest: Vec<String>) {
+        let mut values = vec![second.to_string()];
+        values.extend(rest);
+        Self::set_leaf(items, first, values);
+    }
+}
+
+/// `shutdown` / `no shutdown` from the legacy `no-shutdown` and
+/// `admin-state enabled|disabled` leaves. Invalid admin-state values are
+/// left alone for the intent parser to report.
+fn normalize_admin_leaves(children: &mut [Item]) {
+    for item in children.iter_mut() {
+        let Item::Leaf { name, values } = item else {
+            continue;
+        };
+        match name.as_str() {
+            "no-shutdown" => {
+                *name = "no".into();
+                *values = vec!["shutdown".into()];
+            }
+            "admin-state" => match values.first().map(String::as_str) {
+                Some("enabled") => {
+                    *name = "no".into();
+                    *values = vec!["shutdown".into()];
+                }
+                Some("disabled") => {
+                    *name = "shutdown".into();
+                    values.clear();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Hyphenated switchport keywords to their phrase forms.
+fn normalize_switchport_leaves(children: &mut [Item]) {
+    for item in children.iter_mut() {
+        let Item::Leaf { name, values } = item else {
+            continue;
+        };
+        let (new_name, phrase) = match name.as_str() {
+            "access-vlan" => ("access", "vlan"),
+            "trunk-vlans" => ("trunk", "vlans"),
+            "native-vlan" => ("native", "vlan"),
+            _ => continue,
+        };
+        *name = new_name.into();
+        values.insert(0, phrase.into());
     }
 }
 
@@ -322,10 +417,49 @@ mod tests {
             .next()
             .unwrap();
         assert!(keys.is_empty());
+        // Legacy admin-state converts to the marker form.
+        assert!(ConfigTree::has_leaf(children, "shutdown"));
+        assert_eq!(ConfigTree::leaf_value(children, "admin-state"), None);
+    }
+
+    #[test]
+    fn normalizes_hyphenated_keywords_to_phrases() {
+        let mut tree = crate::parse(
+            "interfaces {\n Ethernet1 {\n no-shutdown\n switchport {\n mode access\naccess-vlan 10\n }\n }\n \
+             Ethernet2 {\n admin-state enabled\n switchport {\n trunk-vlans 10 20\nnative-vlan 5\n }\n }\n }",
+        )
+        .unwrap();
+        tree.normalize_interfaces();
+        let (_, interfaces) = tree.block("interfaces").unwrap();
+        let (_, e1) = ConfigTree::blocks_named(interfaces, "Ethernet1")
+            .next()
+            .unwrap();
+        assert!(ConfigTree::has_phrase(e1, "no", "shutdown"));
+        let (_, sp1) = ConfigTree::blocks_named(e1, "switchport").next().unwrap();
         assert_eq!(
-            ConfigTree::leaf_value(children, "admin-state"),
-            Some("disabled")
+            ConfigTree::phrase_values(sp1, "access", "vlan"),
+            Some(&["10".to_string()][..])
         );
+        let (_, e2) = ConfigTree::blocks_named(interfaces, "Ethernet2")
+            .next()
+            .unwrap();
+        assert!(ConfigTree::has_phrase(e2, "no", "shutdown"));
+        let (_, sp2) = ConfigTree::blocks_named(e2, "switchport").next().unwrap();
+        assert_eq!(
+            ConfigTree::phrase_values(sp2, "trunk", "vlans"),
+            Some(&["10".to_string(), "20".to_string()][..])
+        );
+        assert_eq!(
+            ConfigTree::phrase_values(sp2, "native", "vlan"),
+            Some(&["5".to_string()][..])
+        );
+        // The rendered text carries the new phrases and round-trips.
+        let text = tree.to_text();
+        assert!(text.contains("no shutdown"));
+        assert!(text.contains("access vlan 10"));
+        assert!(text.contains("trunk vlans 10 20"));
+        assert!(text.contains("native vlan 5"));
+        assert_eq!(crate::parse(&text).unwrap(), tree);
     }
 
     #[test]

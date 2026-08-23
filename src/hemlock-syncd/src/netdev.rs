@@ -30,6 +30,73 @@ pub struct NetdevSample {
     pub counters: RawCounters,
 }
 
+/// Reconcile the kernel bridge backing an SVI: a bridge netdev named
+/// `VlanN` whose slaves are the untagged member ports' hostif netdevs.
+/// Punted frames arrive on the port netdevs (the hostif table delivers
+/// per ingress physical port); the bridge forwards them to the SVI
+/// netdev, where the kernel owns the address — the same shape SONiC
+/// uses. Best-effort (warn, don't fail): the ASIC-side RIF is the
+/// source of truth and a re-run converges.
+pub fn reconcile_svi_bridge(name: &str, members: &[String]) {
+    if !cfg!(unix) {
+        return;
+    }
+    let sys = |suffix: &str| format!("/sys/class/net/{name}{suffix}");
+    if !std::path::Path::new(&sys("")).exists() {
+        run_ip(&["link", "add", "name", name, "type", "bridge"]);
+    }
+    run_ip(&["link", "set", "dev", name, "up"]);
+
+    let current: std::collections::HashSet<String> = std::fs::read_dir(sys("/brif"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    for member in members {
+        if !current.contains(member) {
+            run_ip(&["link", "set", "dev", member, "master", name]);
+        }
+        // Slave netdevs must be up for bridge RX/TX; kernel netdev admin
+        // state is independent of the ASIC port's.
+        run_ip(&["link", "set", "dev", member, "up"]);
+    }
+    for stale in current {
+        if !members.contains(&stale) {
+            run_ip(&["link", "set", "dev", &stale, "nomaster"]);
+        }
+    }
+}
+
+/// Remove an SVI's kernel bridge (slaves are released automatically).
+pub fn delete_svi_bridge(name: &str) {
+    if !cfg!(unix) {
+        return;
+    }
+    if std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
+        run_ip(&["link", "del", "dev", name]);
+    }
+}
+
+/// One iproute2 command, logging (not failing) on error.
+fn run_ip(args: &[&str]) {
+    match std::process::Command::new("ip").args(args).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::warn!(
+            command = %format!("ip {}", args.join(" ")),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "SVI bridge command failed"
+        ),
+        Err(err) => tracing::warn!(
+            command = %format!("ip {}", args.join(" ")),
+            %err,
+            "cannot run SVI bridge command"
+        ),
+    }
+}
+
 /// Sample the management netdev (per the platform manifest) plus any
 /// netdev named in Hemlock display convention (`Loopback0`, `Vlan10`,
 /// `Port-Channel1` — created by later orchestration phases).

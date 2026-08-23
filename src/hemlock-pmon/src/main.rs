@@ -76,6 +76,8 @@ pub struct FanReading {
     pub rpm: u32,
     pub pwm_percent: u32,
     pub ok: bool,
+    /// Tray present (always true without presence detect).
+    pub present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -148,8 +150,9 @@ async fn main() -> Result<()> {
 /// manifest's i2c topology (idempotent across restarts).
 fn real_hw_init(platform: &Platform) -> Result<Arc<dyn HwBackend>> {
     hemlock_platform::sysinit::load_kernel_modules(&platform.manifest.kernel)?;
-    let report = hemlock_platform::sysinit::Sysfs::real()
-        .instantiate_i2c(&platform.manifest.hardware.i2c)?;
+    let sysfs = hemlock_platform::sysinit::Sysfs::real();
+    let mut report = sysfs.instantiate_i2c(&platform.manifest.hardware.i2c)?;
+    sysfs.instantiate_psus(&platform.manifest.hardware.psus, &mut report);
     info!(
         created = report.created.len(),
         already_present = report.already_present.len(),
@@ -178,6 +181,8 @@ async fn poll_loop(platform: Arc<Platform>, backend: Arc<dyn HwBackend>, env: Sh
         .unwrap_or(5)
         .max(1);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval.into()));
+    // Last LED color written per fan, to skip redundant writes.
+    let mut fan_leds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     loop {
         ticker.tick().await;
@@ -216,23 +221,48 @@ async fn poll_loop(platform: Arc<Platform>, backend: Arc<dyn HwBackend>, env: Sh
 
         let mut fans = Vec::with_capacity(thermal.fans.len());
         for fan in &thermal.fans {
-            match backend.read_fan_rpm(fan) {
-                Ok(rpm) => fans.push(FanReading {
-                    name: fan.name.clone(),
-                    rpm,
-                    pwm_percent: commanded_pwm.unwrap_or(0),
-                    ok: rpm > 0,
-                }),
+            let present = match backend.fan_present(fan) {
+                Ok(present) => present,
                 Err(err) => {
-                    warn!(fan = %fan.name, %err, "tach read failed");
-                    fans.push(FanReading {
-                        name: fan.name.clone(),
-                        rpm: 0,
-                        pwm_percent: commanded_pwm.unwrap_or(0),
-                        ok: false,
-                    });
+                    warn!(fan = %fan.name, %err, "presence read failed");
+                    true // fail open: report health from the tach
+                }
+            };
+            let rpm = if present {
+                match backend.read_fan_rpm(fan) {
+                    Ok(rpm) => rpm,
+                    Err(err) => {
+                        warn!(fan = %fan.name, %err, "tach read failed");
+                        0
+                    }
+                }
+            } else {
+                0
+            };
+            let reading = FanReading {
+                name: fan.name.clone(),
+                rpm,
+                pwm_percent: commanded_pwm.unwrap_or(0),
+                ok: present && rpm > 0,
+                present,
+            };
+            // Tray LED follows health: spinning green, stalled amber,
+            // empty slot off. Deduplicated so a steady state costs no
+            // CPLD writes; cosmetic, so failures only warn.
+            let color = match (present, reading.ok) {
+                (false, _) => "off",
+                (true, true) => "green",
+                (true, false) => "amber",
+            };
+            if fan_leds.get(&fan.name).map(String::as_str) != Some(color) {
+                match backend.set_fan_led(fan, color) {
+                    Ok(()) => {
+                        fan_leds.insert(fan.name.clone(), color.to_string());
+                    }
+                    Err(err) => warn!(fan = %fan.name, color, %err, "fan LED write failed"),
                 }
             }
+            fans.push(reading);
         }
 
         let mut psus = Vec::with_capacity(platform.manifest.hardware.psus.len());

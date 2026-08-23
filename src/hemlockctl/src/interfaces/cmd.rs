@@ -225,10 +225,8 @@ pub async fn run(syncd: &IpcEndpoint, pmon: &IpcEndpoint, args: &[&str]) -> Resu
         if json {
             let mut sorted = xcvrs;
             sorted.sort_by_key(|x| x.id);
-            println!(
-                "{}",
-                json_object("transceivers", sorted.into_iter().map(|x| (x.id, x)))
-            );
+            let rendered = json_object("transceivers", sorted.into_iter().map(|x| (x.id, x)));
+            crate::pager::page(&format!("{rendered}\n"));
             return Ok(());
         }
         let text = match cmd {
@@ -241,7 +239,7 @@ pub async fn run(syncd: &IpcEndpoint, pmon: &IpcEndpoint, args: &[&str]) -> Resu
             }
             _ => unreachable!(),
         };
-        print!("{text}");
+        crate::pager::page(&text);
         return Ok(());
     }
 
@@ -252,10 +250,8 @@ pub async fn run(syncd: &IpcEndpoint, pmon: &IpcEndpoint, args: &[&str]) -> Resu
     if json {
         let mut sorted = interfaces;
         sorted.sort_by_key(|i| i.id);
-        println!(
-            "{}",
-            json_object("interfaces", sorted.into_iter().map(|i| (i.id, i)))
-        );
+        let rendered = json_object("interfaces", sorted.into_iter().map(|i| (i.id, i)));
+        crate::pager::page(&format!("{rendered}\n"));
         return Ok(());
     }
 
@@ -285,7 +281,7 @@ pub async fn run(syncd: &IpcEndpoint, pmon: &IpcEndpoint, args: &[&str]) -> Resu
         | Cmd::TransceiverProperties
         | Cmd::TransceiverEeprom => unreachable!("handled above"),
     };
-    print!("{text}");
+    crate::pager::page(&text);
     Ok(())
 }
 

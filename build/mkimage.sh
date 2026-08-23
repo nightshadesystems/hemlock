@@ -217,6 +217,13 @@ else
     echo /usr/bin/hemlockctl >> "$ROOTFS/etc/shells"
     chroot "$ROOTFS" useradd -m -s /usr/bin/hemlockctl -G sudo,hemlock admin
     echo 'admin:Hemlock123!' | chroot "$ROOTFS" chpasswd
+
+    # ping needs cap_net_raw; the capability xattr does not always
+    # survive debootstrap's postinst in a chroot, leaving operators
+    # unable to ping without sudo. mksquashfs preserves xattrs, so
+    # setting it here sticks in the image.
+    chroot "$ROOTFS" setcap cap_net_raw+ep /usr/bin/ping \
+        || log "WARNING: setcap on ping failed (ping will need sudo)"
 fi
 
 # Runtime path contract: the initramfs mounts the flash partition (which

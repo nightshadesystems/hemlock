@@ -14,9 +14,22 @@ use crate::ifstats::{utilization_pct, RawCounters, SharedEngine, Snapshot};
 use crate::netdev::NetdevSample;
 use crate::state::{L3State, PortState, SwitchportState, VlanState};
 
-/// L2 MTU reported for front-panel ports. Matches the KNET default the
-/// platform loads; per-interface MTU intents arrive in a later phase.
-const PORT_MTU: u32 = 9214;
+/// Fallback L2 MTU for front-panel ports, matching the KNET default the
+/// platform loads (`linux-bcm-knet default_mtu=9100`). Used when a port's
+/// hostif netdev cannot be read; per-interface MTU intents arrive in a
+/// later phase.
+const PORT_MTU: u32 = 9100;
+
+/// A port's live MTU: its hostif netdev is named after it, so the kernel
+/// has the truth (`ip link` parity). Fallback for mock backends and
+/// pre-hostif states.
+fn port_mtu(name: &str) -> u32 {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&mtu| mtu > 0)
+        .unwrap_or(PORT_MTU)
+}
 
 /// Platform facts the interface RPCs need, resolved once at startup.
 #[derive(Debug, Clone, Default)]
@@ -188,7 +201,7 @@ impl SyncdService {
             mac: self.inventory.mac.clone().unwrap_or_default(),
             bia_mac: self.inventory.mac.clone().unwrap_or_default(),
             description: port.description.clone(),
-            mtu: PORT_MTU,
+            mtu: port_mtu(&port.def.name),
             speed_mbps: speed,
             duplex: "full".into(),
             autoneg: port.def.autoneg,
@@ -238,6 +251,7 @@ impl SyncdService {
         &self,
         vlan: u16,
         name: &str,
+        l3: Option<&L3State>,
         ports: &HashMap<String, PortState>,
     ) -> pb::InterfaceState {
         let oper_up = ports
@@ -256,6 +270,7 @@ impl SyncdService {
             bia_mac: self.inventory.mac.clone().unwrap_or_default(),
             description: name.to_string(),
             mtu: PORT_MTU,
+            ip_addresses: l3.iter().map(|l3| l3.address.clone()).collect(),
             ..pb::InterfaceState::default()
         }
     }
@@ -315,6 +330,186 @@ impl SyncdService {
         let (host, subnet) = Self::routes_for(addr, len);
         std::iter::once(host).chain(subnet).collect()
     }
+
+    /// The untagged member ports of a VLAN, by hostif netdev name —
+    /// what the SVI's kernel bridge should enslave. Tagged trunk
+    /// members are excluded: hostif punt delivery strips tags, so the
+    /// kernel could not tell their VLANs apart.
+    fn svi_members(vlan: u16, ports: &HashMap<String, PortState>) -> Vec<String> {
+        let mut names: Vec<String> = ports
+            .values()
+            .filter(|p| p.l3.is_none())
+            .filter(|p| match &p.switchport {
+                None => vlan == 1,
+                Some(sp) => {
+                    let untagged = if sp.trunk {
+                        sp.native_vlan
+                    } else {
+                        sp.access_vlan
+                    };
+                    let untagged = if untagged == 0 { 1 } else { untagged };
+                    untagged == vlan
+                }
+            })
+            .map(|p| p.def.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Reconcile every SVI's kernel bridge against current VLAN
+    /// membership. Called after anything that changes membership (SVI
+    /// create, switchport program, port address set/clear). No kernel
+    /// side effects under the mock backend (dev hosts).
+    fn reconcile_svi_bridges(&self) {
+        if self.handle.backend_name == "mock" {
+            return;
+        }
+        let (svis, members): (Vec<u16>, Vec<Vec<String>>) = {
+            let (Ok(vlans), Ok(ports)) = (self.handle.vlans.read(), self.handle.ports.read())
+            else {
+                return;
+            };
+            vlans
+                .iter()
+                .filter(|(_, v)| v.l3.is_some())
+                .map(|(id, _)| (*id, Self::svi_members(*id, &ports)))
+                .unzip()
+        };
+        for (id, members) in svis.iter().zip(&members) {
+            crate::netdev::reconcile_svi_bridge(&format!("Vlan{id}"), members);
+        }
+    }
+
+    /// Tear down an SVI's ASIC objects (routes + VLAN RIF) and its
+    /// kernel bridge. The caller updates the VLAN table.
+    async fn teardown_svi(&self, vlan: u16, l3: &L3State) -> Result<(), Status> {
+        for dest in Self::route_dests(&l3.address) {
+            let _ = self.handle.remove_route(dest).await;
+        }
+        self.handle
+            .remove_vlan_rif(l3.rif)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        if self.handle.backend_name != "mock" {
+            crate::netdev::delete_svi_bridge(&format!("Vlan{vlan}"));
+        }
+        Ok(())
+    }
+
+    /// `set_interface_address` for an SVI (`Vlan<id>`): VLAN-type
+    /// router interface + IP2ME/subnet routes, then the kernel bridge.
+    async fn set_svi_address(
+        &self,
+        vlan: u16,
+        address: String,
+        addr: std::net::IpAddr,
+        len: u8,
+    ) -> Result<Response<pb::SetInterfaceAddressResponse>, Status> {
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let (vlan_oid, existing) = {
+            let vlans = self
+                .handle
+                .vlans
+                .read()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            match vlans.get(&vlan) {
+                Some(state) => (state.oid, state.l3.clone()),
+                // The default VLAN always exists in hardware even
+                // without a table entry.
+                None if vlan == 1 => (None, None),
+                None => {
+                    return Err(Status::failed_precondition(format!(
+                        "VLAN {vlan} is not defined (set vlans vlan {vlan})"
+                    )));
+                }
+            }
+        };
+        if existing.as_ref().is_some_and(|l3| l3.address == address) {
+            return Ok(Response::new(pb::SetInterfaceAddressResponse {}));
+        }
+
+        // Same shape as the port path: keep the RIF on an address
+        // change, swap the routes, remove-then-add for convergence.
+        if let Some(old) = &existing {
+            for dest in Self::route_dests(&old.address) {
+                let _ = self.handle.remove_route(dest).await;
+            }
+        }
+        let rif = match &existing {
+            Some(l3) => l3.rif,
+            None => self.handle.create_vlan_rif(vlan_oid).await.map_err(sai)?,
+        };
+        let (host, subnet) = Self::routes_for(addr, len);
+        let _ = self.handle.remove_route(host).await;
+        self.handle
+            .create_route(host, hemlock_sai::RouteTarget::Cpu)
+            .await
+            .map_err(sai)?;
+        if let Some(subnet) = subnet {
+            let _ = self.handle.remove_route(subnet).await;
+            self.handle
+                .create_route(subnet, hemlock_sai::RouteTarget::Rif(rif))
+                .await
+                .map_err(sai)?;
+        }
+
+        {
+            let mut vlans = self
+                .handle
+                .vlans
+                .write()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            let l3 = Some(L3State { rif, address });
+            vlans
+                .entry(vlan)
+                .and_modify(|v| v.l3 = l3.clone())
+                .or_insert(VlanState {
+                    oid: None,
+                    name: String::new(),
+                    l3,
+                });
+        }
+        self.reconcile_svi_bridges();
+        Ok(Response::new(pb::SetInterfaceAddressResponse {}))
+    }
+
+    /// `clear_interface_address` for an SVI.
+    async fn clear_svi_address(
+        &self,
+        vlan: u16,
+    ) -> Result<Response<pb::ClearInterfaceAddressResponse>, Status> {
+        let existing = {
+            let vlans = self
+                .handle
+                .vlans
+                .read()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            vlans.get(&vlan).and_then(|v| v.l3.clone())
+        };
+        let Some(l3) = existing else {
+            return Ok(Response::new(pb::ClearInterfaceAddressResponse {}));
+        };
+        self.teardown_svi(vlan, &l3).await?;
+        let mut vlans = self
+            .handle
+            .vlans
+            .write()
+            .map_err(|_| Status::internal("vlan table poisoned"))?;
+        if let Some(state) = vlans.get_mut(&vlan) {
+            state.l3 = None;
+        }
+        Ok(Response::new(pb::ClearInterfaceAddressResponse {}))
+    }
+}
+
+/// The VLAN id of an SVI interface name (`Vlan10` -> 10).
+fn svi_vlan_id(name: &str) -> Option<u16> {
+    let digits = name.strip_prefix("Vlan")?;
+    digits
+        .parse::<u16>()
+        .ok()
+        .filter(|id| (1..=4094).contains(id) && !digits.starts_with('0'))
 }
 
 #[tonic::async_trait]
@@ -483,7 +678,8 @@ impl pb::syncd_server::Syncd for SyncdService {
                     continue;
                 }
                 let display = vlans.get(id).map(|v| v.name.as_str()).unwrap_or("");
-                interfaces.push(self.vlan_to_iface(*id, display, &table));
+                let l3 = vlans.get(id).and_then(|v| v.l3.as_ref());
+                interfaces.push(self.vlan_to_iface(*id, display, l3, &table));
             }
             let names = vlans
                 .iter()
@@ -516,6 +712,10 @@ impl pb::syncd_server::Syncd for SyncdService {
         let req = request.into_inner();
         let (addr, len) =
             hemlock_common::net::parse_cidr(&req.address).map_err(Status::invalid_argument)?;
+
+        if let Some(vlan) = svi_vlan_id(&req.name) {
+            return self.set_svi_address(vlan, req.address, addr, len).await;
+        }
 
         let (sai_id, existing) = {
             let table = self
@@ -572,18 +772,22 @@ impl pb::syncd_server::Syncd for SyncdService {
                 .map_err(sai)?;
         }
 
-        let mut table = self
-            .handle
-            .ports
-            .write()
-            .map_err(|_| Status::internal("port table poisoned"))?;
-        let port = table
-            .get_mut(&req.name)
-            .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
-        port.l3 = Some(L3State {
-            rif,
-            address: req.address,
-        });
+        {
+            let mut table = self
+                .handle
+                .ports
+                .write()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let port = table
+                .get_mut(&req.name)
+                .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+            port.l3 = Some(L3State {
+                rif,
+                address: req.address,
+            });
+        }
+        // A routed port leaves its VLAN; SVI bridges shed its netdev.
+        self.reconcile_svi_bridges();
         Ok(Response::new(pb::SetInterfaceAddressResponse {}))
     }
 
@@ -592,6 +796,11 @@ impl pb::syncd_server::Syncd for SyncdService {
         request: Request<pb::ClearInterfaceAddressRequest>,
     ) -> Result<Response<pb::ClearInterfaceAddressResponse>, Status> {
         let req = request.into_inner();
+
+        if let Some(vlan) = svi_vlan_id(&req.name) {
+            return self.clear_svi_address(vlan).await;
+        }
+
         let (sai_id, existing) = {
             let table = self
                 .handle
@@ -615,14 +824,18 @@ impl pb::syncd_server::Syncd for SyncdService {
             .await
             .map_err(|e| Status::internal(format!("SAI: {e}")))?;
 
-        let mut table = self
-            .handle
-            .ports
-            .write()
-            .map_err(|_| Status::internal("port table poisoned"))?;
-        if let Some(port) = table.get_mut(&req.name) {
-            port.l3 = None;
+        {
+            let mut table = self
+                .handle
+                .ports
+                .write()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            if let Some(port) = table.get_mut(&req.name) {
+                port.l3 = None;
+            }
         }
+        // The port re-joins its VLAN; SVI bridges pick its netdev up.
+        self.reconcile_svi_bridges();
         Ok(Response::new(pb::ClearInterfaceAddressResponse {}))
     }
 
@@ -661,6 +874,7 @@ impl pb::syncd_server::Syncd for SyncdService {
             .or_insert(VlanState {
                 oid,
                 name: req.name,
+                l3: None,
             });
         Ok(Response::new(pb::EnsureVlanResponse {}))
     }
@@ -698,6 +912,15 @@ impl pb::syncd_server::Syncd for SyncdService {
                 .map(|(_, member, _)| *member)
                 .collect()
         };
+        // An SVI on the VLAN goes first (its RIF references the VLAN).
+        if let Some(l3) = &state.l3 {
+            self.teardown_svi(id, l3).await?;
+            if let Ok(mut vlans) = self.handle.vlans.write() {
+                if let Some(state) = vlans.get_mut(&id) {
+                    state.l3 = None;
+                }
+            }
+        }
         for member in detach {
             self.handle.remove_vlan_member(member).await.map_err(sai)?;
         }
@@ -863,6 +1086,8 @@ impl pb::syncd_server::Syncd for SyncdService {
                 members,
             });
         }
+        drop(table);
+        self.reconcile_svi_bridges();
         Ok(Response::new(pb::SetPortSwitchportResponse {}))
     }
 
@@ -901,6 +1126,8 @@ impl pb::syncd_server::Syncd for SyncdService {
         if let Some(port) = table.get_mut(&req.name) {
             port.switchport = None;
         }
+        drop(table);
+        self.reconcile_svi_bridges();
         Ok(Response::new(pb::ClearPortSwitchportResponse {}))
     }
 }
@@ -1278,5 +1505,102 @@ lanes = [1, 2]
             .await
             .unwrap();
         assert!(handle.vlans.read().unwrap().is_empty());
+    }
+
+    /// SVI lifecycle over the mock data-plane: default-VLAN SVI, a
+    /// created VLAN's SVI, address surfaced via GetInterfaces, teardown
+    /// on clear and on VLAN removal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn svi_address_lifecycle_over_mock_sai() {
+        let platform = test_platform();
+        let backend = Box::new(hemlock_sai::mock::MockSai::new(platform.ports.clone()));
+        let handle = Arc::new(SaiActor::spawn(backend, &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        // An SVI on an undefined VLAN is rejected.
+        let err = service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Vlan10".into(),
+                address: "10.0.10.1/24".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        // Vlan1 always works (the hardware default VLAN).
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Vlan1".into(),
+                address: "10.42.10.9/24".into(),
+            }))
+            .await
+            .unwrap();
+        let vlan1_rif = {
+            let vlans = handle.vlans.read().unwrap();
+            let l3 = vlans[&1].l3.clone().unwrap();
+            assert_eq!(l3.address, "10.42.10.9/24");
+            l3.rif
+        };
+        let response = service
+            .get_interfaces(Request::new(pb::GetInterfacesRequest {
+                names: vec!["Vlan1".into()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.interfaces[0].ip_addresses, ["10.42.10.9/24"]);
+
+        // Address change keeps the RIF; same address is a no-op.
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Vlan1".into(),
+                address: "10.42.10.10/24".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.vlans.read().unwrap()[&1].l3.clone().unwrap().rif,
+            vlan1_rif
+        );
+
+        // A created VLAN takes an SVI too.
+        service
+            .ensure_vlan(Request::new(pb::EnsureVlanRequest {
+                id: 10,
+                name: String::new(),
+            }))
+            .await
+            .unwrap();
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Vlan10".into(),
+                address: "10.0.10.1/24".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(handle.vlans.read().unwrap()[&10].l3.is_some());
+
+        // Clear tears the SVI down; the VLAN itself stays.
+        service
+            .clear_interface_address(Request::new(pb::ClearInterfaceAddressRequest {
+                name: "Vlan1".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(handle.vlans.read().unwrap()[&1].l3.is_none());
+
+        // Removing a VLAN with a live SVI tears the SVI down with it
+        // (the mock refuses to remove a VLAN still fronted by a RIF, so
+        // success proves the ordering).
+        service
+            .remove_vlan(Request::new(pb::RemoveVlanRequest { id: 10 }))
+            .await
+            .unwrap();
+        assert!(!handle.vlans.read().unwrap().contains_key(&10));
     }
 }

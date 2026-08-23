@@ -294,6 +294,18 @@ pub struct FanDef {
     pub tach: String,
     /// PWM output within the device, e.g. `pwm4`.
     pub pwm: String,
+    /// Absolute sysfs attribute holding tray presence (integer), e.g. a
+    /// CPLD's `fan1_prs`. Absent = no presence detect (always present).
+    #[serde(default)]
+    pub presence_attr: Option<String>,
+    /// Presence attribute polarity: true when 0 means present.
+    #[serde(default)]
+    pub presence_active_low: bool,
+    /// Absolute sysfs attribute controlling the tray LED; accepts the
+    /// driver's color words (e.g. `green` / `amber` / `off`). pmon drives
+    /// it from fan health when set.
+    #[serde(default)]
+    pub led_attr: Option<String>,
 }
 
 /// Linear-interpolated fan curve driven by one named sensor.
@@ -329,6 +341,14 @@ pub struct Psu {
     pub driver: String,
     #[serde(default)]
     pub eeprom_address: Option<u32>,
+    /// Absolute sysfs attribute holding presence as an integer (1 =
+    /// present), e.g. the E1031 CPLD's `psuL_prs`. Absent = fall back to
+    /// probing the pmbus device.
+    #[serde(default)]
+    pub presence_attr: Option<String>,
+    /// Absolute sysfs attribute holding power-good as an integer (1 = ok).
+    #[serde(default)]
+    pub status_attr: Option<String>,
 }
 
 /// Maps a front-panel port to the i2c bus carrying its module EEPROM.

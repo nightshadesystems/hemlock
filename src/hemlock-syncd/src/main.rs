@@ -153,6 +153,15 @@ async fn main() -> Result<()> {
     };
     info!(%listen, "serving gRPC");
 
+    // Type=notify: the ASIC is up and the port table built — units
+    // ordered After=hemlock-syncd.service may now start. (The socket
+    // binds microseconds later inside serve; clients retry regardless.)
+    match hemlock_common::systemd::notify_ready() {
+        Ok(true) => info!("systemd notified: READY=1"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "sd_notify failed (continuing)"),
+    }
+
     let router = tonic::transport::Server::builder().add_service(SyncdServer::new(
         service::SyncdService::new(handle, engine, netdevs, inventory),
     ));

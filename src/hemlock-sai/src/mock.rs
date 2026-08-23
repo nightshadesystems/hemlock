@@ -44,6 +44,8 @@ pub struct MockSai {
     /// L2 model: created VLANs, memberships, PVIDs, and which ports
     /// still hold their boot-time untagged default-VLAN membership.
     vlans: HashMap<u16, Oid>,
+    /// SVI RIFs: rif oid -> the VLAN it fronts (None = default VLAN).
+    vlan_rifs: HashMap<Oid, Option<Oid>>,
     vlan_members: HashMap<Oid, (Oid, PortId, bool)>,
     default_members: std::collections::HashSet<PortId>,
     pvids: HashMap<PortId, u16>,
@@ -66,6 +68,7 @@ impl MockSai {
             rifs: HashMap::new(),
             routes: HashMap::new(),
             vlans: HashMap::new(),
+            vlan_rifs: HashMap::new(),
             vlan_members: HashMap::new(),
             default_members: std::collections::HashSet::new(),
             pvids: HashMap::new(),
@@ -227,10 +230,33 @@ impl SaiBackend for MockSai {
         }
     }
 
+    fn create_vlan_router_interface(&mut self, vlan: Option<Oid>) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if let Some(vlan) = vlan {
+            if !self.vlans.values().any(|o| *o == vlan) {
+                return Err(SaiError::Other(format!("no such VLAN {vlan}")));
+            }
+        }
+        if self.vlan_rifs.values().any(|v| *v == vlan) {
+            return Err(SaiError::Other(format!("VLAN {vlan:?} already has a RIF")));
+        }
+        let oid = self.alloc(MOCK_RIF_OID_BASE);
+        self.vlan_rifs.insert(oid, vlan);
+        Ok(oid)
+    }
+
+    fn remove_vlan_router_interface(&mut self, rif: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.vlan_rifs.remove(&rif).is_none() {
+            return Err(SaiError::Other(format!("no such VLAN RIF {rif}")));
+        }
+        Ok(())
+    }
+
     fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError> {
         self.require_switch()?;
         if let RouteTarget::Rif(rif) = target {
-            if !self.rifs.values().any(|r| *r == rif) {
+            if !self.rifs.values().any(|r| *r == rif) && !self.vlan_rifs.contains_key(&rif) {
                 return Err(SaiError::Other(format!("no such RIF {rif}")));
             }
         }
@@ -259,6 +285,9 @@ impl SaiBackend for MockSai {
         self.require_switch()?;
         if self.vlan_members.values().any(|(v, _, _)| *v == vlan) {
             return Err(SaiError::Other(format!("VLAN {vlan} still has members")));
+        }
+        if self.vlan_rifs.values().any(|v| *v == Some(vlan)) {
+            return Err(SaiError::Other(format!("VLAN {vlan} still has a RIF")));
         }
         let Some(id) = self
             .vlans

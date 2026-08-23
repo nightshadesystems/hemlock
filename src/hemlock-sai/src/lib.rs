@@ -283,6 +283,16 @@ pub trait SaiBackend: Send {
     /// create a router interface on the default virtual router.
     fn create_router_interface(&mut self, port: PortId) -> Result<Oid, SaiError>;
 
+    /// Create an SVI: a VLAN-type router interface on the default
+    /// virtual router. `vlan` is the VLAN's object id; `None` means the
+    /// default VLAN. The VLAN keeps bridging; only frames addressed to
+    /// the RIF MAC enter L3.
+    fn create_vlan_router_interface(&mut self, vlan: Option<Oid>) -> Result<Oid, SaiError>;
+
+    /// Undo [`Self::create_vlan_router_interface`]. Unlike a port RIF
+    /// there is no bridge state to restore.
+    fn remove_vlan_router_interface(&mut self, rif: Oid) -> Result<(), SaiError>;
+
     /// Undo [`Self::create_router_interface`]: remove the RIF and
     /// restore default L2 bridging (bridge port + untagged default-VLAN
     /// membership + PVID).

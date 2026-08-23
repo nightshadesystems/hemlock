@@ -51,6 +51,9 @@ pub struct SwitchportState {
 pub struct VlanState {
     pub oid: Option<Oid>,
     pub name: String,
+    /// Present when the VLAN has an SVI (a VLAN router interface with
+    /// an address).
+    pub l3: Option<L3State>,
 }
 
 /// VLAN table keyed by 802.1Q id, shared via `Arc<RwLock<...>>`.

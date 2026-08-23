@@ -161,7 +161,7 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
                 Ok(state) => (state.mode, state.ports.clone()),
                 Err(_) => (CliMode::Operational, Vec::new()),
             };
-            let options = complete::candidates(cli_mode, &tokens, partial, &ports);
+            let options = complete::help_candidates(cli_mode, &tokens, partial, &ports);
             if options.is_empty() {
                 println!("  <cr>");
             } else {
@@ -225,7 +225,8 @@ fn fail(err: anyhow::Error) -> Step {
 /// Render an error, translating a raw gRPC connect failure into the
 /// operator-facing truth. The socket path in the IPC error identifies
 /// which daemon; the cause separates "daemon down" from "socket exists
-/// but this account may not open it" (not in the hemlock group).
+/// but this account may not open it" (not in the hemlock group), and
+/// systemd's unit state separates "still initializing" from "dead".
 pub(crate) fn fmt_err(err: anyhow::Error) -> String {
     let text = format!("{err:#}");
     if text.contains("ipc failure") {
@@ -236,11 +237,43 @@ pub(crate) fn fmt_err(err: anyhow::Error) -> String {
                         "% no permission on the {daemon} socket (is this account in the hemlock group?)"
                     );
                 }
-                return format!("% cannot reach {daemon} (is hemlock-{daemon}.service running?)");
+                return match unit_active_state(daemon).as_deref() {
+                    Some("activating") => format!(
+                        "% {daemon} is still initializing — try again in a moment"
+                    ),
+                    Some("failed") => format!(
+                        "% {daemon} failed (see: journalctl -u hemlock-{daemon})"
+                    ),
+                    Some("inactive") => {
+                        format!("% {daemon} is not running (hemlock-{daemon}.service is inactive)")
+                    }
+                    _ => {
+                        format!("% cannot reach {daemon} (is hemlock-{daemon}.service running?)")
+                    }
+                };
             }
         }
     }
     format!("% {text}")
+}
+
+/// The systemd ActiveState of `hemlock-<daemon>.service`, when systemctl
+/// is available (always on a switch; None on dev hosts).
+fn unit_active_state(daemon: &str) -> Option<String> {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "--property=ActiveState",
+            "--value",
+            &format!("hemlock-{daemon}.service"),
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
@@ -363,7 +396,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
                     stay(Mode::Config)
                 }
                 Ok(text) => {
-                    print!("{text}");
+                    crate::pager::page(&text);
                     stay(Mode::Config)
                 }
                 Err(e) => fail(e),
@@ -411,6 +444,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces <port> description <text>");
             println!("  set interfaces <port> shutdown | no-shutdown");
             println!("  set interfaces <port> address <ip/prefix>     puts the port in L3 mode");
+            println!("  set interfaces Vlan<id> address <ip/prefix>   SVI (in-band management)");
             println!("  set interfaces <port> switchport mode <access|trunk>");
             println!("  set interfaces <port> switchport access vlan <id>");
             println!("  set interfaces <port> switchport trunk vlans <list>   e.g. 10,20,30-32");
@@ -546,9 +580,15 @@ async fn config_interfaces(
     let Some(raw_port) = words.first() else {
         return Err(usage());
     };
-    let mut known = list_port_names(endpoints).await.map_err(fmt_err)?;
-    known.push(management_interface());
-    let port = canonical_port(raw_port, &known)?;
+    let port = match vlan_interface(raw_port) {
+        // SVIs (`Vlan10`) are config-defined, not syncd ports.
+        Some(name) => name,
+        None => {
+            let mut known = list_port_names(endpoints).await.map_err(fmt_err)?;
+            known.push(management_interface());
+            canonical_port(raw_port, &known)?
+        }
+    };
     let rest = &words[1..];
 
     if rest.is_empty() {
@@ -569,7 +609,7 @@ async fn config_interfaces(
         };
     }
 
-    match resolve(
+    let subcommand = resolve(
         rest[0],
         &[
             "description",
@@ -578,7 +618,12 @@ async fn config_interfaces(
             "address",
             "switchport",
         ],
-    )? {
+    )?;
+    // Phase-1 SVIs carry an address and nothing else.
+    if port.starts_with("Vlan") && subcommand != "address" {
+        return Err(format!("% {subcommand} is not supported on VLAN interfaces"));
+    }
+    match subcommand {
         "description" => {
             if delete {
                 edit_interface(endpoints, &port, |eth| {
@@ -597,19 +642,22 @@ async fn config_interfaces(
             }
         }
         marker @ ("shutdown" | "no-shutdown") => {
-            let other = if marker == "shutdown" {
-                "no-shutdown"
-            } else {
-                "shutdown"
-            };
+            // Stored as `shutdown` / `no shutdown` (the candidate is
+            // normalized before editing, so only those forms exist).
+            let shutdown = marker == "shutdown";
             edit_interface(endpoints, &port, move |eth| {
                 if delete {
-                    ConfigTree::remove_leaf(eth, marker);
+                    if shutdown {
+                        ConfigTree::remove_leaf(eth, "shutdown");
+                    } else {
+                        ConfigTree::remove_leaf(eth, "no");
+                    }
+                } else if shutdown {
+                    ConfigTree::set_leaf(eth, "shutdown", vec![]);
+                    ConfigTree::remove_leaf(eth, "no");
                 } else {
-                    ConfigTree::set_leaf(eth, marker, vec![]);
-                    ConfigTree::remove_leaf(eth, other);
-                    // Displace the legacy admin-state form too.
-                    ConfigTree::remove_leaf(eth, "admin-state");
+                    ConfigTree::set_phrase(eth, "no", "shutdown", vec![]);
+                    ConfigTree::remove_leaf(eth, "shutdown");
                 }
             })
             .await
@@ -698,7 +746,8 @@ async fn config_switchport(
                     let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
                     ConfigTree::set_leaf(sp, "mode", vec![value]);
                     if trunk {
-                        ConfigTree::remove_leaf(sp, "access-vlan");
+                        // A trunk carries no access VLAN.
+                        ConfigTree::remove_leaf(sp, "access");
                     }
                 })
                 .await
@@ -708,7 +757,7 @@ async fn config_switchport(
             if delete {
                 edit_interface(endpoints, port, |eth| {
                     if let Some(sp) = block_children_mut(eth, "switchport") {
-                        ConfigTree::remove_leaf(sp, "access-vlan");
+                        ConfigTree::remove_leaf(sp, "access");
                     }
                 })
                 .await
@@ -723,7 +772,7 @@ async fn config_switchport(
                 let id = parse_vlan_arg(raw)?;
                 edit_interface(endpoints, port, move |eth| {
                     let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
-                    ConfigTree::set_leaf(sp, "access-vlan", vec![id]);
+                    ConfigTree::set_phrase(sp, "access", "vlan", vec![id]);
                 })
                 .await
             }
@@ -737,7 +786,7 @@ async fn config_switchport(
                     if delete {
                         edit_interface(endpoints, port, |eth| {
                             if let Some(sp) = block_children_mut(eth, "switchport") {
-                                ConfigTree::remove_leaf(sp, "trunk-vlans");
+                                ConfigTree::remove_leaf(sp, "trunk");
                             }
                         })
                         .await
@@ -748,7 +797,7 @@ async fn config_switchport(
                         let vlans = parse_vlan_list(list)?;
                         edit_interface(endpoints, port, move |eth| {
                             let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
-                            ConfigTree::set_leaf(sp, "trunk-vlans", vlans);
+                            ConfigTree::set_phrase(sp, "trunk", "vlans", vlans);
                         })
                         .await
                     }
@@ -757,7 +806,7 @@ async fn config_switchport(
                     if delete {
                         edit_interface(endpoints, port, |eth| {
                             if let Some(sp) = block_children_mut(eth, "switchport") {
-                                ConfigTree::remove_leaf(sp, "native-vlan");
+                                ConfigTree::remove_leaf(sp, "native");
                             }
                         })
                         .await
@@ -772,7 +821,7 @@ async fn config_switchport(
                         let id = parse_vlan_arg(raw)?;
                         edit_interface(endpoints, port, move |eth| {
                             let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
-                            ConfigTree::set_leaf(sp, "native-vlan", vec![id]);
+                            ConfigTree::set_phrase(sp, "native", "vlan", vec![id]);
                         })
                         .await
                     }
@@ -783,6 +832,26 @@ async fn config_switchport(
         _ => unreachable!(),
     }
     .map_err(fmt_err)
+}
+
+/// Canonical SVI name from user input: `vlan10`, `Vl10`, `v10` all mean
+/// `Vlan10`. `None` when the input is not a VLAN interface form.
+fn vlan_interface(input: &str) -> Option<String> {
+    let digit_at = input
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or(input.len());
+    let (alpha, digits) = input.split_at(digit_at);
+    if alpha.is_empty() || digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !"vlan".starts_with(&alpha.to_ascii_lowercase()) {
+        return None;
+    }
+    digits
+        .parse::<u16>()
+        .ok()
+        .filter(|id| (1..=4094).contains(id))
+        .map(|id| format!("Vlan{id}"))
 }
 
 /// A CLI VLAN id argument, validated and canonicalized.
@@ -1154,6 +1223,20 @@ mod tests {
         assert_eq!(resolve("conf", words).unwrap(), "conf"); // exact beats prefix
         assert!(resolve("c", words).is_err()); // ambiguous: configure/conf
         assert!(resolve("zz", words).is_err());
+    }
+
+    #[test]
+    fn vlan_interface_names_canonicalize() {
+        assert_eq!(vlan_interface("Vlan10"), Some("Vlan10".into()));
+        assert_eq!(vlan_interface("vlan1"), Some("Vlan1".into()));
+        assert_eq!(vlan_interface("Vl10"), Some("Vlan10".into()));
+        assert_eq!(vlan_interface("v4094"), Some("Vlan4094".into()));
+        assert_eq!(vlan_interface("v0"), None);
+        assert_eq!(vlan_interface("v5000"), None);
+        assert_eq!(vlan_interface("Ethernet1"), None);
+        assert_eq!(vlan_interface("e1"), None);
+        assert_eq!(vlan_interface("ma1"), None);
+        assert_eq!(vlan_interface("vlan"), None);
     }
 
     #[test]

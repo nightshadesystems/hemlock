@@ -26,6 +26,16 @@ pub struct Intents {
     pub routes: BTreeMap<String, String>,
     /// VLANs (`vlans { vlan <id> { ... } }`), keyed by 802.1Q id.
     pub vlans: BTreeMap<u16, VlanIntent>,
+    /// SVIs (`interfaces { Vlan<id> { address ... } }`), keyed by
+    /// interface name.
+    pub svis: BTreeMap<String, SviIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SviIntent {
+    /// Interface address in CIDR form; gives the VLAN a router
+    /// interface (ASIC) and a kernel address on its bridge netdev.
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -135,6 +145,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
         enum Kind {
             Port,
             Management,
+            Vlan,
         }
         let (kind, ifname) = match (name.as_str(), keys.as_slice()) {
             // Legacy keyed forms: `ethernet <name> { ... }`.
@@ -148,6 +159,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
             // Current form: the interface name is the block name.
             (n, []) if n.starts_with("Management") => (Kind::Management, name.clone()),
             (n, []) if n.starts_with("Ethernet") => (Kind::Port, name.clone()),
+            (n, []) if n.starts_with("Vlan") => (Kind::Vlan, name.clone()),
             (n, _) => {
                 return Err(IntentError::BadInterfaceBlock(format!(
                     "unrecognized interface block {n:?}"
@@ -202,17 +214,50 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     return Err(IntentError::Duplicate { name: ifname });
                 }
             }
+            Kind::Vlan => {
+                let id = ifname
+                    .strip_prefix("Vlan")
+                    .and_then(|d| d.parse::<u16>().ok())
+                    .filter(|id| (1..=4094).contains(id))
+                    .ok_or_else(|| {
+                        IntentError::BadInterfaceBlock(format!(
+                            "bad VLAN interface name {ifname:?} (Vlan1..Vlan4094)"
+                        ))
+                    })?;
+                if ConfigTree::blocks_named(children, "switchport")
+                    .next()
+                    .is_some()
+                {
+                    return Err(IntentError::BadSwitchport {
+                        name: ifname,
+                        reason: "VLAN interfaces are not switchports".into(),
+                    });
+                }
+                // An SVI needs its VLAN to exist (the default VLAN 1
+                // always does).
+                if address.is_some() && id != 1 && !intents.vlans.contains_key(&id) {
+                    return Err(IntentError::BadInterfaceBlock(format!(
+                        "{ifname}: VLAN {id} is not defined (set vlans vlan {id})"
+                    )));
+                }
+                let intent = SviIntent { address };
+                if intents.svis.insert(ifname.clone(), intent).is_some() {
+                    return Err(IntentError::Duplicate { name: ifname });
+                }
+            }
         }
     }
     Ok(intents)
 }
 
-/// Admin state of an interface: the `shutdown` / `no-shutdown` marker
-/// leaves, with the legacy `admin-state enabled|disabled` form still
-/// accepted for configs persisted before the change.
+/// Admin state of an interface: the `shutdown` / `no shutdown` marker
+/// leaves, with the legacy `no-shutdown` and `admin-state
+/// enabled|disabled` forms still accepted for configs persisted before
+/// the format changes.
 fn admin_state(children: &[Item], name: &str) -> Result<Option<bool>, IntentError> {
     let shutdown = ConfigTree::has_leaf(children, "shutdown");
-    let no_shutdown = ConfigTree::has_leaf(children, "no-shutdown");
+    let no_shutdown = ConfigTree::has_phrase(children, "no", "shutdown")
+        || ConfigTree::has_leaf(children, "no-shutdown");
     if shutdown && no_shutdown {
         return Err(IntentError::BadInterfaceBlock(format!(
             "{name}: both shutdown and no-shutdown"
@@ -261,14 +306,22 @@ fn switchport(children: &[Item], name: &str) -> Result<Option<SwitchportIntent>,
             )))
         }
     };
-    let vlan_leaf = |leaf: &str| -> Result<Option<u16>, IntentError> {
-        match ConfigTree::leaf_value(sp, leaf) {
+    // Phrase forms (`access vlan 10`), with the hyphenated legacy leaves
+    // (`access-vlan 10`) still accepted.
+    let vlan_leaf = |first: &str, second: &str, legacy: &str| -> Result<Option<u16>, IntentError> {
+        let value = ConfigTree::phrase_values(sp, first, second)
+            .and_then(<[String]>::first)
+            .map(String::as_str)
+            .or_else(|| ConfigTree::leaf_value(sp, legacy));
+        match value {
             Some(value) => parse_vlan_id(value).map(Some).map_err(&bad),
             None => Ok(None),
         }
     };
     let mut trunk_vlans = Vec::new();
-    if let Some(values) = ConfigTree::leaf_values(sp, "trunk-vlans") {
+    let trunk_values = ConfigTree::phrase_values(sp, "trunk", "vlans")
+        .or_else(|| ConfigTree::leaf_values(sp, "trunk-vlans"));
+    if let Some(values) = trunk_values {
         for value in values {
             trunk_vlans.push(parse_vlan_id(value).map_err(&bad)?);
         }
@@ -277,9 +330,9 @@ fn switchport(children: &[Item], name: &str) -> Result<Option<SwitchportIntent>,
     }
     Ok(Some(SwitchportIntent {
         trunk,
-        access_vlan: vlan_leaf("access-vlan")?,
+        access_vlan: vlan_leaf("access", "vlan", "access-vlan")?,
         trunk_vlans,
-        native_vlan: vlan_leaf("native-vlan")?,
+        native_vlan: vlan_leaf("native", "vlan", "native-vlan")?,
     }))
 }
 
@@ -557,6 +610,10 @@ pub struct OsChanges {
     /// (router interface + routes); the kernel side is the same
     /// `ip addr` treatment on the port's hostif netdev.
     pub ports: Vec<NetdevChange>,
+    /// SVI address changes: the ASIC side goes to syncd (VLAN router
+    /// interface + routes + kernel bridge); the kernel address lands on
+    /// the bridge netdev the same way.
+    pub svis: Vec<NetdevChange>,
     pub routes: Vec<RouteChange>,
     /// The full wanted SSH state, present exactly when it changed.
     pub ssh: Option<SshIntent>,
@@ -566,6 +623,7 @@ impl OsChanges {
     pub fn is_empty(&self) -> bool {
         self.management.is_empty()
             && self.ports.is_empty()
+            && self.svis.is_empty()
             && self.routes.is_empty()
             && self.ssh.is_none()
     }
@@ -585,6 +643,7 @@ impl OsChanges {
         });
         self.ports
             .iter()
+            .chain(&self.svis)
             .chain(&self.management)
             .map(NetdevChange::describe)
             .chain(self.routes.iter().map(RouteChange::describe))
@@ -676,6 +735,36 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
         }
         if let Some(old) = &had.address {
             changes.ports.push(NetdevChange {
+                name: name.clone(),
+                admin_up: None,
+                set_address: None,
+                del_address: Some(old.clone()),
+            });
+        }
+    }
+
+    // SVI addresses, the same shape as ports.
+    for (name, wanted) in &candidate.svis {
+        let current = running.svis.get(name);
+        let (set_address, del_address) = address_delta(
+            wanted.address.as_ref(),
+            current.and_then(|c| c.address.as_ref()),
+        );
+        if set_address.is_some() || del_address.is_some() {
+            changes.svis.push(NetdevChange {
+                name: name.clone(),
+                admin_up: None,
+                set_address,
+                del_address,
+            });
+        }
+    }
+    for (name, had) in &running.svis {
+        if candidate.svis.contains_key(name) {
+            continue;
+        }
+        if let Some(old) = &had.address {
+            changes.svis.push(NetdevChange {
                 name: name.clone(),
                 admin_up: None,
                 set_address: None,
@@ -908,6 +997,94 @@ interfaces {
             intents.ports["Ethernet1"].address.as_deref(),
             Some("10.0.0.1/24")
         );
+    }
+
+    #[test]
+    fn extracts_svi_intents() {
+        // Vlan1 always exists; other SVIs need their VLAN declared.
+        let intents = intents_of("interfaces { Vlan1 { address 10.42.10.9/24 } }");
+        assert_eq!(
+            intents.svis["Vlan1"].address.as_deref(),
+            Some("10.42.10.9/24")
+        );
+        let intents = intents_of(
+            "vlans { vlan 10 { } }\ninterfaces { Vlan10 { address 10.0.10.1/24 } }",
+        );
+        assert_eq!(
+            intents.svis["Vlan10"].address.as_deref(),
+            Some("10.0.10.1/24")
+        );
+        // Empty Vlan blocks (as `show configuration` renders) are fine.
+        let intents = intents_of("interfaces { Vlan1 { } }");
+        assert_eq!(intents.svis["Vlan1"], SviIntent::default());
+
+        // Undeclared VLAN behind an addressed SVI is an error.
+        let tree = parse("interfaces { Vlan20 { address 10.0.20.1/24 } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadInterfaceBlock(_))
+        ));
+        // SVIs are not switchports.
+        let tree = parse("interfaces { Vlan1 { switchport { } } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadSwitchport { .. })
+        ));
+        // Bad interface id.
+        let tree = parse("interfaces { Vlan5000 { } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadInterfaceBlock(_))
+        ));
+    }
+
+    #[test]
+    fn svi_addresses_diff_like_ports() {
+        let running = intents_of("interfaces { Vlan1 { address 10.42.10.9/24 } }");
+        let candidate = intents_of("interfaces { Vlan1 { address 10.42.10.10/24 } }");
+        let changes = diff_os(&running, &candidate);
+        assert_eq!(
+            changes.svis,
+            vec![NetdevChange {
+                name: "Vlan1".into(),
+                admin_up: None,
+                set_address: Some("10.42.10.10/24".into()),
+                del_address: Some("10.42.10.9/24".into()),
+            }]
+        );
+        // Removal clears the address.
+        let changes = diff_os(&running, &intents_of(""));
+        assert_eq!(
+            changes.svis,
+            vec![NetdevChange {
+                name: "Vlan1".into(),
+                admin_up: None,
+                set_address: None,
+                del_address: Some("10.42.10.9/24".into()),
+            }]
+        );
+        // No change, no delta.
+        assert!(diff_os(&running, &running).svis.is_empty());
+    }
+
+    #[test]
+    fn parses_phrase_keywords() {
+        // `no shutdown` and the switchport phrases, as the CLI now
+        // writes them.
+        let intents = intents_of(
+            "interfaces {\n Ethernet1 {\n no shutdown\n switchport {\n mode trunk\n trunk vlans 10 20\n native vlan 5\n }\n }\n \
+             Ethernet2 {\n shutdown\n switchport {\n mode access\n access vlan 30\n }\n }\n}\n\
+             vlans {\n vlan 5 { }\n vlan 10 { }\n vlan 20 { }\n vlan 30 { }\n}",
+        );
+        let e1 = &intents.ports["Ethernet1"];
+        assert_eq!(e1.admin_up, Some(true));
+        let sp1 = e1.switchport.as_ref().unwrap();
+        assert!(sp1.trunk);
+        assert_eq!(sp1.trunk_vlans, vec![10, 20]);
+        assert_eq!(sp1.native_vlan, Some(5));
+        let e2 = &intents.ports["Ethernet2"];
+        assert_eq!(e2.admin_up, Some(false));
+        assert_eq!(e2.switchport.as_ref().unwrap().access_vlan, Some(30));
     }
 
     #[test]

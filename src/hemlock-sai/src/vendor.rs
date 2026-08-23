@@ -1189,6 +1189,60 @@ impl SaiBackend for VendorSai {
         Ok(Oid(oid))
     }
 
+    fn create_vlan_router_interface(&mut self, vlan: Option<Oid>) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let defaults = self.defaults()?;
+        let vlan_oid = vlan.map(|v| v.0).unwrap_or(defaults.vlan);
+
+        // SAFETY: valid rif api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.rif_api)
+                .create_router_interface
+                .ok_or(SaiError::Other(
+                    "router interface api lacks create_router_interface".into(),
+                ))?
+        };
+        use ffi::_sai_router_interface_attr_t as attr;
+        let mut vr_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID);
+        vr_attr.value.oid = defaults.virtual_router;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_TYPE);
+        type_attr.value.s32 =
+            ffi::_sai_router_interface_type_t::SAI_ROUTER_INTERFACE_TYPE_VLAN as i32;
+        let mut vlan_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_VLAN_ID);
+        vlan_attr.value.oid = vlan_oid;
+        let mut mtu_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_MTU);
+        mtu_attr.value.u32_ = 9214;
+
+        let mut attrs = vec![vr_attr, type_attr, vlan_attr, mtu_attr];
+        if let Some(mac) = self.src_mac {
+            let mut mac_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS);
+            mac_attr.value.mac = mac;
+            attrs.push(mac_attr);
+        }
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_router_interface(VLAN)",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_vlan_router_interface(&mut self, rif: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid rif api table.
+        unsafe {
+            let remove = (*self.rif_api)
+                .remove_router_interface
+                .ok_or(SaiError::Other(
+                    "router interface api lacks remove_router_interface".into(),
+                ))?;
+            check("remove_router_interface(VLAN)", remove(rif.0))
+        }
+    }
+
     fn remove_router_interface(&mut self, port: PortId, rif: Oid) -> Result<(), SaiError> {
         let switch = self.switch_oid()?;
         let defaults = self.defaults()?;

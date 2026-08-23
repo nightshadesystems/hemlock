@@ -19,6 +19,8 @@ vim-tiny
 iproute2
 ethtool
 iputils-ping
+# setcap for ping's cap_net_raw (see the operator-account section)
+libcap2-bin
 tcpdump
 # vendor SAI runtime dependencies (libsaibcm: Depends libstdc++6, libyaml-0-2)
 libstdc++6

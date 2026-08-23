@@ -5,6 +5,7 @@ pub mod error;
 pub mod ipc;
 pub mod logging;
 pub mod net;
+pub mod systemd;
 
 pub use error::HemlockError;
 

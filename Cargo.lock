@@ -743,6 +743,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "crossterm",
  "hemlock-common",
  "hemlock-config",
  "hemlock-platform",

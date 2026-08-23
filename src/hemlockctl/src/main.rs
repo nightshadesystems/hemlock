@@ -12,6 +12,7 @@ mod complete;
 mod config;
 mod interfaces;
 mod motd;
+mod pager;
 mod platform;
 mod show;
 

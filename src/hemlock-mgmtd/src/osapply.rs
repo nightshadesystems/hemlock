@@ -74,6 +74,11 @@ impl OsApplier {
             // A front-panel port's hostif netdev is named after it.
             apply_netdev(change, &change.name);
         }
+        for change in &changes.svis {
+            // An SVI's kernel bridge netdev is named after it (VlanN),
+            // created by syncd just before this applier runs.
+            apply_netdev(change, &change.name);
+        }
         for route in &changes.routes {
             apply_route(route);
         }
@@ -87,6 +92,22 @@ impl OsApplier {
         if !self.active() {
             return;
         }
+        // Early boot races udev: the management NIC's netdev may not
+        // exist yet when mgmtd starts, and every `ip` command against it
+        // would fail (leaving the box unreachable until the next
+        // commit). Bounded wait; on timeout apply anyway and let the
+        // per-command warnings tell the story.
+        if let Some((_, dev)) = &self.management {
+            let sysfs = format!("/sys/class/net/{dev}");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !std::path::Path::new(&sysfs).exists() {
+                if std::time::Instant::now() >= deadline {
+                    warn!(netdev = %dev, "management netdev still absent; applying anyway");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
         for (name, intent) in &intents.management {
             self.apply_management(&NetdevChange {
                 name: name.clone(),
@@ -96,6 +117,19 @@ impl OsApplier {
             });
         }
         for (name, intent) in &intents.ports {
+            if intent.address.is_some() {
+                apply_netdev(
+                    &NetdevChange {
+                        name: name.clone(),
+                        admin_up: None,
+                        set_address: intent.address.clone(),
+                        del_address: None,
+                    },
+                    name,
+                );
+            }
+        }
+        for (name, intent) in &intents.svis {
             if intent.address.is_some() {
                 apply_netdev(
                     &NetdevChange {
@@ -137,6 +171,19 @@ fn apply_netdev(change: &NetdevChange, dev: &str) {
         // config says disabled outright.
         if change.admin_up != Some(false) {
             run("ip", &["link", "set", "dev", dev, "up"]);
+        }
+        // Belt and braces: the kernel installs the connected route with
+        // the address, but the route can go missing without the address
+        // (seen in the field: address present, subnet unreachable —
+        // every reply then dies routeless). `route replace` of what
+        // should already exist is a no-op in the healthy case. Skipped
+        // for shut interfaces (a down device rejects routes).
+        if change.admin_up != Some(false) {
+            if let Ok(prefix) = hemlock_common::net::canonical_prefix(cidr) {
+                if !prefix.ends_with("/32") && !prefix.ends_with("/128") {
+                    run("ip", &["route", "replace", &prefix, "dev", dev]);
+                }
+            }
         }
     }
     if let Some(up) = change.admin_up {

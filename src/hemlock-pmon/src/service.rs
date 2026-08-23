@@ -44,6 +44,7 @@ impl pb::pmon_server::Pmon for PmonService {
                     rpm: f.rpm,
                     pwm_percent: f.pwm_percent,
                     ok: f.ok,
+                    present: f.present,
                 })
                 .collect(),
             psus: state

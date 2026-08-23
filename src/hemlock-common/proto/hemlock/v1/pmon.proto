@@ -27,6 +27,8 @@ message Fan {
   uint32 rpm = 2;
   uint32 pwm_percent = 3;
   bool ok = 4;
+  // Fan tray present (always true on platforms without presence detect).
+  bool present = 5;
 }
 
 message Psu {

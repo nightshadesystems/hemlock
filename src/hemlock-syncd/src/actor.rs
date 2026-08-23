@@ -88,6 +88,15 @@ pub enum SaiCmd {
         port: PortId,
         reply: oneshot::Sender<Result<(), SaiError>>,
     },
+    CreateVlanRif {
+        /// None = the default VLAN.
+        vlan: Option<Oid>,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveVlanRif {
+        rif: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
 }
 
 /// A port's oper status changed (already applied to shared state).
@@ -202,6 +211,15 @@ impl SaiHandle {
     pub async fn restore_port_default_vlan(&self, port: PortId) -> Result<(), SaiError> {
         self.call(|reply| SaiCmd::RestorePortDefaultVlan { port, reply })
             .await
+    }
+
+    pub async fn create_vlan_rif(&self, vlan: Option<Oid>) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateVlanRif { vlan, reply })
+            .await
+    }
+
+    pub async fn remove_vlan_rif(&self, rif: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveVlanRif { rif, reply }).await
     }
 
     pub async fn remove_router_interface(&self, port: PortId, rif: Oid) -> Result<(), SaiError> {
@@ -342,6 +360,12 @@ impl SaiActor {
                         }
                         SaiCmd::RestorePortDefaultVlan { port, reply } => {
                             let _ = reply.send(backend.restore_port_default_vlan(port));
+                        }
+                        SaiCmd::CreateVlanRif { vlan, reply } => {
+                            let _ = reply.send(backend.create_vlan_router_interface(vlan));
+                        }
+                        SaiCmd::RemoveVlanRif { rif, reply } => {
+                            let _ = reply.send(backend.remove_vlan_router_interface(rif));
                         }
                     }
                 }

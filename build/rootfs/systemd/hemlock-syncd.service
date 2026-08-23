@@ -8,7 +8,12 @@ After=local-fs.target
 Before=hemlock-mgmtd.service hemlock-orch.service
 
 [Service]
-Type=exec
+# Type=notify: syncd sends READY=1 once the switch is created and the
+# port table is built, so Before=mgmtd/orch ordering gates on the ASIC
+# actually being ready. Helix4 SDK init takes tens of seconds on a cold
+# boot; give it generous room before systemd declares failure.
+Type=notify
+TimeoutStartSec=300
 # --auto-mock: fall back to the mock SAI backend when no Broadcom ASIC is
 # visible on PCI (QEMU boot tests, bench machines); real hardware still
 # gets the vendor backend and hard failures.

@@ -40,6 +40,8 @@ pub async fn switch(endpoint: IpcEndpoint) -> Result<()> {
 }
 
 pub async fn environment(endpoint: IpcEndpoint) -> Result<()> {
+    use std::fmt::Write;
+
     let channel = endpoint.connect().await.context("connecting to pmon")?;
     let mut client = pb::pmon_client::PmonClient::new(channel);
     let env = client
@@ -47,8 +49,9 @@ pub async fn environment(endpoint: IpcEndpoint) -> Result<()> {
         .await?
         .into_inner();
 
+    let mut out = String::new();
     if !env.temperatures.is_empty() {
-        println!("Temperatures:");
+        let _ = writeln!(out, "Temperatures:");
         for t in &env.temperatures {
             let flag = if t.celsius >= t.crit_celsius {
                 "  CRIT"
@@ -57,16 +60,22 @@ pub async fn environment(endpoint: IpcEndpoint) -> Result<()> {
             } else {
                 ""
             };
-            println!(
+            let _ = writeln!(
+                out,
                 "  {:<28} {:>6.1} C  (warn {:.0}, crit {:.0}){flag}",
                 t.name, t.celsius, t.warn_celsius, t.crit_celsius
             );
         }
     }
     if !env.fans.is_empty() {
-        println!("Fans:");
+        let _ = writeln!(out, "Fans:");
         for f in &env.fans {
-            println!(
+            if !f.present {
+                let _ = writeln!(out, "  {:<28} not present", f.name);
+                continue;
+            }
+            let _ = writeln!(
+                out,
                 "  {:<28} {:>5} rpm  pwm {:>3}%  {}",
                 f.name,
                 f.rpm,
@@ -76,16 +85,17 @@ pub async fn environment(endpoint: IpcEndpoint) -> Result<()> {
         }
     }
     if !env.psus.is_empty() {
-        println!("PSUs:");
+        let _ = writeln!(out, "PSUs:");
         for p in &env.psus {
             let status = match (p.present, p.ok) {
                 (false, _) => "absent",
                 (true, true) => "ok",
                 (true, false) => "FAULT",
             };
-            println!("  {:<28} {status}", p.name);
+            let _ = writeln!(out, "  {:<28} {status}", p.name);
         }
     }
+    crate::pager::page(&out);
     Ok(())
 }
 
@@ -145,12 +155,11 @@ pub async fn configuration(
         for p in &ports {
             let eth = ConfigTree::ensure_block(interfaces, p.name.as_str(), &[]);
             if !has_admin_leaf(eth) {
-                let marker = if p.admin_state == pb::AdminState::Up as i32 {
-                    "no-shutdown"
+                if p.admin_state == pb::AdminState::Up as i32 {
+                    ConfigTree::set_phrase(eth, "no", "shutdown", vec![]);
                 } else {
-                    "shutdown"
-                };
-                ConfigTree::set_leaf(eth, marker, vec![]);
+                    ConfigTree::set_leaf(eth, "shutdown", vec![]);
+                }
             }
             if !p.description.is_empty() && ConfigTree::leaf_value(eth, "description").is_none() {
                 ConfigTree::set_leaf(eth, "description", vec![p.description.clone()]);
@@ -162,7 +171,7 @@ pub async fn configuration(
             if !routed && !has_switchport {
                 let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
                 ConfigTree::set_leaf(sp, "mode", vec!["access".into()]);
-                ConfigTree::set_leaf(sp, "access-vlan", vec!["1".into()]);
+                ConfigTree::set_phrase(sp, "access", "vlan", vec!["1".into()]);
             }
         }
 
@@ -177,12 +186,10 @@ pub async fn configuration(
             if let Some(mgmt) = &platform.manifest.management {
                 let block = ConfigTree::ensure_block(interfaces, mgmt.interface.as_str(), &[]);
                 if !has_admin_leaf(block) {
-                    if let Some(up) = os_netdev_is_up(&mgmt.os_device) {
-                        ConfigTree::set_leaf(
-                            block,
-                            if up { "no-shutdown" } else { "shutdown" },
-                            vec![],
-                        );
+                    match os_netdev_is_up(&mgmt.os_device) {
+                        Some(true) => ConfigTree::set_phrase(block, "no", "shutdown", vec![]),
+                        Some(false) => ConfigTree::set_leaf(block, "shutdown", vec![]),
+                        None => {}
                     }
                 }
             }
@@ -223,15 +230,17 @@ pub async fn configuration(
         _ => 4,
     });
 
-    print!("{}", tree.to_text());
+    crate::pager::page(&tree.to_text());
     Ok(())
 }
 
-/// Admin-state marker present? (`shutdown` / `no-shutdown`, or the
-/// legacy `admin-state` leaf.)
+/// Admin-state marker present? (`shutdown` / `no shutdown`; the legacy
+/// hyphenated and `admin-state` forms are normalized away before this
+/// runs, but tolerate them anyway.)
 fn has_admin_leaf(items: &[hemlock_config::Item]) -> bool {
     use hemlock_config::ConfigTree;
     ConfigTree::has_leaf(items, "shutdown")
+        || ConfigTree::has_phrase(items, "no", "shutdown")
         || ConfigTree::has_leaf(items, "no-shutdown")
         || ConfigTree::has_leaf(items, "admin-state")
 }

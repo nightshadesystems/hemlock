@@ -95,6 +95,12 @@ async fn main() -> Result<()> {
                     Ok(0) => break,
                     Ok(n) => {
                         info!(interfaces = n, "running config replayed to syncd");
+                        // SVI bridge netdevs exist only now (syncd made
+                        // them during the replay); re-run the idempotent
+                        // OS replay so their kernel addresses land.
+                        if let Err(err) = engine.lock().await.replay_os() {
+                            tracing::warn!(%err, "post-replay OS pass failed");
+                        }
                         break;
                     }
                     Err(err) => {

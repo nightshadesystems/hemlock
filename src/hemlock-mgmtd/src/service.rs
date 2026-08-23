@@ -160,11 +160,12 @@ impl Engine {
 
         let os_changes = intents::diff_os(&running_intents, &wanted_intents);
 
-        // ASIC side of front-panel addresses (router interface + routes)
-        // goes through syncd; the kernel side follows in the OS applier.
-        if !os_changes.ports.is_empty() {
+        // ASIC side of front-panel and SVI addresses (router interface +
+        // routes) goes through syncd; the kernel side follows in the OS
+        // applier. SVIs after VLAN ensures (above) so the VLAN exists.
+        if !os_changes.ports.is_empty() || !os_changes.svis.is_empty() {
             let mut client = self.syncd_client().await?;
-            for change in &os_changes.ports {
+            for change in os_changes.ports.iter().chain(&os_changes.svis) {
                 match (&change.set_address, &change.del_address) {
                     (Some(address), _) => {
                         client
@@ -230,7 +231,7 @@ impl Engine {
     /// be replayed onto it (a restart of either daemon converges).
     pub async fn replay_running(&self) -> Result<usize> {
         let running = Self::parse_intents(&self.store.running()?)?;
-        if running.ports.is_empty() && running.vlans.is_empty() {
+        if running.ports.is_empty() && running.vlans.is_empty() && running.svis.is_empty() {
             return Ok(0);
         }
         let mut client = self.syncd_client().await?;
@@ -280,6 +281,18 @@ impl Engine {
                     .set_port_switchport(switchport_request(name, sp))
                     .await
                     .with_context(|| format!("replaying switchport for {name}"))?;
+                applied += 1;
+            }
+        }
+        for (name, intent) in &running.svis {
+            if let Some(address) = &intent.address {
+                client
+                    .set_interface_address(pb::SetInterfaceAddressRequest {
+                        name: name.clone(),
+                        address: address.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("replaying address for {name}"))?;
                 applied += 1;
             }
         }

@@ -294,6 +294,25 @@ impl Sysfs {
         Ok(report)
     }
 
+    /// Instantiate the manifest's PSU pmbus devices (they live in
+    /// `[[hardware.psu]]`, not the generic i2c device list, so
+    /// [`Self::instantiate_i2c`] never sees them). A missing or absent
+    /// PSU makes the driver's probe fail; that is logged and skipped, not
+    /// fatal — presence is reported separately. Idempotent.
+    pub fn instantiate_psus(&self, psus: &[crate::schema::Psu], report: &mut I2cReport) {
+        for psu in psus {
+            let label = format!("{} ({}@{}-0x{:02x})", psu.name, psu.driver, psu.bus, psu.address);
+            if self.device_present(psu.bus, psu.address) {
+                report.already_present.push(label);
+                continue;
+            }
+            match self.new_device(psu.bus, &psu.driver, psu.address) {
+                Ok(()) => report.created.push(label),
+                Err(e) => warn!(psu = %psu.name, error = %e, "PSU device instantiation failed"),
+            }
+        }
+    }
+
     /// The base MAC for the switch (`SAI_SWITCH_ATTR_SRC_MAC_ADDRESS`):
     /// the ONIE syseeprom's TLV 0x24 when readable, else the management
     /// netdev's address. Some vendor SAIs have no working fallback of

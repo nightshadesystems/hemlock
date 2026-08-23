@@ -207,9 +207,31 @@ fn resolve_word<'a>(input: &str, words: impl Iterator<Item = &'a str>) -> Option
 }
 
 /// Candidates for the word being typed: canonicalize the completed
-/// `tokens`, then filter the next level by `partial`. Also drives the
-/// EOS-style `?` contextual help in the CLI loop.
+/// `tokens`, then filter the next level by `partial`.
 pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String]) -> Vec<String> {
+    expand(mode, tokens, partial, ports, false)
+}
+
+/// [`candidates`] for the EOS-style `?` contextual help: where an
+/// interface name may go, show one `<interface>` placeholder instead of
+/// enumerating every port. A typed partial still lists its matches
+/// (`show int Eth?`).
+pub fn help_candidates(
+    mode: CliMode,
+    tokens: &[&str],
+    partial: &str,
+    ports: &[String],
+) -> Vec<String> {
+    expand(mode, tokens, partial, ports, partial.is_empty())
+}
+
+fn expand(
+    mode: CliMode,
+    tokens: &[&str],
+    partial: &str,
+    ports: &[String],
+    placeholder_ports: bool,
+) -> Vec<String> {
     let mut path: Vec<&str> = Vec::with_capacity(tokens.len());
     for token in tokens {
         let level = next_words(mode, &path);
@@ -239,14 +261,18 @@ pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String
         .iter()
         .flat_map(|w| {
             if *w == PORT {
-                ports.to_vec()
+                if placeholder_ports {
+                    vec!["<interface>".to_string()]
+                } else {
+                    ports.to_vec()
+                }
             } else if *w == NUM {
                 Vec::new() // free-form number; nothing to offer
             } else {
                 vec![(*w).to_string()]
             }
         })
-        .filter(|w| w.starts_with(partial))
+        .filter(|w| *w == "<interface>" || w.starts_with(partial))
         .collect()
 }
 
