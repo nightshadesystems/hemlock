@@ -283,14 +283,20 @@ persist dir by the stable `/hemlock/...` paths regardless of where the
 flash lands. Wiping `/hemlock/persist` is a factory
 reset; the squashfs is never modified in place.
 
-In-band upgrades (web console, System → Maintenance) reuse the same
-image format: webd stages an uploaded `.bin` under its state dir,
-verifies the `hemlock_image_platform` header against the installed
-`/hemlock/platform/onie-machine`, unpacks it with the self-extractor's
-`HEMLOCK_EXTRACT_ONLY` hook, and replaces `rootfs.squashfs`, the boot
-assets and the platform overlay on `/host` (each file via copy-to-.new +
-fsync + rename), then reboots. There is no A/B slot — recovery from a
-bad image is a reinstall from ONIE.
+In-band upgrades reuse the same image format. The engine lives in
+`hemlock_common::image` and executes inside mgmtd (root, serialized with
+commits) behind the `InstallImage` RPC: it verifies the
+`hemlock_image_platform` header against the installed
+`/hemlock/platform/onie-machine`, unpacks the `.bin` with the
+self-extractor's `HEMLOCK_EXTRACT_ONLY` hook, and replaces
+`rootfs.squashfs`, the boot assets and the platform overlay on `/host`
+(each file via copy-to-.new + fsync + rename). Two front ends drive it:
+the web console (System → Maintenance; webd streams the upload to its
+flash-backed state dir, then calls the RPC) and the CLI —
+`upgrade <image.bin> [force] [reboot]` in operational mode, or
+`hemlockctl upgrade <image.bin> [--force] [--reboot]` from a shell.
+There is no A/B slot — recovery from a bad image is a reinstall from
+ONIE.
 
 ## Phase-1 boundaries and seams
 

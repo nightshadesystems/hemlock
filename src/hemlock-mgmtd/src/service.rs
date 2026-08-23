@@ -475,4 +475,36 @@ impl pb::mgmt_server::Mgmt for MgmtService {
         engine.store.discard_candidate().map_err(internal)?;
         Ok(Response::new(pb::DiscardResponse {}))
     }
+
+    async fn install_image(
+        &self,
+        request: Request<pb::InstallImageRequest>,
+    ) -> Result<Response<pb::InstallImageResponse>, Status> {
+        let req = request.into_inner();
+        // Hold the engine lock for the duration: no commits land while
+        // the OS image underneath them is being swapped.
+        let _engine = self.engine.lock().await;
+        info!(path = %req.path, force = req.force, "installing os image");
+        let path = std::path::PathBuf::from(&req.path);
+        let header =
+            tokio::task::spawn_blocking(move || hemlock_common::image::install(&path, req.force))
+                .await
+                .map_err(|e| Status::internal(format!("install task failed: {e}")))?
+                .map_err(Status::failed_precondition)?;
+        if req.reboot {
+            // Grace period so the response reaches the caller first.
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                info!("rebooting into the new image");
+                let _ = tokio::process::Command::new("systemctl")
+                    .arg("reboot")
+                    .status()
+                    .await;
+            });
+        }
+        Ok(Response::new(pb::InstallImageResponse {
+            version: header.version,
+            platform: header.platform,
+        }))
+    }
 }

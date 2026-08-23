@@ -282,6 +282,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
     const COMMANDS: &[&str] = &[
         "show",
         "configure",
+        "upgrade",
         "bash",
         "exit",
         "quit",
@@ -292,6 +293,10 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
     match resolve(words[0], COMMANDS)? {
         "show" => {
             show_command(endpoints, &words[1..]).await?;
+            stay(Mode::Operational)
+        }
+        "upgrade" => {
+            upgrade_command(endpoints, &words[1..]).await?;
             stay(Mode::Operational)
         }
         "configure" => {
@@ -316,12 +321,40 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             );
             println!("  show version                           software / platform");
             println!("  configure | conf                       enter configuration mode");
+            println!("  upgrade <image.bin> [force] [reboot]   install an OS image (via mgmtd)");
             println!("  bash                                   drop to the Linux shell");
             println!("  exit                                   leave the CLI");
             stay(Mode::Operational)
         }
         _ => unreachable!(),
     }
+}
+
+/// `upgrade <image.bin> [force] [reboot]` — install an OS image over
+/// the running system through mgmtd's InstallImage RPC. Nothing changes
+/// until the next reboot unless `reboot` is given, so the plain form is
+/// safe to run in production hours.
+async fn upgrade_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), String> {
+    const USAGE: &str = "upgrade <image.bin> [force] [reboot]";
+    let Some((path, rest)) = words.split_first() else {
+        return Err(format!("% Incomplete command: {USAGE}"));
+    };
+    if matches!(*path, "?" | "help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let mut force = false;
+    let mut reboot = false;
+    for word in rest {
+        match resolve(word, &["force", "reboot"])? {
+            "force" => force = true,
+            "reboot" => reboot = true,
+            _ => unreachable!(),
+        }
+    }
+    crate::upgrade::run(endpoints.mgmtd.clone(), path, force, reboot)
+        .await
+        .map_err(fmt_err)
 }
 
 /// Platform overlay directory for manifest-driven display (management

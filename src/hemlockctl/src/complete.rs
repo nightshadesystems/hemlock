@@ -97,6 +97,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, []) => &[
             "show",
             "configure",
+            "upgrade",
             "bash",
             "exit",
             "quit",

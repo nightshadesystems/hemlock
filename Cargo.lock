@@ -889,6 +889,7 @@ dependencies = [
  "hyper-util",
  "prost",
  "protoc-bin-vendored",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",

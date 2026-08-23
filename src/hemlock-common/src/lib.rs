@@ -2,6 +2,7 @@
 //! error conventions, tracing setup, and gRPC/IPC scaffolding.
 
 pub mod error;
+pub mod image;
 pub mod ipc;
 pub mod logging;
 pub mod net;

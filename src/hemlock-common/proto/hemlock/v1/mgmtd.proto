@@ -12,6 +12,10 @@ service Mgmt {
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
   rpc ListRollbacks(ListRollbacksRequest) returns (ListRollbacksResponse);
   rpc Discard(DiscardRequest) returns (DiscardResponse);
+  // Install a Hemlock OS image (.bin) over the running system in place
+  // (single slot, no A/B) — mgmtd runs as root, so the CLI and web
+  // console both route installs through here. Can take minutes.
+  rpc InstallImage(InstallImageRequest) returns (InstallImageResponse);
 }
 
 enum ConfigSource {
@@ -72,3 +76,14 @@ message RollbackEntry {
 
 message DiscardRequest {}
 message DiscardResponse {}
+
+message InstallImageRequest {
+  string path = 1;   // absolute path of the .bin on the switch
+  bool force = 2;    // install despite a platform mismatch
+  bool reboot = 3;   // reboot into the new image after installing
+}
+
+message InstallImageResponse {
+  string version = 1;   // from the image header
+  string platform = 2;
+}

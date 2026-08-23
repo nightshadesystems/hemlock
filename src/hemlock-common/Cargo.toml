@@ -20,6 +20,9 @@ prost = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [build-dependencies]
 tonic-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }

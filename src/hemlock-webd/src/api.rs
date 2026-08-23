@@ -635,15 +635,35 @@ async fn upgrade_apply(
     _op: Operator,
     State(state): State<SharedState>,
     Json(request): Json<UpgradeApplyRequest>,
-) -> Response {
-    match crate::maint::apply_staged(&state.state_dir, request.force).await {
-        Ok(header) => {
+) -> Result<Response, ApiError> {
+    let staged = crate::maint::staged_path(&state.state_dir);
+    if !staged.exists() {
+        return Ok(errors(vec!["no staged image".to_string()]));
+    }
+    // mgmtd performs the install (shared engine, serialized against
+    // commits) — the same path `hemlockctl upgrade` takes.
+    let path = staged.canonicalize().unwrap_or(staged);
+    let mut client = mgmtd_client(&state).await?;
+    match client
+        .install_image(pb::InstallImageRequest {
+            path: path.display().to_string(),
+            force: request.force,
+            reboot: false,
+        })
+        .await
+    {
+        Ok(response) => {
+            let response = response.into_inner();
+            crate::maint::discard_staged(&state.state_dir).await;
             if request.reboot {
                 crate::maint::reboot_now();
             }
-            Json(json!({ "version": header.version, "rebooting": request.reboot })).into_response()
+            Ok(
+                Json(json!({ "version": response.version, "rebooting": request.reboot }))
+                    .into_response(),
+            )
         }
-        Err(message) => errors(vec![message]),
+        Err(status) => Ok(errors(vec![status.message().to_string()])),
     }
 }
 

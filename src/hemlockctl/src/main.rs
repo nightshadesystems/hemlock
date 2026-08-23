@@ -15,6 +15,7 @@ mod motd;
 mod pager;
 mod platform;
 mod show;
+mod upgrade;
 
 #[derive(Parser)]
 #[command(name = "hemlockctl", version = hemlock_common::VERSION, about = "Hemlock operator CLI")]
@@ -95,6 +96,22 @@ enum Command {
 
     /// Discard the candidate (reset to running).
     Discard,
+
+    /// Install a Hemlock OS image (.bin) over the running system.
+    ///
+    /// The install goes through mgmtd; the switch keeps running on the
+    /// old image until the next reboot. Single image slot — recovery
+    /// from a bad image means reinstalling from ONIE.
+    Upgrade {
+        /// Path to the image file.
+        image: String,
+        /// Install even if the image targets a different platform.
+        #[arg(long)]
+        force: bool,
+        /// Reboot into the new image after installing.
+        #[arg(long)]
+        reboot: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -227,5 +244,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Rollbacks => config::rollbacks(endpoint(&cli.mgmtd, Daemon::Mgmtd)?).await,
         Command::Discard => config::discard(endpoint(&cli.mgmtd, Daemon::Mgmtd)?).await,
+        Command::Upgrade {
+            image,
+            force,
+            reboot,
+        } => upgrade::run(endpoint(&cli.mgmtd, Daemon::Mgmtd)?, &image, force, reboot).await,
     }
 }
