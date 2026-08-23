@@ -25,12 +25,14 @@ needed. mock-sai development and CI never need any of this.
 
 ## Known quirks
 
-- **SFP+ port LEDs (Ethernet49-52) are stuck solid green.** Inherited
-  from SONiC: the upstream device tree ships no LED microcode or
-  `led_control` for this board, so the Helix4 LED processor is never
-  programmed and the scan chain sits at reset defaults. The copper
-  ports' LEDs are PHY-driven and unaffected. Bench diagnosis and fix
-  plan: `docs/e1031-led-bringup.md` (uses `hemlock-syncd --diag-shell`).
+- **Per-port SFP+ LEDs (Ethernet49-52) are not achievable on this
+  hardware.** Bench-proven (`docs/e1031-led-bringup.md`): the Helix4
+  LED-processor scan chains are unwired, and the SMC CPLD (fw v5) can
+  only force all four green, blink all four (lamp test), or leave them
+  off — no per-port source exists, which is why SONiC never shipped LED
+  support either. Hemlock runs the CPLD in normal mode (`haliburton`
+  quirks driver): SFP+ LEDs dark, system + fan LEDs driven truthfully.
+  Copper-port LEDs are PHY-driven and work.
 
 ## Notes
 

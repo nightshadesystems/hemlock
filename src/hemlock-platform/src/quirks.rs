@@ -61,6 +61,9 @@ impl PlatformQuirks for GenericQuirks {
 pub struct HaliburtonQuirks;
 
 /// SMC CPLD LPC io-port registers (platforms/cel-e1031/kmod/.../smc.c).
+const SMC_FAN_LED_1: u64 = 0x0205;
+const SMC_FAN_LED_2: u64 = 0x0206;
+const SMC_FAN_LED_3: u64 = 0x0207;
 const SMC_LED_OPMOD: u64 = 0x0208;
 const SMC_LED_FPS: u64 = 0x020a;
 
@@ -68,6 +71,9 @@ const SMC_LED_FPS: u64 = 0x020a;
 const LED_OPMOD_NORMAL: u8 = 0x01;
 /// LED_FPS: [3:2] status = green, [1:0] master = green.
 const LED_FPS_GREEN: u8 = 0x05;
+/// FAN_LED_*: 0 = green (smc.c enum; bench-verified). Power-on default
+/// in normal mode is 4 = off.
+const FAN_LED_GREEN: u8 = 0x00;
 
 impl PlatformQuirks for HaliburtonQuirks {
     fn name(&self) -> &'static str {
@@ -79,6 +85,9 @@ impl PlatformQuirks for HaliburtonQuirks {
         for (name, port, value) in [
             ("LED_OPMOD normal mode", SMC_LED_OPMOD, LED_OPMOD_NORMAL),
             ("LED_FPS system green", SMC_LED_FPS, LED_FPS_GREEN),
+            ("FAN_LED_1 green", SMC_FAN_LED_1, FAN_LED_GREEN),
+            ("FAN_LED_2 green", SMC_FAN_LED_2, FAN_LED_GREEN),
+            ("FAN_LED_3 green", SMC_FAN_LED_3, FAN_LED_GREEN),
         ] {
             match write_io_port(port, value) {
                 Ok(()) => tracing::info!(register = name, value, "SMC CPLD LED write"),

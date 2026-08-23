@@ -89,6 +89,64 @@ Consequences for the fix:
    forced mode turns out to have per-port force registers — nothing in
    `smc.c` suggests so; park the idea unless probing finds more.
 
+### Session 2 findings (CPLD probing on the bench)
+
+- **The SFP+ cage LEDs are driven directly by the SMC CPLD, not by the
+  ASIC.** Both LEDUP scan chains are unconnected on this board: full
+  64-bit all-ones frames from LEDUP0 *and* LEDUP1 changed nothing, while
+  the CPLD's `LED_TEST` register (io 0x0209, write 1) blinks the SFP+
+  LEDs — a lamp test. All LEDUP microcode work is therefore moot for
+  this board; the programs under `platforms/cel-e1031/led/` are kept
+  only as a reference for boards whose chains are wired.
+- `LED_OPMOD` values 2 and 3 behave no differently from 1.
+- Undocumented bytes 0x20b/0x20d/0x20e take writes with no visible
+  effect.
+- **DANGER — never write io 0x20f** (powers up as 0x03; undocumented).
+  Writing it caused a fatal, unrecoverable PCIe error on the Helix4
+  (linux-kernel-bde fell off the bus; full power cycle required). It is
+  presumably a reset/control register. Probing policy from here: reads
+  anywhere, writes only inside register blocks smc.c documents.
+- `LED_FPS[7:4]` ("RESERVED"): writes have no effect — not the SFP LEDs.
+- Fan tray LEDs confirmed register-driven: writing 0 (green) to
+  0x205-0x207 works; power-on state in normal mode is 4 (off). The
+  haliburton quirk sets them green at pmon start.
+- The CPLD has a second register block at io 0x100-0x1ff (version reg
+  0x100 = 0x05, scratch 0x101, watchdog 0x110-0x11a, reboot cause
+  0x112 — mapped from SONiC's watchdog.py/chassis.py). Full read dump
+  shows nothing else alive and nothing sensitive to module presence.
+  **The 0x1xx block contains the watchdog enable — no writes there.**
+
+### Conclusion (2026-08-23): per-port SFP+ LEDs are not achievable
+
+Exhaustively tested: both LEDUP processors with 16/64/255-bit frames in
+both polarities (chains are unwired), every documented CPLD register,
+both CPLD blocks, and all safely-probeable undocumented bytes. The SMC
+CPLD firmware (v5) offers exactly three states for the four SFP+ cage
+LEDs:
+
+| State | How |
+|---|---|
+| Forced solid green (power-on default; a lie) | `LED_OPMOD=0` |
+| Blinking (lamp test, all four) | `LED_TEST=1` |
+| Off | `LED_OPMOD=1` (normal mode; no per-port source exists) |
+
+Hemlock's policy: **normal mode, LEDs dark** — honest for the common
+no-link case, and the quirk keeps system + fan LEDs truthful. This
+matches why SONiC never had SFP LED support here: the hardware feature
+does not exist in this CPLD build. A newer SMC firmware from Celestica
+(SONiC's component.py shows CPLD update plumbing) is the only plausible
+path to real per-port control.
+
+Boot-time visual feedback IS achievable via CPLD writes alone, and is
+**implemented**: `build/rootfs/bin/hemlock-boot-led` driven by
+`hemlock-boot-led.service` (early boot: SFP+ bank lamp-test blink,
+status LED blinking green, fans green) and
+`hemlock-boot-led-done.service` (after the Hemlock daemons: everything
+steady). The script gates on `/hemlock/platform/platform-id` and is a
+silent no-op elsewhere. A per-port sweep is off the table on this
+hardware; a copper-port sweep would require forcing BCM54282 PHY LED
+registers over MDIO once the ASIC is up (untested; future curiosity).
+
 ### Fixes already landed in the repo
 
 - `i2c-dev` added to the manifest's `required_modules` — without it,
@@ -157,15 +215,20 @@ Bench-verified constraints: this drivshell's `led` command supports
 (`platforms/cel-e1031/led/e1031-led-probe.asm`, simulator-validated)
 that emits 16 chain bits, bit *i* from bit 0 of data byte `0xA0+i`.
 
-1. Copy `platforms/cel-e1031/led/e1031-led-probe.hex` to the switch,
-   set `LED_OPMOD=1` (Experiment 2), then:
+1. Set `LED_OPMOD=1` (Experiment 2), then load the program. Serial-only
+   consoles need no file transfer — `led prog` takes the bytes inline
+   (these are the assembled contents of `e1031-led-probe.hex`; execution
+   ends at the final `send`, so unpasted program RAM is never reached):
 
    ```text
    drivshell> led stop
-   drivshell> led load /home/admin/e1031-led-probe.hex
+   drivshell> led prog 02 00 60 E0 12 A0 F8 15 1A 00 71 11 32 0E 87 77 14 32 0F 87 06 E0 80 D2 10 74 02 3A 10
    drivshell> led auto off
    drivshell> led start
    ```
+
+   (With file access, `led load <path>/e1031-led-probe.hex` is
+   equivalent.)
 
    All-zero data RAM should now hold the LEDs in the familiar all-green
    look if the chain is active-low as suspected (`ZERO` bit = LED on).
@@ -197,10 +260,14 @@ reassemble (`vendor/fetch-ledtools.sh`, see `led/README.md`) and:
 
 ```text
 drivshell> led stop
-drivshell> led load /home/admin/e1031-sfp-link.hex
+drivshell> led prog 02 32 67 12 02 33 67 12 02 34 67 12 02 35 67 12 3A 04 12 A0 F8 15 1A 00 71 1E 32 0F 87 57 32 0E 87 57
 drivshell> led auto on
 drivshell> led start
 ```
+
+(The `led prog` bytes are the assembled `e1031-sfp-link.hex`; with file
+access `led load` is equivalent. Re-derive the bytes after any constant
+change by reassembling — see `led/README.md`.)
 
 Then pull/insert the DAC and confirm the right cage tracks link.
 

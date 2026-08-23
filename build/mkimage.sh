@@ -270,6 +270,8 @@ install -D -m 755 "$ROOT/build/rootfs/update-motd.d/00-hemlock-banner" \
 install -D -m 755 "$ROOT/build/rootfs/update-motd.d/10-hemlock-status" \
     "$ROOTFS/etc/update-motd.d/10-hemlock-status"
 install -D -m 755 "$ROOT/build/rootfs/bin/hemlock-motd" "$ROOTFS/usr/bin/hemlock-motd"
+# Boot LED indication (CPLD-driven; no-op on platforms without support).
+install -D -m 755 "$ROOT/build/rootfs/bin/hemlock-boot-led" "$ROOTFS/usr/bin/hemlock-boot-led"
 rm -f "$ROOTFS/etc/update-motd.d/10-uname" "$ROOTFS/etc/motd"
 # pam_motd renders update-motd.d; sshd must not print a motd of its own.
 install -d "$ROOTFS/etc/ssh/sshd_config.d"

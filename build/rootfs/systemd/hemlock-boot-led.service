@@ -1,0 +1,15 @@
+[Unit]
+Description=Hemlock boot LED indication (boot in progress)
+# As early as the platform overlay (/hemlock -> /host/hemlock, mounted by
+# the initramfs) allows. Purely cosmetic; must never block or fail boot.
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+ConditionPathExists=/dev/port
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hemlock-boot-led start
+
+[Install]
+WantedBy=sysinit.target

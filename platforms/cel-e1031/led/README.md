@@ -19,8 +19,9 @@ cd platforms/cel-e1031/led
 ../../../vendor/ledtools/ledasm e1031-sfp-link
 ```
 
-Status: **pending bench verification** of four constants marked in
-`e1031-sfp-link.asm` (physical port numbers, emission order, chain
-length, polarity). Once verified, the load sequence
-(`led load .../e1031-sfp-link.hex`, `led auto on`, `led start`) moves
-into `sai_postinit_cmd.soc` and this note gets updated.
+Status: **reference only — do not deploy.** Bench work (2026-08-23,
+`docs/e1031-led-bringup.md`) proved both LEDUP scan chains are unwired
+on the E1031: the SFP+ cage LEDs are CPLD-connected, and the CPLD offers
+no per-port control. These programs are kept as a validated,
+assembler-checked starting point for future platforms whose LED chains
+are actually wired (AS4610 etc.).

@@ -1,0 +1,57 @@
+#!/bin/sh
+# hemlock-boot-led — boot-progress LED indication via the platform CPLD.
+#
+# Usage: hemlock-boot-led start|done
+#
+#   start   boot in progress: SFP+ bank lamp-test blink, status LED
+#           blinking green, fan LEDs green
+#   done    boot complete: blink off, status LED solid green
+#
+# Invoked by hemlock-boot-led.service (early boot) and
+# hemlock-boot-led-done.service (after the Hemlock daemons). Purely
+# cosmetic: every write is best-effort and the script never fails boot.
+# Platforms without a supported CPLD exit 0 silently.
+#
+# Register map is the Haliburton SMC CPLD (see
+# platforms/cel-e1031/kmod/haliburton/smc.c and
+# docs/e1031-led-bringup.md — and never touch io 0x20f on that board).
+set -eu
+
+PLATFORM_ID="$(cat /hemlock/platform/platform-id 2>/dev/null || true)"
+case "$PLATFORM_ID" in
+    cel-e1031) ;;
+    *) exit 0 ;;
+esac
+
+# One byte to a legacy io port through /dev/port; best-effort.
+outb() { # outb <port> <value>   (0x-hex or decimal)
+    oct=$(printf '%03o' "$(($2))")
+    printf '%b' "\\0$oct" |
+        dd of=/dev/port bs=1 count=1 seek="$(($1))" conv=notrunc 2>/dev/null || :
+}
+
+LED_OPMOD=0x208 # 1 = normal operation (power-on default 0 forces all green)
+LED_TEST=0x209  # 1 = lamp test: the SFP+ bank blinks
+LED_FPS=0x20a   # [3:2] status LED, [1:0] master LED (1=green, 2=blink/amber)
+FAN_LED_1=0x205 # fan tray LEDs: 0 = green
+FAN_LED_2=0x206
+FAN_LED_3=0x207
+
+case "${1:-}" in
+    start)
+        outb $LED_OPMOD 1
+        outb $FAN_LED_1 0
+        outb $FAN_LED_2 0
+        outb $FAN_LED_3 0
+        outb $LED_FPS 0x09 # status blinking green, master green
+        outb $LED_TEST 1   # SFP+ bank blink
+        ;;
+    done)
+        outb $LED_TEST 0
+        outb $LED_FPS 0x05 # status green, master green
+        ;;
+    *)
+        echo "usage: hemlock-boot-led start|done" >&2
+        exit 64
+        ;;
+esac

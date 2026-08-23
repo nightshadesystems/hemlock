@@ -1,0 +1,14 @@
+[Unit]
+Description=Hemlock boot LED indication (boot complete)
+# Steady LEDs once the Hemlock daemons are up. pmon's platform quirk
+# writes the same steady state; the overlap is deliberate so the LEDs
+# settle even if one path is unavailable.
+After=hemlock-syncd.service hemlock-pmon.service hemlock-mgmtd.service hemlock-orch.service
+ConditionPathExists=/dev/port
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hemlock-boot-led done
+
+[Install]
+WantedBy=multi-user.target
