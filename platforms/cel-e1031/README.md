@@ -23,6 +23,15 @@ Inspected and confirmed to retain the full Helix4 family
 (`etc/bcm/hx4-cel-hbtn-48x1G+4x10G.config.bcm`), so no legacy-era pin is
 needed. mock-sai development and CI never need any of this.
 
+## Known quirks
+
+- **SFP+ port LEDs (Ethernet49-52) are stuck solid green.** Inherited
+  from SONiC: the upstream device tree ships no LED microcode or
+  `led_control` for this board, so the Helix4 LED processor is never
+  programmed and the scan chain sits at reset defaults. The copper
+  ports' LEDs are PHY-driven and unaffected. Bench diagnosis and fix
+  plan: `docs/e1031-led-bringup.md` (uses `hemlock-syncd --diag-shell`).
+
 ## Notes
 
 - The kernel BDE modules (`linux-kernel-bde`, `linux-user-bde`) are built

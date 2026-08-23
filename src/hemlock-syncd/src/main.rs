@@ -49,6 +49,13 @@ struct Args {
     #[arg(long)]
     probe: bool,
 
+    /// Bench bring-up: enable the vendor SAI's diagnostic shell on this
+    /// process's stdin/stdout (`BCM.0>` prompt for `led`, `setreg`, ...).
+    /// Run syncd manually in the foreground; the shell coexists with the
+    /// gRPC service. Vendor backend only; ignored with --mock.
+    #[arg(long)]
+    diag_shell: bool,
+
     /// gRPC endpoint to serve (unix:/path or tcp:host:port).
     #[arg(long)]
     listen: Option<String>,
@@ -67,7 +74,7 @@ async fn main() -> Result<()> {
         "platform manifest loaded"
     );
 
-    let backend = build_backend(&platform, args.mock, args.auto_mock)?;
+    let backend = build_backend(&platform, args.mock, args.auto_mock, args.diag_shell)?;
 
     let quirks = platform.quirks()?;
     quirks.pre_asic_init(&platform)?;
@@ -151,7 +158,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box<dyn SaiBackend>> {
+fn build_backend(
+    platform: &Platform,
+    mock: bool,
+    auto_mock: bool,
+    diag_shell: bool,
+) -> Result<Box<dyn SaiBackend>> {
     // --auto-mock only ever mocks when the ASIC is demonstrably absent.
     // With the ASIC present, every failure (missing modules, missing
     // real-sai feature, SAI init) stays fatal — mock ports on a real
@@ -167,6 +179,9 @@ fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box
             no_asic
         });
     if mock {
+        if diag_shell {
+            tracing::warn!("--diag-shell has no effect with the mock backend");
+        }
         return Ok(Box::new(hemlock_sai::mock::MockSai::new(
             platform.ports.clone(),
         )));
@@ -196,6 +211,9 @@ fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box
             ),
         }
 
+        if diag_shell {
+            info!("vendor diag shell enabled — BCM.0> will appear on this terminal");
+        }
         let init = hemlock_sai::SwitchInit {
             libsai_path: platform.manifest.sai.libsai_path.clone(),
             config_bcm_path: platform.config_bcm_path(),
@@ -207,6 +225,7 @@ fn build_backend(platform: &Platform, mock: bool, auto_mock: bool) -> Result<Box
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             src_mac,
+            diag_shell,
         };
         if !init.config_bcm_path.exists() {
             bail!(

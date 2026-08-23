@@ -68,6 +68,12 @@ pub struct SwitchInit {
     /// no working fallback — Broadcom's aborts create_switch on the E1031
     /// without it ("get local MAC address failed").
     pub src_mac: Option<[u8; 6]>,
+    /// Enable the vendor diagnostic shell
+    /// (`SAI_SWITCH_ATTR_SWITCH_SHELL_ENABLE`). Broadcom's SAI then runs
+    /// its `BCM.0>` diag shell on the process's stdin/stdout — bench
+    /// bring-up only (LED scan-chain probing, register pokes); never in
+    /// the production service.
+    pub diag_shell: bool,
 }
 
 /// Human name for a SAI status code, per saistatus.h (`SAI_STATUS_CODE(x)`

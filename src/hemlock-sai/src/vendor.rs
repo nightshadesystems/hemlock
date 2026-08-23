@@ -120,6 +120,7 @@ pub struct VendorSai {
     switch_oid: Option<ffi::sai_object_id_t>,
     events_rx: Option<mpsc::UnboundedReceiver<SaiEvent>>,
     src_mac: Option<[u8; 6]>,
+    diag_shell: bool,
     name: String,
 }
 
@@ -219,6 +220,7 @@ impl VendorSai {
             switch_oid: None,
             events_rx: Some(rx),
             src_mac: init.src_mac,
+            diag_shell: init.diag_shell,
             name: format!("vendor:{}", init.libsai_path.display()),
         })
     }
@@ -267,6 +269,15 @@ impl SaiBackend for VendorSai {
         notify_attr.value.ptr = notify_cb as *mut c_void;
 
         let mut attrs = vec![init_attr, profile_attr, notify_attr];
+        if self.diag_shell {
+            // Bench bring-up: Broadcom's SAI serves its diag shell on our
+            // stdin/stdout (`BCM.0>` prompt) — run syncd in the
+            // foreground to use it.
+            let mut shell_attr =
+                Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_SWITCH_SHELL_ENABLE);
+            shell_attr.value.booldata = true;
+            attrs.push(shell_attr);
+        }
         if let Some(mac) = self.src_mac {
             // Without this, Broadcom's SAI tries to discover a "local MAC
             // address" itself and fails create_switch on boards where that
