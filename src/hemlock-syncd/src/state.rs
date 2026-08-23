@@ -17,6 +17,8 @@ pub struct PortState {
     pub description: String,
     /// Present when the port is routed (has an address).
     pub l3: Option<L3State>,
+    /// Present when the port has explicit switchport config.
+    pub switchport: Option<SwitchportState>,
 }
 
 /// A routed port's L3 objects: its router interface and the address
@@ -27,6 +29,32 @@ pub struct L3State {
     /// The interface address in CIDR form.
     pub address: String,
 }
+
+/// A port's L2 switchport program, as applied: the intent plus the live
+/// non-default VLAN memberships it produced.
+#[derive(Debug, Clone, Default)]
+pub struct SwitchportState {
+    pub trunk: bool,
+    /// 0 = default VLAN.
+    pub access_vlan: u16,
+    pub trunk_vlans: Vec<u16>,
+    /// 0 = default VLAN.
+    pub native_vlan: u16,
+    /// (vlan id, member oid, tagged); default-VLAN membership is not
+    /// tracked here (the backend owns it, idempotently).
+    pub members: Vec<(u16, Oid, bool)>,
+}
+
+/// One created VLAN. `oid` is `None` for the default VLAN (it always
+/// exists; only its display name is tracked).
+#[derive(Debug, Clone)]
+pub struct VlanState {
+    pub oid: Option<Oid>,
+    pub name: String,
+}
+
+/// VLAN table keyed by 802.1Q id, shared via `Arc<RwLock<...>>`.
+pub type SharedVlans = Arc<RwLock<std::collections::BTreeMap<u16, VlanState>>>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SwitchMeta {

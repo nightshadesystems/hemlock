@@ -7,8 +7,11 @@
 //! root@hemlock> show interfaces status
 //! root@hemlock> configure
 //! root@hemlock# set interfaces Ethernet1 description "uplink to core-1"
-//! root@hemlock# set interfaces Eth1 admin-state disabled
+//! root@hemlock# set interfaces Eth1 shutdown
 //! root@hemlock# set interfaces Management1 address 10.42.10.9/24
+//! root@hemlock# set vlans vlan 10 description "Management"
+//! root@hemlock# set interfaces Ethernet1 switchport mode trunk
+//! root@hemlock# set interfaces Ethernet1 switchport trunk vlans 10,20
 //! root@hemlock# set system ssh authentication local
 //! root@hemlock# set routing static 0.0.0.0/0 10.42.10.1
 //! root@hemlock# commit
@@ -406,12 +409,18 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
         "help" | "?" => {
             println!("Configuration commands (edit the candidate; `commit` applies):");
             println!("  set interfaces <port> description <text>");
-            println!("  set interfaces <port> admin-state <enabled|disabled>");
+            println!("  set interfaces <port> shutdown | no-shutdown");
             println!("  set interfaces <port> address <ip/prefix>     puts the port in L3 mode");
+            println!("  set interfaces <port> switchport mode <access|trunk>");
+            println!("  set interfaces <port> switchport access vlan <id>");
+            println!("  set interfaces <port> switchport trunk vlans <list>   e.g. 10,20,30-32");
+            println!("  set interfaces <port> switchport trunk native vlan <id>");
+            println!("  set vlans vlan <id> [description <text>]");
             println!("  set system ssh                                enable the SSH server");
             println!("  set system ssh authentication local           password logins (PAM)");
             println!("  set routing static <prefix> <next-hop>        static route");
-            println!("  delete interfaces <port> [description|admin-state|address]");
+            println!("  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport ...]");
+            println!("  delete vlans vlan <id> [description]");
             println!("  delete system ssh [authentication]");
             println!("  delete routing [static [<prefix>]]");
             println!("  show                      show the candidate configuration");
@@ -433,14 +442,91 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
 async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
     let Some(top) = words.first() else {
-        return Err(format!("% Usage: {verb} <interfaces|system|routing> ..."));
+        return Err(format!(
+            "% Usage: {verb} <interfaces|system|routing|vlans> ..."
+        ));
     };
-    match resolve(top, &["interfaces", "system", "routing"])? {
+    match resolve(top, &["interfaces", "system", "routing", "vlans"])? {
         "interfaces" => config_interfaces(endpoints, &words[1..], delete).await,
         "system" => config_system(endpoints, &words[1..], delete).await,
         "routing" => config_routing(endpoints, &words[1..], delete).await,
+        "vlans" => config_vlans(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
+}
+
+/// `set|delete vlans vlan <id> [description <text>]`.
+async fn config_vlans(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || format!("% Usage: {verb} vlans vlan <id> [description <text>]");
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            ConfigTree::remove_block(&mut tree.items, "vlans", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(usage());
+    };
+    resolve(first, &["vlan"])?;
+    let Some(raw_id) = words.get(1) else {
+        return Err(usage());
+    };
+    let Some(id) = raw_id
+        .parse::<u16>()
+        .ok()
+        .filter(|id| (1..=4094).contains(id))
+    else {
+        return Err(format!("% bad VLAN id {raw_id:?} (1..4094)"));
+    };
+    let id = id.to_string();
+    let rest = &words[2..];
+
+    if rest.is_empty() {
+        return if delete {
+            edit_config(endpoints, |tree| {
+                let vlans = tree.block_mut("vlans");
+                ConfigTree::remove_block(vlans, "vlan", &[&id]);
+                remove_block_if_empty(tree, "vlans");
+            })
+            .await
+        } else {
+            edit_config(endpoints, |tree| {
+                let vlans = tree.block_mut("vlans");
+                ConfigTree::ensure_block(vlans, "vlan", &[&id]);
+            })
+            .await
+        }
+        .map_err(fmt_err);
+    }
+
+    match resolve(rest[0], &["description"])? {
+        "description" => {
+            if delete {
+                edit_config(endpoints, |tree| {
+                    let vlans = tree.block_mut("vlans");
+                    if let Some(vlan) = keyed_block_children_mut(vlans, "vlan", &id) {
+                        ConfigTree::remove_leaf(vlan, "description");
+                    }
+                })
+                .await
+            } else {
+                let text = rest[1..].join(" ");
+                if text.is_empty() {
+                    return Err(format!("% Usage: set vlans vlan {id} description <text>"));
+                }
+                edit_config(endpoints, |tree| {
+                    let vlans = tree.block_mut("vlans");
+                    let vlan = ConfigTree::ensure_block(vlans, "vlan", &[&id]);
+                    ConfigTree::set_leaf(vlan, "description", vec![text]);
+                })
+                .await
+            }
+        }
+        _ => unreachable!(),
+    }
+    .map_err(fmt_err)
 }
 
 /// `set|delete interfaces <port> ...` — the interface name is
@@ -452,8 +538,11 @@ async fn config_interfaces(
     delete: bool,
 ) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
-    let usage =
-        move || format!("% Usage: {verb} interfaces <port> [description|admin-state|address ...]");
+    let usage = move || {
+        format!(
+            "% Usage: {verb} interfaces <port> [description|shutdown|no-shutdown|address|switchport ...]"
+        )
+    };
     let Some(raw_port) = words.first() else {
         return Err(usage());
     };
@@ -480,7 +569,16 @@ async fn config_interfaces(
         };
     }
 
-    match resolve(rest[0], &["description", "admin-state", "address"])? {
+    match resolve(
+        rest[0],
+        &[
+            "description",
+            "shutdown",
+            "no-shutdown",
+            "address",
+            "switchport",
+        ],
+    )? {
         "description" => {
             if delete {
                 edit_interface(endpoints, &port, |eth| {
@@ -498,24 +596,26 @@ async fn config_interfaces(
                 .await
             }
         }
-        "admin-state" => {
-            if delete {
-                edit_interface(endpoints, &port, |eth| {
-                    ConfigTree::remove_leaf(eth, "admin-state");
-                })
-                .await
+        marker @ ("shutdown" | "no-shutdown") => {
+            let other = if marker == "shutdown" {
+                "no-shutdown"
             } else {
-                let Some(value) = rest.get(1) else {
-                    return Err(format!(
-                        "% Usage: set interfaces {port} admin-state <enabled|disabled>"
-                    ));
-                };
-                let value = resolve(value, &["enabled", "disabled"])?.to_string();
-                edit_interface(endpoints, &port, |eth| {
-                    ConfigTree::set_leaf(eth, "admin-state", vec![value]);
-                })
-                .await
-            }
+                "shutdown"
+            };
+            edit_interface(endpoints, &port, move |eth| {
+                if delete {
+                    ConfigTree::remove_leaf(eth, marker);
+                } else {
+                    ConfigTree::set_leaf(eth, marker, vec![]);
+                    ConfigTree::remove_leaf(eth, other);
+                    // Displace the legacy admin-state form too.
+                    ConfigTree::remove_leaf(eth, "admin-state");
+                }
+            })
+            .await
+        }
+        "switchport" => {
+            return config_switchport(endpoints, &port, &rest[1..], delete).await;
         }
         "address" => {
             if delete {
@@ -542,6 +642,186 @@ async fn config_interfaces(
         _ => unreachable!(),
     }
     .map_err(fmt_err)
+}
+
+/// `set|delete interfaces <port> switchport ...`: mode, access vlan,
+/// trunk vlans, trunk native vlan. Setting `mode trunk` auto-deletes
+/// the access-vlan entry (a trunk carries no access VLAN).
+async fn config_switchport(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} interfaces <port> switchport [mode <access|trunk> | access vlan <id> | trunk vlans <list> | trunk native vlan <id>]"
+        )
+    };
+    if port.starts_with("Management") {
+        return Err("% switchport is not supported on management ports".into());
+    }
+
+    if words.is_empty() {
+        return if delete {
+            edit_interface(endpoints, port, |eth| {
+                ConfigTree::remove_block(eth, "switchport", &[]);
+            })
+            .await
+        } else {
+            // Bare `switchport`: explicit default L2 (access, VLAN 1).
+            edit_interface(endpoints, port, |eth| {
+                ConfigTree::ensure_block(eth, "switchport", &[]);
+            })
+            .await
+        }
+        .map_err(fmt_err);
+    }
+
+    match resolve(words[0], &["mode", "access", "trunk"])? {
+        "mode" => {
+            if delete {
+                edit_interface(endpoints, port, |eth| {
+                    if let Some(sp) = block_children_mut(eth, "switchport") {
+                        ConfigTree::remove_leaf(sp, "mode");
+                    }
+                })
+                .await
+            } else {
+                let Some(value) = words.get(1) else {
+                    return Err(usage());
+                };
+                let value = resolve(value, &["access", "trunk"])?.to_string();
+                let trunk = value == "trunk";
+                edit_interface(endpoints, port, move |eth| {
+                    let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
+                    ConfigTree::set_leaf(sp, "mode", vec![value]);
+                    if trunk {
+                        ConfigTree::remove_leaf(sp, "access-vlan");
+                    }
+                })
+                .await
+            }
+        }
+        "access" => {
+            if delete {
+                edit_interface(endpoints, port, |eth| {
+                    if let Some(sp) = block_children_mut(eth, "switchport") {
+                        ConfigTree::remove_leaf(sp, "access-vlan");
+                    }
+                })
+                .await
+            } else {
+                let Some(keyword) = words.get(1) else {
+                    return Err(usage());
+                };
+                resolve(keyword, &["vlan"])?;
+                let Some(raw) = words.get(2) else {
+                    return Err(usage());
+                };
+                let id = parse_vlan_arg(raw)?;
+                edit_interface(endpoints, port, move |eth| {
+                    let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
+                    ConfigTree::set_leaf(sp, "access-vlan", vec![id]);
+                })
+                .await
+            }
+        }
+        "trunk" => {
+            let Some(sub) = words.get(1) else {
+                return Err(usage());
+            };
+            match resolve(sub, &["vlans", "native"])? {
+                "vlans" => {
+                    if delete {
+                        edit_interface(endpoints, port, |eth| {
+                            if let Some(sp) = block_children_mut(eth, "switchport") {
+                                ConfigTree::remove_leaf(sp, "trunk-vlans");
+                            }
+                        })
+                        .await
+                    } else {
+                        let Some(list) = words.get(2) else {
+                            return Err(usage());
+                        };
+                        let vlans = parse_vlan_list(list)?;
+                        edit_interface(endpoints, port, move |eth| {
+                            let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
+                            ConfigTree::set_leaf(sp, "trunk-vlans", vlans);
+                        })
+                        .await
+                    }
+                }
+                "native" => {
+                    if delete {
+                        edit_interface(endpoints, port, |eth| {
+                            if let Some(sp) = block_children_mut(eth, "switchport") {
+                                ConfigTree::remove_leaf(sp, "native-vlan");
+                            }
+                        })
+                        .await
+                    } else {
+                        let Some(keyword) = words.get(2) else {
+                            return Err(usage());
+                        };
+                        resolve(keyword, &["vlan"])?;
+                        let Some(raw) = words.get(3) else {
+                            return Err(usage());
+                        };
+                        let id = parse_vlan_arg(raw)?;
+                        edit_interface(endpoints, port, move |eth| {
+                            let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
+                            ConfigTree::set_leaf(sp, "native-vlan", vec![id]);
+                        })
+                        .await
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => unreachable!(),
+    }
+    .map_err(fmt_err)
+}
+
+/// A CLI VLAN id argument, validated and canonicalized.
+fn parse_vlan_arg(text: &str) -> Result<String, String> {
+    text.parse::<u16>()
+        .ok()
+        .filter(|id| (1..=4094).contains(id))
+        .map(|id| id.to_string())
+        .ok_or_else(|| format!("% bad VLAN id {text:?} (1..4094)"))
+}
+
+/// A trunk VLAN list: comma-separated ids and ranges (`10,20,30-32`),
+/// expanded, deduplicated, and sorted.
+fn parse_vlan_list(text: &str) -> Result<Vec<String>, String> {
+    let one = |t: &str| {
+        t.parse::<u16>()
+            .ok()
+            .filter(|id| (1..=4094).contains(id))
+            .ok_or_else(|| format!("% bad VLAN id {t:?} (1..4094)"))
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for part in text.split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((from, to)) => {
+                let (from, to) = (one(from)?, one(to)?);
+                if from > to {
+                    return Err(format!("% bad VLAN range {part:?}"));
+                }
+                out.extend(from..=to);
+            }
+            None => {
+                out.insert(one(part)?);
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err("% empty VLAN list".into());
+    }
+    Ok(out.into_iter().map(|id| id.to_string()).collect())
 }
 
 /// `set|delete system ssh [authentication local]` — SSH is on exactly
@@ -678,6 +958,22 @@ fn block_children_mut<'a>(
         hemlock_config::Item::Block {
             name: n, children, ..
         } if n == name => Some(children),
+        _ => None,
+    })
+}
+
+/// [`block_children_mut`] for a keyed block (`vlan 10 { ... }`).
+fn keyed_block_children_mut<'a>(
+    items: &'a mut [hemlock_config::Item],
+    name: &str,
+    key: &str,
+) -> Option<&'a mut Vec<hemlock_config::Item>> {
+    items.iter_mut().find_map(|item| match item {
+        hemlock_config::Item::Block {
+            name: n,
+            keys,
+            children,
+        } if n == name && keys.len() == 1 && keys[0] == key => Some(children),
         _ => None,
     })
 }

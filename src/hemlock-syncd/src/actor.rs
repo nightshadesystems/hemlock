@@ -18,7 +18,7 @@ use hemlock_sai::{
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::state::{name_for, PortState, SharedPorts, SwitchMeta};
+use crate::state::{name_for, PortState, SharedPorts, SharedVlans, SwitchMeta};
 
 /// One port's stat sweep result.
 pub struct PortStatsSample {
@@ -57,6 +57,37 @@ pub enum SaiCmd {
         dest: IpPrefix,
         reply: oneshot::Sender<Result<(), SaiError>>,
     },
+    CreateVlan {
+        id: u16,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveVlan {
+        vlan: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    AddVlanMember {
+        vlan: Oid,
+        port: PortId,
+        tagged: bool,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveVlanMember {
+        member: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortPvid {
+        port: PortId,
+        vlan_number: u16,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemovePortDefaultVlan {
+        port: PortId,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RestorePortDefaultVlan {
+        port: PortId,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
 }
 
 /// A port's oper status changed (already applied to shared state).
@@ -71,6 +102,8 @@ pub struct SaiHandle {
     pub backend_name: String,
     pub platform_id: String,
     pub ports: SharedPorts,
+    /// Created VLANs (the default VLAN appears only if named).
+    pub vlans: SharedVlans,
     cmd_tx: mpsc::Sender<SaiCmd>,
     pub events: broadcast::Sender<OperEvent>,
 }
@@ -104,14 +137,71 @@ impl SaiHandle {
             .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))
     }
 
-    pub async fn create_router_interface(&self, port: PortId) -> Result<Oid, SaiError> {
+    /// Send one command and await its reply (every L3/L2 mutation
+    /// shares this shape).
+    async fn call<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, SaiError>>) -> SaiCmd,
+    ) -> Result<T, SaiError> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SaiCmd::CreateRouterInterface { port, reply })
+            .send(make(reply))
             .await
             .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
         rx.await
             .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))?
+    }
+
+    pub async fn create_router_interface(&self, port: PortId) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateRouterInterface { port, reply })
+            .await
+    }
+
+    pub async fn create_vlan(&self, id: u16) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateVlan { id, reply }).await
+    }
+
+    pub async fn remove_vlan(&self, vlan: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveVlan { vlan, reply }).await
+    }
+
+    pub async fn add_vlan_member(
+        &self,
+        vlan: Oid,
+        port: PortId,
+        tagged: bool,
+    ) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::AddVlanMember {
+            vlan,
+            port,
+            tagged,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_vlan_member(&self, member: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveVlanMember { member, reply })
+            .await
+    }
+
+    pub async fn set_port_pvid(&self, port: PortId, vlan_number: u16) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortPvid {
+            port,
+            vlan_number,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_port_default_vlan(&self, port: PortId) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemovePortDefaultVlan { port, reply })
+            .await
+    }
+
+    pub async fn restore_port_default_vlan(&self, port: PortId) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RestorePortDefaultVlan { port, reply })
+            .await
     }
 
     pub async fn remove_router_interface(&self, port: PortId, rif: Oid) -> Result<(), SaiError> {
@@ -223,6 +313,36 @@ impl SaiActor {
                         SaiCmd::RemoveRoute { dest, reply } => {
                             let _ = reply.send(backend.remove_route(dest));
                         }
+                        SaiCmd::CreateVlan { id, reply } => {
+                            let _ = reply.send(backend.create_vlan(id));
+                        }
+                        SaiCmd::RemoveVlan { vlan, reply } => {
+                            let _ = reply.send(backend.remove_vlan(vlan));
+                        }
+                        SaiCmd::AddVlanMember {
+                            vlan,
+                            port,
+                            tagged,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.add_vlan_member(vlan, port, tagged));
+                        }
+                        SaiCmd::RemoveVlanMember { member, reply } => {
+                            let _ = reply.send(backend.remove_vlan_member(member));
+                        }
+                        SaiCmd::SetPortPvid {
+                            port,
+                            vlan_number,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_port_pvid(port, vlan_number));
+                        }
+                        SaiCmd::RemovePortDefaultVlan { port, reply } => {
+                            let _ = reply.send(backend.remove_port_default_vlan(port));
+                        }
+                        SaiCmd::RestorePortDefaultVlan { port, reply } => {
+                            let _ = reply.send(backend.restore_port_default_vlan(port));
+                        }
                     }
                 }
                 debug!("sai actor thread exiting");
@@ -241,6 +361,7 @@ impl SaiActor {
             backend_name,
             platform_id,
             ports,
+            vlans: SharedVlans::default(),
             cmd_tx,
             events,
         })
@@ -288,6 +409,7 @@ fn init_switch(
                 oper_up: sai_port.oper_up,
                 description: String::new(),
                 l3: None,
+                switchport: None,
             },
         );
     }

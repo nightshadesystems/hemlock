@@ -61,6 +61,22 @@ impl ConfigTree {
         })
     }
 
+    /// All values of a leaf among `items` (`trunk-vlans 10 20 30`).
+    pub fn leaf_values<'a>(items: &'a [Item], name: &str) -> Option<&'a [String]> {
+        items.iter().find_map(|item| match item {
+            Item::Leaf { name: n, values } if n == name => Some(values.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Is a leaf named `name` present among `items`? (For value-less
+    /// marker leaves like `shutdown`.)
+    pub fn has_leaf(items: &[Item], name: &str) -> bool {
+        items
+            .iter()
+            .any(|item| matches!(item, Item::Leaf { name: n, .. } if n == name))
+    }
+
     /// Render canonical text (4-space indent, quoted where needed,
     /// newline-terminated statements — no trailing semicolons).
     pub fn to_text(&self) -> String {

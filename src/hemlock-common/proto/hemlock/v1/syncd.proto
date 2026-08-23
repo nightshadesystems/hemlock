@@ -26,6 +26,15 @@ service Syncd {
   // Remove the port's address and router interface, restoring default
   // L2 bridging.
   rpc ClearInterfaceAddress(ClearInterfaceAddressRequest) returns (ClearInterfaceAddressResponse);
+  // Create a VLAN (or update its display name if it already exists).
+  rpc EnsureVlan(EnsureVlanRequest) returns (EnsureVlanResponse);
+  // Remove a VLAN, detaching any remaining port memberships first.
+  rpc RemoveVlan(RemoveVlanRequest) returns (RemoveVlanResponse);
+  // Program a port's L2 switchport mode declaratively: memberships and
+  // PVID are reconciled to match the request.
+  rpc SetPortSwitchport(SetPortSwitchportRequest) returns (SetPortSwitchportResponse);
+  // Back to default L2 (untagged member of the default VLAN).
+  rpc ClearPortSwitchport(ClearPortSwitchportRequest) returns (ClearPortSwitchportResponse);
 }
 
 message GetSwitchInfoRequest {}
@@ -86,6 +95,10 @@ message GetInterfacesResponse {
   // Platform model string for `show interfaces capabilities`,
   // e.g. "Celestica E1031".
   string platform_model = 2;
+  // VLANs that exist (always includes the default VLAN 1).
+  repeated uint32 active_vlans = 3;
+  // Display names of named VLANs.
+  map<uint32, string> vlan_names = 4;
 }
 
 // The full hardware counter set, baselined against the last clear.
@@ -178,6 +191,11 @@ message InterfaceState {
   string errdisable_reason = 24;
   // Port-channel member display names.
   repeated string members = 25;
+  // L2 switchport program: "" (default access), "access", or "trunk".
+  string switchport_mode = 26;
+  uint32 access_vlan = 27;         // 0 = default VLAN (1)
+  uint32 native_vlan = 28;         // 0 = default VLAN (1)
+  repeated uint32 trunk_vlans = 29;
 }
 
 message ClearCountersRequest {
@@ -188,6 +206,41 @@ message ClearCountersRequest {
 message ClearCountersResponse {
   uint32 cleared = 1;
 }
+
+message EnsureVlanRequest {
+  uint32 id = 1;    // 1..4094
+  string name = 2;  // display name (config `description`); "" = unnamed
+}
+
+message EnsureVlanResponse {}
+
+message RemoveVlanRequest {
+  uint32 id = 1;
+}
+
+message RemoveVlanResponse {}
+
+enum SwitchportMode {
+  SWITCHPORT_MODE_UNSPECIFIED = 0;
+  SWITCHPORT_MODE_ACCESS = 1;
+  SWITCHPORT_MODE_TRUNK = 2;
+}
+
+message SetPortSwitchportRequest {
+  string name = 1;
+  SwitchportMode mode = 2;
+  uint32 access_vlan = 3;          // 0 = default VLAN (1)
+  repeated uint32 trunk_vlans = 4; // allowed tagged VLANs (trunk mode)
+  uint32 native_vlan = 5;          // 0 = default VLAN (1)
+}
+
+message SetPortSwitchportResponse {}
+
+message ClearPortSwitchportRequest {
+  string name = 1;
+}
+
+message ClearPortSwitchportResponse {}
 
 message SetInterfaceAddressRequest {
   string name = 1;     // port name, e.g. "Ethernet49"

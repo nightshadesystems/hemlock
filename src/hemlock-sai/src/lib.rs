@@ -292,4 +292,30 @@ pub trait SaiBackend: Send {
     fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError>;
 
     fn remove_route(&mut self, dest: IpPrefix) -> Result<(), SaiError>;
+
+    // --- L2 VLANs ---------------------------------------------------------
+
+    /// Create a VLAN (802.1Q id 2..=4094; 1 is the default VLAN, which
+    /// always exists).
+    fn create_vlan(&mut self, vlan_id: u16) -> Result<Oid, SaiError>;
+
+    /// Remove a VLAN; its members must already be gone.
+    fn remove_vlan(&mut self, vlan: Oid) -> Result<(), SaiError>;
+
+    /// Add `port` as a tagged or untagged member of `vlan`. The port
+    /// must be bridged (not routed).
+    fn add_vlan_member(&mut self, vlan: Oid, port: PortId, tagged: bool) -> Result<Oid, SaiError>;
+
+    fn remove_vlan_member(&mut self, member: Oid) -> Result<(), SaiError>;
+
+    /// Ingress VLAN classification of untagged frames (PVID).
+    fn set_port_pvid(&mut self, port: PortId, vlan_number: u16) -> Result<(), SaiError>;
+
+    /// Take the port out of the default VLAN — the first step of any
+    /// non-default switchport program. Idempotent.
+    fn remove_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError>;
+
+    /// Put the port back to default L2: untagged default-VLAN member
+    /// with matching PVID. Idempotent.
+    fn restore_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError>;
 }

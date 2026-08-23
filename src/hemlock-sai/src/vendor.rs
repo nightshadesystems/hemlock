@@ -555,6 +555,64 @@ impl VendorSai {
             destination: Self::ip_prefix(dest),
         })
     }
+
+    /// Create a (tagged|untagged) member of `vlan` fronting `bridge_port`.
+    fn create_vlan_member_on(
+        &self,
+        vlan: ffi::sai_object_id_t,
+        bridge_port: ffi::sai_object_id_t,
+        tagged: bool,
+    ) -> Result<ffi::sai_object_id_t, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid vlan api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.vlan_api)
+                .create_vlan_member
+                .ok_or(SaiError::Other("vlan api lacks create_vlan_member".into()))?
+        };
+        use ffi::_sai_vlan_member_attr_t as attr;
+        let mut vlan_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_VLAN_ID);
+        vlan_attr.value.oid = vlan;
+        let mut bp_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID);
+        bp_attr.value.oid = bridge_port;
+        let mut mode_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE);
+        mode_attr.value.s32 = if tagged {
+            ffi::_sai_vlan_tagging_mode_t::SAI_VLAN_TAGGING_MODE_TAGGED as i32
+        } else {
+            ffi::_sai_vlan_tagging_mode_t::SAI_VLAN_TAGGING_MODE_UNTAGGED as i32
+        };
+        let attrs = [vlan_attr, bp_attr, mode_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_vlan_member",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(oid)
+    }
+
+    /// Ingress VLAN classification of untagged frames.
+    fn set_pvid(&self, port: PortId, vlan_number: u16) -> Result<(), SaiError> {
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_PORT_VLAN_ID);
+        attr.value.u16_ = vlan_number;
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check("set_port_attribute(PORT_VLAN_ID)", set(port.0, &attr))
+        }
+    }
+
+    /// The bridge port fronting `port`, as an error when absent (routed
+    /// ports have none).
+    fn bridge_port_of(&self, port: PortId) -> Result<ffi::sai_object_id_t, SaiError> {
+        self.find_bridge_port(port)?.ok_or(SaiError::Other(format!(
+            "port {port} has no bridge port (routed?)"
+        )))
+    }
 }
 
 fn path_to_cstring(path: &Path) -> Result<CString, SaiError> {
@@ -1174,42 +1232,8 @@ impl SaiBackend for VendorSai {
             }
             oid
         };
-        {
-            // SAFETY: valid vlan api table; attr array outlives the call.
-            let create = unsafe {
-                (*self.vlan_api)
-                    .create_vlan_member
-                    .ok_or(SaiError::Other("vlan api lacks create_vlan_member".into()))?
-            };
-            use ffi::_sai_vlan_member_attr_t as attr;
-            let mut vlan_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_VLAN_ID);
-            vlan_attr.value.oid = defaults.vlan;
-            let mut bp_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID);
-            bp_attr.value.oid = bridge_port;
-            let mut mode_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE);
-            mode_attr.value.s32 =
-                ffi::_sai_vlan_tagging_mode_t::SAI_VLAN_TAGGING_MODE_UNTAGGED as i32;
-            let attrs = [vlan_attr, bp_attr, mode_attr];
-            let mut oid: ffi::sai_object_id_t = 0;
-            // SAFETY: attr array outlives the call.
-            unsafe {
-                check(
-                    "create_vlan_member(default)",
-                    create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
-                )?;
-            }
-        }
-        {
-            let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_PORT_VLAN_ID);
-            attr.value.u16_ = defaults.vlan_number;
-            // SAFETY: valid port api table; attr outlives the call.
-            unsafe {
-                let set = (*self.port_api)
-                    .set_port_attribute
-                    .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
-                check("set_port_attribute(PORT_VLAN_ID)", set(port.0, &attr))?;
-            }
-        }
+        self.create_vlan_member_on(defaults.vlan, bridge_port, false)?;
+        self.set_pvid(port, defaults.vlan_number)?;
         Ok(())
     }
 
@@ -1241,6 +1265,81 @@ impl SaiBackend for VendorSai {
                 .ok_or(SaiError::Other("route api lacks remove_route_entry".into()))?;
             check("remove_route_entry", remove(&entry))
         }
+    }
+
+    fn create_vlan(&mut self, vlan_id: u16) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid vlan api table; attr outlives the call.
+        let create = unsafe {
+            (*self.vlan_api)
+                .create_vlan
+                .ok_or(SaiError::Other("vlan api lacks create_vlan".into()))?
+        };
+        let mut attr = Self::zeroed_attr(ffi::_sai_vlan_attr_t::SAI_VLAN_ATTR_VLAN_ID);
+        attr.value.u16_ = vlan_id;
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr outlives the call.
+        unsafe {
+            check("create_vlan", create(&mut oid, switch, 1, &attr))?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_vlan(&mut self, vlan: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid vlan api table.
+        unsafe {
+            let remove = (*self.vlan_api)
+                .remove_vlan
+                .ok_or(SaiError::Other("vlan api lacks remove_vlan".into()))?;
+            check("remove_vlan", remove(vlan.0))
+        }
+    }
+
+    fn add_vlan_member(&mut self, vlan: Oid, port: PortId, tagged: bool) -> Result<Oid, SaiError> {
+        let bridge_port = self.bridge_port_of(port)?;
+        self.create_vlan_member_on(vlan.0, bridge_port, tagged)
+            .map(Oid)
+    }
+
+    fn remove_vlan_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid vlan api table.
+        unsafe {
+            let remove = (*self.vlan_api)
+                .remove_vlan_member
+                .ok_or(SaiError::Other("vlan api lacks remove_vlan_member".into()))?;
+            check("remove_vlan_member", remove(member.0))
+        }
+    }
+
+    fn set_port_pvid(&mut self, port: PortId, vlan_number: u16) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        self.set_pvid(port, vlan_number)
+    }
+
+    fn remove_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let bridge_port = self.bridge_port_of(port)?;
+        if let Some(member) = self.find_default_vlan_member(bridge_port)? {
+            // SAFETY: valid vlan api table.
+            unsafe {
+                let remove = (*self.vlan_api)
+                    .remove_vlan_member
+                    .ok_or(SaiError::Other("vlan api lacks remove_vlan_member".into()))?;
+                check("remove_vlan_member(default)", remove(member))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        let defaults = self.defaults()?;
+        let bridge_port = self.bridge_port_of(port)?;
+        if self.find_default_vlan_member(bridge_port)?.is_none() {
+            self.create_vlan_member_on(defaults.vlan, bridge_port, false)?;
+        }
+        self.set_pvid(port, defaults.vlan_number)
     }
 }
 

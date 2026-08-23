@@ -34,10 +34,16 @@ pub async fn interfaces(syncd: &IpcEndpoint) -> Result<Fetched> {
         .collect();
     let ctx = Context {
         default_switchport_mode: "access".into(),
-        // VLAN objects arrive with the L2 orchestration phase; until then
-        // only the default VLAN exists.
-        vlan_names: Default::default(),
-        active_vlans: vec![1],
+        vlan_names: response
+            .vlan_names
+            .iter()
+            .map(|(id, name)| (*id, name.clone()))
+            .collect(),
+        active_vlans: if response.active_vlans.is_empty() {
+            vec![1] // pre-VLAN syncd
+        } else {
+            response.active_vlans.clone()
+        },
         system_time: Some(
             chrono::Local::now()
                 .format("%a %b %e %H:%M:%S %Y")
@@ -173,12 +179,19 @@ fn convert(state: &pb::InterfaceState, platform_model: &str) -> Option<Interface
     if id.kind == Kind::PortChannel {
         i.fallback_mode = Some("off".into());
     }
+    let trunk = state.switchport_mode == "trunk";
+    let access_vlan = if state.access_vlan == 0 {
+        1
+    } else {
+        state.access_vlan
+    };
     i.vlan_membership = if i.l3 {
         VlanCell::Routed
+    } else if trunk {
+        VlanCell::Trunk
     } else {
-        // L2 defaults until VLAN/switchport config exists: every switch
-        // port is an access port in the default VLAN.
-        VlanCell::Access(1)
+        // Default L2: an access port in the default VLAN.
+        VlanCell::Access(access_vlan)
     };
     i.media = (!state.media.is_empty()).then(|| state.media.clone());
     i.queues = state
@@ -226,7 +239,27 @@ fn convert(state: &pb::InterfaceState, platform_model: &str) -> Option<Interface
             fec_corrected: None,
             fec_uncorrected: None,
         });
-        i.switchport = Some(Switchport::default());
+        i.switchport = Some(if i.l3 {
+            // Routed port: the two-line "not a switchport" block.
+            Switchport {
+                enabled: false,
+                ..Switchport::default()
+            }
+        } else {
+            let mode = if trunk { "trunk" } else { "static access" };
+            Switchport {
+                admin_mode: mode.into(),
+                oper_mode: mode.into(),
+                access_vlan,
+                native_vlan: if state.native_vlan == 0 {
+                    1
+                } else {
+                    state.native_vlan
+                },
+                trunk_vlans: trunk.then(|| state.trunk_vlans.clone()),
+                ..Switchport::default()
+            }
+        });
     }
     if id.kind == Kind::Management {
         i.switchport = Some(Switchport {

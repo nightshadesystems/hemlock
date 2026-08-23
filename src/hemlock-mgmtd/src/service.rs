@@ -114,6 +114,50 @@ impl Engine {
             }
         }
 
+        // VLANs and switchport programs (ASIC-side through syncd):
+        // ensure VLANs before the switchports that reference them, and
+        // remove VLANs only after those ports are reprogrammed.
+        let vlan_changes = intents::diff_vlans(&running_intents, &wanted_intents);
+        let switchport_changes = intents::diff_switchports(&running_intents, &wanted_intents);
+        if !vlan_changes.is_empty() || !switchport_changes.is_empty() {
+            let mut client = self.syncd_client().await?;
+            for change in vlan_changes.iter().filter(|c| c.ensure.is_some()) {
+                client
+                    .ensure_vlan(pb::EnsureVlanRequest {
+                        id: change.id.into(),
+                        name: change.ensure.clone().unwrap_or_default(),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+            for change in &switchport_changes {
+                match &change.set {
+                    Some(sp) => {
+                        client
+                            .set_port_switchport(switchport_request(&change.name, sp))
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                    None => {
+                        client
+                            .clear_port_switchport(pb::ClearPortSwitchportRequest {
+                                name: change.name.clone(),
+                            })
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                }
+            }
+            for change in vlan_changes.iter().filter(|c| c.ensure.is_none()) {
+                client
+                    .remove_vlan(pb::RemoveVlanRequest {
+                        id: change.id.into(),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+        }
+
         let os_changes = intents::diff_os(&running_intents, &wanted_intents);
 
         // ASIC side of front-panel addresses (router interface + routes)
@@ -154,8 +198,29 @@ impl Engine {
         )?;
         self.commit_seq += 1;
         let mut described: Vec<String> = port_changes.iter().map(PortChange::describe).collect();
+        described.extend(vlan_changes.iter().map(intents::VlanChange::describe));
+        described.extend(
+            switchport_changes
+                .iter()
+                .map(intents::SwitchportChange::describe),
+        );
         described.extend(os_changes.describe());
         Ok(described)
+    }
+}
+
+/// The full wanted switchport program as a syncd request.
+fn switchport_request(name: &str, sp: &intents::SwitchportIntent) -> pb::SetPortSwitchportRequest {
+    pb::SetPortSwitchportRequest {
+        name: name.to_string(),
+        mode: if sp.trunk {
+            pb::SwitchportMode::Trunk
+        } else {
+            pb::SwitchportMode::Access
+        } as i32,
+        access_vlan: sp.access_vlan.map(u32::from).unwrap_or(0),
+        trunk_vlans: sp.trunk_vlans.iter().map(|v| u32::from(*v)).collect(),
+        native_vlan: sp.native_vlan.map(u32::from).unwrap_or(0),
     }
 }
 
@@ -165,11 +230,22 @@ impl Engine {
     /// be replayed onto it (a restart of either daemon converges).
     pub async fn replay_running(&self) -> Result<usize> {
         let running = Self::parse_intents(&self.store.running()?)?;
-        if running.ports.is_empty() {
+        if running.ports.is_empty() && running.vlans.is_empty() {
             return Ok(0);
         }
         let mut client = self.syncd_client().await?;
         let mut applied = 0;
+        // VLANs first, so switchport replays find them.
+        for (id, vlan) in &running.vlans {
+            client
+                .ensure_vlan(pb::EnsureVlanRequest {
+                    id: (*id).into(),
+                    name: vlan.description.clone().unwrap_or_default(),
+                })
+                .await
+                .with_context(|| format!("replaying vlan {id}"))?;
+            applied += 1;
+        }
         for (name, intent) in &running.ports {
             let request = pb::SetPortAttrsRequest {
                 name: name.clone(),
@@ -197,6 +273,13 @@ impl Engine {
                     })
                     .await
                     .with_context(|| format!("replaying address for {name}"))?;
+                applied += 1;
+            }
+            if let Some(sp) = &intent.switchport {
+                client
+                    .set_port_switchport(switchport_request(name, sp))
+                    .await
+                    .with_context(|| format!("replaying switchport for {name}"))?;
                 applied += 1;
             }
         }

@@ -35,6 +35,10 @@ pub struct CliHelper {
 /// Sentinel in the word tables meaning "an interface name goes here".
 const PORT: &str = "\0port";
 
+/// Sentinel meaning "a number goes here" (VLAN ids). Not offered as a
+/// completion; it only lets deeper levels key off "a number was given".
+const NUM: &str = "\0num";
+
 /// The `show interfaces` subcommand words (the interface argument is
 /// optional and completes separately via [`PORT`]).
 const INTERFACES_SUBCOMMANDS: &[&str] = &[
@@ -106,12 +110,34 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, []) => &[
             "set", "delete", "show", "commit", "rollback", "discard", "exit", "help",
         ],
-        (CliMode::Config, ["set" | "delete"]) => &["interfaces", "system", "routing"],
+        (CliMode::Config, ["set" | "delete"]) => &["interfaces", "system", "routing", "vlans"],
         (CliMode::Config, ["set" | "delete", "interfaces"]) => &[PORT],
-        (CliMode::Config, ["set" | "delete", "interfaces", PORT]) => {
-            &["description", "admin-state", "address"]
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT]) => &[
+            "description",
+            "shutdown",
+            "no-shutdown",
+            "address",
+            "switchport",
+        ],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "switchport"]) => {
+            &["mode", "access", "trunk"]
         }
-        (CliMode::Config, ["set", "interfaces", PORT, "admin-state"]) => &["enabled", "disabled"],
+        (CliMode::Config, ["set", "interfaces", PORT, "switchport", "mode"]) => {
+            &["access", "trunk"]
+        }
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "switchport", "access"]) => {
+            &["vlan"]
+        }
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "switchport", "trunk"]) => {
+            &["vlans", "native"]
+        }
+        (
+            CliMode::Config,
+            ["set" | "delete", "interfaces", PORT, "switchport", "trunk", "native"],
+        ) => &["vlan"],
+        (CliMode::Config, ["set" | "delete", "vlans"]) => &["vlan"],
+        (CliMode::Config, ["set" | "delete", "vlans", "vlan"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "vlans", "vlan", NUM]) => &["description"],
         (CliMode::Config, ["set" | "delete", "system"]) => &["ssh"],
         (CliMode::Config, ["set" | "delete", "system", "ssh"]) => &["authentication"],
         (CliMode::Config, ["set", "system", "ssh", "authentication"]) => &["local"],
@@ -196,6 +222,11 @@ pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String
                 PortMatch::One(_) => Some(PORT),
                 _ => resolve_word(token, level.iter().copied().filter(|w| *w != PORT)),
             }
+        } else if level.contains(&NUM)
+            && !token.is_empty()
+            && token.chars().all(|c| c.is_ascii_digit())
+        {
+            Some(NUM)
         } else {
             resolve_word(token, level.iter().copied())
         };
@@ -209,6 +240,8 @@ pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String
         .flat_map(|w| {
             if *w == PORT {
                 ports.to_vec()
+            } else if *w == NUM {
+                Vec::new() // free-form number; nothing to offer
             } else {
                 vec![(*w).to_string()]
             }
@@ -342,32 +375,27 @@ mod tests {
             c,
             vec![
                 "description".to_string(),
-                "admin-state".to_string(),
-                "address".to_string()
+                "shutdown".to_string(),
+                "no-shutdown".to_string(),
+                "address".to_string(),
+                "switchport".to_string()
             ]
         );
         let c = candidates(
             CliMode::Config,
-            &["set", "interfaces", "e1", "admin-state"],
+            &["set", "interfaces", "e1", "switchport", "mode"],
             "",
             &ports(),
         );
-        assert_eq!(c, vec!["enabled".to_string(), "disabled".to_string()]);
-        // delete shares the path but has no admin-state values to complete.
+        assert_eq!(c, vec!["access".to_string(), "trunk".to_string()]);
+        // delete shares the path.
         let c = candidates(
             CliMode::Config,
             &["delete", "interfaces", "Eth0"],
-            "",
+            "sh",
             &ports(),
         );
-        assert_eq!(
-            c,
-            vec![
-                "description".to_string(),
-                "admin-state".to_string(),
-                "address".to_string()
-            ]
-        );
+        assert_eq!(c, vec!["shutdown".to_string()]);
     }
 
     #[test]
@@ -378,7 +406,8 @@ mod tests {
             vec![
                 "interfaces".to_string(),
                 "system".to_string(),
-                "routing".to_string()
+                "routing".to_string(),
+                "vlans".to_string()
             ]
         );
         // delete shares the tree.
@@ -426,7 +455,71 @@ mod tests {
             "a",
             &ports(),
         );
-        assert_eq!(c, vec!["admin-state".to_string(), "address".to_string()]);
+        assert_eq!(c, vec!["address".to_string()]);
+    }
+
+    #[test]
+    fn switchport_tree_completes() {
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "switchport"],
+            "",
+            &ports(),
+        );
+        assert_eq!(
+            c,
+            vec![
+                "mode".to_string(),
+                "access".to_string(),
+                "trunk".to_string()
+            ]
+        );
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "switchport", "trunk"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["vlans".to_string(), "native".to_string()]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "switchport", "trunk", "native"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["vlan".to_string()]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "switchport", "access"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["vlan".to_string()]);
+    }
+
+    #[test]
+    fn vlans_path_completes_through_an_id() {
+        let c = candidates(CliMode::Config, &["set", "vlans"], "", &ports());
+        assert_eq!(c, vec!["vlan".to_string()]);
+        // The id slot is free-form...
+        let c = candidates(CliMode::Config, &["set", "vlans", "vlan"], "", &ports());
+        assert!(c.is_empty());
+        // ...but a typed number leads to description.
+        let c = candidates(
+            CliMode::Config,
+            &["set", "vlans", "vlan", "10"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["description".to_string()]);
+        // A non-number in the id slot stops completion.
+        let c = candidates(
+            CliMode::Config,
+            &["set", "vlans", "vlan", "banana"],
+            "",
+            &ports(),
+        );
+        assert!(c.is_empty());
     }
 
     #[test]

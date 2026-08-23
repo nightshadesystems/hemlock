@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 use crate::actor::SaiHandle;
 use crate::ifstats::{utilization_pct, RawCounters, SharedEngine, Snapshot};
 use crate::netdev::NetdevSample;
-use crate::state::{L3State, PortState};
+use crate::state::{L3State, PortState, SwitchportState, VlanState};
 
 /// L2 MTU reported for front-panel ports. Matches the KNET default the
 /// platform loads; per-interface MTU intents arrive in a later phase.
@@ -198,10 +198,66 @@ impl SyncdService {
             ip_addresses: port.l3.iter().map(|l3| l3.address.clone()).collect(),
             ..pb::InterfaceState::default()
         };
+        if let Some(sp) = &port.switchport {
+            state.switchport_mode = if sp.trunk { "trunk" } else { "access" }.into();
+            state.access_vlan = u32::from(sp.access_vlan);
+            state.native_vlan = u32::from(sp.native_vlan);
+            state.trunk_vlans = sp.trunk_vlans.iter().map(|v| u32::from(*v)).collect();
+        }
         if let Some(snap) = self.engine.snapshot(&port.def.name, now) {
             self.stats_fields(&mut state, &snap, speed, true, true);
         }
         state
+    }
+
+    /// Is `port` carrying `vlan`? Explicit memberships are tracked in its
+    /// switchport state; default-VLAN membership is implicit (a bridged
+    /// port with no non-default access/native VLAN).
+    fn port_in_vlan(port: &PortState, vlan: u16) -> bool {
+        if port.l3.is_some() {
+            return false;
+        }
+        match &port.switchport {
+            None => vlan == 1,
+            Some(sp) => {
+                sp.members.iter().any(|(v, _, _)| *v == vlan)
+                    || (vlan == 1 && {
+                        let untagged = if sp.trunk {
+                            sp.native_vlan
+                        } else {
+                            sp.access_vlan
+                        };
+                        untagged <= 1
+                    })
+            }
+        }
+    }
+
+    /// A VLAN as a (synthesized) interface: up when any member port is.
+    fn vlan_to_iface(
+        &self,
+        vlan: u16,
+        name: &str,
+        ports: &HashMap<String, PortState>,
+    ) -> pb::InterfaceState {
+        let oper_up = ports
+            .values()
+            .any(|p| p.oper_up && Self::port_in_vlan(p, vlan));
+        pb::InterfaceState {
+            name: format!("Vlan{vlan}"),
+            kind: "vlan".into(),
+            admin_state: pb::AdminState::Up as i32,
+            oper_status: if oper_up {
+                pb::OperStatus::Up
+            } else {
+                pb::OperStatus::Down
+            } as i32,
+            mac: self.inventory.mac.clone().unwrap_or_default(),
+            bia_mac: self.inventory.mac.clone().unwrap_or_default(),
+            description: name.to_string(),
+            mtu: PORT_MTU,
+            ..pb::InterfaceState::default()
+        }
     }
 
     fn netdev_to_iface(&self, dev: &NetdevSample, now: Instant) -> pb::InterfaceState {
@@ -402,9 +458,45 @@ impl pb::syncd_server::Syncd for SyncdService {
                 }
             }
         }
+        // Every VLAN is an interface too (Vlan1 always; a kernel netdev
+        // with the same name, should one ever exist, wins).
+        let (active_vlans, vlan_names) = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let vlans = self
+                .handle
+                .vlans
+                .read()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            let taken: std::collections::HashSet<String> =
+                interfaces.iter().map(|i| i.name.clone()).collect();
+            let mut ids: Vec<u16> = vlans.keys().copied().collect();
+            if !ids.contains(&1) {
+                ids.insert(0, 1);
+            }
+            for id in &ids {
+                let name = format!("Vlan{id}");
+                if !wanted(&name) || taken.contains(&name) {
+                    continue;
+                }
+                let display = vlans.get(id).map(|v| v.name.as_str()).unwrap_or("");
+                interfaces.push(self.vlan_to_iface(*id, display, &table));
+            }
+            let names = vlans
+                .iter()
+                .filter(|(_, v)| !v.name.is_empty())
+                .map(|(id, v)| (u32::from(*id), v.name.clone()))
+                .collect();
+            (ids.iter().map(|id| u32::from(*id)).collect(), names)
+        };
         Ok(Response::new(pb::GetInterfacesResponse {
             interfaces,
             platform_model: self.inventory.platform_model.clone(),
+            active_vlans,
+            vlan_names,
         }))
     }
 
@@ -434,6 +526,12 @@ impl pb::syncd_server::Syncd for SyncdService {
             let port = table
                 .get(&req.name)
                 .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+            if port.switchport.is_some() {
+                return Err(Status::failed_precondition(format!(
+                    "{} has switchport config; delete it before addressing the port",
+                    req.name
+                )));
+            }
             (port.sai_id, port.l3.clone())
         };
         if existing
@@ -526,6 +624,301 @@ impl pb::syncd_server::Syncd for SyncdService {
             port.l3 = None;
         }
         Ok(Response::new(pb::ClearInterfaceAddressResponse {}))
+    }
+
+    async fn ensure_vlan(
+        &self,
+        request: Request<pb::EnsureVlanRequest>,
+    ) -> Result<Response<pb::EnsureVlanResponse>, Status> {
+        let req = request.into_inner();
+        let id = vlan_id(req.id).map_err(Status::invalid_argument)?;
+        let exists = self
+            .handle
+            .vlans
+            .read()
+            .map_err(|_| Status::internal("vlan table poisoned"))?
+            .contains_key(&id);
+        // The default VLAN always exists in hardware; only non-default
+        // VLANs are created. Drive the ASIC outside the lock.
+        let oid = if exists || id == 1 {
+            None
+        } else {
+            Some(
+                self.handle
+                    .create_vlan(id)
+                    .await
+                    .map_err(|e| Status::internal(format!("SAI: {e}")))?,
+            )
+        };
+        let mut vlans = self
+            .handle
+            .vlans
+            .write()
+            .map_err(|_| Status::internal("vlan table poisoned"))?;
+        vlans
+            .entry(id)
+            .and_modify(|v| v.name = req.name.clone())
+            .or_insert(VlanState {
+                oid,
+                name: req.name,
+            });
+        Ok(Response::new(pb::EnsureVlanResponse {}))
+    }
+
+    async fn remove_vlan(
+        &self,
+        request: Request<pb::RemoveVlanRequest>,
+    ) -> Result<Response<pb::RemoveVlanResponse>, Status> {
+        let req = request.into_inner();
+        let id = vlan_id(req.id).map_err(Status::invalid_argument)?;
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let Some(state) = self
+            .handle
+            .vlans
+            .read()
+            .map_err(|_| Status::internal("vlan table poisoned"))?
+            .get(&id)
+            .cloned()
+        else {
+            return Ok(Response::new(pb::RemoveVlanResponse {}));
+        };
+
+        // Detach any port memberships still referencing it.
+        let detach: Vec<hemlock_sai::Oid> = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            table
+                .values()
+                .flat_map(|p| p.switchport.iter())
+                .flat_map(|sp| sp.members.iter())
+                .filter(|(v, _, _)| *v == id)
+                .map(|(_, member, _)| *member)
+                .collect()
+        };
+        for member in detach {
+            self.handle.remove_vlan_member(member).await.map_err(sai)?;
+        }
+        {
+            let mut table = self
+                .handle
+                .ports
+                .write()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            for port in table.values_mut() {
+                if let Some(sp) = &mut port.switchport {
+                    sp.members.retain(|(v, _, _)| *v != id);
+                }
+            }
+        }
+        if let Some(oid) = state.oid {
+            self.handle.remove_vlan(oid).await.map_err(sai)?;
+        }
+        self.handle
+            .vlans
+            .write()
+            .map_err(|_| Status::internal("vlan table poisoned"))?
+            .remove(&id);
+        Ok(Response::new(pb::RemoveVlanResponse {}))
+    }
+
+    async fn set_port_switchport(
+        &self,
+        request: Request<pb::SetPortSwitchportRequest>,
+    ) -> Result<Response<pb::SetPortSwitchportResponse>, Status> {
+        let req = request.into_inner();
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let trunk = match pb::SwitchportMode::try_from(req.mode) {
+            Ok(pb::SwitchportMode::Trunk) => true,
+            Ok(pb::SwitchportMode::Access) => false,
+            _ => return Err(Status::invalid_argument("unspecified switchport mode")),
+        };
+        let access_vlan = default_vlan_id(req.access_vlan).map_err(Status::invalid_argument)?;
+        let native_vlan = default_vlan_id(req.native_vlan).map_err(Status::invalid_argument)?;
+        let mut trunk_vlans: Vec<u16> = req
+            .trunk_vlans
+            .iter()
+            .map(|v| vlan_id(*v))
+            .collect::<Result<_, String>>()
+            .map_err(Status::invalid_argument)?;
+        trunk_vlans.sort_unstable();
+        trunk_vlans.dedup();
+
+        let (sai_id, current) = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let port = table
+                .get(&req.name)
+                .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+            if port.l3.is_some() {
+                return Err(Status::failed_precondition(format!(
+                    "{} is routed; delete its address before switchport config",
+                    req.name
+                )));
+            }
+            (
+                port.sai_id,
+                port.switchport
+                    .as_ref()
+                    .map(|sp| sp.members.clone())
+                    .unwrap_or_default(),
+            )
+        };
+
+        // Desired non-default memberships; VLANs not (yet) defined are
+        // skipped â€” they attach when the VLAN is created and the port
+        // reprogrammed.
+        let mut desired: Vec<(u16, bool)> = Vec::new();
+        if trunk {
+            if native_vlan != 1 {
+                desired.push((native_vlan, false));
+            }
+            for vlan in &trunk_vlans {
+                if *vlan != native_vlan && *vlan != 1 {
+                    desired.push((*vlan, true));
+                }
+            }
+        } else if access_vlan != 1 {
+            desired.push((access_vlan, false));
+        }
+        let desired: Vec<(u16, bool, hemlock_sai::Oid)> = {
+            let vlans = self
+                .handle
+                .vlans
+                .read()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            desired
+                .into_iter()
+                .filter_map(
+                    |(vlan, tagged)| match vlans.get(&vlan).and_then(|v| v.oid) {
+                        Some(oid) => Some((vlan, tagged, oid)),
+                        None => {
+                            tracing::warn!(
+                                port = %req.name,
+                                vlan,
+                                "switchport references an undefined VLAN; membership skipped"
+                            );
+                            None
+                        }
+                    },
+                )
+                .collect()
+        };
+
+        // Reconcile: drop stale memberships, settle the default VLAN,
+        // add what's missing, then classify untagged ingress.
+        let mut members = Vec::new();
+        for (vlan, member, tagged) in current {
+            if desired.iter().any(|(v, t, _)| *v == vlan && *t == tagged) {
+                members.push((vlan, member, tagged));
+            } else {
+                self.handle.remove_vlan_member(member).await.map_err(sai)?;
+            }
+        }
+        let wants_default = if trunk {
+            native_vlan == 1
+        } else {
+            access_vlan == 1
+        };
+        if wants_default {
+            self.handle
+                .restore_port_default_vlan(sai_id)
+                .await
+                .map_err(sai)?;
+        } else {
+            self.handle
+                .remove_port_default_vlan(sai_id)
+                .await
+                .map_err(sai)?;
+        }
+        for (vlan, tagged, oid) in &desired {
+            if !members.iter().any(|(v, _, t)| v == vlan && t == tagged) {
+                let member = self
+                    .handle
+                    .add_vlan_member(*oid, sai_id, *tagged)
+                    .await
+                    .map_err(sai)?;
+                members.push((*vlan, member, *tagged));
+            }
+        }
+        let pvid = if trunk { native_vlan } else { access_vlan };
+        self.handle.set_port_pvid(sai_id, pvid).await.map_err(sai)?;
+
+        let mut table = self
+            .handle
+            .ports
+            .write()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        if let Some(port) = table.get_mut(&req.name) {
+            port.switchport = Some(SwitchportState {
+                trunk,
+                access_vlan,
+                trunk_vlans,
+                native_vlan,
+                members,
+            });
+        }
+        Ok(Response::new(pb::SetPortSwitchportResponse {}))
+    }
+
+    async fn clear_port_switchport(
+        &self,
+        request: Request<pb::ClearPortSwitchportRequest>,
+    ) -> Result<Response<pb::ClearPortSwitchportResponse>, Status> {
+        let req = request.into_inner();
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let (sai_id, existing) = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let port = table
+                .get(&req.name)
+                .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+            (port.sai_id, port.switchport.clone())
+        };
+        let Some(sp) = existing else {
+            return Ok(Response::new(pb::ClearPortSwitchportResponse {}));
+        };
+        for (_, member, _) in sp.members {
+            self.handle.remove_vlan_member(member).await.map_err(sai)?;
+        }
+        self.handle
+            .restore_port_default_vlan(sai_id)
+            .await
+            .map_err(sai)?;
+        let mut table = self
+            .handle
+            .ports
+            .write()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        if let Some(port) = table.get_mut(&req.name) {
+            port.switchport = None;
+        }
+        Ok(Response::new(pb::ClearPortSwitchportResponse {}))
+    }
+}
+
+/// A user-supplied 802.1Q VLAN id (1..=4094).
+fn vlan_id(raw: u32) -> Result<u16, String> {
+    u16::try_from(raw)
+        .ok()
+        .filter(|id| (1..=4094).contains(id))
+        .ok_or_else(|| format!("bad VLAN id {raw}"))
+}
+
+/// Like [`vlan_id`], with 0 meaning "the default VLAN".
+fn default_vlan_id(raw: u32) -> Result<u16, String> {
+    if raw == 0 {
+        Ok(1)
+    } else {
+        vlan_id(raw)
     }
 }
 
@@ -622,7 +1015,11 @@ lanes = [1, 2]
             .unwrap()
             .into_inner();
         assert_eq!(response.platform_model, "Hemlock TestSwitch");
-        assert_eq!(response.interfaces.len(), 2);
+        // Two ports plus the ever-present default VLAN interface.
+        assert_eq!(response.interfaces.len(), 3);
+        assert_eq!(response.interfaces[2].name, "Vlan1");
+        assert_eq!(response.interfaces[2].kind, "vlan");
+        assert_eq!(response.active_vlans, [1]);
         let et1 = &response.interfaces[0];
         assert_eq!(et1.name, "Ethernet1");
         assert_eq!(et1.kind, "ethernet");
@@ -756,5 +1153,130 @@ lanes = [1, 2]
             }))
             .await
             .unwrap();
+    }
+
+    /// VLAN + switchport lifecycle over the mock data-plane.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vlan_and_switchport_lifecycle_over_mock_sai() {
+        let platform = test_platform();
+        let backend = Box::new(hemlock_sai::mock::MockSai::new(platform.ports.clone()));
+        let handle = Arc::new(SaiActor::spawn(backend, &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+        let ensure = |id: u32, name: &str| {
+            service.ensure_vlan(Request::new(pb::EnsureVlanRequest {
+                id,
+                name: name.into(),
+            }))
+        };
+        ensure(10, "Management").await.unwrap();
+        ensure(20, "Servers").await.unwrap();
+        ensure(40, "").await.unwrap();
+        assert!(ensure(0, "x").await.is_err());
+        assert!(ensure(4095, "x").await.is_err());
+
+        // Access on VLAN 10.
+        service
+            .set_port_switchport(Request::new(pb::SetPortSwitchportRequest {
+                name: "Ethernet1".into(),
+                mode: pb::SwitchportMode::Access as i32,
+                access_vlan: 10,
+                trunk_vlans: vec![],
+                native_vlan: 0,
+            }))
+            .await
+            .unwrap();
+        {
+            let table = handle.ports.read().unwrap();
+            let sp = table["Ethernet1"].switchport.clone().unwrap();
+            assert!(!sp.trunk);
+            assert_eq!(sp.access_vlan, 10);
+            assert_eq!(sp.members.len(), 1);
+            assert_eq!(sp.members[0].0, 10);
+            assert!(!sp.members[0].2, "access membership is untagged");
+        }
+
+        // Reprogram as a trunk: vlans 10,20 native 40.
+        service
+            .set_port_switchport(Request::new(pb::SetPortSwitchportRequest {
+                name: "Ethernet1".into(),
+                mode: pb::SwitchportMode::Trunk as i32,
+                access_vlan: 0,
+                trunk_vlans: vec![10, 20],
+                native_vlan: 40,
+            }))
+            .await
+            .unwrap();
+        {
+            let table = handle.ports.read().unwrap();
+            let sp = table["Ethernet1"].switchport.clone().unwrap();
+            assert!(sp.trunk);
+            let mut vlans: Vec<(u16, bool)> = sp.members.iter().map(|(v, _, t)| (*v, *t)).collect();
+            vlans.sort_unstable();
+            assert_eq!(vlans, [(10, true), (20, true), (40, false)]);
+        }
+
+        // A routed port refuses switchport config, and vice versa.
+        let err = service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+                address: "10.0.0.1/24".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet2".into(),
+                address: "10.0.0.1/24".into(),
+            }))
+            .await
+            .unwrap();
+        let err = service
+            .set_port_switchport(Request::new(pb::SetPortSwitchportRequest {
+                name: "Ethernet2".into(),
+                mode: pb::SwitchportMode::Access as i32,
+                access_vlan: 10,
+                trunk_vlans: vec![],
+                native_vlan: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        // Removing a VLAN detaches the trunk's membership.
+        service
+            .remove_vlan(Request::new(pb::RemoveVlanRequest { id: 20 }))
+            .await
+            .unwrap();
+        {
+            let table = handle.ports.read().unwrap();
+            let sp = table["Ethernet1"].switchport.clone().unwrap();
+            assert!(sp.members.iter().all(|(v, _, _)| *v != 20));
+        }
+
+        // Clear: back to default L2; the other VLANs can then go too.
+        service
+            .clear_port_switchport(Request::new(pb::ClearPortSwitchportRequest {
+                name: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(handle.ports.read().unwrap()["Ethernet1"]
+            .switchport
+            .is_none());
+        service
+            .remove_vlan(Request::new(pb::RemoveVlanRequest { id: 10 }))
+            .await
+            .unwrap();
+        service
+            .remove_vlan(Request::new(pb::RemoveVlanRequest { id: 40 }))
+            .await
+            .unwrap();
+        assert!(handle.vlans.read().unwrap().is_empty());
     }
 }

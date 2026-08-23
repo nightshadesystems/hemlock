@@ -24,6 +24,8 @@ pub struct Intents {
     pub ssh: SshIntent,
     /// Static routes: canonical prefix -> next hop.
     pub routes: BTreeMap<String, String>,
+    /// VLANs (`vlans { vlan <id> { ... } }`), keyed by 802.1Q id.
+    pub vlans: BTreeMap<u16, VlanIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -35,6 +37,25 @@ pub struct InterfaceIntent {
     /// (router interface + routes in the ASIC, address on the port's
     /// hostif netdev).
     pub address: Option<String>,
+    /// Explicit L2 switchport program; None = default (access, VLAN 1).
+    pub switchport: Option<SwitchportIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VlanIntent {
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SwitchportIntent {
+    /// `mode trunk`; false = access.
+    pub trunk: bool,
+    /// None = default VLAN (1).
+    pub access_vlan: Option<u16>,
+    /// Allowed tagged VLANs in trunk mode.
+    pub trunk_vlans: Vec<u16>,
+    /// None = default VLAN (1).
+    pub native_vlan: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -68,6 +89,18 @@ pub enum IntentError {
     #[error("interface {name}: bad address: {reason}")]
     BadAddress { name: String, reason: String },
 
+    #[error("interface {name}: switchport: {reason}")]
+    BadSwitchport { name: String, reason: String },
+
+    #[error("interface {name}: address and switchport are mutually exclusive")]
+    AddressSwitchportConflict { name: String },
+
+    #[error("vlans: {0}")]
+    BadVlanBlock(String),
+
+    #[error("vlan {id}: {reason}")]
+    BadVlan { id: String, reason: String },
+
     #[error("system ssh: {0}")]
     BadSsh(String),
 
@@ -83,6 +116,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
     let mut intents = Intents {
         ssh: ssh(tree)?,
         routes: routes(tree)?,
+        vlans: vlans(tree)?,
         ..Intents::default()
     };
     let Some((_, items)) = tree.block("interfaces") else {
@@ -121,17 +155,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
             }
         };
 
-        let admin_up = match ConfigTree::leaf_value(children, "admin-state") {
-            Some("enabled") => Some(true),
-            Some("disabled") => Some(false),
-            Some(other) => {
-                return Err(IntentError::BadAdminState {
-                    name: ifname.clone(),
-                    value: other.to_string(),
-                })
-            }
-            None => None,
-        };
+        let admin_up = admin_state(children, &ifname)?;
 
         let address = match ConfigTree::leaf_value(children, "address") {
             Some(value) => {
@@ -148,17 +172,31 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
 
         match kind {
             Kind::Port => {
+                let switchport = switchport(children, &ifname)?;
+                if switchport.is_some() && address.is_some() {
+                    return Err(IntentError::AddressSwitchportConflict { name: ifname });
+                }
                 let intent = InterfaceIntent {
                     admin_up,
                     description: ConfigTree::leaf_value(children, "description")
                         .map(str::to_string),
                     address,
+                    switchport,
                 };
                 if intents.ports.insert(ifname.clone(), intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
                 }
             }
             Kind::Management => {
+                if ConfigTree::blocks_named(children, "switchport")
+                    .next()
+                    .is_some()
+                {
+                    return Err(IntentError::BadSwitchport {
+                        name: ifname,
+                        reason: "management ports are not switchports".into(),
+                    });
+                }
                 let intent = MgmtIntent { admin_up, address };
                 if intents.management.insert(ifname.clone(), intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
@@ -167,6 +205,127 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
         }
     }
     Ok(intents)
+}
+
+/// Admin state of an interface: the `shutdown` / `no-shutdown` marker
+/// leaves, with the legacy `admin-state enabled|disabled` form still
+/// accepted for configs persisted before the change.
+fn admin_state(children: &[Item], name: &str) -> Result<Option<bool>, IntentError> {
+    let shutdown = ConfigTree::has_leaf(children, "shutdown");
+    let no_shutdown = ConfigTree::has_leaf(children, "no-shutdown");
+    if shutdown && no_shutdown {
+        return Err(IntentError::BadInterfaceBlock(format!(
+            "{name}: both shutdown and no-shutdown"
+        )));
+    }
+    if shutdown {
+        return Ok(Some(false));
+    }
+    if no_shutdown {
+        return Ok(Some(true));
+    }
+    match ConfigTree::leaf_value(children, "admin-state") {
+        Some("enabled") => Ok(Some(true)),
+        Some("disabled") => Ok(Some(false)),
+        Some(other) => Err(IntentError::BadAdminState {
+            name: name.to_string(),
+            value: other.to_string(),
+        }),
+        None => Ok(None),
+    }
+}
+
+/// An 802.1Q VLAN id.
+fn parse_vlan_id(text: &str) -> Result<u16, String> {
+    text.parse::<u16>()
+        .ok()
+        .filter(|id| (1..=4094).contains(id))
+        .ok_or_else(|| format!("bad VLAN id {text:?} (1..4094)"))
+}
+
+/// The `switchport { ... }` block of a port, when present.
+fn switchport(children: &[Item], name: &str) -> Result<Option<SwitchportIntent>, IntentError> {
+    let Some((_, sp)) = ConfigTree::blocks_named(children, "switchport").next() else {
+        return Ok(None);
+    };
+    let bad = |reason: String| IntentError::BadSwitchport {
+        name: name.to_string(),
+        reason,
+    };
+    let trunk = match ConfigTree::leaf_value(sp, "mode") {
+        Some("trunk") => true,
+        Some("access") | None => false,
+        Some(other) => {
+            return Err(bad(format!(
+                "mode must be `access` or `trunk`, got {other:?}"
+            )))
+        }
+    };
+    let vlan_leaf = |leaf: &str| -> Result<Option<u16>, IntentError> {
+        match ConfigTree::leaf_value(sp, leaf) {
+            Some(value) => parse_vlan_id(value).map(Some).map_err(&bad),
+            None => Ok(None),
+        }
+    };
+    let mut trunk_vlans = Vec::new();
+    if let Some(values) = ConfigTree::leaf_values(sp, "trunk-vlans") {
+        for value in values {
+            trunk_vlans.push(parse_vlan_id(value).map_err(&bad)?);
+        }
+        trunk_vlans.sort_unstable();
+        trunk_vlans.dedup();
+    }
+    Ok(Some(SwitchportIntent {
+        trunk,
+        access_vlan: vlan_leaf("access-vlan")?,
+        trunk_vlans,
+        native_vlan: vlan_leaf("native-vlan")?,
+    }))
+}
+
+/// `vlans { vlan <id> { description ... } }`.
+fn vlans(tree: &ConfigTree) -> Result<BTreeMap<u16, VlanIntent>, IntentError> {
+    let mut out = BTreeMap::new();
+    let Some((_, items)) = tree.block("vlans") else {
+        return Ok(out);
+    };
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadVlanBlock(format!(
+                "unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        let (n, [key]) = (name.as_str(), keys.as_slice()) else {
+            return Err(IntentError::BadVlanBlock(format!(
+                "vlan block needs exactly one id key, got {name:?}"
+            )));
+        };
+        if n != "vlan" {
+            return Err(IntentError::BadVlanBlock(format!(
+                "unrecognized block {n:?}"
+            )));
+        }
+        let id = parse_vlan_id(key).map_err(|reason| IntentError::BadVlan {
+            id: key.clone(),
+            reason,
+        })?;
+        let intent = VlanIntent {
+            description: ConfigTree::leaf_value(children, "description").map(str::to_string),
+        };
+        if out.insert(id, intent).is_some() {
+            return Err(IntentError::BadVlan {
+                id: key.clone(),
+                reason: "duplicate vlan block".into(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn ssh(tree: &ConfigTree) -> Result<SshIntent, IntentError> {
@@ -548,6 +707,110 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
     changes
 }
 
+/// One VLAN change for syncd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VlanChange {
+    pub id: u16,
+    /// Display name to ensure; None = remove the VLAN.
+    pub ensure: Option<String>,
+}
+
+impl VlanChange {
+    pub fn describe(&self) -> String {
+        match &self.ensure {
+            Some(name) if !name.is_empty() => format!("vlan {} ({name})", self.id),
+            Some(_) => format!("vlan {}", self.id),
+            None => format!("vlan {} removed", self.id),
+        }
+    }
+}
+
+/// Diff the VLAN table, candidate against running.
+pub fn diff_vlans(running: &Intents, candidate: &Intents) -> Vec<VlanChange> {
+    let mut changes = Vec::new();
+    for (id, wanted) in &candidate.vlans {
+        if running.vlans.get(id) != Some(wanted) {
+            changes.push(VlanChange {
+                id: *id,
+                ensure: Some(wanted.description.clone().unwrap_or_default()),
+            });
+        }
+    }
+    for id in running.vlans.keys() {
+        if !candidate.vlans.contains_key(id) {
+            changes.push(VlanChange {
+                id: *id,
+                ensure: None,
+            });
+        }
+    }
+    changes
+}
+
+/// One port's switchport change for syncd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchportChange {
+    pub name: String,
+    /// The full wanted program; None = back to default L2.
+    pub set: Option<SwitchportIntent>,
+}
+
+impl SwitchportChange {
+    pub fn describe(&self) -> String {
+        match &self.set {
+            None => format!("{}: switchport removed", self.name),
+            Some(sp) if sp.trunk => {
+                let vlans = sp
+                    .trunk_vlans
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{}: switchport trunk vlans {} native {}",
+                    self.name,
+                    if vlans.is_empty() { "-".into() } else { vlans },
+                    sp.native_vlan.unwrap_or(1)
+                )
+            }
+            Some(sp) => format!(
+                "{}: switchport access vlan {}",
+                self.name,
+                sp.access_vlan.unwrap_or(1)
+            ),
+        }
+    }
+}
+
+/// Diff the switchport programs, candidate against running.
+pub fn diff_switchports(running: &Intents, candidate: &Intents) -> Vec<SwitchportChange> {
+    let mut changes = Vec::new();
+    for (name, wanted) in &candidate.ports {
+        let current = running.ports.get(name).and_then(|p| p.switchport.as_ref());
+        match (&wanted.switchport, current) {
+            (Some(w), Some(n)) if w == n => {}
+            (Some(w), _) => changes.push(SwitchportChange {
+                name: name.clone(),
+                set: Some(w.clone()),
+            }),
+            (None, Some(_)) => changes.push(SwitchportChange {
+                name: name.clone(),
+                set: None,
+            }),
+            (None, None) => {}
+        }
+    }
+    for (name, had) in &running.ports {
+        if !candidate.ports.contains_key(name) && had.switchport.is_some() {
+            changes.push(SwitchportChange {
+                name: name.clone(),
+                set: None,
+            });
+        }
+    }
+    changes
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -580,6 +843,7 @@ interfaces {
                 admin_up: Some(false),
                 description: Some("uplink".into()),
                 address: None,
+                switchport: None,
             }
         );
         assert_eq!(intents.ports["Ethernet1"].admin_up, Some(true));
@@ -597,6 +861,7 @@ interfaces {
                 admin_up: Some(false),
                 description: Some("uplink".into()),
                 address: None,
+                switchport: None,
             }
         );
         assert_eq!(
@@ -795,6 +1060,136 @@ interfaces {
                 del_address: Some("10.0.0.5/24".into()),
             }]
         );
+    }
+
+    #[test]
+    fn extracts_shutdown_markers() {
+        let intents = intents_of(
+            "interfaces { Ethernet1 { shutdown } Ethernet2 { no-shutdown } Ethernet3 { } }",
+        );
+        assert_eq!(intents.ports["Ethernet1"].admin_up, Some(false));
+        assert_eq!(intents.ports["Ethernet2"].admin_up, Some(true));
+        assert_eq!(intents.ports["Ethernet3"].admin_up, None);
+        let tree = parse("interfaces { Ethernet1 { shutdown\nno-shutdown } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadInterfaceBlock(_))
+        ));
+    }
+
+    #[test]
+    fn extracts_vlans_and_switchports() {
+        let intents = intents_of(
+            r#"
+vlans {
+    vlan 10 {
+        description "Management"
+    }
+    vlan 20 { }
+}
+interfaces {
+    Ethernet1 {
+        switchport {
+            mode trunk
+            trunk-vlans 10 20 30
+            native-vlan 40
+        }
+    }
+    Ethernet2 {
+        switchport {
+            mode access
+            access-vlan 10
+        }
+    }
+}
+"#,
+        );
+        assert_eq!(intents.vlans.len(), 2);
+        assert_eq!(
+            intents.vlans[&10].description.as_deref(),
+            Some("Management")
+        );
+        assert_eq!(intents.vlans[&20].description, None);
+        assert_eq!(
+            intents.ports["Ethernet1"].switchport,
+            Some(SwitchportIntent {
+                trunk: true,
+                access_vlan: None,
+                trunk_vlans: vec![10, 20, 30],
+                native_vlan: Some(40),
+            })
+        );
+        assert_eq!(
+            intents.ports["Ethernet2"].switchport,
+            Some(SwitchportIntent {
+                trunk: false,
+                access_vlan: Some(10),
+                trunk_vlans: vec![],
+                native_vlan: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_vlans_and_switchports() {
+        let tree = parse("vlans { vlan 5000 { } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadVlan { .. })));
+        let tree = parse("vlans { vlan 10 { } vlan 10 { } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadVlan { .. })));
+        let tree = parse("interfaces { Ethernet1 { switchport { mode banana } } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadSwitchport { .. })
+        ));
+        // Address and switchport are mutually exclusive.
+        let tree =
+            parse("interfaces { Ethernet1 { address 10.0.0.1/24\nswitchport { } } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::AddressSwitchportConflict { .. })
+        ));
+        // Management ports are not switchports.
+        let tree = parse("interfaces { Management1 { switchport { } } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadSwitchport { .. })
+        ));
+    }
+
+    #[test]
+    fn diff_vlans_and_switchports_report_changes() {
+        let running = intents_of("");
+        let candidate = intents_of(
+            "vlans { vlan 10 { description \"Management\" } }\ninterfaces { Ethernet1 { switchport { mode access\naccess-vlan 10 } } }",
+        );
+        let vlans = diff_vlans(&running, &candidate);
+        assert_eq!(
+            vlans,
+            vec![VlanChange {
+                id: 10,
+                ensure: Some("Management".into())
+            }]
+        );
+        let switchports = diff_switchports(&running, &candidate);
+        assert_eq!(switchports.len(), 1);
+        assert_eq!(
+            switchports[0].describe(),
+            "Ethernet1: switchport access vlan 10"
+        );
+
+        // Unchanged -> empty; reverting -> removals.
+        assert!(diff_vlans(&candidate, &candidate).is_empty());
+        assert!(diff_switchports(&candidate, &candidate).is_empty());
+        let back_vlans = diff_vlans(&candidate, &running);
+        assert_eq!(
+            back_vlans,
+            vec![VlanChange {
+                id: 10,
+                ensure: None
+            }]
+        );
+        let back_sp = diff_switchports(&candidate, &running);
+        assert_eq!(back_sp[0].describe(), "Ethernet1: switchport removed");
     }
 
     #[test]

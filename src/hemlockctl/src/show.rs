@@ -123,21 +123,52 @@ pub async fn configuration(
         .ports;
     ports.sort_by_key(|p| p.index);
 
+    // VLANs: the default VLAN 1 always exists, so the config always
+    // shows it (alongside any configured VLANs), in numeric order.
+    let vlan_ids: Vec<String> = {
+        let vlans = tree.block_mut("vlans");
+        ConfigTree::ensure_block(vlans, "vlan", &["1"]);
+        vlans.sort_by_key(|item| match item {
+            hemlock_config::Item::Block { keys, .. } => keys
+                .first()
+                .and_then(|k| k.parse().ok())
+                .unwrap_or(u16::MAX),
+            hemlock_config::Item::Leaf { .. } => u16::MAX,
+        });
+        ConfigTree::blocks_named(vlans, "vlan")
+            .filter_map(|(keys, _)| keys.first().cloned())
+            .collect()
+    };
+
     {
         let interfaces = tree.block_mut("interfaces");
         for p in &ports {
             let eth = ConfigTree::ensure_block(interfaces, p.name.as_str(), &[]);
-            if ConfigTree::leaf_value(eth, "admin-state").is_none() {
-                let admin = if p.admin_state == pb::AdminState::Up as i32 {
-                    "enabled"
+            if !has_admin_leaf(eth) {
+                let marker = if p.admin_state == pb::AdminState::Up as i32 {
+                    "no-shutdown"
                 } else {
-                    "disabled"
+                    "shutdown"
                 };
-                ConfigTree::set_leaf(eth, "admin-state", vec![admin.into()]);
+                ConfigTree::set_leaf(eth, marker, vec![]);
             }
             if !p.description.is_empty() && ConfigTree::leaf_value(eth, "description").is_none() {
                 ConfigTree::set_leaf(eth, "description", vec![p.description.clone()]);
             }
+            // Default L2: every unconfigured switch port is an access
+            // port in VLAN 1 (routed ports excepted).
+            let routed = ConfigTree::leaf_value(eth, "address").is_some();
+            let has_switchport = ConfigTree::blocks_named(eth, "switchport").next().is_some();
+            if !routed && !has_switchport {
+                let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
+                ConfigTree::set_leaf(sp, "mode", vec!["access".into()]);
+                ConfigTree::set_leaf(sp, "access-vlan", vec!["1".into()]);
+            }
+        }
+
+        // Every VLAN is an interface, too.
+        for id in &vlan_ids {
+            ConfigTree::ensure_block(interfaces, &format!("Vlan{id}"), &[]);
         }
 
         // Management port: an OS netdev named by the manifest, not an ASIC
@@ -145,12 +176,12 @@ pub async fn configuration(
         if let Ok(platform) = hemlock_platform::Platform::find("/", platform_dir) {
             if let Some(mgmt) = &platform.manifest.management {
                 let block = ConfigTree::ensure_block(interfaces, mgmt.interface.as_str(), &[]);
-                if ConfigTree::leaf_value(block, "admin-state").is_none() {
+                if !has_admin_leaf(block) {
                     if let Some(up) = os_netdev_is_up(&mgmt.os_device) {
                         ConfigTree::set_leaf(
                             block,
-                            "admin-state",
-                            vec![if up { "enabled" } else { "disabled" }.into()],
+                            if up { "no-shutdown" } else { "shutdown" },
+                            vec![],
                         );
                     }
                 }
@@ -159,7 +190,7 @@ pub async fn configuration(
 
         // Deterministic display order regardless of which ports were
         // explicitly configured first: ethernet by port number, then
-        // management.
+        // management, then VLANs.
         sort_interface_blocks(interfaces);
     }
 
@@ -182,22 +213,33 @@ pub async fn configuration(
         }
     }
 
-    // Canonical top-level order: system, interfaces, routing, then
-    // anything else in its original order (sort is stable).
+    // Canonical top-level order: system, vlans, interfaces, routing,
+    // then anything else in its original order (sort is stable).
     tree.items.sort_by_key(|item| match item.name() {
         "system" => 0,
-        "interfaces" => 1,
-        "routing" => 2,
-        _ => 3,
+        "vlans" => 1,
+        "interfaces" => 2,
+        "routing" => 3,
+        _ => 4,
     });
 
     print!("{}", tree.to_text());
     Ok(())
 }
 
+/// Admin-state marker present? (`shutdown` / `no-shutdown`, or the
+/// legacy `admin-state` leaf.)
+fn has_admin_leaf(items: &[hemlock_config::Item]) -> bool {
+    use hemlock_config::ConfigTree;
+    ConfigTree::has_leaf(items, "shutdown")
+        || ConfigTree::has_leaf(items, "no-shutdown")
+        || ConfigTree::has_leaf(items, "admin-state")
+}
+
 /// Sort an `interfaces` block for display: Ethernet ports in numeric
-/// order, Management after them, anything unrecognized last. Stable, so
-/// equal keys keep their running-config order.
+/// order, Management after them, then VLAN interfaces, anything
+/// unrecognized last. Stable, so equal keys keep their running-config
+/// order.
 fn sort_interface_blocks(items: &mut [hemlock_config::Item]) {
     fn key(item: &hemlock_config::Item) -> (u8, u64, String) {
         match item {
@@ -206,8 +248,10 @@ fn sort_interface_blocks(items: &mut [hemlock_config::Item]) {
                     0
                 } else if name.starts_with("Management") {
                     1
-                } else {
+                } else if name.starts_with("Vlan") {
                     2
+                } else {
+                    3
                 };
                 let number: String = name
                     .chars()
@@ -216,7 +260,7 @@ fn sort_interface_blocks(items: &mut [hemlock_config::Item]) {
                     .collect();
                 (rank, number.parse().unwrap_or(u64::MAX), name.clone())
             }
-            hemlock_config::Item::Leaf { name, .. } => (3, 0, name.clone()),
+            hemlock_config::Item::Leaf { name, .. } => (4, 0, name.clone()),
         }
     }
     items.sort_by_key(key);

@@ -22,6 +22,11 @@ const MOCK_SWITCH_OID: u64 = 0x2100_0000_0000_0000;
 const MOCK_PORT_OID_BASE: u64 = 0x2100_0000_0000_1000;
 const MOCK_HOSTIF_OID_BASE: u64 = 0x2100_0000_0000_2000;
 const MOCK_RIF_OID_BASE: u64 = 0x2100_0000_0000_3000;
+const MOCK_VLAN_OID_BASE: u64 = 0x2100_0000_0000_4000;
+const MOCK_VLAN_MEMBER_OID_BASE: u64 = 0x2100_0000_0000_5000;
+
+/// The default 802.1Q VLAN every port starts in.
+const DEFAULT_VLAN: u16 = 1;
 
 pub struct MockSai {
     port_table: Vec<PortDef>,
@@ -36,6 +41,12 @@ pub struct MockSai {
     hostifs: HashMap<PortId, (Oid, String)>,
     rifs: HashMap<PortId, Oid>,
     routes: HashMap<IpPrefix, RouteTarget>,
+    /// L2 model: created VLANs, memberships, PVIDs, and which ports
+    /// still hold their boot-time untagged default-VLAN membership.
+    vlans: HashMap<u16, Oid>,
+    vlan_members: HashMap<Oid, (Oid, PortId, bool)>,
+    default_members: std::collections::HashSet<PortId>,
+    pvids: HashMap<PortId, u16>,
     next_oid: u64,
 }
 
@@ -54,6 +65,10 @@ impl MockSai {
             hostifs: HashMap::new(),
             rifs: HashMap::new(),
             routes: HashMap::new(),
+            vlans: HashMap::new(),
+            vlan_members: HashMap::new(),
+            default_members: std::collections::HashSet::new(),
+            pvids: HashMap::new(),
             next_oid: 0,
         }
     }
@@ -109,6 +124,12 @@ impl SaiBackend for MockSai {
                 oper_up: false,
             })
             .collect();
+        // Like the real ASIC: every port boots as an untagged member of
+        // the default VLAN with a matching PVID.
+        for port in &self.ports {
+            self.default_members.insert(port.id);
+            self.pvids.insert(port.id, DEFAULT_VLAN);
+        }
         Ok(SwitchInfo {
             oid: MOCK_SWITCH_OID,
         })
@@ -184,6 +205,9 @@ impl SaiBackend for MockSai {
         if self.rifs.contains_key(&port) {
             return Err(SaiError::Other(format!("port {port} already has a RIF")));
         }
+        // Routing a port pulls it out of the 802.1Q bridge (the vendor
+        // path removes its bridge port).
+        self.default_members.remove(&port);
         let oid = self.alloc(MOCK_RIF_OID_BASE);
         self.rifs.insert(port, oid);
         Ok(oid)
@@ -194,6 +218,9 @@ impl SaiBackend for MockSai {
         match self.rifs.get(&port) {
             Some(have) if *have == rif => {
                 self.rifs.remove(&port);
+                // Back to default L2 bridging.
+                self.default_members.insert(port);
+                self.pvids.insert(port, DEFAULT_VLAN);
                 Ok(())
             }
             _ => Err(SaiError::Other(format!("port {port} has no RIF {rif}"))),
@@ -215,6 +242,93 @@ impl SaiBackend for MockSai {
                 dest.0, dest.1
             )));
         }
+        Ok(())
+    }
+
+    fn create_vlan(&mut self, vlan_id: u16) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if vlan_id == DEFAULT_VLAN || self.vlans.contains_key(&vlan_id) {
+            return Err(SaiError::Other(format!("VLAN {vlan_id} already exists")));
+        }
+        let oid = self.alloc(MOCK_VLAN_OID_BASE);
+        self.vlans.insert(vlan_id, oid);
+        Ok(oid)
+    }
+
+    fn remove_vlan(&mut self, vlan: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.vlan_members.values().any(|(v, _, _)| *v == vlan) {
+            return Err(SaiError::Other(format!("VLAN {vlan} still has members")));
+        }
+        let Some(id) = self
+            .vlans
+            .iter()
+            .find(|(_, o)| **o == vlan)
+            .map(|(id, _)| *id)
+        else {
+            return Err(SaiError::Other(format!("no such VLAN {vlan}")));
+        };
+        self.vlans.remove(&id);
+        Ok(())
+    }
+
+    fn add_vlan_member(&mut self, vlan: Oid, port: PortId, tagged: bool) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        if self.rifs.contains_key(&port) {
+            return Err(SaiError::Other(format!(
+                "port {port} is routed (no bridge port)"
+            )));
+        }
+        if !self.vlans.values().any(|o| *o == vlan) {
+            return Err(SaiError::Other(format!("no such VLAN {vlan}")));
+        }
+        if self
+            .vlan_members
+            .values()
+            .any(|(v, p, _)| *v == vlan && *p == port)
+        {
+            return Err(SaiError::Other(format!(
+                "port {port} is already a member of VLAN {vlan}"
+            )));
+        }
+        let member = self.alloc(MOCK_VLAN_MEMBER_OID_BASE);
+        self.vlan_members.insert(member, (vlan, port, tagged));
+        Ok(member)
+    }
+
+    fn remove_vlan_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.vlan_members.remove(&member).is_none() {
+            return Err(SaiError::Other(format!("no such VLAN member {member}")));
+        }
+        Ok(())
+    }
+
+    fn set_port_pvid(&mut self, port: PortId, vlan_number: u16) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        self.pvids.insert(port, vlan_number);
+        Ok(())
+    }
+
+    fn remove_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        self.default_members.remove(&port);
+        Ok(())
+    }
+
+    fn restore_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        if self.rifs.contains_key(&port) {
+            return Err(SaiError::Other(format!(
+                "port {port} is routed (no bridge port)"
+            )));
+        }
+        self.default_members.insert(port);
+        self.pvids.insert(port, DEFAULT_VLAN);
         Ok(())
     }
 
@@ -334,5 +448,50 @@ mod tests {
         assert!(sai.remove_router_interface(port, rif).is_err());
         // Back to L2: a fresh RIF can be created again.
         sai.create_router_interface(port).unwrap();
+    }
+
+    #[test]
+    fn vlan_lifecycle_members_and_pvid() {
+        let mut sai = MockSai::new(port_table(2));
+        sai.create_switch().unwrap();
+        let port = sai.ports().unwrap()[0].id;
+
+        let vlan10 = sai.create_vlan(10).unwrap();
+        let vlan20 = sai.create_vlan(20).unwrap();
+        assert!(sai.create_vlan(10).is_err(), "duplicate VLAN id");
+        assert!(sai.create_vlan(1).is_err(), "default VLAN already exists");
+
+        // Access on VLAN 10: leave default, untagged member, PVID 10.
+        sai.remove_port_default_vlan(port).unwrap();
+        sai.remove_port_default_vlan(port).unwrap(); // idempotent
+        let member = sai.add_vlan_member(vlan10, port, false).unwrap();
+        assert!(
+            sai.add_vlan_member(vlan10, port, false).is_err(),
+            "one membership per (vlan, port)"
+        );
+        sai.set_port_pvid(port, 10).unwrap();
+
+        // A VLAN with members refuses removal.
+        assert!(sai.remove_vlan(vlan10).is_err());
+        sai.remove_vlan_member(member).unwrap();
+        assert!(sai.remove_vlan_member(member).is_err());
+
+        // Trunk-ish: tagged members on both VLANs.
+        let m10 = sai.add_vlan_member(vlan10, port, true).unwrap();
+        let m20 = sai.add_vlan_member(vlan20, port, true).unwrap();
+        sai.remove_vlan_member(m10).unwrap();
+        sai.remove_vlan_member(m20).unwrap();
+
+        // Back to default L2.
+        sai.restore_port_default_vlan(port).unwrap();
+        sai.remove_vlan(vlan10).unwrap();
+        sai.remove_vlan(vlan20).unwrap();
+        assert!(sai.remove_vlan(vlan10).is_err());
+
+        // Routed ports have no bridge port to hang members on.
+        let vlan30 = sai.create_vlan(30).unwrap();
+        sai.create_router_interface(port).unwrap();
+        assert!(sai.add_vlan_member(vlan30, port, false).is_err());
+        assert!(sai.restore_port_default_vlan(port).is_err());
     }
 }
