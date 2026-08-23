@@ -61,6 +61,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/mirror", get(mirror))
         .route("/api/mirror/edit", post(mirror_edit))
         .route("/api/routes", get(routes))
+        .route("/api/routes/static/edit", post(static_routes_edit))
         .route("/api/system", get(system))
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
@@ -872,20 +873,66 @@ async fn routes(
     let text = running_config(&state.mgmtd).await?;
     let tree =
         hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
-    let mut static_routes = Vec::new();
+    // Repeated leaves per prefix are ECMP; aggregate to one row each.
+    struct StaticRoute {
+        next_hops: Vec<String>,
+        drop: bool,
+        distance: u32,
+    }
+    let mut statics: std::collections::BTreeMap<String, StaticRoute> = Default::default();
     if let Some((_, routing)) = tree.block("routing") {
-        if let Some((_, statics)) = ConfigTree::blocks_named(routing, "static").next() {
-            for item in statics {
-                if let hemlock_config::Item::Leaf { name, values } = item {
-                    static_routes.push(json!({
-                        "prefix": name,
-                        "next_hop": values.first().cloned().unwrap_or_default(),
-                    }));
+        for (_, items) in ConfigTree::blocks_named(routing, "static") {
+            for item in items {
+                let hemlock_config::Item::Leaf { name, values } = item else {
+                    continue;
+                };
+                let entry = statics.entry(name.clone()).or_insert(StaticRoute {
+                    next_hops: Vec::new(),
+                    drop: false,
+                    distance: 1,
+                });
+                match values.as_slice() {
+                    [keyword] if keyword == "drop" => entry.drop = true,
+                    [next_hop, rest @ ..] => {
+                        if !entry.next_hops.contains(next_hop) {
+                            entry.next_hops.push(next_hop.clone());
+                        }
+                        if let [keyword, value] = rest {
+                            if keyword == "distance" {
+                                if let Ok(distance) = value.parse() {
+                                    entry.distance = distance;
+                                }
+                            }
+                        }
+                    }
+                    [] => {}
                 }
             }
         }
     }
+    let static_routes: Vec<serde_json::Value> = statics
+        .iter()
+        .map(|(prefix, route)| {
+            json!({
+                "prefix": prefix,
+                "next_hops": route.next_hops,
+                "drop": route.drop,
+                "distance": route.distance,
+            })
+        })
+        .collect();
     Ok(Json(json!({ "static_routes": static_routes })))
+}
+
+async fn static_routes_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::routing_edit::StaticRouteEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::routing_edit::apply_static_route_edit(tree, &edit)
+    })
+    .await
 }
 
 async fn system(
