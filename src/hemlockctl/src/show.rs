@@ -182,12 +182,13 @@ pub async fn configuration(
         }
     }
 
-    // Canonical top-level order: system, interfaces, then anything else
-    // in its original order (sort is stable).
+    // Canonical top-level order: system, interfaces, routing, then
+    // anything else in its original order (sort is stable).
     tree.items.sort_by_key(|item| match item.name() {
         "system" => 0,
         "interfaces" => 1,
-        _ => 2,
+        "routing" => 2,
+        _ => 3,
     });
 
     print!("{}", tree.to_text());

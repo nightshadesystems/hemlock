@@ -106,12 +106,16 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, []) => &[
             "set", "delete", "show", "commit", "rollback", "discard", "exit", "help",
         ],
-        (CliMode::Config, ["set" | "delete"]) => &["interfaces"],
+        (CliMode::Config, ["set" | "delete"]) => &["interfaces", "system", "routing"],
         (CliMode::Config, ["set" | "delete", "interfaces"]) => &[PORT],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT]) => {
-            &["description", "admin-state"]
+            &["description", "admin-state", "address"]
         }
         (CliMode::Config, ["set", "interfaces", PORT, "admin-state"]) => &["enabled", "disabled"],
+        (CliMode::Config, ["set" | "delete", "system"]) => &["ssh"],
+        (CliMode::Config, ["set" | "delete", "system", "ssh"]) => &["authentication"],
+        (CliMode::Config, ["set", "system", "ssh", "authentication"]) => &["local"],
+        (CliMode::Config, ["set" | "delete", "routing"]) => &["static"],
         (CliMode::Config, ["commit"]) => &["confirmed"],
         _ => &[],
     }
@@ -336,7 +340,11 @@ mod tests {
         );
         assert_eq!(
             c,
-            vec!["description".to_string(), "admin-state".to_string()]
+            vec![
+                "description".to_string(),
+                "admin-state".to_string(),
+                "address".to_string()
+            ]
         );
         let c = candidates(
             CliMode::Config,
@@ -354,8 +362,71 @@ mod tests {
         );
         assert_eq!(
             c,
-            vec!["description".to_string(), "admin-state".to_string()]
+            vec![
+                "description".to_string(),
+                "admin-state".to_string(),
+                "address".to_string()
+            ]
         );
+    }
+
+    #[test]
+    fn config_nouns_complete() {
+        let c = candidates(CliMode::Config, &["set"], "", &ports());
+        assert_eq!(
+            c,
+            vec![
+                "interfaces".to_string(),
+                "system".to_string(),
+                "routing".to_string()
+            ]
+        );
+        // delete shares the tree.
+        let c = candidates(CliMode::Config, &["delete"], "r", &ports());
+        assert_eq!(c, vec!["routing".to_string()]);
+    }
+
+    #[test]
+    fn system_ssh_path_completes() {
+        let c = candidates(CliMode::Config, &["set", "system"], "", &ports());
+        assert_eq!(c, vec!["ssh".to_string()]);
+        let c = candidates(CliMode::Config, &["set", "system", "ssh"], "", &ports());
+        assert_eq!(c, vec!["authentication".to_string()]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "system", "ssh", "authentication"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["local".to_string()]);
+        // delete stops at authentication (no value to complete).
+        let c = candidates(
+            CliMode::Config,
+            &["delete", "system", "ssh", "authentication"],
+            "",
+            &ports(),
+        );
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn routing_path_completes() {
+        let c = candidates(CliMode::Config, &["set", "routing"], "", &ports());
+        assert_eq!(c, vec!["static".to_string()]);
+        // The prefix/next-hop slots are free text.
+        let c = candidates(CliMode::Config, &["set", "routing", "static"], "", &ports());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn interface_address_completes() {
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth0"],
+            "a",
+            &ports(),
+        );
+        assert_eq!(c, vec!["admin-state".to_string(), "address".to_string()]);
     }
 
     #[test]

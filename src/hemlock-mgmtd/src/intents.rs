@@ -1,24 +1,53 @@
-//! Interface intents: the slice of the config tree mgmtd knows how to
-//! apply in phase 1 (`interfaces { Ethernet1 { ... } }` — the interface
-//! name is the block name; the legacy `ethernet <name>` keyed form is
-//! still accepted for configs persisted before the format change).
+//! Config intents: the typed slices of the config tree mgmtd knows how
+//! to apply. ASIC ports (`interfaces { Ethernet1 { ... } }`) are pushed
+//! to syncd; the OS-side families — management addressing (`interfaces
+//! { Management1 { address ... } }`), static routes (`routing { static
+//! { <prefix> <next-hop> } }`) and the SSH service (`system { ssh {
+//! ... } }`) — go through the OS applier (`osapply`). The legacy
+//! `ethernet <name>` keyed form is still accepted for configs persisted
+//! before the format change.
 //!
-//! Management interfaces (`Management*`) are OS netdevs, not ASIC ports;
-//! their blocks are ignored here until an OS-side applier exists.
-//!
-//! Later phases add more intent families (vlans, lags, routing policy);
-//! each stays a pure function from config tree to typed intent, diffed
-//! against the running tree and pushed to the owning daemon.
+//! Each family stays a pure function from config tree to typed intent,
+//! diffed against the running tree and pushed to the owning applier.
 
 use std::collections::BTreeMap;
 
 use hemlock_config::{ConfigTree, Item};
+
+/// Every intent family extracted from one config tree.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Intents {
+    /// ASIC ports, keyed by interface name.
+    pub ports: BTreeMap<String, InterfaceIntent>,
+    /// Management (OS netdev) interfaces, keyed by interface name.
+    pub management: BTreeMap<String, MgmtIntent>,
+    pub ssh: SshIntent,
+    /// Static routes: canonical prefix -> next hop.
+    pub routes: BTreeMap<String, String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InterfaceIntent {
     /// None = leave the daemon default (up) untouched.
     pub admin_up: Option<bool>,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MgmtIntent {
+    /// None = leave the netdev alone.
+    pub admin_up: Option<bool>,
+    /// Primary address in CIDR form; puts the interface in L3 mode.
+    pub address: Option<String>,
+}
+
+/// `system { ssh { ... } }` — SSH is on exactly when the block exists.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SshIntent {
+    pub enabled: bool,
+    /// `authentication local`: password logins against the on-box user
+    /// database (PAM).
+    pub auth_local: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -31,11 +60,30 @@ pub enum IntentError {
 
     #[error("interface {name}: duplicate interface block")]
     Duplicate { name: String },
+
+    #[error("interface {name}: bad address: {reason}")]
+    BadAddress { name: String, reason: String },
+
+    #[error("interface {name}: address is only supported on Management interfaces")]
+    AddressUnsupported { name: String },
+
+    #[error("system ssh: {0}")]
+    BadSsh(String),
+
+    #[error("routing: {0}")]
+    BadRouting(String),
+
+    #[error("route {prefix}: {reason}")]
+    BadRoute { prefix: String, reason: String },
 }
 
-/// Extract per-interface intents from a config tree.
-pub fn interfaces(tree: &ConfigTree) -> Result<BTreeMap<String, InterfaceIntent>, IntentError> {
-    let mut intents = BTreeMap::new();
+/// Extract every intent family from a config tree.
+pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
+    let mut intents = Intents {
+        ssh: ssh(tree)?,
+        routes: routes(tree)?,
+        ..Intents::default()
+    };
     let Some((_, items)) = tree.block("interfaces") else {
         return Ok(intents);
     };
@@ -49,48 +97,165 @@ pub fn interfaces(tree: &ConfigTree) -> Result<BTreeMap<String, InterfaceIntent>
         else {
             continue;
         };
-        let ifname = match (name.as_str(), keys.as_slice()) {
-            // Legacy keyed form: `ethernet <name> { ... }`.
-            ("ethernet", [key]) => key.clone(),
-            ("ethernet", _) => {
-                return Err(IntentError::BadInterfaceBlock(
-                    "ethernet block needs exactly one name key".into(),
-                ));
+        enum Kind {
+            Port,
+            Management,
+        }
+        let (kind, ifname) = match (name.as_str(), keys.as_slice()) {
+            // Legacy keyed forms: `ethernet <name> { ... }`.
+            ("ethernet", [key]) => (Kind::Port, key.clone()),
+            ("management", [key]) => (Kind::Management, key.clone()),
+            ("ethernet" | "management", _) => {
+                return Err(IntentError::BadInterfaceBlock(format!(
+                    "{name} block needs exactly one name key"
+                )));
             }
-            // Management interfaces are OS netdevs; not applied here.
-            ("management", _) => continue,
-            (n, []) if n.starts_with("Management") => continue,
             // Current form: the interface name is the block name.
-            (n, []) if n.starts_with("Ethernet") => name.clone(),
+            (n, []) if n.starts_with("Management") => (Kind::Management, name.clone()),
+            (n, []) if n.starts_with("Ethernet") => (Kind::Port, name.clone()),
             (n, _) => {
                 return Err(IntentError::BadInterfaceBlock(format!(
                     "unrecognized interface block {n:?}"
                 )));
             }
         };
-        let mut intent = InterfaceIntent::default();
 
-        if let Some(value) = ConfigTree::leaf_value(children, "admin-state") {
-            intent.admin_up = match value {
-                "enabled" => Some(true),
-                "disabled" => Some(false),
-                other => {
-                    return Err(IntentError::BadAdminState {
+        let admin_up = match ConfigTree::leaf_value(children, "admin-state") {
+            Some("enabled") => Some(true),
+            Some("disabled") => Some(false),
+            Some(other) => {
+                return Err(IntentError::BadAdminState {
+                    name: ifname.clone(),
+                    value: other.to_string(),
+                })
+            }
+            None => None,
+        };
+
+        match kind {
+            Kind::Port => {
+                if ConfigTree::leaf_value(children, "address").is_some() {
+                    return Err(IntentError::AddressUnsupported {
                         name: ifname.clone(),
-                        value: other.to_string(),
-                    })
+                    });
                 }
-            };
-        }
-        if let Some(value) = ConfigTree::leaf_value(children, "description") {
-            intent.description = Some(value.to_string());
-        }
-
-        if intents.insert(ifname.clone(), intent).is_some() {
-            return Err(IntentError::Duplicate { name: ifname });
+                let intent = InterfaceIntent {
+                    admin_up,
+                    description: ConfigTree::leaf_value(children, "description")
+                        .map(str::to_string),
+                };
+                if intents.ports.insert(ifname.clone(), intent).is_some() {
+                    return Err(IntentError::Duplicate { name: ifname });
+                }
+            }
+            Kind::Management => {
+                let address = match ConfigTree::leaf_value(children, "address") {
+                    Some(value) => {
+                        hemlock_common::net::parse_cidr(value).map_err(|reason| {
+                            IntentError::BadAddress {
+                                name: ifname.clone(),
+                                reason,
+                            }
+                        })?;
+                        Some(value.to_string())
+                    }
+                    None => None,
+                };
+                let intent = MgmtIntent { admin_up, address };
+                if intents.management.insert(ifname.clone(), intent).is_some() {
+                    return Err(IntentError::Duplicate { name: ifname });
+                }
+            }
         }
     }
     Ok(intents)
+}
+
+fn ssh(tree: &ConfigTree) -> Result<SshIntent, IntentError> {
+    let Some((_, system)) = tree.block("system") else {
+        return Ok(SshIntent::default());
+    };
+    let Some((_, ssh)) = ConfigTree::blocks_named(system, "ssh").next() else {
+        return Ok(SshIntent::default());
+    };
+    let mut intent = SshIntent {
+        enabled: true,
+        auth_local: false,
+    };
+    if let Some(value) = ConfigTree::leaf_value(ssh, "authentication") {
+        match value {
+            "local" => intent.auth_local = true,
+            other => {
+                return Err(IntentError::BadSsh(format!(
+                    "authentication must be `local`, got {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(intent)
+}
+
+fn routes(tree: &ConfigTree) -> Result<BTreeMap<String, String>, IntentError> {
+    let mut routes = BTreeMap::new();
+    let Some((_, routing)) = tree.block("routing") else {
+        return Ok(routes);
+    };
+    for item in routing {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadRouting(format!(
+                "unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        if name != "static" || !keys.is_empty() {
+            return Err(IntentError::BadRouting(format!(
+                "unrecognized block {name:?}"
+            )));
+        }
+        for route in children {
+            let Item::Leaf {
+                name: prefix,
+                values,
+            } = route
+            else {
+                return Err(IntentError::BadRouting(format!(
+                    "static: unrecognized block {:?}",
+                    route.name()
+                )));
+            };
+            let [next_hop] = values.as_slice() else {
+                return Err(IntentError::BadRoute {
+                    prefix: prefix.clone(),
+                    reason: "expected exactly one next-hop".into(),
+                });
+            };
+            let canonical =
+                hemlock_common::net::validate_route(prefix, next_hop).map_err(|reason| {
+                    IntentError::BadRoute {
+                        prefix: prefix.clone(),
+                        reason,
+                    }
+                })?;
+            if canonical != *prefix {
+                return Err(IntentError::BadRoute {
+                    prefix: prefix.clone(),
+                    reason: format!("host bits set (use {canonical})"),
+                });
+            }
+            if routes.insert(canonical, next_hop.clone()).is_some() {
+                return Err(IntentError::BadRoute {
+                    prefix: prefix.clone(),
+                    reason: "duplicate route".into(),
+                });
+            }
+        }
+    }
+    Ok(routes)
 }
 
 /// One change to push to syncd.
@@ -179,14 +344,169 @@ pub fn diff(
     changes
 }
 
+/// One management-interface change for the OS applier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MgmtChange {
+    pub name: String,
+    pub admin_up: Option<bool>,
+    pub set_address: Option<String>,
+    /// Previous address to remove first — an address change is del +
+    /// add, since `ip addr replace` only replaces an identical local
+    /// address.
+    pub del_address: Option<String>,
+}
+
+impl MgmtChange {
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(up) = self.admin_up {
+            parts.push(format!(
+                "admin-state {}",
+                if up { "enabled" } else { "disabled" }
+            ));
+        }
+        match (&self.set_address, &self.del_address) {
+            (Some(new), _) => parts.push(format!("address {new}")),
+            (None, Some(old)) => parts.push(format!("address {old} removed")),
+            (None, None) => {}
+        }
+        format!("{}: {}", self.name, parts.join(", "))
+    }
+}
+
+/// One static-route change for the OS applier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteChange {
+    pub prefix: String,
+    /// None = remove the route.
+    pub next_hop: Option<String>,
+}
+
+impl RouteChange {
+    pub fn describe(&self) -> String {
+        match &self.next_hop {
+            Some(next_hop) => format!("route {} via {next_hop}", self.prefix),
+            None => format!("route {} removed", self.prefix),
+        }
+    }
+}
+
+/// The OS-side delta of one commit.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OsChanges {
+    pub management: Vec<MgmtChange>,
+    pub routes: Vec<RouteChange>,
+    /// The full wanted SSH state, present exactly when it changed.
+    pub ssh: Option<SshIntent>,
+}
+
+impl OsChanges {
+    pub fn is_empty(&self) -> bool {
+        self.management.is_empty() && self.routes.is_empty() && self.ssh.is_none()
+    }
+
+    pub fn describe(&self) -> Vec<String> {
+        let ssh = self.ssh.as_ref().map(|s| {
+            if s.enabled {
+                let auth = if s.auth_local {
+                    " (authentication local)"
+                } else {
+                    ""
+                };
+                format!("ssh enabled{auth}")
+            } else {
+                "ssh disabled".into()
+            }
+        });
+        self.management
+            .iter()
+            .map(MgmtChange::describe)
+            .chain(self.routes.iter().map(RouteChange::describe))
+            .chain(ssh)
+            .collect()
+    }
+}
+
+/// Diff the OS-side families, candidate against running.
+pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
+    let mut changes = OsChanges::default();
+
+    for (name, wanted) in &candidate.management {
+        let current = running.management.get(name);
+        let admin_now = current.and_then(|c| c.admin_up);
+        let addr_now = current.and_then(|c| c.address.clone());
+
+        let admin_up = match (wanted.admin_up, admin_now) {
+            (Some(w), Some(n)) if w == n => None,
+            (Some(w), _) => Some(w),
+            // Intent removed -> back to default (up).
+            (None, Some(false)) => Some(true),
+            (None, _) => None,
+        };
+        let (set_address, del_address) = match (&wanted.address, &addr_now) {
+            (Some(w), Some(n)) if w == n => (None, None),
+            (Some(w), Some(n)) => (Some(w.clone()), Some(n.clone())),
+            (Some(w), None) => (Some(w.clone()), None),
+            (None, Some(n)) => (None, Some(n.clone())),
+            (None, None) => (None, None),
+        };
+
+        if admin_up.is_some() || set_address.is_some() || del_address.is_some() {
+            changes.management.push(MgmtChange {
+                name: name.clone(),
+                admin_up,
+                set_address,
+                del_address,
+            });
+        }
+    }
+    for (name, had) in &running.management {
+        if candidate.management.contains_key(name) {
+            continue;
+        }
+        let admin_up = matches!(had.admin_up, Some(false)).then_some(true);
+        let del_address = had.address.clone();
+        if admin_up.is_some() || del_address.is_some() {
+            changes.management.push(MgmtChange {
+                name: name.clone(),
+                admin_up,
+                set_address: None,
+                del_address,
+            });
+        }
+    }
+
+    for (prefix, next_hop) in &candidate.routes {
+        if running.routes.get(prefix) != Some(next_hop) {
+            changes.routes.push(RouteChange {
+                prefix: prefix.clone(),
+                next_hop: Some(next_hop.clone()),
+            });
+        }
+    }
+    for prefix in running.routes.keys() {
+        if !candidate.routes.contains_key(prefix) {
+            changes.routes.push(RouteChange {
+                prefix: prefix.clone(),
+                next_hop: None,
+            });
+        }
+    }
+
+    if running.ssh != candidate.ssh {
+        changes.ssh = Some(candidate.ssh.clone());
+    }
+    changes
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use hemlock_config::parse;
 
-    fn intents_of(text: &str) -> BTreeMap<String, InterfaceIntent> {
-        interfaces(&parse(text).unwrap()).unwrap()
+    fn intents_of(text: &str) -> Intents {
+        extract(&parse(text).unwrap()).unwrap()
     }
 
     #[test]
@@ -204,28 +524,35 @@ interfaces {
 }
 "#,
         );
-        assert_eq!(intents.len(), 2);
+        assert_eq!(intents.ports.len(), 2);
         assert_eq!(
-            intents["Ethernet0"],
+            intents.ports["Ethernet0"],
             InterfaceIntent {
                 admin_up: Some(false),
                 description: Some("uplink".into())
             }
         );
-        assert_eq!(intents["Ethernet1"].admin_up, Some(true));
+        assert_eq!(intents.ports["Ethernet1"].admin_up, Some(true));
     }
 
     #[test]
-    fn extracts_name_as_block_form_and_skips_management() {
+    fn extracts_name_as_block_form_and_management() {
         let intents = intents_of(
-            "interfaces {\n    Ethernet1 {\n        admin-state disabled\n        description uplink\n    }\n    Management1 {\n        admin-state enabled\n    }\n}\n",
+            "interfaces {\n    Ethernet1 {\n        admin-state disabled\n        description uplink\n    }\n    Management1 {\n        admin-state enabled\n        address 10.42.10.9/24\n    }\n}\n",
         );
-        assert_eq!(intents.len(), 1);
+        assert_eq!(intents.ports.len(), 1);
         assert_eq!(
-            intents["Ethernet1"],
+            intents.ports["Ethernet1"],
             InterfaceIntent {
                 admin_up: Some(false),
                 description: Some("uplink".into())
+            }
+        );
+        assert_eq!(
+            intents.management["Management1"],
+            MgmtIntent {
+                admin_up: Some(true),
+                address: Some("10.42.10.9/24".into())
             }
         );
     }
@@ -242,9 +569,68 @@ interfaces {
     fn rejects_bad_admin_state() {
         let tree = parse("interfaces { ethernet Ethernet0 { admin-state banana; } }").unwrap();
         assert!(matches!(
-            interfaces(&tree),
+            extract(&tree),
             Err(IntentError::BadAdminState { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_bad_or_misplaced_addresses() {
+        let tree = parse("interfaces { Management1 { address banana } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAddress { .. })
+        ));
+        // Front-panel ports have no L3 support yet.
+        let tree = parse("interfaces { Ethernet1 { address 10.0.0.1/24 } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::AddressUnsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn extracts_ssh_intent() {
+        assert_eq!(intents_of("").ssh, SshIntent::default());
+        assert_eq!(
+            intents_of("system { ssh { } }").ssh,
+            SshIntent {
+                enabled: true,
+                auth_local: false
+            }
+        );
+        assert_eq!(
+            intents_of("system { ssh { authentication local } }").ssh,
+            SshIntent {
+                enabled: true,
+                auth_local: true
+            }
+        );
+        let tree = parse("system { ssh { authentication radius } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadSsh(_))));
+    }
+
+    #[test]
+    fn extracts_static_routes() {
+        let intents = intents_of(
+            "routing {\n    static {\n        0.0.0.0/0 10.42.10.1\n        10.99.0.0/16 10.42.10.2\n    }\n}\n",
+        );
+        assert_eq!(intents.routes.len(), 2);
+        assert_eq!(intents.routes["0.0.0.0/0"], "10.42.10.1");
+        assert_eq!(intents.routes["10.99.0.0/16"], "10.42.10.2");
+    }
+
+    #[test]
+    fn rejects_bad_routes() {
+        // Host bits set in the prefix.
+        let tree = parse("routing { static { 10.42.10.9/24 10.42.10.1 } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        // Next hop family mismatch.
+        let tree = parse("routing { static { 0.0.0.0/0 2001:db8::1 } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        // Unknown routing sub-block.
+        let tree = parse("routing { ospf { } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRouting(_))));
     }
 
     #[test]
@@ -252,13 +638,13 @@ interfaces {
         let running = intents_of(
             "interfaces { ethernet Ethernet0 { admin-state disabled; description \"a\"; } }",
         );
-        let unchanged = diff(&running, &running);
+        let unchanged = diff(&running.ports, &running.ports);
         assert!(unchanged.is_empty());
 
         let candidate = intents_of(
             "interfaces { ethernet Ethernet0 { admin-state enabled; description \"a\"; } }",
         );
-        let changes = diff(&running, &candidate);
+        let changes = diff(&running.ports, &candidate.ports);
         assert_eq!(
             changes,
             vec![PortChange {
@@ -275,13 +661,82 @@ interfaces {
             "interfaces { ethernet Ethernet5 { admin-state disabled; description \"x\"; } }",
         );
         let candidate = intents_of("");
-        let changes = diff(&running, &candidate);
+        let changes = diff(&running.ports, &candidate.ports);
         assert_eq!(
             changes,
             vec![PortChange {
                 name: "Ethernet5".into(),
                 admin_up: Some(true),
                 description: Some(String::new()),
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_os_reports_address_route_and_ssh_deltas() {
+        let running = intents_of("");
+        let candidate = intents_of(
+            "system { ssh { authentication local } }\ninterfaces { Management1 { address 10.42.10.9/24 } }\nrouting { static { 0.0.0.0/0 10.42.10.1 } }\n",
+        );
+        let changes = diff_os(&running, &candidate);
+        assert_eq!(
+            changes.management,
+            vec![MgmtChange {
+                name: "Management1".into(),
+                admin_up: None,
+                set_address: Some("10.42.10.9/24".into()),
+                del_address: None,
+            }]
+        );
+        assert_eq!(
+            changes.routes,
+            vec![RouteChange {
+                prefix: "0.0.0.0/0".into(),
+                next_hop: Some("10.42.10.1".into()),
+            }]
+        );
+        assert_eq!(
+            changes.ssh,
+            Some(SshIntent {
+                enabled: true,
+                auth_local: true
+            })
+        );
+
+        // Unchanged -> empty; reverting -> deletions + ssh disabled.
+        assert!(diff_os(&candidate, &candidate).is_empty());
+        let back = diff_os(&candidate, &running);
+        assert_eq!(
+            back.management,
+            vec![MgmtChange {
+                name: "Management1".into(),
+                admin_up: None,
+                set_address: None,
+                del_address: Some("10.42.10.9/24".into()),
+            }]
+        );
+        assert_eq!(
+            back.routes,
+            vec![RouteChange {
+                prefix: "0.0.0.0/0".into(),
+                next_hop: None,
+            }]
+        );
+        assert_eq!(back.ssh, Some(SshIntent::default()));
+    }
+
+    #[test]
+    fn diff_os_replaces_a_changed_address() {
+        let running = intents_of("interfaces { Management1 { address 10.0.0.5/24 } }");
+        let candidate = intents_of("interfaces { Management1 { address 10.42.10.9/24 } }");
+        let changes = diff_os(&running, &candidate);
+        assert_eq!(
+            changes.management,
+            vec![MgmtChange {
+                name: "Management1".into(),
+                admin_up: None,
+                set_address: Some("10.42.10.9/24".into()),
+                del_address: Some("10.0.0.5/24".into()),
             }]
         );
     }

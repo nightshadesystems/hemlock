@@ -1,12 +1,15 @@
 //! hemlock-mgmtd — the management daemon.
 //!
 //! Owns the configuration lifecycle: candidate/running separation, commit,
-//! commit-confirm with auto-rollback, and the on-disk rollback ring. In
-//! phase 1 the only intent family it applies is interface admin-state and
-//! description, pushed to syncd; further families slot into
-//! `intents.rs` + `service.rs` without changing the lifecycle machinery.
+//! commit-confirm with auto-rollback, and the on-disk rollback ring.
+//! Intent families: interface admin-state and description (pushed to
+//! syncd) and the OS-side families — management addressing, static
+//! routes, and the SSH service (applied via `osapply`). Further families
+//! slot into `intents.rs` + `service.rs` without changing the lifecycle
+//! machinery.
 
 mod intents;
+mod osapply;
 mod service;
 mod store;
 
@@ -29,6 +32,11 @@ struct Args {
     /// syncd endpoint to apply config through.
     #[arg(long)]
     syncd: Option<String>,
+
+    /// Platform manifest dir (management netdev mapping for OS-side
+    /// config apply). OS-side apply is skipped when absent (dev hosts).
+    #[arg(long, default_value = "/hemlock/platform")]
+    platform: String,
 
     /// gRPC endpoint to serve (unix:/path or tcp:host:port).
     #[arg(long)]
@@ -56,7 +64,23 @@ async fn main() -> Result<()> {
     };
     info!(state_dir = %args.state_dir.display(), %syncd, "mgmtd starting");
 
-    let engine = Arc::new(Mutex::new(service::Engine::new(store, syncd)));
+    let management = hemlock_platform::Platform::find("/", &args.platform)
+        .ok()
+        .and_then(|platform| platform.manifest.management)
+        .map(|m| (m.interface, m.os_device));
+    if management.is_none() {
+        info!("no platform manifest; OS-side config (management address, routes, ssh) will not be applied");
+    }
+    let engine = Arc::new(Mutex::new(service::Engine::new(
+        store,
+        syncd,
+        osapply::OsApplier::new(management),
+    )));
+
+    // OS-side families don't depend on syncd; replay them once now.
+    if let Err(err) = engine.lock().await.replay_os() {
+        tracing::warn!(%err, "cannot replay OS-side running config");
+    }
 
     // Replay the persisted running config onto syncd (which boots with
     // default port state). Retry until syncd is up — daemon start order is

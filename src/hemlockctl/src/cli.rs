@@ -8,6 +8,9 @@
 //! root@hemlock> configure
 //! root@hemlock# set interfaces Ethernet1 description "uplink to core-1"
 //! root@hemlock# set interfaces Eth1 admin-state disabled
+//! root@hemlock# set interfaces Management1 address 10.42.10.9/24
+//! root@hemlock# set system ssh authentication local
+//! root@hemlock# set routing static 0.0.0.0/0 10.42.10.1
 //! root@hemlock# commit
 //! root@hemlock# exit
 //! ```
@@ -85,10 +88,12 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
 
     // Keep the completer's interface-name cache fresh from syncd; a dead
     // or restarting syncd just means stale/no port completion, never an
-    // error at the prompt.
+    // error at the prompt. The management port is an OS netdev, not a
+    // syncd port, so it joins the cache from the manifest.
     {
         let state = helper_state.clone();
         let syncd = endpoints.syncd.clone();
+        let management = management_interface();
         tokio::spawn(async move {
             loop {
                 if let Ok(channel) = syncd.connect().await {
@@ -101,6 +106,7 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
                             .map(|p| p.name)
                             .collect();
                         names.sort();
+                        names.push(management.clone());
                         if let Ok(mut state) = state.lock() {
                             state.ports = names;
                         }
@@ -401,7 +407,13 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("Configuration commands (edit the candidate; `commit` applies):");
             println!("  set interfaces <port> description <text>");
             println!("  set interfaces <port> admin-state <enabled|disabled>");
-            println!("  delete interfaces <port> [description|admin-state]");
+            println!("  set interfaces <port> address <ip/prefix>     (Management: L3 mode)");
+            println!("  set system ssh                                enable the SSH server");
+            println!("  set system ssh authentication local           password logins (PAM)");
+            println!("  set routing static <prefix> <next-hop>        static route");
+            println!("  delete interfaces <port> [description|admin-state|address]");
+            println!("  delete system ssh [authentication]");
+            println!("  delete routing [static [<prefix>]]");
             println!("  show                      show the candidate configuration");
             println!(
                 "  commit [confirmed <s>]    apply the candidate (auto-rollback unless confirmed)"
@@ -416,21 +428,39 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
     }
 }
 
-/// Shared body of `set` and `delete`: resolve the path, canonicalize the
-/// interface name, apply the edit to the candidate.
+/// Shared body of `set` and `delete`: dispatch on the top-level config
+/// noun.
 async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
-    let usage = move || format!("% Usage: {verb} interfaces <port> [description|admin-state ...]");
     let Some(top) = words.first() else {
+        return Err(format!("% Usage: {verb} <interfaces|system|routing> ..."));
+    };
+    match resolve(top, &["interfaces", "system", "routing"])? {
+        "interfaces" => config_interfaces(endpoints, &words[1..], delete).await,
+        "system" => config_system(endpoints, &words[1..], delete).await,
+        "routing" => config_routing(endpoints, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete interfaces <port> ...` — the interface name is
+/// canonicalized against syncd's ports plus the manifest's management
+/// port (an OS netdev, so it never appears in syncd's list).
+async fn config_interfaces(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage =
+        move || format!("% Usage: {verb} interfaces <port> [description|admin-state|address ...]");
+    let Some(raw_port) = words.first() else {
         return Err(usage());
     };
-    resolve(top, &["interfaces"])?;
-    let Some(raw_port) = words.get(1) else {
-        return Err(usage());
-    };
-    let known = list_port_names(endpoints).await.map_err(fmt_err)?;
+    let mut known = list_port_names(endpoints).await.map_err(fmt_err)?;
+    known.push(management_interface());
     let port = canonical_port(raw_port, &known)?;
-    let rest = &words[2..];
+    let rest = &words[1..];
 
     if rest.is_empty() {
         return if delete {
@@ -450,7 +480,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
         };
     }
 
-    match resolve(rest[0], &["description", "admin-state"])? {
+    match resolve(rest[0], &["description", "admin-state", "address"])? {
         "description" => {
             if delete {
                 edit_interface(endpoints, &port, |eth| {
@@ -487,9 +517,190 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
                 .await
             }
         }
+        "address" => {
+            if delete {
+                edit_interface(endpoints, &port, |eth| {
+                    ConfigTree::remove_leaf(eth, "address");
+                })
+                .await
+            } else {
+                let Some(value) = rest.get(1) else {
+                    return Err(format!(
+                        "% Usage: set interfaces {port} address <ip/prefix-length>"
+                    ));
+                };
+                if let Err(e) = hemlock_common::net::parse_cidr(value) {
+                    return Err(format!("% {e}"));
+                }
+                let value = value.to_string();
+                edit_interface(endpoints, &port, |eth| {
+                    ConfigTree::set_leaf(eth, "address", vec![value]);
+                })
+                .await
+            }
+        }
         _ => unreachable!(),
     }
     .map_err(fmt_err)
+}
+
+/// `set|delete system ssh [authentication local]` — SSH is on exactly
+/// when the `system { ssh }` block exists; commit applies it.
+async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || format!("% Usage: {verb} system ssh [authentication local]");
+    let Some(first) = words.first() else {
+        return Err(usage());
+    };
+    resolve(first, &["ssh"])?;
+    let rest = &words[1..];
+
+    if rest.is_empty() {
+        return if delete {
+            edit_config(endpoints, |tree| {
+                let system = tree.block_mut("system");
+                ConfigTree::remove_block(system, "ssh", &[]);
+                remove_block_if_empty(tree, "system");
+            })
+            .await
+        } else {
+            edit_config(endpoints, |tree| {
+                let system = tree.block_mut("system");
+                ConfigTree::ensure_block(system, "ssh", &[]);
+            })
+            .await
+        }
+        .map_err(fmt_err);
+    }
+
+    match resolve(rest[0], &["authentication"])? {
+        "authentication" => {
+            if delete {
+                edit_config(endpoints, |tree| {
+                    let system = tree.block_mut("system");
+                    if let Some(ssh) = block_children_mut(system, "ssh") {
+                        ConfigTree::remove_leaf(ssh, "authentication");
+                    }
+                })
+                .await
+            } else {
+                let Some(value) = rest.get(1) else {
+                    return Err(usage());
+                };
+                let value = resolve(value, &["local"])?.to_string();
+                // Setting authentication implies turning SSH on.
+                edit_config(endpoints, |tree| {
+                    let system = tree.block_mut("system");
+                    let ssh = ConfigTree::ensure_block(system, "ssh", &[]);
+                    ConfigTree::set_leaf(ssh, "authentication", vec![value]);
+                })
+                .await
+            }
+        }
+        _ => unreachable!(),
+    }
+    .map_err(fmt_err)
+}
+
+/// `set routing static <prefix> <next-hop>` and its deletes. Prefixes
+/// are canonicalized (host bits cleared) before they enter the config.
+async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            ConfigTree::remove_block(&mut tree.items, "routing", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let usage = move || {
+        if delete {
+            "% Usage: delete routing [static [<prefix>]]".to_string()
+        } else {
+            "% Usage: set routing static <prefix> <next-hop>".to_string()
+        }
+    };
+    let Some(first) = words.first() else {
+        return Err(usage());
+    };
+    resolve(first, &["static"])?;
+    let rest = &words[1..];
+
+    if delete {
+        match rest.first() {
+            None => edit_config(endpoints, |tree| {
+                let routing = tree.block_mut("routing");
+                ConfigTree::remove_block(routing, "static", &[]);
+                remove_block_if_empty(tree, "routing");
+            })
+            .await
+            .map_err(fmt_err),
+            Some(prefix) => {
+                let prefix =
+                    hemlock_common::net::canonical_prefix(prefix).map_err(|e| format!("% {e}"))?;
+                edit_config(endpoints, |tree| {
+                    let routing = tree.block_mut("routing");
+                    if let Some(routes) = block_children_mut(routing, "static") {
+                        ConfigTree::remove_leaf(routes, &prefix);
+                        if routes.is_empty() {
+                            ConfigTree::remove_block(routing, "static", &[]);
+                        }
+                    }
+                    remove_block_if_empty(tree, "routing");
+                })
+                .await
+                .map_err(fmt_err)
+            }
+        }
+    } else {
+        let (Some(prefix), Some(next_hop)) = (rest.first(), rest.get(1)) else {
+            return Err(usage());
+        };
+        let prefix =
+            hemlock_common::net::validate_route(prefix, next_hop).map_err(|e| format!("% {e}"))?;
+        let next_hop = next_hop.to_string();
+        edit_config(endpoints, |tree| {
+            let routing = tree.block_mut("routing");
+            let routes = ConfigTree::ensure_block(routing, "static", &[]);
+            ConfigTree::set_leaf(routes, &prefix, vec![next_hop]);
+        })
+        .await
+        .map_err(fmt_err)
+    }
+}
+
+/// Mutable children of an existing block among `items` (no creation —
+/// the delete paths must not conjure the block they are deleting from).
+fn block_children_mut<'a>(
+    items: &'a mut [hemlock_config::Item],
+    name: &str,
+) -> Option<&'a mut Vec<hemlock_config::Item>> {
+    items.iter_mut().find_map(|item| match item {
+        hemlock_config::Item::Block {
+            name: n, children, ..
+        } if n == name => Some(children),
+        _ => None,
+    })
+}
+
+/// Drop a top-level block that a delete left empty, so the stored
+/// config doesn't accumulate `system { }` / `routing { }` husks.
+fn remove_block_if_empty(tree: &mut ConfigTree, name: &str) {
+    if tree
+        .block(name)
+        .is_some_and(|(_, children)| children.is_empty())
+    {
+        ConfigTree::remove_block(&mut tree.items, name, &[]);
+    }
+}
+
+/// The management interface name from the platform manifest
+/// ("Management1" off-manifest): an OS netdev, so it never appears in
+/// syncd's port list but is configurable like a port.
+fn management_interface() -> String {
+    hemlock_platform::Platform::find("/", &platform_dir())
+        .ok()
+        .and_then(|p| p.manifest.management.map(|m| m.interface))
+        .unwrap_or_else(|| "Management1".into())
 }
 
 /// Canonical interface name from user input (exact, alias like `Eth1`,

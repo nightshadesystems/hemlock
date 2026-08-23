@@ -1,6 +1,5 @@
 //! The commit engine and its gRPC surface (`hemlock.v1.Mgmt`).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,12 +10,14 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::intents::{self, InterfaceIntent, PortChange};
+use crate::intents::{self, Intents, PortChange};
+use crate::osapply::OsApplier;
 use crate::store::{RollbackMeta, Store};
 
 pub struct Engine {
     store: Store,
     syncd: IpcEndpoint,
+    os: OsApplier,
     commit_seq: u64,
     /// Pending commit-confirm: the pre-commit running text to restore if no
     /// confirmation arrives, plus a cancel handle for the timer task.
@@ -30,10 +31,11 @@ struct PendingConfirm {
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
 impl Engine {
-    pub fn new(store: Store, syncd: IpcEndpoint) -> Self {
+    pub fn new(store: Store, syncd: IpcEndpoint, os: OsApplier) -> Self {
         Self {
             store,
             syncd,
+            os,
             commit_seq: 0,
             pending_confirm: None,
         }
@@ -46,15 +48,25 @@ impl Engine {
         Ok(pb::syncd_client::SyncdClient::new(channel))
     }
 
-    fn parse_intents(text: &str) -> Result<BTreeMap<String, InterfaceIntent>> {
+    fn parse_intents(text: &str) -> Result<Intents> {
         let tree = hemlock_config::parse(text).map_err(|e| anyhow!("{e}"))?;
-        intents::interfaces(&tree).map_err(|e| anyhow!("{e}"))
+        intents::extract(&tree).map_err(|e| anyhow!("{e}"))
     }
 
-    /// Validate candidate text (syntax + intents + port names).
+    /// Validate candidate text (syntax + intents + interface names).
     async fn validate(&self, text: &str) -> Result<()> {
         let wanted = Self::parse_intents(text)?;
-        if wanted.is_empty() {
+        // Management blocks must name the manifest's management port
+        // (any Management* is accepted off-switch, where no manifest
+        // pins the name).
+        if let Some(mgmt) = self.os.management_interface() {
+            for name in wanted.management.keys() {
+                if name != mgmt {
+                    anyhow::bail!("unknown interface {name:?}");
+                }
+            }
+        }
+        if wanted.ports.is_empty() {
             return Ok(());
         }
         let mut client = self.syncd_client().await?;
@@ -65,7 +77,7 @@ impl Engine {
             .into_inner()
             .ports;
         let known: std::collections::HashSet<_> = ports.into_iter().map(|p| p.name).collect();
-        for name in wanted.keys() {
+        for name in wanted.ports.keys() {
             if !known.contains(name) {
                 anyhow::bail!("unknown interface {name:?}");
             }
@@ -73,20 +85,18 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply the delta between running and `new_text` through syncd, then
-    /// persist `new_text` as running. Returns the applied changes.
-    async fn apply_and_persist(
-        &mut self,
-        new_text: &str,
-        comment: &str,
-    ) -> Result<Vec<PortChange>> {
+    /// Apply the delta between running and `new_text` — ASIC ports
+    /// through syncd, OS-side families through the OS applier — then
+    /// persist `new_text` as running. Returns the applied changes,
+    /// described.
+    async fn apply_and_persist(&mut self, new_text: &str, comment: &str) -> Result<Vec<String>> {
         let running_intents = Self::parse_intents(&self.store.running()?).unwrap_or_default();
         let wanted_intents = Self::parse_intents(new_text)?;
-        let changes = intents::diff(&running_intents, &wanted_intents);
+        let port_changes = intents::diff(&running_intents.ports, &wanted_intents.ports);
 
-        if !changes.is_empty() {
+        if !port_changes.is_empty() {
             let mut client = self.syncd_client().await?;
-            for change in &changes {
+            for change in &port_changes {
                 client
                     .set_port_attrs(pb::SetPortAttrsRequest {
                         name: change.name.clone(),
@@ -104,6 +114,9 @@ impl Engine {
             }
         }
 
+        let os_changes = intents::diff_os(&running_intents, &wanted_intents);
+        self.os.apply(&os_changes);
+
         self.store.commit(
             new_text,
             &RollbackMeta {
@@ -112,7 +125,9 @@ impl Engine {
             },
         )?;
         self.commit_seq += 1;
-        Ok(changes)
+        let mut described: Vec<String> = port_changes.iter().map(PortChange::describe).collect();
+        described.extend(os_changes.describe());
+        Ok(described)
     }
 }
 
@@ -122,12 +137,12 @@ impl Engine {
     /// be replayed onto it (a restart of either daemon converges).
     pub async fn replay_running(&self) -> Result<usize> {
         let running = Self::parse_intents(&self.store.running()?)?;
-        if running.is_empty() {
+        if running.ports.is_empty() {
             return Ok(0);
         }
         let mut client = self.syncd_client().await?;
         let mut applied = 0;
-        for (name, intent) in &running {
+        for (name, intent) in &running.ports {
             let request = pb::SetPortAttrsRequest {
                 name: name.clone(),
                 admin_state: intent.admin_up.map(|up| {
@@ -149,6 +164,15 @@ impl Engine {
             applied += 1;
         }
         Ok(applied)
+    }
+
+    /// Replay the OS-side families (management address, static routes,
+    /// sshd state) from the running config. Independent of syncd, so it
+    /// runs once at startup rather than inside the syncd retry loop.
+    pub fn replay_os(&self) -> Result<()> {
+        let running = Self::parse_intents(&self.store.running()?)?;
+        self.os.replay(&running);
+        Ok(())
     }
 }
 
@@ -257,7 +281,7 @@ impl pb::mgmt_server::Mgmt for MgmtService {
 
         Ok(Response::new(pb::CommitResponse {
             commit_id,
-            applied_changes: changes.iter().map(PortChange::describe).collect(),
+            applied_changes: changes,
         }))
     }
 

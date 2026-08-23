@@ -276,6 +276,11 @@ rm -f "$ROOTFS/etc/update-motd.d/10-uname" "$ROOTFS/etc/motd"
 # pam_motd renders update-motd.d; sshd must not print a motd of its own.
 install -d "$ROOTFS/etc/ssh/sshd_config.d"
 printf 'PrintMotd no\n' > "$ROOTFS/etc/ssh/sshd_config.d/10-hemlock-motd.conf"
+# SSH is config-driven: `set system ssh` + commit turns it on, and mgmtd
+# replays the persisted running config at every boot. The Debian package
+# enables sshd unconditionally, so disable it here — an unconfigured
+# switch (console only) then matches its empty running config.
+chroot "$ROOTFS" systemctl disable ssh >/dev/null 2>&1 || true
 
 # --- 2. Boot assets ---------------------------------------------------------
 # Copied out of the rootfs BEFORE squashing: GRUB loads kernel + initrd

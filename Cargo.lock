@@ -660,6 +660,7 @@ dependencies = [
  "clap",
  "hemlock-common",
  "hemlock-config",
+ "hemlock-platform",
  "serde",
  "serde_json",
  "tempfile",
