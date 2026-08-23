@@ -1,0 +1,84 @@
+00:         ;
+00:         ; Hemlock E1031 SFP+ link-status LED program (LEDUP0).
+00:         ;
+00:         ; Drives the four SFP+ cage LEDs (Ethernet49-52 / xe0-xe3) from link
+00:         ; state: green when the link is up, dark otherwise. The 48 copper ports'
+00:         ; LEDs are PHY-driven and are not on this scan chain.
+00:         ;
+00:         ; Link state comes from bit 0 of LED data RAM byte (PORTDATA + physical
+00:         ; port number), maintained by the SDK linkscan when `led auto on` is set
+00:         ; (the LED processor's own LINKUP bit is not reliable under software
+00:         ; linkscan — see sdk56334.asm in the OpenBCM examples).
+00:         ;
+00:         ; !! BENCH-VERIFY BEFORE PRODUCTIZING (docs/e1031-led-bringup.md):
+00:         ;   - XE*_PORT: the physical port numbers linkscan uses for xe0-3
+00:         ;     (diag `ps` / `led status` rows; expected 50-53 on this config).
+00:         ;   - Emission order: which cage the first emitted bit lands on; swap
+00:         ;     the call order below to match the probe program's findings.
+00:         ;   - CHAIN_BITS: actual scan chain length from the probe.
+00:         ;   - Polarity: ONE=dark/ZERO=green assumed (active-low chain).
+00:         ;
+00:         ; Load sequence (sai_postinit_cmd.soc once verified):
+00:         ;   led load e1031-sfp-link.hex
+00:         ;   led auto on
+00:         ;   led start
+00:         ;
+00:         ; Assemble with the OpenBCM SM-Lite LED assembler (see README.md):
+00:         ;   ledasm e1031-sfp-link
+00:         ;
+00:         
+00:         XE0_PORT        equ     50
+00:         XE1_PORT        equ     51
+00:         XE2_PORT        equ     52
+00:         XE3_PORT        equ     53
+00:         
+00:         CHAIN_BITS      equ     4
+00:         PORTDATA        equ     0xa0
+00:         
+00:         update:
+00: 02 32           ld      a,XE0_PORT
+02: 67 12           call    led_link
+04: 02 33           ld      a,XE1_PORT
+06: 67 12           call    led_link
+08: 02 34           ld      a,XE2_PORT
+0A: 67 12           call    led_link
+0C: 02 35           ld      a,XE3_PORT
+0E: 67 12           call    led_link
+10: 3A 04           send    CHAIN_BITS
+12:         
+12:         ;
+12:         ; led_link: emit one LED bit for the physical port in register a.
+12:         ; Carry <- bit 0 of PORTDATA[port]; active-low output.
+12:         ;
+12:         led_link:
+12: 12 A0           ld      b,PORTDATA
+14: F8              add     b,a
+15: 15              ld      b,(b)
+16: 1A 00           tst     b,0
+18: 71 1E           jc      led_green
+1A: 32 0F           pushst  ONE             ; link down -> dark
+1C: 87              pack
+1D: 57              ret
+1E:         led_green:
+1E: 32 0E           pushst  ZERO            ; link up -> green
+20: 87              pack
+21: 57              ret
+22:         
+22:         ; pushst constant sources
+22:         ZERO            equ     0xE     ; always 0
+22:         ONE             equ     0xF     ; always 1
+
+
+
+----- symbol table, 11 symbols -----
+    xe0_port	0x0032
+    xe1_port	0x0033
+    xe2_port	0x0034
+    xe3_port	0x0035
+  chain_bits	0x0004
+    portdata	0x00A0
+      update	0x0000
+    led_link	0x0012
+   led_green	0x001E
+        zero	0x000E
+         one	0x000F

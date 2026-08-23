@@ -5,6 +5,8 @@
 vendor/sai/*
 !vendor/sai/README.md
 !vendor/sai/.gitkeep
+# Broadcom LED toolchain, fetched by vendor/fetch-ledtools.sh
+vendor/ledtools/
 platforms/**/*.bcm
 platforms/**/*.soc
 platforms/**/*.deb

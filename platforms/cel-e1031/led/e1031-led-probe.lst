@@ -1,0 +1,69 @@
+00:         ;
+00:         ; Hemlock E1031 LED scan-chain PROBE program (LEDUP0).
+00:         ;
+00:         ; Purpose: map the SFP+ LED scan chain on the bench. Emits NUM_BITS bits
+00:         ; per refresh, bit i taken from bit 0 of LED data RAM byte (0xA0 + i).
+00:         ; With `led auto off`, nothing else writes the data RAM, so each byte is
+00:         ; poked by hand from the diag shell and the faceplate observed:
+00:         ;
+00:         ;   led stop
+00:         ;   led load e1031-led-probe.hex     (or: led prog <hex bytes>)
+00:         ;   led auto off
+00:         ;   led start
+00:         ;   setreg CMIC_LEDUP0_DATA_RAM(0xa0) 1     ; chain bit 0 -> which LED?
+00:         ;   setreg CMIC_LEDUP0_DATA_RAM(0xa0) 0
+00:         ;   setreg CMIC_LEDUP0_DATA_RAM(0xa1) 1     ; chain bit 1 -> ...
+00:         ;   ...
+00:         ;
+00:         ; Polarity note: on this board the chain appears active-low (idle/reset
+00:         ; chain = all LEDs solid green), so all-zero data RAM should reproduce
+00:         ; the familiar all-green state and poking a byte to 1 should DARKEN one
+00:         ; LED. Record which offset darkens which cage, and whether it is the
+00:         ; whole cage LED or one color of a bi-color pair.
+00:         ;
+00:         ; Assemble with the OpenBCM SM-Lite LED assembler (see README.md):
+00:         ;   ledasm e1031-led-probe
+00:         ;
+00:         
+00:         NUM_BITS        equ     16      ; walk more bits than we expect LEDs
+00:         PORTDATA        equ     0xa0
+00:         TMP             equ     0xe0
+00:         
+00:         update:
+00: 02 00           ld      a,0
+02:         bitloop:
+02: 60 E0           ld      (TMP),a
+04: 12 A0           ld      b,PORTDATA
+06: F8              add     b,a
+07: 15              ld      b,(b)
+08: 1A 00           tst     b,0
+0A: 71 11           jc      bit_one
+0C: 32 0E           pushst  ZERO
+0E: 87              pack
+0F: 77 14           jmp     next
+11:         bit_one:
+11: 32 0F           pushst  ONE
+13: 87              pack
+14:         next:
+14: 06 E0           ld      a,(TMP)
+16: 80              inc     a
+17: D2 10           cmp     a,NUM_BITS
+19: 74 02           jnz     bitloop
+1B: 3A 10           send    NUM_BITS
+1D:         
+1D:         ; pushst constant sources
+1D:         ZERO            equ     0xE     ; always 0
+1D:         ONE             equ     0xF     ; always 1
+
+
+
+----- symbol table, 9 symbols -----
+    num_bits	0x0010
+    portdata	0x00A0
+         tmp	0x00E0
+      update	0x0000
+     bitloop	0x0002
+     bit_one	0x0011
+        next	0x0014
+        zero	0x000E
+         one	0x000F

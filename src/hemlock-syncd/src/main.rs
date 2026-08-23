@@ -76,10 +76,17 @@ async fn main() -> Result<()> {
 
     let backend = build_backend(&platform, args.mock, args.auto_mock, args.diag_shell)?;
 
+    // Board quirks touch real hardware (CPLD registers); never run them
+    // against the mock backend on a dev machine.
+    let real_hardware = backend.name() != "mock";
     let quirks = platform.quirks()?;
-    quirks.pre_asic_init(&platform)?;
+    if real_hardware {
+        quirks.pre_asic_init(&platform)?;
+    }
     let handle = actor::SaiActor::spawn(backend, &platform).await?;
-    quirks.post_asic_init(&platform)?;
+    if real_hardware {
+        quirks.post_asic_init(&platform)?;
+    }
 
     info!(
         switch_oid = format_args!("{:#x}", handle.switch.oid),

@@ -120,8 +120,12 @@ async fn main() -> Result<()> {
         "pmon starting"
     );
 
-    let quirks = platform.quirks()?;
-    quirks.post_hw_init(&platform)?;
+    // Board quirks touch real hardware (CPLD registers); never run them
+    // against the mock backend on a dev machine.
+    if backend.name() != "mock" {
+        let quirks = platform.quirks()?;
+        quirks.post_hw_init(&platform)?;
+    }
 
     let env: SharedEnv = Arc::new(RwLock::new(EnvState::default()));
     let platform = Arc::new(platform);

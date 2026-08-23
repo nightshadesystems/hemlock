@@ -52,6 +52,58 @@ sudo /usr/sbin/hemlock-syncd --platform /hemlock/platform --diag-shell
 Keep a fiber loop or a DAC plugged into at least one SFP+ cage so a
 genuine link exists while probing.
 
+## Bench findings so far (2026-08-23)
+
+Established on real hardware; later experiments build on these, don't
+re-derive them:
+
+- **The SMC CPLD gates the port LEDs.** `LED_OPMOD` (io 0x0208) powers
+  up as `0x00` = forced/default mode — this is the stuck-green. Writing
+  `0x01` switches to normal operation: all forced LEDs drop, and the
+  real sources take over.
+- In mode 1: **copper (RJ45) LEDs work** (PHY-driven, as assumed);
+  **SFP+ LEDs stay dark even with link up** → they are driven by the
+  ASIC LED processor scan chain, which has no program.
+- **LEDUP program RAM contains only power-on garbage** (`led dump`
+  shows high-entropy noise); `led start` had set `LEDUP_EN=1`
+  (`CMIC_LEDUP0_CTRL=0xa3`) but there is nothing real to execute. No
+  layer of the stack (CPLD, SAI, SONiC heritage) ever loads ledcode.
+- In mode 1 the **system LEDs follow `LED_FPS` (io 0x020a)**: writing
+  `0x05` = status green + master green works. In mode 0 the register is
+  ignored (forced). So flipping to mode 1 in production requires pmon
+  to own `LED_FPS`, or the system LEDs go dark.
+
+Consequences for the fix:
+
+1. Platform init must set `LED_OPMOD=1` (a `haliburton` PlatformQuirks
+   impl) **and** pmon must drive `LED_FPS` from then on.
+2. The SFP+ LEDs need real LEDUP microcode (4 LEDs only). The complete
+   toolchain is public in OpenBCM — matching our exact SDK:
+   `sdk-6.5.27/tools/led/tools/` (`ledasm.c` assembler, `leddasm.c`
+   disassembler, `ledsim.c` simulator) and ~150 annotated example
+   programs under `sdk-6.5.27/tools/led/example/` at
+   https://github.com/Broadcom-Network-Switching-Software/OpenBCM
+   (no BCM56340/Helix4 example ships; write a minimal 4-bit program and
+   map the chain with it).
+3. The boot sweep could even run CPU-driven pre-ASIC if the CPLD's
+   forced mode turns out to have per-port force registers — nothing in
+   `smc.c` suggests so; park the idea unless probing finds more.
+
+### Fixes already landed in the repo
+
+- `i2c-dev` added to the manifest's `required_modules` — without it,
+  pmon's raw i2cset pre-writes have no `/dev/i2c-*` nodes and pmon
+  crash-loops before instantiating anything.
+- `[hardware.quirks] driver = "haliburton"`: pmon's post-hw-init now
+  writes `LED_OPMOD=1` and `LED_FPS=0x05` (system LEDs green). **Deploy
+  the manifest change together with matching binaries** — an older
+  pmon/syncd rejects the unknown quirks name at startup.
+- LED programs (probe + link-tracking) committed under
+  `platforms/cel-e1031/led/`, assembled with Broadcom's own toolchain
+  (`vendor/fetch-ledtools.sh`, OpenBCM sdk-6.5.27) and validated in its
+  simulator. The link program's constants await Experiment 3/4 results;
+  then its load sequence moves into `sai_postinit_cmd.soc`.
+
 ## Experiment 1 — does the SDK default LED program just work? (5 min)
 
 SONiC's Helix4 Delta ET-6248BRB (48x1G + 2x10G, same ASIC family) fixes
@@ -96,62 +148,61 @@ printf '\x00' | dd of=/dev/port bs=1 count=1 seek=$((0x209)) 2>/dev/null
 
 (One byte at a time; note every change so it can be reverted.)
 
-## Experiment 3 — scan-chain mapping
+## Experiment 3 — scan-chain mapping with the probe program
 
-Goal: which scan-chain bit position drives which faceplate LED, and
-whether the copper ports appear on the chain at all.
+Bench-verified constraints: this drivshell's `led` command supports
+`status | start | stop | load <file.hex> | auto | prog <hex> | dump`
+(no `led data`); data RAM is poked via the register array
+`CMIC_LEDUP0_DATA_RAM(i)`. Hemlock ships a purpose-built probe program
+(`platforms/cel-e1031/led/e1031-led-probe.asm`, simulator-validated)
+that emits 16 chain bits, bit *i* from bit 0 of data byte `0xA0+i`.
 
-1. With the LED processor running (`led start` from Experiment 1), stop
-   the auto-updater so the data RAM is yours to poke:
+1. Copy `platforms/cel-e1031/led/e1031-led-probe.hex` to the switch,
+   set `LED_OPMOD=1` (Experiment 2), then:
 
    ```text
-   BCM.0> led auto off
+   drivshell> led stop
+   drivshell> led load /home/admin/e1031-led-probe.hex
+   drivshell> led auto off
+   drivshell> led start
    ```
 
-2. The program reads per-port link state from LEDUP data RAM (one byte
-   per port for the stock program, `0x01` = link up). Walk it:
+   All-zero data RAM should now hold the LEDs in the familiar all-green
+   look if the chain is active-low as suspected (`ZERO` bit = LED on).
+
+2. Walk the bits and watch the four cages:
 
    ```text
-   BCM.0> led data 0x00 01
-   ; watch the faceplate; then clear and advance
-   BCM.0> led data 0x00 00
-   BCM.0> led data 0x01 01
+   drivshell> setreg CMIC_LEDUP0_DATA_RAM(0xa0) 1   ; chain bit 0
+   drivshell> setreg CMIC_LEDUP0_DATA_RAM(0xa0) 0
+   drivshell> setreg CMIC_LEDUP0_DATA_RAM(0xa1) 1   ; chain bit 1
    ...
    ```
 
-   `led data` with no value dumps the RAM. If `led data` is unavailable
-   in this SAI's shell, the raw register path is:
+3. Record: chain length, bit -> cage order, polarity, and whether any
+   bit touches anything besides the four SFP+ cages.
 
-   ```text
-   BCM.0> getreg CMIC_LEDUP0_CTRL
-   BCM.0> mod CMIC_LEDUP0_DATA_RAM 0 1 DATA=1
-   ```
-
-3. Record the mapping:
-
-   | Data-RAM offset / chain bit | Faceplate LED | Notes |
+   | Chain bit (data byte) | Faceplate LED | Notes |
    |---|---|---|
    | | | |
 
-4. If the stock program produces nothing sensible, load the Delta-style
-   port remap first (`m CMIC_LEDUP0_PORT_ORDER_REMAP_0_3 REMAP_PORT_0=…`,
-   groups of four — see sonic-buildimage
-   `device/delta/x86_64-delta_et-6248brb-r0/led_proc_init.soc` for the
-   idiom), then repeat.
+## Experiment 4 — the link-tracking program
 
-Key question to answer here: do any of offsets corresponding to the
-copper ports move a copper LED? If yes, the boot sweep can cover all 52
-ports; if no, the copper LEDs are PHY-hardwired and the sweep is limited
-to Ethernet49-52.
+`platforms/cel-e1031/led/e1031-sfp-link.asm` (also simulator-validated)
+drives the four cages from linkscan-maintained link state: green up,
+dark down. Four constants at the top are marked for bench verification
+against the Experiment 3 results — physical port numbers (expected
+50-53), emission order, chain length, polarity. After fixing constants,
+reassemble (`vendor/fetch-ledtools.sh`, see `led/README.md`) and:
 
-## Experiment 4 — custom microcode (only if the stock program is wrong)
+```text
+drivshell> led stop
+drivshell> led load /home/admin/e1031-sfp-link.hex
+drivshell> led auto on
+drivshell> led start
+```
 
-If the chain layout doesn't match anything the stock program can drive,
-the LEDUP needs a small custom program (classic 256-byte LEDUP ISA,
-program RAM `CMIC_LEDUP0_PROGRAM_RAM`, loaded via `led prog <hex bytes>`
-or `led load <file>`). Start from a published Helix4-era example
-(`led_proc_init.soc` files under sonic-buildimage `device/*/`) and adapt
-the bit order found in Experiment 3.
+Then pull/insert the DAC and confirm the right cage tracks link.
 
 ## Productizing the result
 
