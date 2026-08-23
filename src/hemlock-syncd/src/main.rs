@@ -146,6 +146,25 @@ async fn main() -> Result<()> {
             }
         });
     }
+    {
+        // Storm-control levels are percent of link speed: re-derive the
+        // programmed rate whenever a link comes up (autoneg may have
+        // settled on a different speed than the last derivation used).
+        let handle = handle.clone();
+        let mut events = handle.events.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) if event.oper_up => {
+                        reprogram_storm_rates(&handle, &event.name).await;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     let listen: IpcEndpoint = match &args.listen {
         Some(s) => s.parse()?,
@@ -324,6 +343,46 @@ async fn collect_stats(
         }
         if let Ok(mut shared) = netdevs.write() {
             *shared = map;
+        }
+    }
+}
+
+/// Re-derive one port's storm-control rates from its current speed
+/// (percent levels are relative to link speed, so a renegotiated link
+/// wants new absolute rates).
+async fn reprogram_storm_rates(handle: &actor::SaiHandle, name: &str) {
+    let programs: Vec<(hemlock_sai::PortId, hemlock_sai::StormClass, String, u64)> = {
+        let Ok(table) = handle.ports.read() else {
+            return;
+        };
+        let Some(port) = table.get(name) else { return };
+        port.storm
+            .iter()
+            .map(|(class, state)| {
+                (
+                    port.sai_id,
+                    *class,
+                    state.level.clone(),
+                    u64::from(port.def.speed_mbps),
+                )
+            })
+            .collect()
+    };
+    for (sai_id, class, level, speed_mbps) in programs {
+        let Some((whole, frac)) = level.split_once('.') else {
+            continue;
+        };
+        let hundredths =
+            whole.parse::<u64>().unwrap_or(0) * 100 + frac.parse::<u64>().unwrap_or(0);
+        let kbps = speed_mbps * hundredths / 10;
+        if let Err(e) = handle.set_port_storm(sai_id, class, Some(kbps)).await {
+            tracing::warn!(port = name, error = %e, "storm-control rate re-derivation failed");
+        } else if let Ok(mut table) = handle.ports.write() {
+            if let Some(port) = table.get_mut(name) {
+                if let Some(state) = port.storm.get_mut(&class) {
+                    state.kbps = kbps;
+                }
+            }
         }
     }
 }

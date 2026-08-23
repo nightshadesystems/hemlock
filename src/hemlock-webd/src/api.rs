@@ -22,6 +22,7 @@ use crate::auth::{self, Sessions};
 pub struct AppState {
     pub mgmtd: IpcEndpoint,
     pub syncd: IpcEndpoint,
+    pub orch: IpcEndpoint,
     pub sessions: Sessions,
     pub dev_auth: Option<(String, String)>,
     pub secure_cookie: bool,
@@ -42,6 +43,20 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/interfaces/edit", post(interfaces_edit))
         .route("/api/vlans", get(vlans))
         .route("/api/vlans/edit", post(vlans_edit))
+        .route("/api/lags", get(lags))
+        .route("/api/lags/edit", post(lags_edit))
+        .route("/api/spanning-tree", get(spanning_tree))
+        .route("/api/spanning-tree/edit", post(spanning_tree_edit))
+        .route("/api/spanning-tree/clear-errdisable", post(clear_errdisable))
+        .route("/api/mac-table", get(mac_table))
+        .route("/api/mac-table/edit", post(mac_table_edit))
+        .route("/api/mac-table/flush", post(mac_table_flush))
+        .route("/api/snooping", get(snooping))
+        .route("/api/snooping/edit", post(snooping_edit))
+        .route("/api/storm-control", get(storm_control))
+        .route("/api/storm-control/edit", post(storm_control_edit))
+        .route("/api/mirror", get(mirror))
+        .route("/api/mirror/edit", post(mirror_edit))
         .route("/api/routes", get(routes))
         .route("/api/system", get(system))
         .route("/api/users", get(users))
@@ -454,6 +469,397 @@ async fn users_add(
         )
             .into_response(),
     }
+}
+
+async fn orch_client(
+    state: &AppState,
+) -> anyhow::Result<pb::orch_client::OrchClient<tonic::transport::Channel>> {
+    let channel = state.orch.connect().await?;
+    Ok(pb::orch_client::OrchClient::new(channel))
+}
+
+// ----------------------------------------------------- switching suite
+
+/// `GET /api/lags` — syncd identity/membership merged with orch's LACP
+/// runtime (which degrades gracefully when orch is unreachable).
+async fn lags(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let lags = client
+        .get_lags(pb::GetLagsRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner()
+        .lags;
+    let lacp = match orch_client(&state).await {
+        Ok(mut orch) => orch
+            .get_lacp_state(pb::GetLacpStateRequest {})
+            .await
+            .map(|r| r.into_inner())
+            .ok(),
+        Err(_) => None,
+    };
+    let rows: Vec<serde_json::Value> = lags
+        .iter()
+        .map(|lag| {
+            let state = lacp
+                .as_ref()
+                .and_then(|l| l.lags.iter().find(|s| s.group == lag.group));
+            json!({
+                "group": lag.group,
+                "description": lag.description,
+                "admin_up": lag.admin_up,
+                "up": state.map(|s| s.up).unwrap_or_else(|| {
+                    lag.members.iter().any(|m| m.enabled && m.oper_up)
+                }),
+                "lacp": state.map(|s| s.lacp).unwrap_or(true),
+                "active_mode": state.map(|s| s.active_mode).unwrap_or(false),
+                "bundled": state.map(|s| s.bundled).unwrap_or(0),
+                "total": lag.members.len(),
+                "min_links": state.map(|s| s.min_links).unwrap_or(0),
+                "fallback_mode": state.map(|s| s.fallback_mode.clone()).unwrap_or_default(),
+                "fallback_timeout_secs": state.map(|s| s.fallback_timeout_secs).unwrap_or(90),
+                "fallback_active": state.map(|s| s.fallback_active).unwrap_or(false),
+                "members": lag.members.iter().map(|member| {
+                    let lacp_member = state.and_then(|s| {
+                        s.members.iter().find(|m| m.port == member.port)
+                    });
+                    json!({
+                        "port": member.port,
+                        "enabled": member.enabled,
+                        "oper_up": member.oper_up,
+                        "status": lacp_member.map(|m| m.status.clone()).unwrap_or_else(|| {
+                            if member.enabled && member.oper_up { "bundled" }
+                            else if member.oper_up { "standby" } else { "down" }.into()
+                        }),
+                        "partner_system": lacp_member
+                            .map(|m| m.partner_system.clone())
+                            .unwrap_or_default(),
+                        "partner_port": lacp_member.map(|m| m.partner_port).unwrap_or(0),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "lags": rows })))
+}
+
+async fn lags_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::switching_edit::LagEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::switching_edit::apply_lag_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/spanning-tree` — orch's bridge view.
+async fn spanning_tree(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let stp = orch
+        .get_stp_state(pb::GetStpStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "mode": stp.mode,
+        "bridge_priority": stp.bridge_priority,
+        "bridge_mac": stp.bridge_mac,
+        "root_priority": stp.root_priority,
+        "root_mac": stp.root_mac,
+        "is_root": stp.is_root,
+        "root_cost": stp.root_cost,
+        "root_port": stp.root_port,
+        "hello_time": stp.hello_time,
+        "max_age": stp.max_age,
+        "forward_time": stp.forward_time,
+        "mst_name": stp.mst_name,
+        "mst_revision": stp.mst_revision,
+        "instances": stp.instances.iter().map(|map| json!({
+            "instance": map.instance,
+            "vlans": map.vlans,
+        })).collect::<Vec<_>>(),
+        "topology_changes": stp.topology_changes,
+        "seconds_since_tc": stp.seconds_since_tc,
+        "last_tc_port": stp.last_tc_port,
+        "ports": stp.ports.iter().map(|p| json!({
+            "port": p.port,
+            "role": p.role,
+            "state": p.state,
+            "cost": p.cost,
+            "priority": p.priority,
+            "portfast": p.portfast,
+            "bpduguard": p.bpduguard,
+            "errdisabled": p.errdisabled,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn spanning_tree_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::switching_edit::StpEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::switching_edit::apply_stp_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ClearErrdisableRequest {
+    port: String,
+}
+
+/// `POST /api/spanning-tree/clear-errdisable` — re-enable a
+/// BPDU-guard-errdisabled port.
+async fn clear_errdisable(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<ClearErrdisableRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    client
+        .set_port_errdisable(pb::SetPortErrdisableRequest {
+            name: request.port.clone(),
+            reason: String::new(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(Json(json!({ "port": request.port })))
+}
+
+#[derive(Deserialize)]
+struct MacTableQuery {
+    #[serde(default)]
+    vlan: u32,
+    #[serde(default)]
+    port: String,
+    #[serde(default)]
+    mac: String,
+    /// "" | "static" | "dynamic".
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    page_size: u32,
+    #[serde(default)]
+    page_token: String,
+}
+
+/// `GET /api/mac-table` — paged/filtered dump from syncd.
+async fn mac_table(
+    _op: Operator,
+    State(state): State<SharedState>,
+    axum::extract::Query(query): axum::extract::Query<MacTableQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .dump_fdb(pb::DumpFdbRequest {
+            vlan: query.vlan,
+            port: query.port,
+            mac: query.mac,
+            kind: match query.kind.as_str() {
+                "static" => pb::FdbEntryKind::Static,
+                "dynamic" => pb::FdbEntryKind::Dynamic,
+                _ => pb::FdbEntryKind::Unspecified,
+            } as i32,
+            page_size: query.page_size,
+            page_token: query.page_token,
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "aging_time_secs": response.aging_time_secs,
+        "total": response.total,
+        "next_page_token": response.next_page_token,
+        "entries": response.entries.iter().map(|e| json!({
+            "vlan": e.vlan,
+            "mac": e.mac,
+            "port": e.port,
+            "drop": e.drop,
+            "is_static": e.is_static,
+            "moves": e.moves,
+            "seconds_since_move": e.seconds_since_move,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn mac_table_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::switching_edit::MacTableEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::switching_edit::apply_mac_table_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct FlushRequest {
+    #[serde(default)]
+    vlan: u32,
+    #[serde(default)]
+    port: String,
+}
+
+/// `POST /api/mac-table/flush` — flush dynamic entries (scoped).
+async fn mac_table_flush(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<FlushRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .flush_fdb(pb::FlushFdbRequest {
+            vlan: request.vlan,
+            port: request.port,
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({ "flushed": response.flushed })))
+}
+
+#[derive(Deserialize)]
+struct SnoopingQuery {
+    #[serde(default = "default_family")]
+    family: String,
+}
+
+fn default_family() -> String {
+    "igmp".into()
+}
+
+/// `GET /api/snooping?family=igmp|mld` — orch's snooping view.
+async fn snooping(
+    _op: Operator,
+    State(state): State<SharedState>,
+    axum::extract::Query(query): axum::extract::Query<SnoopingQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .get_snooping_state(pb::GetSnoopingStateRequest {
+            family: query.family,
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "enabled": response.enabled,
+        "robustness": response.robustness,
+        "vlans": response.vlans.iter().map(|vlan| json!({
+            "vlan": vlan.vlan,
+            "enabled": vlan.enabled,
+            "fast_leave": vlan.fast_leave,
+            "querier_enabled": vlan.querier_enabled,
+            "querier_address": vlan.querier_address,
+            "querier_active": vlan.querier_active,
+            "static_mrouters": vlan.static_mrouters,
+            "dynamic_mrouters": vlan.dynamic_mrouters,
+            "groups": vlan.groups.iter().map(|group| json!({
+                "group": group.group,
+                "version": group.version,
+                "ports": group.ports,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn snooping_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::switching_edit::SnoopingEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::switching_edit::apply_snooping_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/storm-control` — syncd's per-port levels, rates, drops.
+async fn storm_control(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .get_storm_control(pb::GetStormControlRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "entries": response.entries.iter().map(|e| json!({
+            "name": e.name,
+            "kind": match e.class {
+                c if c == pb::StormClass::Broadcast as i32 => "broadcast",
+                c if c == pb::StormClass::Multicast as i32 => "multicast",
+                _ => "unknown-unicast",
+            },
+            "level": e.level,
+            "rate_kbps": e.rate_kbps,
+            "drops": e.drops,
+            "active": e.active,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn storm_control_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::switching_edit::StormEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::switching_edit::apply_storm_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/mirror` — syncd's session state.
+async fn mirror(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .get_mirror_sessions(pb::GetMirrorSessionsRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "sessions": response.sessions.iter().map(|s| json!({
+            "session": s.session,
+            "destination": s.destination,
+            "destination_up": s.destination_up,
+            "sources": s.sources.iter().map(|source| json!({
+                "port": source.name,
+                "direction": match source.direction {
+                    d if d == pb::MirrorDirection::Rx as i32 => "rx",
+                    d if d == pb::MirrorDirection::Tx as i32 => "tx",
+                    _ => "both",
+                },
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn mirror_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::switching_edit::MirrorEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::switching_edit::apply_mirror_edit(tree, &edit)
+    })
+    .await
 }
 
 async fn routes(

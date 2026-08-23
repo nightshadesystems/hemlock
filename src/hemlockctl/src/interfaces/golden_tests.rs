@@ -103,7 +103,7 @@ fn status() {
 
 #[test]
 fn status_errdisabled() {
-    let ifs = vec![fx::et1(), fx::et7(), fx::ma1()];
+    let ifs = vec![fx::et1(), fx::et7(), fx::et8(), fx::ma1()];
     assert_golden(
         &render::summary::status(&ifs, StatusFilter::ErrDisabled),
         include_str!("../../tests/golden/status_errdisabled.txt"),
@@ -279,7 +279,7 @@ fn mac_detail() {
 
 #[test]
 fn switchport() {
-    let ifs = vec![fx::et1(), fx::et2(), fx::ma1()];
+    let ifs = vec![fx::et1(), fx::et2(), fx::et6(), fx::ma1()];
     assert_golden(
         &render::l2::switchport(&ifs, &fx::context()),
         include_str!("../../tests/golden/switchport.txt"),

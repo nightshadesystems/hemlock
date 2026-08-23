@@ -1,0 +1,10 @@
+Port-Channel1:
+  Admin state    : up
+  Oper state     : up (2 of 2 members bundled)
+  Protocol       : LACP active
+  Min links      : 1
+  Fallback       : individual (timeout 90s)
+  MAC address    : 2c:dd:e9:4a:1b:31
+  Members:
+    Ethernet49   : bundled   (LACP: current, collecting/distributing)
+    Ethernet50   : bundled   (LACP: current, collecting/distributing)

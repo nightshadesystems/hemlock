@@ -1,0 +1,59 @@
+{
+  "snooping": {
+    "enabled": true,
+    "family": "IGMP",
+    "robustness": 2,
+    "vlans": [
+      {
+        "dynamic_mrouters": [],
+        "enabled": true,
+        "fast_leave": true,
+        "groups": [
+          {
+            "group": "239.1.1.10",
+            "ports": [
+              "Ethernet1",
+              "Ethernet3"
+            ],
+            "version": 2
+          },
+          {
+            "group": "239.255.255.250",
+            "ports": [
+              "Ethernet1",
+              "Ethernet3",
+              "Ethernet5"
+            ],
+            "version": 2
+          }
+        ],
+        "querier_active": false,
+        "querier_address": null,
+        "querier_enabled": false,
+        "static_mrouters": [
+          "Port-Channel1"
+        ],
+        "vlan": 10
+      },
+      {
+        "dynamic_mrouters": [],
+        "enabled": true,
+        "fast_leave": false,
+        "groups": [
+          {
+            "group": "239.20.0.7",
+            "ports": [
+              "Ethernet2"
+            ],
+            "version": 3
+          }
+        ],
+        "querier_active": true,
+        "querier_address": "10.0.20.1",
+        "querier_enabled": true,
+        "static_mrouters": [],
+        "vlan": 20
+      }
+    ]
+  }
+}

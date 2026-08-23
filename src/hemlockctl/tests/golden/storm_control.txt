@@ -1,0 +1,5 @@
+Port   Type              Level     Rate (Mbps)   Drops         Status
+-----  ----------------  --------  ------------  ------------  ------
+Et1    broadcast         10.00%    100           1284          active
+Et1    unknown-unicast   5.00%     50            0             active
+Po1    broadcast         10.00%    2000          0             active

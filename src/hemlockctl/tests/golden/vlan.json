@@ -1,0 +1,53 @@
+{
+  "vlans": [
+    {
+      "id": 1,
+      "name": null,
+      "ports": [
+        "Ethernet2",
+        "Ethernet3",
+        "Ethernet4",
+        "Ethernet5",
+        "Port-Channel1"
+      ],
+      "suspended": false
+    },
+    {
+      "id": 10,
+      "name": "LAN-USERS",
+      "ports": [
+        "Ethernet1",
+        "Ethernet2",
+        "Port-Channel1"
+      ],
+      "suspended": false
+    },
+    {
+      "id": 20,
+      "name": "VOICE",
+      "ports": [
+        "Ethernet2",
+        "Port-Channel1"
+      ],
+      "suspended": true
+    },
+    {
+      "id": 30,
+      "name": null,
+      "ports": [
+        "Ethernet2",
+        "Port-Channel1"
+      ],
+      "suspended": false
+    },
+    {
+      "id": 99,
+      "name": null,
+      "ports": [
+        "Ethernet2",
+        "Port-Channel1"
+      ],
+      "suspended": false
+    }
+  ]
+}

@@ -271,11 +271,44 @@ pub fn et3() -> Interface {
     i
 }
 
+pub fn et6() -> Interface {
+    // QinQ tunnel port: S-VLAN 100, customer tags ride through.
+    let mut i = Interface::new(InterfaceId::new(Kind::Ethernet, 6));
+    i.description = Some("customer qinq drop".into());
+    i.mac = Some(mac(0x06));
+    i.bia = Some(mac(0x06));
+    i.mtu = 9214;
+    i.phys = Some(copper_phys(Some(1000), true));
+    i.vlan_membership = VlanCell::Access(100);
+    i.media = Some("1000BASE-T".into());
+    i.switchport = Some(Switchport {
+        admin_mode: "dot1q-tunnel".into(),
+        oper_mode: "dot1q-tunnel".into(),
+        tpid: "0x88a8".into(),
+        access_vlan: 100,
+        ..Switchport::default()
+    });
+    i
+}
+
 pub fn et7() -> Interface {
     let mut i = Interface::new(InterfaceId::new(Kind::Ethernet, 7));
     i.proto = LineProtocol::Down;
     i.status = IfStatus::ErrDisabled;
     i.errdisable_reason = Some("link-flap".into());
+    i.mtu = 9214;
+    i.phys = Some(copper_phys(None, true));
+    i.vlan_membership = VlanCell::Access(1);
+    i.media = Some("1000BASE-T".into());
+    i
+}
+
+pub fn et8() -> Interface {
+    // BPDU guard tripped: orch errdisabled the port through syncd.
+    let mut i = Interface::new(InterfaceId::new(Kind::Ethernet, 8));
+    i.proto = LineProtocol::Down;
+    i.status = IfStatus::ErrDisabled;
+    i.errdisable_reason = Some("bpduguard".into());
     i.mtu = 9214;
     i.phys = Some(copper_phys(None, true));
     i.vlan_membership = VlanCell::Access(1);

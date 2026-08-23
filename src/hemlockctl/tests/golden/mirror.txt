@@ -1,0 +1,6 @@
+Session 1
+------------------------
+Source Ports:
+  Both:        Et1, Et2
+Destination Ports:
+  Et4          active

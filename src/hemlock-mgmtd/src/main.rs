@@ -33,6 +33,11 @@ struct Args {
     #[arg(long)]
     syncd: Option<String>,
 
+    /// orch endpoint the protocol families (LACP/STP/snooping) are
+    /// pushed through.
+    #[arg(long)]
+    orch: Option<String>,
+
     /// Platform manifest dir (management netdev mapping for OS-side
     /// config apply). OS-side apply is skipped when absent (dev hosts).
     #[arg(long, default_value = "/hemlock/platform")]
@@ -62,7 +67,11 @@ async fn main() -> Result<()> {
         Some(s) => s.parse()?,
         None => Daemon::Syncd.default_endpoint(),
     };
-    info!(state_dir = %args.state_dir.display(), %syncd, "mgmtd starting");
+    let orch: IpcEndpoint = match &args.orch {
+        Some(s) => s.parse()?,
+        None => Daemon::Orch.default_endpoint(),
+    };
+    info!(state_dir = %args.state_dir.display(), %syncd, %orch, "mgmtd starting");
 
     let management = hemlock_platform::Platform::find("/", &args.platform)
         .ok()
@@ -74,6 +83,7 @@ async fn main() -> Result<()> {
     let engine = Arc::new(Mutex::new(service::Engine::new(
         store,
         syncd,
+        orch,
         osapply::OsApplier::new(management),
     )));
 

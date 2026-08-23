@@ -14,7 +14,9 @@ const NO_CHANGE = '';
 function deriveMode(iface) {
   if (iface.kind === 'management') return 'management';
   if (iface.addresses && iface.addresses.length > 0) return 'routed';
-  return iface.switchport_mode === 'trunk' ? 'trunk' : 'access';
+  if (iface.switchport_mode === 'trunk') return 'trunk';
+  if (iface.switchport_mode === 'dot1q-tunnel') return 'dot1q-tunnel';
+  return 'access';
 }
 
 function vlanSummary(r) {
@@ -86,13 +88,13 @@ function EditModal({ open, targets, onClose, onSaved }) {
         if (description !== (target.description || '')) body.description = description;
       }
       if (admin !== NO_CHANGE) body.admin_up = admin === 'up';
-      if (mode === 'access' || mode === 'trunk' || mode === 'routed') {
+      if (mode === 'access' || mode === 'trunk' || mode === 'dot1q-tunnel' || mode === 'routed') {
         if (hasManagement && mode !== 'routed') {
           throw new Error('Management ports are not switchports — deselect them to change mode.');
         }
         body.mode = mode;
-        if (mode === 'access' && accessVlan !== '') {
-          body.access_vlan = parseVlanField(accessVlan, 'Access VLAN');
+        if ((mode === 'access' || mode === 'dot1q-tunnel') && accessVlan !== '') {
+          body.access_vlan = parseVlanField(accessVlan, mode === 'access' ? 'Access VLAN' : 'S-VLAN');
         }
         if (mode === 'trunk') {
           if (trunkVlans !== '') body.trunk_vlans = parseVlanList(trunkVlans);
@@ -122,6 +124,7 @@ function EditModal({ open, targets, onClose, onSaved }) {
     ...(single ? [] : [{ value: NO_CHANGE, label: 'No change' }]),
     { value: 'access', label: 'Access' },
     { value: 'trunk', label: 'Trunk' },
+    { value: 'dot1q-tunnel', label: 'Dot1q tunnel (QinQ)' },
     { value: 'routed', label: 'Routed' },
   ];
 
@@ -174,6 +177,14 @@ function EditModal({ open, targets, onClose, onSaved }) {
             {mode === 'access' && (
               <FormField label="Access VLAN" htmlFor="if-access-vlan">
                 <Input id="if-access-vlan" className="mono" value={accessVlan}
+                  placeholder={single ? undefined : 'unchanged'}
+                  onChange={(e) => setAccessVlan(e.target.value)} style={{ maxWidth: 120 }} />
+              </FormField>
+            )}
+            {mode === 'dot1q-tunnel' && (
+              <FormField label="S-VLAN" htmlFor="if-svlan"
+                helper="Customer frames tunnel inside this VLAN. Raise the MTU if frames exceed 1504 bytes.">
+                <Input id="if-svlan" className="mono" value={accessVlan}
                   placeholder={single ? undefined : 'unchanged'}
                   onChange={(e) => setAccessVlan(e.target.value)} style={{ maxWidth: 120 }} />
               </FormField>

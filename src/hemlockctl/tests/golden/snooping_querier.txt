@@ -1,0 +1,3 @@
+Vlan  Querier Address   State
+----  ----------------  --------
+20    10.0.20.1         Active

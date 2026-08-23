@@ -1,0 +1,18 @@
+MST0 is executing the mstp compatible Spanning Tree protocol
+  Bridge Identifier has priority 32768, address 2c:dd:e9:4a:1b:00
+  Configured hello time 2, max age 20, forward delay 15
+  Number of topology changes 3 last change occurred 0:14:22 ago
+          from Ethernet2
+
+ Port 1 (Ethernet1) of MST0 is forwarding
+   Port path cost 20000, Port priority 128
+   The port is configured portfast, bpduguard
+   BPDU: sent 1284, received 2
+
+ Port 2 (Ethernet2) of MST0 is forwarding
+   Port path cost 20000, Port priority 128
+   BPDU: sent 1200, received 3
+
+ Port 1 (Port-Channel1) of MST0 is forwarding
+   Port path cost 10000, Port priority 128
+   BPDU: sent 900, received 1

@@ -14,9 +14,12 @@ use std::sync::OnceLock;
 
 use tokio::sync::mpsc;
 
+use std::collections::HashMap;
+
 use crate::{
-    ffi, IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiError,
-    SaiEvent, SaiPort, SwitchInfo, SwitchInit,
+    ffi, FdbAction, FdbEventKind, IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget,
+    SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo,
+    SwitchInit,
 };
 
 /// SAI profile key/value store handed to the vendor library. Static because
@@ -26,6 +29,16 @@ static PROFILE_ITER: AtomicUsize = AtomicUsize::new(0);
 
 /// Destination for vendor notification callbacks (same constraint).
 static EVENT_TX: OnceLock<mpsc::UnboundedSender<SaiEvent>> = OnceLock::new();
+
+/// Bridge-port -> port index for the FDB event callback: notifications
+/// carry bridge-port OIDs, and API calls are off-limits inside vendor
+/// callbacks, so the mapping is maintained here (populated at
+/// create_switch, updated when RIF churn recreates bridge ports).
+static BRIDGE_PORTS: OnceLock<std::sync::RwLock<HashMap<u64, u64>>> = OnceLock::new();
+
+fn bridge_ports() -> &'static std::sync::RwLock<HashMap<u64, u64>> {
+    BRIDGE_PORTS.get_or_init(Default::default)
+}
 
 /// The vendor library is process-global state; permit exactly one instance.
 static INSTANCE_LIVE: AtomicBool = AtomicBool::new(false);
@@ -83,6 +96,49 @@ unsafe extern "C" fn profile_get_next_value(
     }
 }
 
+unsafe extern "C" fn on_fdb_event(
+    count: u32,
+    data: *const ffi::sai_fdb_event_notification_data_t,
+) {
+    let Some(tx) = EVENT_TX.get() else { return };
+    if data.is_null() {
+        return;
+    }
+    let items = unsafe { std::slice::from_raw_parts(data, count as usize) };
+    for item in items {
+        let kind = match item.event_type {
+            ffi::_sai_fdb_event_t::SAI_FDB_EVENT_LEARNED => FdbEventKind::Learned,
+            ffi::_sai_fdb_event_t::SAI_FDB_EVENT_AGED => FdbEventKind::Aged,
+            ffi::_sai_fdb_event_t::SAI_FDB_EVENT_MOVE => FdbEventKind::Moved,
+            ffi::_sai_fdb_event_t::SAI_FDB_EVENT_FLUSHED => FdbEventKind::Flushed,
+            _ => continue,
+        };
+        // The entry's bridge port rides in the attr list; map it back to
+        // its port through the maintained index.
+        let mut port = None;
+        if !item.attr.is_null() {
+            let attrs = unsafe { std::slice::from_raw_parts(item.attr, item.attr_count as usize) };
+            for attr in attrs {
+                if attr.id == ffi::_sai_fdb_entry_attr_t::SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID {
+                    // SAFETY: union read matches the attr id.
+                    let bridge_port = unsafe { attr.value.oid };
+                    port = bridge_ports()
+                        .read()
+                        .ok()
+                        .and_then(|map| map.get(&bridge_port).copied())
+                        .map(PortId);
+                }
+            }
+        }
+        let _ = tx.send(SaiEvent::Fdb {
+            kind,
+            bv_id: item.fdb_entry.bv_id,
+            mac: item.fdb_entry.mac_address,
+            port,
+        });
+    }
+}
+
 unsafe extern "C" fn on_port_state_change(
     count: u32,
     data: *const ffi::sai_port_oper_status_notification_t,
@@ -113,6 +169,9 @@ fn check(call: &'static str, status: ffi::sai_status_t) -> Result<(), SaiError> 
 #[derive(Debug, Clone, Copy)]
 struct SwitchDefaults {
     virtual_router: ffi::sai_object_id_t,
+    /// The always-present default STP instance (0 when the switch
+    /// cannot report one).
+    stp: ffi::sai_object_id_t,
     vlan: ffi::sai_object_id_t,
     /// The default VLAN's 802.1Q number (for restoring a port's PVID).
     vlan_number: u16,
@@ -135,6 +194,31 @@ pub struct VendorSai {
     route_api: *mut ffi::sai_route_api_t,
     bridge_api: *mut ffi::sai_bridge_api_t,
     vlan_api: *mut ffi::sai_vlan_api_t,
+    fdb_api: *mut ffi::sai_fdb_api_t,
+    policer_api: *mut ffi::sai_policer_api_t,
+    mirror_api: *mut ffi::sai_mirror_api_t,
+    lag_api: *mut ffi::sai_lag_api_t,
+    stp_api: *mut ffi::sai_stp_api_t,
+    l2mc_api: *mut ffi::sai_l2mc_api_t,
+    l2mc_group_api: *mut ffi::sai_l2mc_group_api_t,
+    /// `sai_query_attribute_capability`, when the library exports it
+    /// (optional in the SAI spec; absent = assume supported and let the
+    /// call fail with a real status).
+    query_capability: Option<
+        unsafe extern "C" fn(
+            ffi::sai_object_id_t,
+            ffi::sai_object_type_t,
+            ffi::sai_attr_id_t,
+            *mut ffi::sai_attr_capability_t,
+        ) -> ffi::sai_status_t,
+    >,
+    /// Storm-control policers this backend created, per (port, class).
+    storm_policers: HashMap<(u64, StormClass), ffi::sai_object_id_t>,
+    /// LAG object ids this backend created (PVID dispatches to the LAG
+    /// attribute for these).
+    lags: std::collections::HashSet<u64>,
+    /// stp-port objects this backend created, per (stp, port).
+    stp_ports: HashMap<(u64, u64), ffi::sai_object_id_t>,
     switch_oid: Option<ffi::sai_object_id_t>,
     defaults: Option<SwitchDefaults>,
     events_rx: Option<mpsc::UnboundedReceiver<SaiEvent>>,
@@ -249,6 +333,41 @@ impl VendorSai {
                 "sai_api_query(VLAN)",
                 api_query(ffi::_sai_api_t::SAI_API_VLAN, &mut vlan_api),
             )?;
+            let mut fdb_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(FDB)",
+                api_query(ffi::_sai_api_t::SAI_API_FDB, &mut fdb_api),
+            )?;
+            let mut policer_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(POLICER)",
+                api_query(ffi::_sai_api_t::SAI_API_POLICER, &mut policer_api),
+            )?;
+            let mut mirror_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(MIRROR)",
+                api_query(ffi::_sai_api_t::SAI_API_MIRROR, &mut mirror_api),
+            )?;
+            let mut lag_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(LAG)",
+                api_query(ffi::_sai_api_t::SAI_API_LAG, &mut lag_api),
+            )?;
+            let mut stp_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(STP)",
+                api_query(ffi::_sai_api_t::SAI_API_STP, &mut stp_api),
+            )?;
+            let mut l2mc_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(L2MC)",
+                api_query(ffi::_sai_api_t::SAI_API_L2MC, &mut l2mc_api),
+            )?;
+            let mut l2mc_group_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(L2MC_GROUP)",
+                api_query(ffi::_sai_api_t::SAI_API_L2MC_GROUP, &mut l2mc_group_api),
+            )?;
             (
                 switch_api as *mut ffi::sai_switch_api_t,
                 port_api as *mut ffi::sai_port_api_t,
@@ -258,10 +377,45 @@ impl VendorSai {
                 route_api as *mut ffi::sai_route_api_t,
                 bridge_api as *mut ffi::sai_bridge_api_t,
                 vlan_api as *mut ffi::sai_vlan_api_t,
+                fdb_api as *mut ffi::sai_fdb_api_t,
+                policer_api as *mut ffi::sai_policer_api_t,
+                mirror_api as *mut ffi::sai_mirror_api_t,
+                lag_api as *mut ffi::sai_lag_api_t,
+                stp_api as *mut ffi::sai_stp_api_t,
+                l2mc_api as *mut ffi::sai_l2mc_api_t,
+                l2mc_group_api as *mut ffi::sai_l2mc_group_api_t,
             )
         };
-        let (switch_api, port_api, queue_api, hostif_api, rif_api, route_api, bridge_api, vlan_api) =
-            apis;
+        let (
+            switch_api,
+            port_api,
+            queue_api,
+            hostif_api,
+            rif_api,
+            route_api,
+            bridge_api,
+            vlan_api,
+            fdb_api,
+            policer_api,
+            mirror_api,
+            lag_api,
+            stp_api,
+            l2mc_api,
+            l2mc_group_api,
+        ) = apis;
+        // SAFETY: symbol lookup only; the fn pointer is copied out and
+        // the library stays mapped for our whole lifetime.
+        let query_capability = unsafe {
+            library
+                .get::<unsafe extern "C" fn(
+                    ffi::sai_object_id_t,
+                    ffi::sai_object_type_t,
+                    ffi::sai_attr_id_t,
+                    *mut ffi::sai_attr_capability_t,
+                ) -> ffi::sai_status_t>(b"sai_query_attribute_capability\0")
+                .ok()
+                .map(|symbol| *symbol)
+        };
         Ok(Self {
             library,
             _services: services,
@@ -273,6 +427,17 @@ impl VendorSai {
             route_api,
             bridge_api,
             vlan_api,
+            fdb_api,
+            policer_api,
+            mirror_api,
+            lag_api,
+            stp_api,
+            l2mc_api,
+            l2mc_group_api,
+            query_capability,
+            storm_policers: HashMap::new(),
+            stp_ports: HashMap::new(),
+            lags: std::collections::HashSet::new(),
             switch_oid: None,
             defaults: None,
             events_rx: Some(rx),
@@ -395,6 +560,15 @@ impl VendorSai {
             sw::SAI_SWITCH_ATTR_DEFAULT_TRAP_GROUP,
             switch,
         )?;
+        // Optional: platforms without STP support report no default
+        // instance; STP calls then fail with a clear error.
+        let stp = self
+            .switch_attr_oid(
+                "get(DEFAULT_STP_INST_ID)",
+                sw::SAI_SWITCH_ATTR_DEFAULT_STP_INST_ID,
+                switch,
+            )
+            .unwrap_or(0);
 
         // The default VLAN's 802.1Q number, for restoring a port's PVID.
         let vlan_number = {
@@ -414,6 +588,7 @@ impl VendorSai {
 
         Ok(SwitchDefaults {
             virtual_router,
+            stp,
             vlan,
             vlan_number,
             bridge_1q,
@@ -593,8 +768,20 @@ impl VendorSai {
         Ok(oid)
     }
 
-    /// Ingress VLAN classification of untagged frames.
+    /// Ingress VLAN classification of untagged frames. LAG ids dispatch
+    /// to the LAG's own PVID attribute.
     fn set_pvid(&self, port: PortId, vlan_number: u16) -> Result<(), SaiError> {
+        if self.lags.contains(&port.0) {
+            let mut attr = Self::zeroed_attr(ffi::_sai_lag_attr_t::SAI_LAG_ATTR_PORT_VLAN_ID);
+            attr.value.u16_ = vlan_number;
+            // SAFETY: valid lag api table; attr outlives the call.
+            return unsafe {
+                let set = (*self.lag_api)
+                    .set_lag_attribute
+                    .ok_or(SaiError::Other("lag api lacks set_lag_attribute".into()))?;
+                check("set_lag_attribute(PORT_VLAN_ID)", set(port.0, &attr))
+            };
+        }
         let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_PORT_VLAN_ID);
         attr.value.u16_ = vlan_number;
         // SAFETY: valid port api table; attr outlives the call.
@@ -606,12 +793,191 @@ impl VendorSai {
         }
     }
 
+    /// Detach a (port-like) object from the 802.1Q bridge: its
+    /// default-VLAN membership, then its bridge port. Idempotent.
+    fn detach_from_bridge(&self, port: PortId) -> Result<(), SaiError> {
+        let Some(bridge_port) = self.find_bridge_port(port)? else {
+            return Ok(());
+        };
+        if let Some(member) = self.find_default_vlan_member(bridge_port)? {
+            // SAFETY: valid vlan api table.
+            unsafe {
+                let remove = (*self.vlan_api)
+                    .remove_vlan_member
+                    .ok_or(SaiError::Other("vlan api lacks remove_vlan_member".into()))?;
+                check("remove_vlan_member(default)", remove(member))?;
+            }
+        }
+        // SAFETY: valid bridge api table.
+        unsafe {
+            let remove = (*self.bridge_api)
+                .remove_bridge_port
+                .ok_or(SaiError::Other(
+                    "bridge api lacks remove_bridge_port".into(),
+                ))?;
+            check("remove_bridge_port", remove(bridge_port))?;
+        }
+        if let Ok(mut index) = bridge_ports().write() {
+            index.remove(&bridge_port);
+        }
+        Ok(())
+    }
+
+    /// Front a (port-like) object with a fresh 1Q bridge port and put
+    /// it back in the default VLAN untagged with a matching PVID.
+    fn attach_to_bridge(&self, port: PortId) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        let defaults = self.defaults()?;
+        let bridge_port = {
+            // SAFETY: valid bridge api table; attr array outlives the call.
+            let create = unsafe {
+                (*self.bridge_api)
+                    .create_bridge_port
+                    .ok_or(SaiError::Other(
+                        "bridge api lacks create_bridge_port".into(),
+                    ))?
+            };
+            use ffi::_sai_bridge_port_attr_t as attr;
+            let mut type_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_TYPE);
+            type_attr.value.s32 = ffi::_sai_bridge_port_type_t::SAI_BRIDGE_PORT_TYPE_PORT as i32;
+            let mut port_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_PORT_ID);
+            port_attr.value.oid = port.0;
+            let mut admin_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_ADMIN_STATE);
+            admin_attr.value.booldata = true;
+            let attrs = [type_attr, port_attr, admin_attr];
+            let mut oid: ffi::sai_object_id_t = 0;
+            // SAFETY: attr array outlives the call.
+            unsafe {
+                check(
+                    "create_bridge_port(PORT)",
+                    create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+                )?;
+            }
+            oid
+        };
+        if let Ok(mut index) = bridge_ports().write() {
+            index.insert(bridge_port, port.0);
+        }
+        self.create_vlan_member_on(defaults.vlan, bridge_port, false)?;
+        self.set_pvid(port, defaults.vlan_number)
+    }
+
     /// The bridge port fronting `port`, as an error when absent (routed
     /// ports have none).
     fn bridge_port_of(&self, port: PortId) -> Result<ffi::sai_object_id_t, SaiError> {
         self.find_bridge_port(port)?.ok_or(SaiError::Other(format!(
             "port {port} has no bridge port (routed?)"
         )))
+    }
+
+    /// Enumerate every 1Q bridge port and record its fronting port in
+    /// the FDB-callback index.
+    fn index_bridge_ports(&self) -> Result<(), SaiError> {
+        let defaults = self.defaults()?;
+        // SAFETY per block below: valid api tables, buffers outlive calls.
+        let get_bridge = unsafe {
+            (*self.bridge_api)
+                .get_bridge_attribute
+                .ok_or(SaiError::Other(
+                    "bridge api lacks get_bridge_attribute".into(),
+                ))?
+        };
+        let get_bridge_port = unsafe {
+            (*self.bridge_api)
+                .get_bridge_port_attribute
+                .ok_or(SaiError::Other(
+                    "bridge api lacks get_bridge_port_attribute".into(),
+                ))?
+        };
+        let mut members: Vec<ffi::sai_object_id_t> = vec![0; 256];
+        {
+            let mut attr = Self::zeroed_attr(ffi::_sai_bridge_attr_t::SAI_BRIDGE_ATTR_PORT_LIST);
+            attr.value.objlist.count = members.len() as u32;
+            attr.value.objlist.list = members.as_mut_ptr();
+            // SAFETY: list buffer alive across the call.
+            unsafe {
+                check(
+                    "get_bridge_attribute(PORT_LIST)",
+                    get_bridge(defaults.bridge_1q, 1, &mut attr),
+                )?;
+                members.truncate(attr.value.objlist.count as usize);
+            }
+        }
+        let Ok(mut index) = bridge_ports().write() else {
+            return Ok(());
+        };
+        for bridge_port in members {
+            let mut attr =
+                Self::zeroed_attr(ffi::_sai_bridge_port_attr_t::SAI_BRIDGE_PORT_ATTR_PORT_ID);
+            // SAFETY: single-attr get; non-PORT bridge ports may reject it.
+            let port = unsafe { (get_bridge_port(bridge_port, 1, &mut attr) == 0).then(|| attr.value.oid) };
+            if let Some(port) = port {
+                index.insert(bridge_port, port);
+            }
+        }
+        Ok(())
+    }
+
+    /// One probed attr capability; an unavailable probe reads as
+    /// supported (the real call then fails with a real status).
+    fn attr_supported(&self, object_type: ffi::sai_object_type_t, attr: u32, set: bool) -> bool {
+        let Some(query) = self.query_capability else {
+            return true;
+        };
+        let Ok(switch) = self.switch_oid() else {
+            return true;
+        };
+        // SAFETY: sai_attr_capability_t is POD; query fills it.
+        let mut caps: ffi::sai_attr_capability_t = unsafe { std::mem::zeroed() };
+        let status = unsafe { query(switch, object_type, attr, &mut caps) };
+        if status != 0 {
+            return true;
+        }
+        if set {
+            caps.set_implemented || caps.create_implemented
+        } else {
+            caps.create_implemented
+        }
+    }
+
+    fn fdb_entry(
+        &self,
+        vlan: Option<Oid>,
+        mac: [u8; 6],
+    ) -> Result<ffi::sai_fdb_entry_t, SaiError> {
+        Ok(ffi::sai_fdb_entry_t {
+            switch_id: self.switch_oid()?,
+            mac_address: mac,
+            bv_id: match vlan {
+                Some(vlan) => vlan.0,
+                None => self.defaults()?.vlan,
+            },
+        })
+    }
+
+    /// Attach (or detach, with `SAI_NULL_OBJECT_ID`) a storm-control
+    /// policer on one port attribute.
+    fn set_storm_policer_attr(
+        &self,
+        port: PortId,
+        class: StormClass,
+        policer: ffi::sai_object_id_t,
+    ) -> Result<(), SaiError> {
+        use ffi::_sai_port_attr_t as attr;
+        let id = match class {
+            StormClass::Broadcast => attr::SAI_PORT_ATTR_BROADCAST_STORM_CONTROL_POLICER_ID,
+            StormClass::Multicast => attr::SAI_PORT_ATTR_MULTICAST_STORM_CONTROL_POLICER_ID,
+            StormClass::UnknownUnicast => attr::SAI_PORT_ATTR_FLOOD_STORM_CONTROL_POLICER_ID,
+        };
+        let mut a = Self::zeroed_attr(id);
+        a.value.oid = policer;
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check("set_port_attribute(STORM_CONTROL_POLICER_ID)", set(port.0, &a))
+        }
     }
 }
 
@@ -645,7 +1011,13 @@ impl SaiBackend for VendorSai {
             on_port_state_change;
         notify_attr.value.ptr = notify_cb as *mut c_void;
 
-        let mut attrs = vec![init_attr, profile_attr, notify_attr];
+        let mut fdb_notify_attr =
+            Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_FDB_EVENT_NOTIFY);
+        let fdb_cb: unsafe extern "C" fn(u32, *const ffi::sai_fdb_event_notification_data_t) =
+            on_fdb_event;
+        fdb_notify_attr.value.ptr = fdb_cb as *mut c_void;
+
+        let mut attrs = vec![init_attr, profile_attr, notify_attr, fdb_notify_attr];
         if let Some(mac) = self.src_mac {
             // Without this, Broadcom's SAI tries to discover a "local MAC
             // address" itself and fails create_switch on boards where that
@@ -680,10 +1052,20 @@ impl SaiBackend for VendorSai {
             Err(err) => tracing::warn!(%err, "switch L3 defaults unresolved; L3 unavailable"),
         }
 
+        // Seed the bridge-port index the FDB event callback maps
+        // through; best-effort (no bridge ports = no port names on FDB
+        // events, not a failed boot).
+        if let Err(err) = self.index_bridge_ports() {
+            tracing::warn!(%err, "cannot index bridge ports; FDB events lose port identity");
+        }
+
         if self.diag_shell {
             self.spawn_diag_shell(oid)?;
         }
-        Ok(SwitchInfo { oid })
+        Ok(SwitchInfo {
+            oid,
+            default_vlan_oid: self.defaults.map(|d| d.vlan).unwrap_or(0),
+        })
     }
 
     fn ports(&mut self) -> Result<Vec<SaiPort>, SaiError> {
@@ -1132,26 +1514,7 @@ impl SaiBackend for VendorSai {
 
         // A port RIF needs the port out of the 802.1Q bridge first:
         // default-VLAN membership, then the bridge port itself.
-        if let Some(bridge_port) = self.find_bridge_port(port)? {
-            if let Some(member) = self.find_default_vlan_member(bridge_port)? {
-                // SAFETY: valid vlan api table.
-                unsafe {
-                    let remove = (*self.vlan_api)
-                        .remove_vlan_member
-                        .ok_or(SaiError::Other("vlan api lacks remove_vlan_member".into()))?;
-                    check("remove_vlan_member(default)", remove(member))?;
-                }
-            }
-            // SAFETY: valid bridge api table.
-            unsafe {
-                let remove = (*self.bridge_api)
-                    .remove_bridge_port
-                    .ok_or(SaiError::Other(
-                        "bridge api lacks remove_bridge_port".into(),
-                    ))?;
-                check("remove_bridge_port", remove(bridge_port))?;
-            }
-        }
+        self.detach_from_bridge(port)?;
 
         // SAFETY: valid rif api table; attr array outlives the call.
         let create = unsafe {
@@ -1244,8 +1607,7 @@ impl SaiBackend for VendorSai {
     }
 
     fn remove_router_interface(&mut self, port: PortId, rif: Oid) -> Result<(), SaiError> {
-        let switch = self.switch_oid()?;
-        let defaults = self.defaults()?;
+        self.switch_oid()?;
 
         // SAFETY: valid rif api table.
         unsafe {
@@ -1259,36 +1621,7 @@ impl SaiBackend for VendorSai {
 
         // Restore default L2 bridging: bridge port, untagged default-VLAN
         // membership, PVID.
-        let bridge_port = {
-            // SAFETY: valid bridge api table; attr array outlives the call.
-            let create = unsafe {
-                (*self.bridge_api)
-                    .create_bridge_port
-                    .ok_or(SaiError::Other(
-                        "bridge api lacks create_bridge_port".into(),
-                    ))?
-            };
-            use ffi::_sai_bridge_port_attr_t as attr;
-            let mut type_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_TYPE);
-            type_attr.value.s32 = ffi::_sai_bridge_port_type_t::SAI_BRIDGE_PORT_TYPE_PORT as i32;
-            let mut port_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_PORT_ID);
-            port_attr.value.oid = port.0;
-            let mut admin_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_ADMIN_STATE);
-            admin_attr.value.booldata = true;
-            let attrs = [type_attr, port_attr, admin_attr];
-            let mut oid: ffi::sai_object_id_t = 0;
-            // SAFETY: attr array outlives the call.
-            unsafe {
-                check(
-                    "create_bridge_port(PORT)",
-                    create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
-                )?;
-            }
-            oid
-        };
-        self.create_vlan_member_on(defaults.vlan, bridge_port, false)?;
-        self.set_pvid(port, defaults.vlan_number)?;
-        Ok(())
+        self.attach_to_bridge(port)
     }
 
     fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError> {
@@ -1394,6 +1727,825 @@ impl SaiBackend for VendorSai {
             self.create_vlan_member_on(defaults.vlan, bridge_port, false)?;
         }
         self.set_pvid(port, defaults.vlan_number)
+    }
+
+    fn capabilities(&mut self) -> Result<SaiCapabilities, SaiError> {
+        self.switch_oid()?;
+        use ffi::_sai_object_type_t as object;
+
+        // SAFETY per block below: valid api tables (fn-pointer presence
+        // reads only).
+        let fdb_flush = unsafe { (*self.fdb_api).flush_fdb_entries.is_some() };
+        let policer_fns = unsafe { (*self.policer_api).create_policer.is_some() };
+        let mirror_fns = unsafe { (*self.mirror_api).create_mirror_session.is_some() };
+
+        let mirror = mirror_fns
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_MIRROR_SESSION,
+                ffi::_sai_mirror_session_attr_t::SAI_MIRROR_SESSION_ATTR_MONITOR_PORT,
+                false,
+            );
+        // Session capacity, when the switch reports it; 4 is the Helix4
+        // default otherwise.
+        let mirror_sessions_max = if !mirror {
+            0
+        } else {
+            let mut max = 4u32;
+            // SAFETY: valid switch api table; attr outlives the call;
+            // union read matches the u32 attr.
+            unsafe {
+                if let Some(get) = (*self.switch_api).get_switch_attribute {
+                    let mut attr = Self::zeroed_attr(
+                        ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_MAX_MIRROR_SESSION,
+                    );
+                    if get(self.switch_oid()?, 1, &mut attr) == 0 && attr.value.u32_ > 0 {
+                        max = attr.value.u32_;
+                    }
+                }
+            }
+            max
+        };
+
+        Ok(SaiCapabilities {
+            lag: self.attr_supported(
+                object::SAI_OBJECT_TYPE_LAG,
+                ffi::_sai_lag_attr_t::SAI_LAG_ATTR_PORT_LIST,
+                false,
+            ),
+            stp: self.attr_supported(
+                object::SAI_OBJECT_TYPE_STP,
+                ffi::_sai_stp_attr_t::SAI_STP_ATTR_VLAN_LIST,
+                false,
+            ),
+            fdb_flush,
+            fdb_aging: self.attr_supported(
+                object::SAI_OBJECT_TYPE_SWITCH,
+                ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_FDB_AGING_TIME,
+                true,
+            ),
+            l2mc: self.attr_supported(
+                object::SAI_OBJECT_TYPE_L2MC_GROUP,
+                ffi::_sai_l2mc_group_attr_t::SAI_L2MC_GROUP_ATTR_L2MC_OUTPUT_COUNT,
+                false,
+            ),
+            storm_control: policer_fns
+                && self.attr_supported(
+                    object::SAI_OBJECT_TYPE_PORT,
+                    ffi::_sai_port_attr_t::SAI_PORT_ATTR_BROADCAST_STORM_CONTROL_POLICER_ID,
+                    true,
+                ),
+            mirror,
+            mirror_sessions_max,
+            port_tpid: self.attr_supported(
+                object::SAI_OBJECT_TYPE_PORT,
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_TPID,
+                true,
+            ),
+        })
+    }
+
+    fn set_fdb_aging(&mut self, secs: u32) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        let mut attr = Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_FDB_AGING_TIME);
+        attr.value.u32_ = secs;
+        // SAFETY: valid switch api table; attr outlives the call.
+        unsafe {
+            let set = (*self.switch_api)
+                .set_switch_attribute
+                .ok_or(SaiError::Other(
+                    "switch api lacks set_switch_attribute".into(),
+                ))?;
+            check("set_switch_attribute(FDB_AGING_TIME)", set(switch, &attr))
+        }
+    }
+
+    fn add_fdb_entry(
+        &mut self,
+        vlan: Option<Oid>,
+        mac: [u8; 6],
+        action: FdbAction,
+    ) -> Result<(), SaiError> {
+        let entry = self.fdb_entry(vlan, mac)?;
+        // SAFETY per block below: valid fdb api table; buffers outlive
+        // the calls.
+        let create = unsafe {
+            (*self.fdb_api)
+                .create_fdb_entry
+                .ok_or(SaiError::Other("fdb api lacks create_fdb_entry".into()))?
+        };
+        let remove = unsafe { (*self.fdb_api).remove_fdb_entry };
+
+        use ffi::_sai_fdb_entry_attr_t as attr;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_FDB_ENTRY_ATTR_TYPE);
+        type_attr.value.s32 = ffi::_sai_fdb_entry_type_t::SAI_FDB_ENTRY_TYPE_STATIC as i32;
+        let mut action_attr = Self::zeroed_attr(attr::SAI_FDB_ENTRY_ATTR_PACKET_ACTION);
+        let mut attrs = vec![type_attr];
+        match action {
+            FdbAction::Forward(port) => {
+                let bridge_port = self.bridge_port_of(port)?;
+                action_attr.value.s32 = ffi::_sai_packet_action_t::SAI_PACKET_ACTION_FORWARD as i32;
+                let mut bp_attr = Self::zeroed_attr(attr::SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID);
+                bp_attr.value.oid = bridge_port;
+                attrs.push(action_attr);
+                attrs.push(bp_attr);
+            }
+            FdbAction::Drop => {
+                action_attr.value.s32 = ffi::_sai_packet_action_t::SAI_PACKET_ACTION_DROP as i32;
+                attrs.push(action_attr);
+            }
+        }
+        // Replace semantics: clear any previous entry for this key first
+        // (a dynamic learn or an earlier static).
+        if let Some(remove) = remove {
+            // SAFETY: entry outlives the call; absence is fine.
+            let _ = unsafe { remove(&entry) };
+        }
+        // SAFETY: entry + attr array outlive the call.
+        unsafe {
+            check(
+                "create_fdb_entry",
+                create(&entry, attrs.len() as u32, attrs.as_ptr()),
+            )
+        }
+    }
+
+    fn remove_fdb_entry(&mut self, vlan: Option<Oid>, mac: [u8; 6]) -> Result<(), SaiError> {
+        let entry = self.fdb_entry(vlan, mac)?;
+        // SAFETY: valid fdb api table; entry outlives the call.
+        unsafe {
+            let remove = (*self.fdb_api)
+                .remove_fdb_entry
+                .ok_or(SaiError::Other("fdb api lacks remove_fdb_entry".into()))?;
+            check("remove_fdb_entry", remove(&entry))
+        }
+    }
+
+    fn flush_fdb(&mut self, vlan: Option<Oid>, port: Option<PortId>) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid fdb api table; attr array outlives the call.
+        let flush = unsafe {
+            (*self.fdb_api)
+                .flush_fdb_entries
+                .ok_or(SaiError::Other("fdb api lacks flush_fdb_entries".into()))?
+        };
+        use ffi::_sai_fdb_flush_attr_t as attr;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_FDB_FLUSH_ATTR_ENTRY_TYPE);
+        type_attr.value.s32 =
+            ffi::_sai_fdb_flush_entry_type_t::SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC as i32;
+        let mut attrs = vec![type_attr];
+        if let Some(vlan) = vlan {
+            let mut bv_attr = Self::zeroed_attr(attr::SAI_FDB_FLUSH_ATTR_BV_ID);
+            bv_attr.value.oid = vlan.0;
+            attrs.push(bv_attr);
+        }
+        if let Some(port) = port {
+            let bridge_port = self.bridge_port_of(port)?;
+            let mut bp_attr = Self::zeroed_attr(attr::SAI_FDB_FLUSH_ATTR_BRIDGE_PORT_ID);
+            bp_attr.value.oid = bridge_port;
+            attrs.push(bp_attr);
+        }
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "flush_fdb_entries",
+                flush(switch, attrs.len() as u32, attrs.as_ptr()),
+            )
+        }
+    }
+
+    fn set_port_storm_control(
+        &mut self,
+        port: PortId,
+        class: StormClass,
+        kbps: Option<u64>,
+    ) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        let existing = self.storm_policers.get(&(port.0, class)).copied();
+        match (kbps, existing) {
+            (None, None) => Ok(()),
+            (None, Some(policer)) => {
+                // Detach, then drop the policer object.
+                self.set_storm_policer_attr(port, class, 0)?;
+                // SAFETY: valid policer api table.
+                unsafe {
+                    let remove = (*self.policer_api)
+                        .remove_policer
+                        .ok_or(SaiError::Other("policer api lacks remove_policer".into()))?;
+                    check("remove_policer", remove(policer))?;
+                }
+                self.storm_policers.remove(&(port.0, class));
+                Ok(())
+            }
+            (Some(kbps), Some(policer)) => {
+                // Rate change: update CIR in place.
+                let mut attr = Self::zeroed_attr(ffi::_sai_policer_attr_t::SAI_POLICER_ATTR_CIR);
+                attr.value.u64_ = kbps * 1000 / 8; // bytes/sec
+                // SAFETY: valid policer api table; attr outlives the call.
+                unsafe {
+                    let set = (*self.policer_api)
+                        .set_policer_attribute
+                        .ok_or(SaiError::Other(
+                            "policer api lacks set_policer_attribute".into(),
+                        ))?;
+                    check("set_policer_attribute(CIR)", set(policer, &attr))
+                }
+            }
+            (Some(kbps), None) => {
+                // SAFETY: valid policer api table; attr array outlives
+                // the call.
+                let create = unsafe {
+                    (*self.policer_api)
+                        .create_policer
+                        .ok_or(SaiError::Other("policer api lacks create_policer".into()))?
+                };
+                use ffi::_sai_policer_attr_t as attr;
+                let mut meter_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_METER_TYPE);
+                meter_attr.value.s32 = ffi::_sai_meter_type_t::SAI_METER_TYPE_BYTES as i32;
+                let mut mode_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_MODE);
+                mode_attr.value.s32 =
+                    ffi::_sai_policer_mode_t::SAI_POLICER_MODE_STORM_CONTROL as i32;
+                let mut cir_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_CIR);
+                cir_attr.value.u64_ = kbps * 1000 / 8; // bytes/sec
+                let mut red_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_RED_PACKET_ACTION);
+                red_attr.value.s32 = ffi::_sai_packet_action_t::SAI_PACKET_ACTION_DROP as i32;
+                let attrs = [meter_attr, mode_attr, cir_attr, red_attr];
+                let mut oid: ffi::sai_object_id_t = 0;
+                // SAFETY: attr array outlives the call.
+                unsafe {
+                    check(
+                        "create_policer(STORM_CONTROL)",
+                        create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+                    )?;
+                }
+                if let Err(err) = self.set_storm_policer_attr(port, class, oid) {
+                    // Roll the orphan policer back before surfacing.
+                    // SAFETY: valid policer api table.
+                    unsafe {
+                        if let Some(remove) = (*self.policer_api).remove_policer {
+                            let _ = remove(oid);
+                        }
+                    }
+                    return Err(err);
+                }
+                self.storm_policers.insert((port.0, class), oid);
+                Ok(())
+            }
+        }
+    }
+
+    fn port_storm_drops(&mut self, port: PortId, class: StormClass) -> Result<u64, SaiError> {
+        self.switch_oid()?;
+        let Some(policer) = self.storm_policers.get(&(port.0, class)).copied() else {
+            return Ok(0);
+        };
+        // SAFETY: valid policer api table; buffers outlive the call.
+        let get_stats = unsafe {
+            (*self.policer_api)
+                .get_policer_stats
+                .ok_or(SaiError::Other(
+                    "policer api lacks get_policer_stats".into(),
+                ))?
+        };
+        let ids = [ffi::_sai_policer_stat_t::SAI_POLICER_STAT_RED_PACKETS as ffi::sai_stat_id_t];
+        let mut values = [0u64; 1];
+        // SAFETY: id and value buffers sized identically.
+        unsafe {
+            check(
+                "get_policer_stats(RED_PACKETS)",
+                get_stats(policer, ids.len() as u32, ids.as_ptr(), values.as_mut_ptr()),
+            )?;
+        }
+        Ok(values[0])
+    }
+
+    fn create_mirror_session(&mut self, monitor: PortId) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid mirror api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.mirror_api)
+                .create_mirror_session
+                .ok_or(SaiError::Other(
+                    "mirror api lacks create_mirror_session".into(),
+                ))?
+        };
+        use ffi::_sai_mirror_session_attr_t as attr;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_MIRROR_SESSION_ATTR_TYPE);
+        type_attr.value.s32 = ffi::_sai_mirror_session_type_t::SAI_MIRROR_SESSION_TYPE_LOCAL as i32;
+        let mut monitor_attr = Self::zeroed_attr(attr::SAI_MIRROR_SESSION_ATTR_MONITOR_PORT);
+        monitor_attr.value.oid = monitor.0;
+        let attrs = [type_attr, monitor_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_mirror_session(LOCAL)",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_mirror_session(&mut self, session: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid mirror api table.
+        unsafe {
+            let remove = (*self.mirror_api)
+                .remove_mirror_session
+                .ok_or(SaiError::Other(
+                    "mirror api lacks remove_mirror_session".into(),
+                ))?;
+            check("remove_mirror_session", remove(session.0))
+        }
+    }
+
+    fn set_port_mirror(
+        &mut self,
+        port: PortId,
+        ingress: Option<Oid>,
+        egress: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid port api table; attr + list outlive each call.
+        let set = unsafe {
+            (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?
+        };
+        for (id, call, session) in [
+            (
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_INGRESS_MIRROR_SESSION,
+                "set_port_attribute(INGRESS_MIRROR_SESSION)",
+                ingress,
+            ),
+            (
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_EGRESS_MIRROR_SESSION,
+                "set_port_attribute(EGRESS_MIRROR_SESSION)",
+                egress,
+            ),
+        ] {
+            let mut list: Vec<ffi::sai_object_id_t> = session.map(|s| s.0).into_iter().collect();
+            let mut attr = Self::zeroed_attr(id);
+            attr.value.objlist.count = list.len() as u32;
+            attr.value.objlist.list = list.as_mut_ptr();
+            // SAFETY: list buffer alive across the call.
+            unsafe {
+                check(call, set(port.0, &attr))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_port_tpid(&mut self, port: PortId, tpid: u16) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_TPID);
+        attr.value.u16_ = tpid;
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check("set_port_attribute(TPID)", set(port.0, &attr))
+        }
+    }
+
+    fn create_lag(&mut self) -> Result<PortId, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid lag api table.
+        let create = unsafe {
+            (*self.lag_api)
+                .create_lag
+                .ok_or(SaiError::Other("lag api lacks create_lag".into()))?
+        };
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: no attrs; oid written by the call.
+        unsafe {
+            check("create_lag", create(&mut oid, switch, 0, std::ptr::null()))?;
+        }
+        self.lags.insert(oid);
+        let lag = PortId(oid);
+        // Front the LAG with a bridge port + default-VLAN membership so
+        // it behaves like a boot-time port for the L2 program.
+        if let Err(err) = self.attach_to_bridge(lag) {
+            // Roll back the orphan LAG before surfacing.
+            // SAFETY: valid lag api table.
+            unsafe {
+                if let Some(remove) = (*self.lag_api).remove_lag {
+                    let _ = remove(oid);
+                }
+            }
+            self.lags.remove(&oid);
+            return Err(err);
+        }
+        Ok(lag)
+    }
+
+    fn remove_lag(&mut self, lag: PortId) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        self.detach_from_bridge(lag)?;
+        // SAFETY: valid lag api table.
+        unsafe {
+            let remove = (*self.lag_api)
+                .remove_lag
+                .ok_or(SaiError::Other("lag api lacks remove_lag".into()))?;
+            check("remove_lag", remove(lag.0))?;
+        }
+        self.lags.remove(&lag.0);
+        Ok(())
+    }
+
+    fn add_lag_member(&mut self, lag: PortId, port: PortId) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // The member's traffic rides the LAG's bridge port from now on.
+        self.detach_from_bridge(port)?;
+        // SAFETY: valid lag api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.lag_api)
+                .create_lag_member
+                .ok_or(SaiError::Other("lag api lacks create_lag_member".into()))?
+        };
+        use ffi::_sai_lag_member_attr_t as attr;
+        let mut lag_attr = Self::zeroed_attr(attr::SAI_LAG_MEMBER_ATTR_LAG_ID);
+        lag_attr.value.oid = lag.0;
+        let mut port_attr = Self::zeroed_attr(attr::SAI_LAG_MEMBER_ATTR_PORT_ID);
+        port_attr.value.oid = port.0;
+        // Members start gated closed: LACP opens them when the partner
+        // agrees to collect/distribute.
+        let mut egress_attr = Self::zeroed_attr(attr::SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE);
+        egress_attr.value.booldata = true;
+        let mut ingress_attr = Self::zeroed_attr(attr::SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE);
+        ingress_attr.value.booldata = true;
+        let attrs = [lag_attr, port_attr, egress_attr, ingress_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_lag_member",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_lag_member(&mut self, member: Oid, port: PortId) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid lag api table.
+        unsafe {
+            let remove = (*self.lag_api)
+                .remove_lag_member
+                .ok_or(SaiError::Other("lag api lacks remove_lag_member".into()))?;
+            check("remove_lag_member", remove(member.0))?;
+        }
+        // Standalone default L2 again.
+        self.attach_to_bridge(port)
+    }
+
+    fn set_lag_member_state(&mut self, member: Oid, enabled: bool) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid lag api table; attrs outlive the calls.
+        let set = unsafe {
+            (*self.lag_api)
+                .set_lag_member_attribute
+                .ok_or(SaiError::Other(
+                    "lag api lacks set_lag_member_attribute".into(),
+                ))?
+        };
+        use ffi::_sai_lag_member_attr_t as attr;
+        for id in [
+            attr::SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE,
+            attr::SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE,
+        ] {
+            let mut a = Self::zeroed_attr(id);
+            a.value.booldata = !enabled;
+            // SAFETY: attr outlives the call.
+            unsafe {
+                check("set_lag_member_attribute(DISABLE)", set(member.0, &a))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_stp_instance(&mut self) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid stp api table.
+        let create = unsafe {
+            (*self.stp_api)
+                .create_stp
+                .ok_or(SaiError::Other("stp api lacks create_stp".into()))?
+        };
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: no attrs; oid written by the call.
+        unsafe {
+            check("create_stp", create(&mut oid, switch, 0, std::ptr::null()))?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_stp_instance(&mut self, stp: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // Drop its stp-port objects first.
+        let ports: Vec<((u64, u64), ffi::sai_object_id_t)> = self
+            .stp_ports
+            .iter()
+            .filter(|((instance, _), _)| *instance == stp.0)
+            .map(|(key, oid)| (*key, *oid))
+            .collect();
+        // SAFETY per block below: valid stp api table.
+        let remove_port = unsafe { (*self.stp_api).remove_stp_port };
+        for (key, oid) in ports {
+            if let Some(remove_port) = remove_port {
+                // SAFETY: oid from our own map.
+                let _ = unsafe { remove_port(oid) };
+            }
+            self.stp_ports.remove(&key);
+        }
+        // SAFETY: valid stp api table.
+        unsafe {
+            let remove = (*self.stp_api)
+                .remove_stp
+                .ok_or(SaiError::Other("stp api lacks remove_stp".into()))?;
+            check("remove_stp", remove(stp.0))
+        }
+    }
+
+    fn set_vlan_stp_instance(
+        &mut self,
+        vlan: Option<Oid>,
+        stp: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        let defaults = self.defaults()?;
+        let vlan_oid = vlan.map(|v| v.0).unwrap_or(defaults.vlan);
+        let stp_oid = match stp {
+            Some(stp) => stp.0,
+            None if defaults.stp != 0 => defaults.stp,
+            None => {
+                return Err(SaiError::Other(
+                    "switch reports no default STP instance".into(),
+                ));
+            }
+        };
+        let mut attr = Self::zeroed_attr(ffi::_sai_vlan_attr_t::SAI_VLAN_ATTR_STP_INSTANCE);
+        attr.value.oid = stp_oid;
+        // SAFETY: valid vlan api table; attr outlives the call.
+        unsafe {
+            let set = (*self.vlan_api)
+                .set_vlan_attribute
+                .ok_or(SaiError::Other("vlan api lacks set_vlan_attribute".into()))?;
+            check("set_vlan_attribute(STP_INSTANCE)", set(vlan_oid, &attr))
+        }
+    }
+
+    fn set_stp_port_state(
+        &mut self,
+        stp: Option<Oid>,
+        port: PortId,
+        state: StpPortState,
+    ) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        let defaults = self.defaults()?;
+        let stp_oid = match stp {
+            Some(stp) => stp.0,
+            None if defaults.stp != 0 => defaults.stp,
+            None => {
+                return Err(SaiError::Other(
+                    "switch reports no default STP instance".into(),
+                ));
+            }
+        };
+        let state_value = match state {
+            StpPortState::Blocking => ffi::_sai_stp_port_state_t::SAI_STP_PORT_STATE_BLOCKING,
+            StpPortState::Learning => ffi::_sai_stp_port_state_t::SAI_STP_PORT_STATE_LEARNING,
+            StpPortState::Forwarding => {
+                ffi::_sai_stp_port_state_t::SAI_STP_PORT_STATE_FORWARDING
+            }
+        } as i32;
+
+        if let Some(existing) = self.stp_ports.get(&(stp_oid, port.0)).copied() {
+            let mut attr =
+                Self::zeroed_attr(ffi::_sai_stp_port_attr_t::SAI_STP_PORT_ATTR_STATE);
+            attr.value.s32 = state_value;
+            // SAFETY: valid stp api table; attr outlives the call.
+            return unsafe {
+                let set = (*self.stp_api)
+                    .set_stp_port_attribute
+                    .ok_or(SaiError::Other(
+                        "stp api lacks set_stp_port_attribute".into(),
+                    ))?;
+                check("set_stp_port_attribute(STATE)", set(existing, &attr))
+            };
+        }
+
+        let bridge_port = self.bridge_port_of(port)?;
+        // SAFETY: valid stp api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.stp_api)
+                .create_stp_port
+                .ok_or(SaiError::Other("stp api lacks create_stp_port".into()))?
+        };
+        use ffi::_sai_stp_port_attr_t as attr;
+        let mut stp_attr = Self::zeroed_attr(attr::SAI_STP_PORT_ATTR_STP);
+        stp_attr.value.oid = stp_oid;
+        let mut bp_attr = Self::zeroed_attr(attr::SAI_STP_PORT_ATTR_BRIDGE_PORT);
+        bp_attr.value.oid = bridge_port;
+        let mut state_attr = Self::zeroed_attr(attr::SAI_STP_PORT_ATTR_STATE);
+        state_attr.value.s32 = state_value;
+        let attrs = [stp_attr, bp_attr, state_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_stp_port",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        self.stp_ports.insert((stp_oid, port.0), oid);
+        Ok(())
+    }
+
+    fn create_l2mc_group(&mut self) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid l2mc-group api table.
+        let create = unsafe {
+            (*self.l2mc_group_api)
+                .create_l2mc_group
+                .ok_or(SaiError::Other(
+                    "l2mc-group api lacks create_l2mc_group".into(),
+                ))?
+        };
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: no attrs; oid written by the call.
+        unsafe {
+            check(
+                "create_l2mc_group",
+                create(&mut oid, switch, 0, std::ptr::null()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_l2mc_group(&mut self, group: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid l2mc-group api table.
+        unsafe {
+            let remove = (*self.l2mc_group_api)
+                .remove_l2mc_group
+                .ok_or(SaiError::Other(
+                    "l2mc-group api lacks remove_l2mc_group".into(),
+                ))?;
+            check("remove_l2mc_group", remove(group.0))
+        }
+    }
+
+    fn add_l2mc_member(&mut self, group: Oid, port: PortId) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let bridge_port = self.bridge_port_of(port)?;
+        // SAFETY: valid l2mc-group api table; attr array outlives the
+        // call.
+        let create = unsafe {
+            (*self.l2mc_group_api)
+                .create_l2mc_group_member
+                .ok_or(SaiError::Other(
+                    "l2mc-group api lacks create_l2mc_group_member".into(),
+                ))?
+        };
+        use ffi::_sai_l2mc_group_member_attr_t as attr;
+        let mut group_attr = Self::zeroed_attr(attr::SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID);
+        group_attr.value.oid = group.0;
+        let mut output_attr = Self::zeroed_attr(attr::SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID);
+        output_attr.value.oid = bridge_port;
+        let attrs = [group_attr, output_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_l2mc_group_member",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_l2mc_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid l2mc-group api table.
+        unsafe {
+            let remove = (*self.l2mc_group_api)
+                .remove_l2mc_group_member
+                .ok_or(SaiError::Other(
+                    "l2mc-group api lacks remove_l2mc_group_member".into(),
+                ))?;
+            check("remove_l2mc_group_member", remove(member.0))
+        }
+    }
+
+    fn set_l2mc_entry(
+        &mut self,
+        vlan: Option<Oid>,
+        group_ip: std::net::IpAddr,
+        l2mc: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        let defaults = self.defaults()?;
+        // SAFETY: sai_l2mc_entry_t is POD; all-zero is a valid start.
+        let mut entry: ffi::sai_l2mc_entry_t = unsafe { std::mem::zeroed() };
+        entry.switch_id = switch;
+        entry.bv_id = vlan.map(|v| v.0).unwrap_or(defaults.vlan);
+        entry.type_ = ffi::_sai_l2mc_entry_type_t::SAI_L2MC_ENTRY_TYPE_XG;
+        match group_ip {
+            std::net::IpAddr::V4(v4) => {
+                entry.destination.addr_family = ffi::_sai_ip_addr_family_t::SAI_IP_ADDR_FAMILY_IPV4;
+                entry.destination.addr.ip4 = u32::from_ne_bytes(v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                entry.destination.addr_family = ffi::_sai_ip_addr_family_t::SAI_IP_ADDR_FAMILY_IPV6;
+                entry.destination.addr.ip6 = v6.octets();
+            }
+        }
+        match l2mc {
+            Some(group) => {
+                // SAFETY: valid l2mc api table; entry + attrs outlive
+                // the call.
+                let create = unsafe {
+                    (*self.l2mc_api)
+                        .create_l2mc_entry
+                        .ok_or(SaiError::Other("l2mc api lacks create_l2mc_entry".into()))?
+                };
+                let remove = unsafe { (*self.l2mc_api).remove_l2mc_entry };
+                use ffi::_sai_l2mc_entry_attr_t as attr;
+                let mut action_attr = Self::zeroed_attr(attr::SAI_L2MC_ENTRY_ATTR_PACKET_ACTION);
+                action_attr.value.s32 = ffi::_sai_packet_action_t::SAI_PACKET_ACTION_FORWARD as i32;
+                let mut group_attr = Self::zeroed_attr(attr::SAI_L2MC_ENTRY_ATTR_OUTPUT_GROUP_ID);
+                group_attr.value.oid = group.0;
+                let attrs = [action_attr, group_attr];
+                // Replace semantics: drop any previous entry for the key.
+                if let Some(remove) = remove {
+                    // SAFETY: entry outlives the call; absence is fine.
+                    let _ = unsafe { remove(&entry) };
+                }
+                // SAFETY: entry + attr array outlive the call.
+                unsafe {
+                    check(
+                        "create_l2mc_entry",
+                        create(&entry, attrs.len() as u32, attrs.as_ptr()),
+                    )
+                }
+            }
+            None => {
+                // SAFETY: valid l2mc api table; entry outlives the call.
+                unsafe {
+                    let remove = (*self.l2mc_api)
+                        .remove_l2mc_entry
+                        .ok_or(SaiError::Other("l2mc api lacks remove_l2mc_entry".into()))?;
+                    check("remove_l2mc_entry", remove(&entry))
+                }
+            }
+        }
+    }
+
+    fn set_vlan_unknown_mcast_group(
+        &mut self,
+        vlan: Option<Oid>,
+        l2mc: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        let defaults = self.defaults()?;
+        let vlan_oid = vlan.map(|v| v.0).unwrap_or(defaults.vlan);
+        // SAFETY: valid vlan api table; attrs outlive the calls.
+        let set = unsafe {
+            (*self.vlan_api)
+                .set_vlan_attribute
+                .ok_or(SaiError::Other("vlan api lacks set_vlan_attribute".into()))?
+        };
+        use ffi::_sai_vlan_attr_t as attr;
+        let mut type_attr =
+            Self::zeroed_attr(attr::SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_CONTROL_TYPE);
+        type_attr.value.s32 = match l2mc {
+            Some(_) => ffi::_sai_vlan_flood_control_type_t::SAI_VLAN_FLOOD_CONTROL_TYPE_L2MC_GROUP,
+            None => ffi::_sai_vlan_flood_control_type_t::SAI_VLAN_FLOOD_CONTROL_TYPE_ALL,
+        } as i32;
+        if let Some(group) = l2mc {
+            let mut group_attr =
+                Self::zeroed_attr(attr::SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_GROUP);
+            group_attr.value.oid = group.0;
+            // The group first, then the control type that references it.
+            // SAFETY: attrs outlive the calls.
+            unsafe {
+                check(
+                    "set_vlan_attribute(UNKNOWN_MULTICAST_FLOOD_GROUP)",
+                    set(vlan_oid, &group_attr),
+                )?;
+                check(
+                    "set_vlan_attribute(UNKNOWN_MULTICAST_FLOOD_CONTROL_TYPE)",
+                    set(vlan_oid, &type_attr),
+                )
+            }
+        } else {
+            // SAFETY: attr outlives the call.
+            unsafe {
+                check(
+                    "set_vlan_attribute(UNKNOWN_MULTICAST_FLOOD_CONTROL_TYPE)",
+                    set(vlan_oid, &type_attr),
+                )
+            }
+        }
     }
 }
 

@@ -1,0 +1,18 @@
+Global IGMP Snooping configuration:
+-----------------------------------
+IGMP snooping           : Enabled
+Robustness variable     : 2
+
+Vlan 10 :
+---------
+IGMP snooping           : Enabled
+Querier                 : Disabled
+Fast-leave              : Enabled
+Mrouter ports           : Po1 (static)
+
+Vlan 20 :
+---------
+IGMP snooping           : Enabled
+Querier                 : Enabled (10.0.20.1)
+Fast-leave              : Disabled
+Mrouter ports           : None

@@ -1,0 +1,17 @@
+Port-Channel1, member Ethernet49
+  Partner Sys-ID   : 32768,d4:af:f7:12:9c:00
+  Partner Port     : 49
+  Partner Key      : 1
+  Partner Priority : 32768
+  Partner State    : ACDS----
+  Actor State      : ACDS----
+  Rate             : fast
+
+Port-Channel1, member Ethernet50
+  Partner Sys-ID   : 32768,d4:af:f7:12:9c:00
+  Partner Port     : 50
+  Partner Key      : 1
+  Partner Priority : 32768
+  Partner State    : ACDS----
+  Actor State      : ACDS----
+  Rate             : fast

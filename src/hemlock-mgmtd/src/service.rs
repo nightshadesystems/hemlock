@@ -17,6 +17,7 @@ use crate::store::{RollbackMeta, Store};
 pub struct Engine {
     store: Store,
     syncd: IpcEndpoint,
+    orch: IpcEndpoint,
     os: OsApplier,
     commit_seq: u64,
     /// Pending commit-confirm: the pre-commit running text to restore if no
@@ -31,10 +32,11 @@ struct PendingConfirm {
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
 impl Engine {
-    pub fn new(store: Store, syncd: IpcEndpoint, os: OsApplier) -> Self {
+    pub fn new(store: Store, syncd: IpcEndpoint, orch: IpcEndpoint, os: OsApplier) -> Self {
         Self {
             store,
             syncd,
+            orch,
             os,
             commit_seq: 0,
             pending_confirm: None,
@@ -46,6 +48,11 @@ impl Engine {
     ) -> Result<pb::syncd_client::SyncdClient<tonic::transport::Channel>> {
         let channel = self.syncd.connect().await.context("connecting to syncd")?;
         Ok(pb::syncd_client::SyncdClient::new(channel))
+    }
+
+    async fn orch_client(&self) -> Result<pb::orch_client::OrchClient<tonic::transport::Channel>> {
+        let channel = self.orch.connect().await.context("connecting to orch")?;
+        Ok(pb::orch_client::OrchClient::new(channel))
     }
 
     fn parse_intents(text: &str) -> Result<Intents> {
@@ -66,7 +73,13 @@ impl Engine {
                 }
             }
         }
-        if wanted.ports.is_empty() {
+        let port_references = !wanted.ports.is_empty()
+            || !wanted.mac_table.statics.is_empty()
+            || !wanted.mirror.is_empty()
+            || [&wanted.igmp_snooping, &wanted.mld_snooping]
+                .iter()
+                .any(|s| s.vlans.values().any(|v| !v.mrouters.is_empty()));
+        if !port_references {
             return Ok(());
         }
         let mut client = self.syncd_client().await?;
@@ -80,6 +93,45 @@ impl Engine {
         for name in wanted.ports.keys() {
             if !known.contains(name) {
                 anyhow::bail!("unknown interface {name:?}");
+            }
+        }
+        // L2 references may also name a configured port-channel.
+        let lags: std::collections::HashSet<String> = intents::lag_state(&wanted)
+            .keys()
+            .map(|group| format!("Port-Channel{group}"))
+            .collect();
+        let l2_ref = |name: &str| known.contains(name) || lags.contains(name);
+        for ((mac, vlan), target) in &wanted.mac_table.statics {
+            if let intents::FdbTarget::Port(port) = target {
+                if !l2_ref(port) {
+                    anyhow::bail!("mac-table static {mac} vlan {vlan}: unknown interface {port:?}");
+                }
+            }
+        }
+        for (session, mirror) in &wanted.mirror {
+            for port in mirror.sources.keys() {
+                if !l2_ref(port) {
+                    anyhow::bail!("mirror session {session}: unknown source {port:?}");
+                }
+            }
+            if let Some(dest) = &mirror.destination {
+                if !known.contains(dest) {
+                    anyhow::bail!(
+                        "mirror session {session}: destination must be a physical port, got {dest:?}"
+                    );
+                }
+            }
+        }
+        for (family, snooping) in [
+            ("igmp-snooping", &wanted.igmp_snooping),
+            ("mld-snooping", &wanted.mld_snooping),
+        ] {
+            for (vlan, config) in &snooping.vlans {
+                for port in &config.mrouters {
+                    if !l2_ref(port) {
+                        anyhow::bail!("{family} vlan {vlan}: unknown mrouter interface {port:?}");
+                    }
+                }
             }
         }
         Ok(())
@@ -121,11 +173,15 @@ impl Engine {
         let switchport_changes = intents::diff_switchports(&running_intents, &wanted_intents);
         if !vlan_changes.is_empty() || !switchport_changes.is_empty() {
             let mut client = self.syncd_client().await?;
-            for change in vlan_changes.iter().filter(|c| c.ensure.is_some()) {
+            for change in &vlan_changes {
+                let Some(vlan) = &change.ensure else {
+                    continue;
+                };
                 client
                     .ensure_vlan(pb::EnsureVlanRequest {
                         id: change.id.into(),
-                        name: change.ensure.clone().unwrap_or_default(),
+                        name: vlan.description.clone().unwrap_or_default(),
+                        suspend: vlan.suspended,
                     })
                     .await
                     .with_context(|| format!("applying {}", change.describe()))?;
@@ -190,6 +246,82 @@ impl Engine {
         }
         self.os.apply(&os_changes);
 
+        // Switching-suite families: the mac-table, storm-control and
+        // mirror deltas apply through syncd; the protocol families (LAG/
+        // LACP, STP, snooping) go to orch when its engines land — until
+        // then their diffs are computed and shown in the commit output.
+        let lag_changes = intents::diff_lags(&running_intents, &wanted_intents);
+        let stp_change = intents::diff_stp(&running_intents, &wanted_intents);
+        let igmp_change = intents::diff_snooping(
+            &running_intents.igmp_snooping,
+            &wanted_intents.igmp_snooping,
+        );
+        let mld_change =
+            intents::diff_snooping(&running_intents.mld_snooping, &wanted_intents.mld_snooping);
+        let mac_changes = intents::diff_mac_table(&running_intents, &wanted_intents);
+        let storm_changes = intents::diff_storm_control(&running_intents, &wanted_intents);
+        let mirror_changes = intents::diff_mirror(&running_intents, &wanted_intents);
+
+        // LAGs: ensure the syncd objects (and their switchport
+        // programs), push the protocol state to orch (which drives the
+        // member gates), then drop removed groups.
+        let lacp_changed = running_intents.lacp != wanted_intents.lacp;
+        if !lag_changes.is_empty() || lacp_changed {
+            let mut client = self.syncd_client().await?;
+            for change in lag_changes.iter().filter(|c| c.ensure.is_some()) {
+                let ensure = change.ensure.as_ref().expect("filtered on is_some");
+                self.ensure_lag(&mut client, change.group, ensure).await?;
+            }
+            self.push_lag_configs(&wanted_intents)
+                .await
+                .context("pushing LAG configs to orch")?;
+            for change in lag_changes.iter().filter(|c| c.ensure.is_none()) {
+                client
+                    .remove_lag(pb::RemoveLagRequest {
+                        group: u32::from(change.group),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+        }
+
+        if !mac_changes.is_empty() || !storm_changes.is_empty() || !mirror_changes.is_empty() {
+            let mut client = self.syncd_client().await?;
+            self.apply_switching(
+                &mut client,
+                &running_intents,
+                &mac_changes,
+                &storm_changes,
+                &mirror_changes,
+            )
+            .await?;
+        }
+
+        // Spanning tree: MST instances in syncd, then the full state to
+        // the orch engine (which drives the port states back into
+        // syncd).
+        if let Some(stp) = &stp_change {
+            let mut client = self.syncd_client().await?;
+            self.apply_stp_instances(&mut client, &running_intents.stp, &wanted_intents.stp)
+                .await?;
+            self.push_stp_config(stp)
+                .await
+                .context("pushing STP config to orch")?;
+        }
+
+        // Snooping: the full family state to the orch engines (which
+        // drive the L2MC programming back into syncd).
+        if let Some(snooping) = &igmp_change {
+            self.push_snooping_config("igmp", snooping)
+                .await
+                .context("pushing igmp-snooping config to orch")?;
+        }
+        if let Some(snooping) = &mld_change {
+            self.push_snooping_config("mld", snooping)
+                .await
+                .context("pushing mld-snooping config to orch")?;
+        }
+
         self.store.commit(
             new_text,
             &RollbackMeta {
@@ -206,7 +338,334 @@ impl Engine {
                 .map(intents::SwitchportChange::describe),
         );
         described.extend(os_changes.describe());
+        described.extend(lag_changes.iter().map(intents::LagChange::describe));
+        if stp_change.is_some() {
+            described.push("spanning-tree configuration updated".into());
+        }
+        if igmp_change.is_some() {
+            described.push("igmp-snooping configuration updated".into());
+        }
+        if mld_change.is_some() {
+            described.push("mld-snooping configuration updated".into());
+        }
+        described.extend(mac_changes.describe());
+        described.extend(storm_changes.iter().map(intents::StormChange::describe));
+        described.extend(mirror_changes.iter().map(intents::MirrorChange::describe));
+        described.extend(wanted_intents.warnings.iter().cloned());
         Ok(described)
+    }
+}
+
+impl Engine {
+    /// Ensure one port-channel in syncd: the LAG object itself plus its
+    /// switchport program. Membership and gates are orch's to drive.
+    async fn ensure_lag(
+        &self,
+        client: &mut pb::syncd_client::SyncdClient<tonic::transport::Channel>,
+        group: u16,
+        ensure: &intents::LagEnsure,
+    ) -> Result<()> {
+        client
+            .create_lag(pb::CreateLagRequest {
+                group: u32::from(group),
+                description: ensure.lag.description.clone().unwrap_or_default(),
+                admin_up: ensure.lag.admin_up.unwrap_or(true),
+            })
+            .await
+            .with_context(|| format!("ensuring Port-Channel{group}"))?;
+        let name = format!("Port-Channel{group}");
+        match &ensure.lag.switchport {
+            Some(sp) => {
+                client
+                    .set_port_switchport(switchport_request(&name, sp))
+                    .await
+                    .with_context(|| format!("applying {name} switchport"))?;
+            }
+            None => {
+                client
+                    .clear_port_switchport(pb::ClearPortSwitchportRequest { name: name.clone() })
+                    .await
+                    .with_context(|| format!("clearing {name} switchport"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Push the full wanted LAG/LACP state to orch (declarative; orch
+    /// tears down groups absent from the push). Orch being down fails
+    /// the commit the same way syncd being down does.
+    async fn push_lag_configs(&self, wanted: &Intents) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        let lags = intents::lag_state(wanted)
+            .into_iter()
+            .map(|(group, ensure)| pb::LagConfig {
+                group: u32::from(group),
+                min_links: u32::from(ensure.lag.min_links.unwrap_or(0)),
+                fallback: match ensure.lag.fallback {
+                    Some(intents::LagFallback::Static) => pb::LagFallbackMode::Static,
+                    Some(intents::LagFallback::Individual) => pb::LagFallbackMode::Individual,
+                    None => pb::LagFallbackMode::None,
+                } as i32,
+                fallback_timeout_secs: u32::from(ensure.lag.fallback_timeout.unwrap_or(90)),
+                members: ensure
+                    .members
+                    .iter()
+                    .map(|(port, (mode, lacp))| pb::LacpMemberConfig {
+                        port: port.clone(),
+                        mode: match mode {
+                            intents::LacpMode::Active => pb::LacpConfigMode::Active,
+                            intents::LacpMode::Passive => pb::LacpConfigMode::Passive,
+                            intents::LacpMode::On => pb::LacpConfigMode::On,
+                        } as i32,
+                        rate_fast: lacp.rate_fast,
+                        port_priority: u32::from(lacp.port_priority.unwrap_or(32768)),
+                    })
+                    .collect(),
+            })
+            .collect();
+        client
+            .set_lag_configs(pb::SetLagConfigsRequest {
+                lags,
+                system_priority: u32::from(wanted.lacp.system_priority.unwrap_or(32768)),
+            })
+            .await
+            .context("SetLagConfigs")?;
+        Ok(())
+    }
+
+    /// Push one snooping family's full wanted state to orch.
+    async fn push_snooping_config(
+        &self,
+        family: &str,
+        wanted: &intents::SnoopingIntent,
+    ) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_snooping_config(pb::SetSnoopingConfigRequest {
+                family: family.to_string(),
+                disabled: wanted.disabled,
+                robustness: u32::from(wanted.robustness.unwrap_or(2)),
+                vlans: wanted
+                    .vlans
+                    .iter()
+                    .map(|(vlan, config)| pb::SnoopingVlanConfig {
+                        vlan: u32::from(*vlan),
+                        disabled: config.disabled,
+                        fast_leave: config.fast_leave,
+                        querier: config.querier,
+                        querier_address: config.querier_address.clone().unwrap_or_default(),
+                        mrouters: config.mrouters.clone(),
+                    })
+                    .collect(),
+            })
+            .await
+            .context("SetSnoopingConfig")?;
+        Ok(())
+    }
+
+    /// Reconcile the MST instance objects in syncd: create/update the
+    /// wanted instances' VLAN mappings, drop the stale ones.
+    async fn apply_stp_instances(
+        &self,
+        client: &mut pb::syncd_client::SyncdClient<tonic::transport::Channel>,
+        running: &intents::StpIntent,
+        wanted: &intents::StpIntent,
+    ) -> Result<()> {
+        for (instance, vlans) in &wanted.instances {
+            if running.instances.get(instance) == Some(vlans) {
+                continue;
+            }
+            client
+                .create_stp_instance(pb::CreateStpInstanceRequest {
+                    instance: u32::from(*instance),
+                })
+                .await
+                .with_context(|| format!("creating mst instance {instance}"))?;
+            client
+                .set_stp_instance_vlans(pb::SetStpInstanceVlansRequest {
+                    instance: u32::from(*instance),
+                    vlans: vlans.iter().map(|v| u32::from(*v)).collect(),
+                })
+                .await
+                .with_context(|| format!("mapping mst instance {instance} vlans"))?;
+        }
+        for instance in running.instances.keys() {
+            if !wanted.instances.contains_key(instance) {
+                client
+                    .remove_stp_instance(pb::RemoveStpInstanceRequest {
+                        instance: u32::from(*instance),
+                    })
+                    .await
+                    .with_context(|| format!("removing mst instance {instance}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Push the full wanted spanning-tree state to orch.
+    async fn push_stp_config(&self, state: &intents::StpState) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_stp_config(pb::SetStpConfigRequest {
+                mode: match state.global.mode {
+                    intents::StpMode::Mstp => "mstp",
+                    intents::StpMode::Rstp => "rstp",
+                    intents::StpMode::None => "none",
+                }
+                .into(),
+                priority: u32::from(state.global.priority.unwrap_or(32768)),
+                hello_time: u32::from(state.global.hello_time.unwrap_or(2)),
+                max_age: u32::from(state.global.max_age.unwrap_or(20)),
+                forward_time: u32::from(state.global.forward_time.unwrap_or(15)),
+                mst_name: state.global.mst_name.clone().unwrap_or_default(),
+                mst_revision: u32::from(state.global.mst_revision.unwrap_or(0)),
+                instances: state
+                    .global
+                    .instances
+                    .iter()
+                    .map(|(instance, vlans)| pb::MstInstanceMap {
+                        instance: u32::from(*instance),
+                        vlans: vlans.iter().map(|v| u32::from(*v)).collect(),
+                    })
+                    .collect(),
+                ports: state
+                    .ports
+                    .iter()
+                    .map(|(port, config)| pb::StpPortConfig {
+                        port: port.clone(),
+                        portfast: config.portfast,
+                        bpduguard: config.bpduguard,
+                        cost: config.cost.unwrap_or(0),
+                        priority: u32::from(config.port_priority.unwrap_or(128)),
+                    })
+                    .collect(),
+            })
+            .await
+            .context("SetStpConfig")?;
+        Ok(())
+    }
+
+    /// Apply the switching-suite deltas (mac-table, storm-control,
+    /// mirror) through syncd. Mirror sources on port-channels are the
+    /// one deferred case (the ASIC mirrors ports, not LAGs) and are
+    /// skipped loudly.
+    async fn apply_switching(
+        &self,
+        client: &mut pb::syncd_client::SyncdClient<tonic::transport::Channel>,
+        running: &Intents,
+        mac_changes: &intents::MacTableChanges,
+        storm_changes: &[intents::StormChange],
+        mirror_changes: &[intents::MirrorChange],
+    ) -> Result<()> {
+        for (mac, vlan) in &mac_changes.remove {
+            client
+                .remove_static_fdb(pb::RemoveStaticFdbRequest {
+                    mac: mac.clone(),
+                    vlan: u32::from(*vlan),
+                })
+                .await
+                .with_context(|| format!("removing mac-table static {mac} vlan {vlan}"))?;
+        }
+        for (mac, vlan, target) in &mac_changes.add {
+            let (port, drop) = match target {
+                intents::FdbTarget::Port(port) => (port.clone(), false),
+                intents::FdbTarget::Drop => (String::new(), true),
+            };
+            client
+                .add_static_fdb(pb::AddStaticFdbRequest {
+                    mac: mac.clone(),
+                    vlan: u32::from(*vlan),
+                    port,
+                    drop,
+                })
+                .await
+                .with_context(|| format!("applying mac-table static {mac} vlan {vlan}"))?;
+        }
+        if let Some(secs) = mac_changes.aging_time {
+            client
+                .set_fdb_aging_time(pb::SetFdbAgingTimeRequest { seconds: secs })
+                .await
+                .with_context(|| format!("applying mac-table aging-time {secs}"))?;
+        }
+
+        for change in storm_changes {
+            client
+                .set_port_storm_control(pb::SetPortStormControlRequest {
+                    name: change.name.clone(),
+                    class: match change.kind {
+                        intents::StormKind::Broadcast => pb::StormClass::Broadcast,
+                        intents::StormKind::Multicast => pb::StormClass::Multicast,
+                        intents::StormKind::UnknownUnicast => pb::StormClass::UnknownUnicast,
+                    } as i32,
+                    level: change.level.clone(),
+                })
+                .await
+                .with_context(|| format!("applying {}", change.describe()))?;
+        }
+
+        for change in mirror_changes {
+            let Some(mirror) = &change.ensure else {
+                client
+                    .remove_mirror_session(pb::RemoveMirrorSessionRequest {
+                        session: u32::from(change.session),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+                continue;
+            };
+            let Some(destination) = &mirror.destination else {
+                warn!(
+                    session = change.session,
+                    "mirror session has no destination; not programmed"
+                );
+                continue;
+            };
+            client
+                .create_mirror_session(pb::CreateMirrorSessionRequest {
+                    session: u32::from(change.session),
+                    destination: destination.clone(),
+                })
+                .await
+                .with_context(|| format!("applying {}", change.describe()))?;
+            // Detach sources the previous program had and this one lost.
+            if let Some(had) = running.mirror.get(&change.session) {
+                for port in had.sources.keys() {
+                    if !mirror.sources.contains_key(port) {
+                        client
+                            .set_port_mirror(pb::SetPortMirrorRequest {
+                                name: port.clone(),
+                                session: u32::from(change.session),
+                                direction: pb::MirrorDirection::None as i32,
+                            })
+                            .await
+                            .with_context(|| {
+                                format!("detaching mirror source {port} (session {})", change.session)
+                            })?;
+                    }
+                }
+            }
+            for (port, direction) in &mirror.sources {
+                if port.starts_with("Port-Channel") {
+                    warn!(%port, "mirror source on a port-channel waits for LAG objects");
+                    continue;
+                }
+                client
+                    .set_port_mirror(pb::SetPortMirrorRequest {
+                        name: port.clone(),
+                        session: u32::from(change.session),
+                        direction: match direction {
+                            intents::MirrorDirection::Rx => pb::MirrorDirection::Rx,
+                            intents::MirrorDirection::Tx => pb::MirrorDirection::Tx,
+                            intents::MirrorDirection::Both => pb::MirrorDirection::Both,
+                        } as i32,
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("attaching mirror source {port} (session {})", change.session)
+                    })?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -214,10 +673,10 @@ impl Engine {
 fn switchport_request(name: &str, sp: &intents::SwitchportIntent) -> pb::SetPortSwitchportRequest {
     pb::SetPortSwitchportRequest {
         name: name.to_string(),
-        mode: if sp.trunk {
-            pb::SwitchportMode::Trunk
-        } else {
-            pb::SwitchportMode::Access
+        mode: match sp.mode {
+            intents::SwitchportMode::Access => pb::SwitchportMode::Access,
+            intents::SwitchportMode::Trunk => pb::SwitchportMode::Trunk,
+            intents::SwitchportMode::Dot1qTunnel => pb::SwitchportMode::Dot1qTunnel,
         } as i32,
         access_vlan: sp.access_vlan.map(u32::from).unwrap_or(0),
         trunk_vlans: sp.trunk_vlans.iter().map(|v| u32::from(*v)).collect(),
@@ -231,7 +690,14 @@ impl Engine {
     /// be replayed onto it (a restart of either daemon converges).
     pub async fn replay_running(&self) -> Result<usize> {
         let running = Self::parse_intents(&self.store.running()?)?;
-        if running.ports.is_empty() && running.vlans.is_empty() && running.svis.is_empty() {
+        let lag_state = intents::lag_state(&running);
+        if running.ports.is_empty()
+            && running.vlans.is_empty()
+            && running.svis.is_empty()
+            && running.mac_table == intents::MacTableIntent::default()
+            && running.mirror.is_empty()
+            && lag_state.is_empty()
+        {
             return Ok(0);
         }
         let mut client = self.syncd_client().await?;
@@ -242,6 +708,7 @@ impl Engine {
                 .ensure_vlan(pb::EnsureVlanRequest {
                     id: (*id).into(),
                     name: vlan.description.clone().unwrap_or_default(),
+                    suspend: vlan.suspended,
                 })
                 .await
                 .with_context(|| format!("replaying vlan {id}"))?;
@@ -295,6 +762,69 @@ impl Engine {
                     .with_context(|| format!("replaying address for {name}"))?;
                 applied += 1;
             }
+        }
+
+        // LAGs: syncd objects + switchport, then the protocol push to
+        // orch (which reconciles member gates from there).
+        if !lag_state.is_empty() {
+            for (group, ensure) in &lag_state {
+                self.ensure_lag(&mut client, *group, ensure)
+                    .await
+                    .with_context(|| format!("replaying Port-Channel{group}"))?;
+                applied += 1;
+            }
+        }
+        if !lag_state.is_empty() || running.lacp != intents::LacpGlobalIntent::default() {
+            self.push_lag_configs(&running)
+                .await
+                .context("replaying LAG configs to orch")?;
+        }
+
+        // Spanning tree: MST instances + the engine config, when the
+        // running config carries any STP state.
+        let stp_state = intents::stp_state(&running);
+        if stp_state != intents::StpState::default() {
+            self.apply_stp_instances(&mut client, &intents::StpIntent::default(), &running.stp)
+                .await
+                .context("replaying mst instances")?;
+            self.push_stp_config(&stp_state)
+                .await
+                .context("replaying STP config to orch")?;
+            applied += 1;
+        }
+
+        // Snooping families with any explicit config replay to orch.
+        for (family, snooping) in [
+            ("igmp", &running.igmp_snooping),
+            ("mld", &running.mld_snooping),
+        ] {
+            if *snooping != intents::SnoopingIntent::default() {
+                self.push_snooping_config(family, snooping)
+                    .await
+                    .with_context(|| format!("replaying {family}-snooping config to orch"))?;
+                applied += 1;
+            }
+        }
+
+        // The switching-suite families replay as a diff against nothing.
+        let empty = Intents::default();
+        let mac_changes = intents::diff_mac_table(&empty, &running);
+        let storm_changes = intents::diff_storm_control(&empty, &running);
+        let mirror_changes = intents::diff_mirror(&empty, &running);
+        if !mac_changes.is_empty() || !storm_changes.is_empty() || !mirror_changes.is_empty() {
+            applied += mac_changes.add.len()
+                + usize::from(mac_changes.aging_time.is_some())
+                + storm_changes.len()
+                + mirror_changes.len();
+            self.apply_switching(
+                &mut client,
+                &empty,
+                &mac_changes,
+                &storm_changes,
+                &mirror_changes,
+            )
+            .await
+            .context("replaying switching families")?;
         }
         Ok(applied)
     }

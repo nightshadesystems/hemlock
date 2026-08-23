@@ -1,0 +1,2 @@
+Number of existing VLANs         : 5
+Number of existing user VLANs    : 4

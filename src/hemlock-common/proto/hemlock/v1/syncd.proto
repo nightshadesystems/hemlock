@@ -31,10 +31,75 @@ service Syncd {
   // Remove a VLAN, detaching any remaining port memberships first.
   rpc RemoveVlan(RemoveVlanRequest) returns (RemoveVlanResponse);
   // Program a port's L2 switchport mode declaratively: memberships and
-  // PVID are reconciled to match the request.
+  // PVID are reconciled to match the request. A dot1q-tunnel mode also
+  // programs the port's TPID treatment (there is no separate
+  // SetPortTpidMode RPC: TPID rides the declarative switchport program,
+  // matching the one-RPC-per-port-state style of this service).
   rpc SetPortSwitchport(SetPortSwitchportRequest) returns (SetPortSwitchportResponse);
   // Back to default L2 (untagged member of the default VLAN).
   rpc ClearPortSwitchport(ClearPortSwitchportRequest) returns (ClearPortSwitchportResponse);
+
+  // --- MAC address table ----------------------------------------------
+  // syncd keeps a software mirror of the hardware FDB, fed by SAI FDB
+  // event notifications (learn/age/move); DumpFdb serves from it.
+  rpc SetFdbAgingTime(SetFdbAgingTimeRequest) returns (SetFdbAgingTimeResponse);
+  rpc AddStaticFdb(AddStaticFdbRequest) returns (AddStaticFdbResponse);
+  rpc RemoveStaticFdb(RemoveStaticFdbRequest) returns (RemoveStaticFdbResponse);
+  // Flush dynamic entries, optionally scoped to a VLAN and/or a port.
+  rpc FlushFdb(FlushFdbRequest) returns (FlushFdbResponse);
+  // Filtered, paged dump of the table (dynamic mirror + statics).
+  rpc DumpFdb(DumpFdbRequest) returns (DumpFdbResponse);
+  // Server-streaming feed of FDB changes (learn/age/move/flush).
+  rpc WatchFdbEvents(WatchFdbEventsRequest) returns (stream FdbEventMessage);
+
+  // --- Storm control --------------------------------------------------
+  // Percent levels; syncd converts percent to a rate from the port's
+  // speed at programming time and re-derives it on speed change.
+  rpc SetPortStormControl(SetPortStormControlRequest) returns (SetPortStormControlResponse);
+  rpc GetStormControl(GetStormControlRequest) returns (GetStormControlResponse);
+
+  // --- Port mirroring -------------------------------------------------
+  rpc CreateMirrorSession(CreateMirrorSessionRequest) returns (CreateMirrorSessionResponse);
+  rpc RemoveMirrorSession(RemoveMirrorSessionRequest) returns (RemoveMirrorSessionResponse);
+  // Attach/detach one source port (direction NONE detaches).
+  rpc SetPortMirror(SetPortMirrorRequest) returns (SetPortMirrorResponse);
+  rpc GetMirrorSessions(GetMirrorSessionsRequest) returns (GetMirrorSessionsResponse);
+
+  // --- Link aggregation -------------------------------------------------
+  // Ensure a port-channel exists (idempotent; updates description/admin).
+  // The LAG then takes the port-shaped RPCs by name ("Port-Channel1"):
+  // SetPortSwitchport, SetPortStormControl, AddStaticFdb targets.
+  rpc CreateLag(CreateLagRequest) returns (CreateLagResponse);
+  rpc RemoveLag(RemoveLagRequest) returns (RemoveLagResponse);
+  // Declarative membership, including each member's collect/distribute
+  // gate (LACP holds a member's gate closed until the partner syncs).
+  rpc SetLagMembers(SetLagMembersRequest) returns (SetLagMembersResponse);
+  rpc GetLags(GetLagsRequest) returns (GetLagsResponse);
+
+  // --- Spanning tree ----------------------------------------------------
+  // MST instances beyond the always-present default (instance 0).
+  rpc CreateStpInstance(CreateStpInstanceRequest) returns (CreateStpInstanceResponse);
+  rpc RemoveStpInstance(RemoveStpInstanceRequest) returns (RemoveStpInstanceResponse);
+  // Declarative VLAN mapping of one instance (dropped VLANs move back
+  // to the default instance).
+  rpc SetStpInstanceVlans(SetStpInstanceVlansRequest) returns (SetStpInstanceVlansResponse);
+  // A port's forwarding state within an instance (0 = every instance,
+  // the common case with one shared state machine).
+  rpc SetPortStpState(SetPortStpStateRequest) returns (SetPortStpStateResponse);
+  // BPDU-guard errdisable: admin-down with a recorded reason (an empty
+  // reason re-enables the port).
+  rpc SetPortErrdisable(SetPortErrdisableRequest) returns (SetPortErrdisableResponse);
+
+  // --- L2 multicast (IGMP/MLD snooping) ---------------------------------
+  // A (vlan, group) forwarding entry backed by an L2MC output group.
+  rpc EnsureL2mcGroup(EnsureL2mcGroupRequest) returns (EnsureL2mcGroupResponse);
+  // Declarative output ports of one (vlan, group).
+  rpc SetL2mcMembers(SetL2mcMembersRequest) returns (SetL2mcMembersResponse);
+  rpc RemoveL2mcGroup(RemoveL2mcGroupRequest) returns (RemoveL2mcGroupResponse);
+  // Unknown-multicast flood scope of a VLAN: restricted to `ports`
+  // (the mrouter set) while snooping is active, back to flood-all when
+  // not.
+  rpc SetVlanUnknownMcast(SetVlanUnknownMcastRequest) returns (SetVlanUnknownMcastResponse);
 }
 
 message GetSwitchInfoRequest {}
@@ -45,6 +110,21 @@ message SwitchInfo {
   string backend = 2;
   uint64 switch_oid = 3;
   uint32 port_count = 4;
+  // What the platform's SAI supports (probed at startup). A commit
+  // needing an absent capability fails cleanly, never silently no-ops.
+  SwitchCapabilities capabilities = 5;
+}
+
+message SwitchCapabilities {
+  bool lag = 1;
+  bool stp = 2;
+  bool fdb_flush = 3;
+  bool fdb_aging = 4;
+  bool l2mc = 5;
+  bool storm_control = 6;
+  bool mirror = 7;
+  uint32 mirror_sessions_max = 8;
+  bool port_tpid = 9;
 }
 
 message ListPortsRequest {}
@@ -99,6 +179,8 @@ message GetInterfacesResponse {
   repeated uint32 active_vlans = 3;
   // Display names of named VLANs.
   map<uint32, string> vlan_names = 4;
+  // VLANs configured `state suspend` (subset of active_vlans).
+  repeated uint32 suspended_vlans = 5;
 }
 
 // The full hardware counter set, baselined against the last clear.
@@ -210,6 +292,7 @@ message ClearCountersResponse {
 message EnsureVlanRequest {
   uint32 id = 1;    // 1..4094
   string name = 2;  // display name (config `description`); "" = unnamed
+  bool suspend = 3; // `state suspend`: the VLAN exists but forwards nothing
 }
 
 message EnsureVlanResponse {}
@@ -224,6 +307,9 @@ enum SwitchportMode {
   SWITCHPORT_MODE_UNSPECIFIED = 0;
   SWITCHPORT_MODE_ACCESS = 1;
   SWITCHPORT_MODE_TRUNK = 2;
+  // QinQ tunnel port: access-VLAN membership is the S-VLAN; the port's
+  // TPID mode changes so customer tags ride through untouched.
+  SWITCHPORT_MODE_DOT1Q_TUNNEL = 3;
 }
 
 message SetPortSwitchportRequest {
@@ -241,6 +327,302 @@ message ClearPortSwitchportRequest {
 }
 
 message ClearPortSwitchportResponse {}
+
+// --- MAC address table -----------------------------------------------
+
+message SetFdbAgingTimeRequest {
+  uint32 seconds = 1;  // 0 = no aging
+}
+
+message SetFdbAgingTimeResponse {}
+
+message AddStaticFdbRequest {
+  string mac = 1;   // colon-separated lowercase
+  uint32 vlan = 2;  // 1..4094
+  // Destination port; empty when `drop` is set.
+  string port = 3;
+  bool drop = 4;
+}
+
+message AddStaticFdbResponse {}
+
+message RemoveStaticFdbRequest {
+  string mac = 1;
+  uint32 vlan = 2;
+}
+
+message RemoveStaticFdbResponse {}
+
+message FlushFdbRequest {
+  uint32 vlan = 1;  // 0 = every VLAN
+  string port = 2;  // "" = every port
+}
+
+message FlushFdbResponse {
+  // Dynamic mirror entries dropped by this flush.
+  uint32 flushed = 1;
+}
+
+enum FdbEntryKind {
+  FDB_ENTRY_KIND_UNSPECIFIED = 0;
+  FDB_ENTRY_KIND_DYNAMIC = 1;
+  FDB_ENTRY_KIND_STATIC = 2;
+}
+
+message DumpFdbRequest {
+  // Filters; zero values match everything.
+  uint32 vlan = 1;
+  string port = 2;
+  string mac = 3;
+  FdbEntryKind kind = 4;
+  // Paging: entries per page (0 = all), and the opaque token from the
+  // previous page.
+  uint32 page_size = 5;
+  string page_token = 6;
+}
+
+message FdbEntryState {
+  uint32 vlan = 1;
+  string mac = 2;      // colon-separated lowercase
+  string port = 3;     // "" for drop entries
+  bool drop = 4;
+  bool is_static = 5;
+  uint32 moves = 6;
+  // Seconds since the entry last moved ports; unset = never moved.
+  optional uint64 seconds_since_move = 7;
+}
+
+message DumpFdbResponse {
+  repeated FdbEntryState entries = 1;
+  // Present when more pages follow.
+  string next_page_token = 2;
+  // Total entries matching the filter (across all pages).
+  uint32 total = 3;
+  uint32 aging_time_secs = 4;
+}
+
+message WatchFdbEventsRequest {}
+
+message FdbEventMessage {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_LEARNED = 1;
+    KIND_AGED = 2;
+    KIND_MOVED = 3;
+    KIND_FLUSHED = 4;
+  }
+  Kind kind = 1;
+  uint32 vlan = 2;
+  string mac = 3;
+  string port = 4;
+}
+
+// --- Storm control ---------------------------------------------------
+
+enum StormClass {
+  STORM_CLASS_UNSPECIFIED = 0;
+  STORM_CLASS_BROADCAST = 1;
+  STORM_CLASS_MULTICAST = 2;
+  STORM_CLASS_UNKNOWN_UNICAST = 3;
+}
+
+message SetPortStormControlRequest {
+  string name = 1;
+  StormClass class = 2;
+  // Percent with two decimals ("10.00"); absent = remove the policer.
+  optional string level = 3;
+}
+
+message SetPortStormControlResponse {}
+
+message GetStormControlRequest {}
+
+message StormControlEntry {
+  string name = 1;
+  StormClass class = 2;
+  string level = 3;      // percent, two decimals
+  uint64 rate_kbps = 4;  // derived from the port's current speed
+  uint64 drops = 5;      // policer red-packet count
+  bool active = 6;       // port is up (rate currently enforced)
+}
+
+message GetStormControlResponse {
+  repeated StormControlEntry entries = 1;
+}
+
+// --- Port mirroring --------------------------------------------------
+
+enum MirrorDirection {
+  MIRROR_DIRECTION_UNSPECIFIED = 0;
+  MIRROR_DIRECTION_NONE = 1;  // detach
+  MIRROR_DIRECTION_RX = 2;
+  MIRROR_DIRECTION_TX = 3;
+  MIRROR_DIRECTION_BOTH = 4;
+}
+
+message CreateMirrorSessionRequest {
+  uint32 session = 1;       // operator-visible id (1..4)
+  string destination = 2;   // physical port
+}
+
+message CreateMirrorSessionResponse {}
+
+message RemoveMirrorSessionRequest {
+  uint32 session = 1;
+}
+
+message RemoveMirrorSessionResponse {}
+
+message SetPortMirrorRequest {
+  string name = 1;
+  uint32 session = 2;
+  MirrorDirection direction = 3;
+}
+
+message SetPortMirrorResponse {}
+
+message GetMirrorSessionsRequest {}
+
+message MirrorSourceState {
+  string name = 1;
+  MirrorDirection direction = 2;
+}
+
+message MirrorSessionState {
+  uint32 session = 1;
+  string destination = 2;
+  bool destination_up = 3;
+  repeated MirrorSourceState sources = 4;
+}
+
+message GetMirrorSessionsResponse {
+  repeated MirrorSessionState sessions = 1;
+}
+
+// --- Link aggregation ------------------------------------------------
+
+message CreateLagRequest {
+  uint32 group = 1;        // 1..64 -> "Port-Channel<group>"
+  string description = 2;
+  bool admin_up = 3;
+}
+
+message CreateLagResponse {}
+
+message RemoveLagRequest {
+  uint32 group = 1;
+}
+
+message RemoveLagResponse {}
+
+message LagMemberSpec {
+  string port = 1;
+  // The collect/distribute gate: enabled members forward.
+  bool enabled = 2;
+}
+
+message SetLagMembersRequest {
+  uint32 group = 1;
+  repeated LagMemberSpec members = 2;
+}
+
+message SetLagMembersResponse {}
+
+message GetLagsRequest {}
+
+message LagMemberState {
+  string port = 1;
+  bool enabled = 2;
+  bool oper_up = 3;
+}
+
+message LagState {
+  uint32 group = 1;
+  string description = 2;
+  bool admin_up = 3;
+  repeated LagMemberState members = 4;
+}
+
+message GetLagsResponse {
+  repeated LagState lags = 1;
+}
+
+// --- Spanning tree ---------------------------------------------------
+
+message CreateStpInstanceRequest {
+  uint32 instance = 1;  // 1..15
+}
+
+message CreateStpInstanceResponse {}
+
+message RemoveStpInstanceRequest {
+  uint32 instance = 1;
+}
+
+message RemoveStpInstanceResponse {}
+
+message SetStpInstanceVlansRequest {
+  uint32 instance = 1;
+  repeated uint32 vlans = 2;
+}
+
+message SetStpInstanceVlansResponse {}
+
+enum StpState {
+  STP_STATE_UNSPECIFIED = 0;
+  STP_STATE_BLOCKING = 1;
+  STP_STATE_LEARNING = 2;
+  STP_STATE_FORWARDING = 3;
+}
+
+message SetPortStpStateRequest {
+  string name = 1;
+  // 0 = apply to the default instance and every created MST instance.
+  uint32 instance = 2;
+  StpState state = 3;
+}
+
+message SetPortStpStateResponse {}
+
+message SetPortErrdisableRequest {
+  string name = 1;
+  // e.g. "bpduguard"; empty = re-enable.
+  string reason = 2;
+}
+
+message SetPortErrdisableResponse {}
+
+// --- L2 multicast ----------------------------------------------------
+
+message EnsureL2mcGroupRequest {
+  uint32 vlan = 1;
+  string group = 2;  // group IP (IPv4 for IGMP, IPv6 for MLD)
+}
+
+message EnsureL2mcGroupResponse {}
+
+message SetL2mcMembersRequest {
+  uint32 vlan = 1;
+  string group = 2;
+  repeated string ports = 3;
+}
+
+message SetL2mcMembersResponse {}
+
+message RemoveL2mcGroupRequest {
+  uint32 vlan = 1;
+  string group = 2;
+}
+
+message RemoveL2mcGroupResponse {}
+
+message SetVlanUnknownMcastRequest {
+  uint32 vlan = 1;
+  bool restrict = 2;
+  repeated string ports = 3;
+}
+
+message SetVlanUnknownMcastResponse {}
 
 message SetInterfaceAddressRequest {
   string name = 1;     // port name, e.g. "Ethernet49"

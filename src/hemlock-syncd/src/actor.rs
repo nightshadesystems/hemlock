@@ -12,13 +12,13 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 use hemlock_platform::Platform;
 use hemlock_sai::{
-    IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiError,
-    SaiEvent, SwitchInfo,
+    FdbAction, FdbEventKind, IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget,
+    SaiBackend, SaiCapabilities, SaiError, SaiEvent, StormClass, StpPortState, SwitchInfo,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::state::{name_for, PortState, SharedPorts, SharedVlans, SwitchMeta};
+use crate::state::{name_for, FdbDynamicEntry, PortState, SharedFdb, SharedPorts, SharedVlans, SwitchMeta};
 
 /// One port's stat sweep result.
 pub struct PortStatsSample {
@@ -97,6 +97,123 @@ pub enum SaiCmd {
         rif: Oid,
         reply: oneshot::Sender<Result<(), SaiError>>,
     },
+    SetFdbAging {
+        secs: u32,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    AddFdbEntry {
+        vlan: Option<Oid>,
+        mac: [u8; 6],
+        action: FdbAction,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemoveFdbEntry {
+        vlan: Option<Oid>,
+        mac: [u8; 6],
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    FlushFdb {
+        vlan: Option<Oid>,
+        port: Option<PortId>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortStorm {
+        port: PortId,
+        class: StormClass,
+        kbps: Option<u64>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    PortStormDrops {
+        port: PortId,
+        class: StormClass,
+        reply: oneshot::Sender<Result<u64, SaiError>>,
+    },
+    CreateMirrorSession {
+        monitor: PortId,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveMirrorSession {
+        session: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortMirror {
+        port: PortId,
+        ingress: Option<Oid>,
+        egress: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortTpid {
+        port: PortId,
+        tpid: u16,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateLag {
+        reply: oneshot::Sender<Result<PortId, SaiError>>,
+    },
+    RemoveLag {
+        lag: PortId,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    AddLagMember {
+        lag: PortId,
+        port: PortId,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveLagMember {
+        member: Oid,
+        port: PortId,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetLagMemberState {
+        member: Oid,
+        enabled: bool,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateStpInstance {
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveStpInstance {
+        stp: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetVlanStpInstance {
+        vlan: Option<Oid>,
+        stp: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetStpPortState {
+        stp: Option<Oid>,
+        port: PortId,
+        state: StpPortState,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateL2mcGroup {
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveL2mcGroup {
+        group: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    AddL2mcMember {
+        group: Oid,
+        port: PortId,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveL2mcMember {
+        member: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetL2mcEntry {
+        vlan: Option<Oid>,
+        group_ip: std::net::IpAddr,
+        l2mc: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetVlanUnknownMcast {
+        vlan: Option<Oid>,
+        l2mc: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
 }
 
 /// A port's oper status changed (already applied to shared state).
@@ -106,15 +223,43 @@ pub struct OperEvent {
     pub oper_up: bool,
 }
 
+/// An FDB change, resolved to display names (already applied to the
+/// software mirror). Feeds `WatchFdbEvents`.
+#[derive(Debug, Clone)]
+pub struct FdbNotify {
+    pub kind: FdbEventKind,
+    pub vlan: u16,
+    /// Colon-separated lowercase.
+    pub mac: String,
+    pub port: Option<String>,
+}
+
 pub struct SaiHandle {
     pub switch: SwitchMeta,
     pub backend_name: String,
     pub platform_id: String,
+    /// What the platform's SAI supports (probed at startup).
+    pub capabilities: SaiCapabilities,
+    /// The default 802.1Q VLAN's object id (scoped FDB flushes on VLAN 1).
+    pub default_vlan_oid: u64,
     pub ports: SharedPorts,
     /// Created VLANs (the default VLAN appears only if named).
     pub vlans: SharedVlans,
+    /// Software mirror of the hardware FDB (dynamics from SAI events).
+    pub fdb: SharedFdb,
+    /// Mirror sessions keyed by operator-visible id.
+    pub mirrors: crate::state::SharedMirrors,
+    /// Port-channels keyed by group number.
+    pub lags: crate::state::SharedLags,
+    /// MST instances keyed by instance number.
+    pub stps: crate::state::SharedStps,
+    /// Snooping-programmed multicast groups keyed by (vlan, group IP).
+    pub l2mc: crate::state::SharedL2mc,
+    /// Per-VLAN unknown-multicast restriction groups.
+    pub unknown_mcast: crate::state::SharedUnknownMcast,
     cmd_tx: mpsc::Sender<SaiCmd>,
     pub events: broadcast::Sender<OperEvent>,
+    pub fdb_events: broadcast::Sender<FdbNotify>,
 }
 
 impl SaiHandle {
@@ -218,6 +363,192 @@ impl SaiHandle {
             .await
     }
 
+    pub async fn set_fdb_aging(&self, secs: u32) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetFdbAging { secs, reply }).await
+    }
+
+    pub async fn add_fdb_entry(
+        &self,
+        vlan: Option<Oid>,
+        mac: [u8; 6],
+        action: FdbAction,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::AddFdbEntry {
+            vlan,
+            mac,
+            action,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_fdb_entry(&self, vlan: Option<Oid>, mac: [u8; 6]) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveFdbEntry { vlan, mac, reply })
+            .await
+    }
+
+    pub async fn flush_fdb(&self, vlan: Option<Oid>, port: Option<PortId>) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::FlushFdb { vlan, port, reply })
+            .await
+    }
+
+    pub async fn set_port_storm(
+        &self,
+        port: PortId,
+        class: StormClass,
+        kbps: Option<u64>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortStorm {
+            port,
+            class,
+            kbps,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn port_storm_drops(&self, port: PortId, class: StormClass) -> Result<u64, SaiError> {
+        self.call(|reply| SaiCmd::PortStormDrops { port, class, reply })
+            .await
+    }
+
+    pub async fn create_mirror_session(&self, monitor: PortId) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateMirrorSession { monitor, reply })
+            .await
+    }
+
+    pub async fn remove_mirror_session(&self, session: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveMirrorSession { session, reply })
+            .await
+    }
+
+    pub async fn set_port_mirror(
+        &self,
+        port: PortId,
+        ingress: Option<Oid>,
+        egress: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortMirror {
+            port,
+            ingress,
+            egress,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_port_tpid(&self, port: PortId, tpid: u16) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortTpid { port, tpid, reply })
+            .await
+    }
+
+    pub async fn create_lag(&self) -> Result<PortId, SaiError> {
+        self.call(|reply| SaiCmd::CreateLag { reply }).await
+    }
+
+    pub async fn remove_lag(&self, lag: PortId) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveLag { lag, reply }).await
+    }
+
+    pub async fn add_lag_member(&self, lag: PortId, port: PortId) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::AddLagMember { lag, port, reply })
+            .await
+    }
+
+    pub async fn remove_lag_member(&self, member: Oid, port: PortId) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveLagMember {
+            member,
+            port,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_lag_member_state(&self, member: Oid, enabled: bool) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetLagMemberState {
+            member,
+            enabled,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn create_stp_instance(&self) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateStpInstance { reply }).await
+    }
+
+    pub async fn remove_stp_instance(&self, stp: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveStpInstance { stp, reply })
+            .await
+    }
+
+    pub async fn set_vlan_stp_instance(
+        &self,
+        vlan: Option<Oid>,
+        stp: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetVlanStpInstance { vlan, stp, reply })
+            .await
+    }
+
+    pub async fn set_stp_port_state(
+        &self,
+        stp: Option<Oid>,
+        port: PortId,
+        state: StpPortState,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetStpPortState {
+            stp,
+            port,
+            state,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn create_l2mc_group(&self) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateL2mcGroup { reply }).await
+    }
+
+    pub async fn remove_l2mc_group(&self, group: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveL2mcGroup { group, reply })
+            .await
+    }
+
+    pub async fn add_l2mc_member(&self, group: Oid, port: PortId) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::AddL2mcMember { group, port, reply })
+            .await
+    }
+
+    pub async fn remove_l2mc_member(&self, member: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveL2mcMember { member, reply })
+            .await
+    }
+
+    pub async fn set_l2mc_entry(
+        &self,
+        vlan: Option<Oid>,
+        group_ip: std::net::IpAddr,
+        l2mc: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetL2mcEntry {
+            vlan,
+            group_ip,
+            l2mc,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_vlan_unknown_mcast(
+        &self,
+        vlan: Option<Oid>,
+        l2mc: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetVlanUnknownMcast { vlan, l2mc, reply })
+            .await
+    }
+
     pub async fn remove_vlan_rif(&self, rif: Oid) -> Result<(), SaiError> {
         self.call(|reply| SaiCmd::RemoveVlanRif { rif, reply })
             .await
@@ -273,7 +604,7 @@ impl SaiActor {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<SaiCmd>(64);
         let (init_tx, init_rx) =
-            oneshot::channel::<Result<(SwitchInfo, HashMap<String, PortState>)>>();
+            oneshot::channel::<Result<(SwitchInfo, SaiCapabilities, HashMap<String, PortState>)>>();
 
         let sai_events = backend
             .take_events()
@@ -368,27 +699,155 @@ impl SaiActor {
                         SaiCmd::RemoveVlanRif { rif, reply } => {
                             let _ = reply.send(backend.remove_vlan_router_interface(rif));
                         }
+                        SaiCmd::SetFdbAging { secs, reply } => {
+                            let _ = reply.send(backend.set_fdb_aging(secs));
+                        }
+                        SaiCmd::AddFdbEntry {
+                            vlan,
+                            mac,
+                            action,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.add_fdb_entry(vlan, mac, action));
+                        }
+                        SaiCmd::RemoveFdbEntry { vlan, mac, reply } => {
+                            let _ = reply.send(backend.remove_fdb_entry(vlan, mac));
+                        }
+                        SaiCmd::FlushFdb { vlan, port, reply } => {
+                            let _ = reply.send(backend.flush_fdb(vlan, port));
+                        }
+                        SaiCmd::SetPortStorm {
+                            port,
+                            class,
+                            kbps,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_port_storm_control(port, class, kbps));
+                        }
+                        SaiCmd::PortStormDrops { port, class, reply } => {
+                            let _ = reply.send(backend.port_storm_drops(port, class));
+                        }
+                        SaiCmd::CreateMirrorSession { monitor, reply } => {
+                            let _ = reply.send(backend.create_mirror_session(monitor));
+                        }
+                        SaiCmd::RemoveMirrorSession { session, reply } => {
+                            let _ = reply.send(backend.remove_mirror_session(session));
+                        }
+                        SaiCmd::SetPortMirror {
+                            port,
+                            ingress,
+                            egress,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_port_mirror(port, ingress, egress));
+                        }
+                        SaiCmd::SetPortTpid { port, tpid, reply } => {
+                            let _ = reply.send(backend.set_port_tpid(port, tpid));
+                        }
+                        SaiCmd::CreateLag { reply } => {
+                            let _ = reply.send(backend.create_lag());
+                        }
+                        SaiCmd::RemoveLag { lag, reply } => {
+                            let _ = reply.send(backend.remove_lag(lag));
+                        }
+                        SaiCmd::AddLagMember { lag, port, reply } => {
+                            let _ = reply.send(backend.add_lag_member(lag, port));
+                        }
+                        SaiCmd::RemoveLagMember {
+                            member,
+                            port,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.remove_lag_member(member, port));
+                        }
+                        SaiCmd::SetLagMemberState {
+                            member,
+                            enabled,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_lag_member_state(member, enabled));
+                        }
+                        SaiCmd::CreateStpInstance { reply } => {
+                            let _ = reply.send(backend.create_stp_instance());
+                        }
+                        SaiCmd::RemoveStpInstance { stp, reply } => {
+                            let _ = reply.send(backend.remove_stp_instance(stp));
+                        }
+                        SaiCmd::SetVlanStpInstance { vlan, stp, reply } => {
+                            let _ = reply.send(backend.set_vlan_stp_instance(vlan, stp));
+                        }
+                        SaiCmd::SetStpPortState {
+                            stp,
+                            port,
+                            state,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_stp_port_state(stp, port, state));
+                        }
+                        SaiCmd::CreateL2mcGroup { reply } => {
+                            let _ = reply.send(backend.create_l2mc_group());
+                        }
+                        SaiCmd::RemoveL2mcGroup { group, reply } => {
+                            let _ = reply.send(backend.remove_l2mc_group(group));
+                        }
+                        SaiCmd::AddL2mcMember { group, port, reply } => {
+                            let _ = reply.send(backend.add_l2mc_member(group, port));
+                        }
+                        SaiCmd::RemoveL2mcMember { member, reply } => {
+                            let _ = reply.send(backend.remove_l2mc_member(member));
+                        }
+                        SaiCmd::SetL2mcEntry {
+                            vlan,
+                            group_ip,
+                            l2mc,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_l2mc_entry(vlan, group_ip, l2mc));
+                        }
+                        SaiCmd::SetVlanUnknownMcast { vlan, l2mc, reply } => {
+                            let _ = reply.send(backend.set_vlan_unknown_mcast_group(vlan, l2mc));
+                        }
                     }
                 }
                 debug!("sai actor thread exiting");
             })
             .context("spawning sai-actor thread")?;
 
-        let (switch, port_map) = init_rx.await.context("SAI init aborted")??;
+        let (switch, capabilities, port_map) = init_rx.await.context("SAI init aborted")??;
         let ports: SharedPorts = std::sync::Arc::new(std::sync::RwLock::new(port_map));
+        let vlans = SharedVlans::default();
+        let fdb = SharedFdb::default();
 
         // Event pump: apply SAI notifications to shared state, then fan out.
         let (events, _) = broadcast::channel(256);
-        tokio::spawn(pump_events(sai_events, ports.clone(), events.clone()));
+        let (fdb_events, _) = broadcast::channel(1024);
+        tokio::spawn(pump_events(
+            sai_events,
+            ports.clone(),
+            vlans.clone(),
+            fdb.clone(),
+            switch.default_vlan_oid,
+            events.clone(),
+            fdb_events.clone(),
+        ));
 
         Ok(SaiHandle {
             switch: SwitchMeta { oid: switch.oid },
             backend_name,
             platform_id,
+            capabilities,
+            default_vlan_oid: switch.default_vlan_oid,
             ports,
-            vlans: SharedVlans::default(),
+            vlans,
+            fdb,
+            mirrors: crate::state::SharedMirrors::default(),
+            lags: crate::state::SharedLags::default(),
+            stps: crate::state::SharedStps::default(),
+            l2mc: crate::state::SharedL2mc::default(),
+            unknown_mcast: crate::state::SharedUnknownMcast::default(),
             cmd_tx,
             events,
+            fdb_events,
         })
     }
 }
@@ -398,9 +857,15 @@ impl SaiActor {
 fn init_switch(
     backend: &mut dyn SaiBackend,
     port_defs: &[hemlock_platform::PortDef],
-) -> Result<(SwitchInfo, HashMap<String, PortState>)> {
+) -> Result<(SwitchInfo, SaiCapabilities, HashMap<String, PortState>)> {
     let switch = backend.create_switch().context("create_switch")?;
     info!(oid = format_args!("{:#x}", switch.oid), "switch created");
+
+    // Capability probe: which optional SAI families this platform's
+    // library actually implements. Recorded once; the service gates
+    // RPCs on it so unsupported commits fail cleanly.
+    let capabilities = backend.capabilities().context("capability probe")?;
+    info!(?capabilities, "SAI capability probe");
 
     let sai_ports = backend.ports().context("enumerating ports")?;
 
@@ -435,6 +900,8 @@ fn init_switch(
                 description: String::new(),
                 l3: None,
                 switchport: None,
+                storm: std::collections::BTreeMap::new(),
+                errdisable_reason: None,
             },
         );
     }
@@ -475,13 +942,23 @@ fn init_switch(
         }
     }
 
-    Ok((switch, ports))
+    Ok((switch, capabilities, ports))
 }
 
+/// Colon-separated lowercase MAC display form.
+pub fn format_mac(mac: [u8; 6]) -> String {
+    mac.map(|b| format!("{b:02x}")).join(":")
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn pump_events(
     mut sai_events: mpsc::UnboundedReceiver<SaiEvent>,
     ports: SharedPorts,
+    vlans: SharedVlans,
+    fdb: SharedFdb,
+    default_vlan_oid: u64,
     out: broadcast::Sender<OperEvent>,
+    fdb_out: broadcast::Sender<FdbNotify>,
 ) {
     while let Some(event) = sai_events.recv().await {
         match event {
@@ -503,6 +980,68 @@ async fn pump_events(
                 };
                 debug!(%name, up, "port oper status");
                 let _ = out.send(OperEvent { name, oper_up: up });
+            }
+            SaiEvent::Fdb {
+                kind,
+                bv_id,
+                mac,
+                port,
+            } => {
+                // Resolve the notification's raw ids to display terms.
+                let vlan = if bv_id == default_vlan_oid {
+                    Some(1)
+                } else {
+                    vlans.read().ok().and_then(|table| {
+                        table
+                            .iter()
+                            .find(|(_, v)| v.oid.map(|o| o.0) == Some(bv_id))
+                            .map(|(id, _)| *id)
+                    })
+                };
+                let Some(vlan) = vlan else {
+                    debug!(bv_id, "FDB event on unknown VLAN; dropped");
+                    continue;
+                };
+                let port_name = port.and_then(|id| {
+                    ports.read().ok().and_then(|table| name_for(&table, id))
+                });
+                let mac_text = format_mac(mac);
+
+                // Apply to the software mirror.
+                if let Ok(mut table) = fdb.write() {
+                    let key = (vlan, mac_text.clone());
+                    match kind {
+                        FdbEventKind::Learned | FdbEventKind::Moved => {
+                            if let Some(port_name) = &port_name {
+                                let now = std::time::Instant::now();
+                                table
+                                    .dynamics
+                                    .entry(key)
+                                    .and_modify(|entry| {
+                                        if entry.port != *port_name {
+                                            entry.port = port_name.clone();
+                                            entry.moves += 1;
+                                            entry.last_move = Some(now);
+                                        }
+                                    })
+                                    .or_insert(FdbDynamicEntry {
+                                        port: port_name.clone(),
+                                        moves: 1,
+                                        last_move: Some(now),
+                                    });
+                            }
+                        }
+                        FdbEventKind::Aged | FdbEventKind::Flushed => {
+                            table.dynamics.remove(&key);
+                        }
+                    }
+                }
+                let _ = fdb_out.send(FdbNotify {
+                    kind,
+                    vlan,
+                    mac: mac_text,
+                    port: port_name,
+                });
             }
         }
     }

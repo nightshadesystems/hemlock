@@ -46,6 +46,56 @@ pub fn validate_route(prefix: &str, next_hop: &str) -> Result<String, String> {
     Ok(format!("{}/{len}", network(addr, len)))
 }
 
+/// A MAC address, canonicalized to colon-separated lowercase. Accepts
+/// the colon (`00:50:56:be:ef:01`), dashed (`00-50-56-be-ef-01`) and
+/// dotted (`0050.56be.ef01`) forms.
+pub fn parse_mac(text: &str) -> Result<String, String> {
+    let hex: String = text
+        .chars()
+        .filter(|c| !matches!(c, ':' | '-' | '.'))
+        .collect();
+    if hex.len() != 12 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("bad MAC address {text:?}"));
+    }
+    let hex = hex.to_ascii_lowercase();
+    let octets: Vec<&str> = (0..6).map(|i| &hex[i * 2..i * 2 + 2]).collect();
+    Ok(octets.join(":"))
+}
+
+/// [`parse_mac`], additionally requiring a unicast address.
+pub fn parse_unicast_mac(text: &str) -> Result<String, String> {
+    let mac = parse_mac(text)?;
+    let first = u8::from_str_radix(&mac[0..2], 16).unwrap_or(0);
+    if first & 1 != 0 {
+        return Err(format!("{mac} is not a unicast MAC address"));
+    }
+    Ok(mac)
+}
+
+/// A storm-control percent level, canonicalized to two decimals
+/// (`10` -> `10.00`, `10.5` -> `10.50`); 0.00..=100.00.
+pub fn parse_storm_level(text: &str) -> Result<String, String> {
+    let bad = || format!("bad level {text:?} (0.00..100.00)");
+    let (whole, frac) = match text.split_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        None => (text, ""),
+    };
+    if whole.is_empty()
+        || whole.len() > 3
+        || frac.len() > 2
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || !frac.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let whole_n: u32 = whole.parse().map_err(|_| bad())?;
+    let hundredths: u32 = format!("{frac:0<2}").parse().map_err(|_| bad())?;
+    if whole_n > 100 || (whole_n == 100 && hundredths > 0) {
+        return Err(bad());
+    }
+    Ok(format!("{whole_n}.{hundredths:02}"))
+}
+
 /// The network address of `addr/len` (host bits cleared).
 pub fn network(addr: IpAddr, len: u8) -> IpAddr {
     match addr {

@@ -45,6 +45,7 @@ pub struct Endpoints {
     pub syncd: IpcEndpoint,
     pub pmon: IpcEndpoint,
     pub mgmtd: IpcEndpoint,
+    pub orch: IpcEndpoint,
 }
 
 enum Mode {
@@ -230,7 +231,7 @@ fn fail(err: anyhow::Error) -> Step {
 pub(crate) fn fmt_err(err: anyhow::Error) -> String {
     let text = format!("{err:#}");
     if text.contains("ipc failure") {
-        for daemon in ["syncd", "pmon", "mgmtd"] {
+        for daemon in ["syncd", "pmon", "mgmtd", "orch"] {
             if text.contains(&format!("/{daemon}.sock")) {
                 if text.contains("Permission denied") {
                     return format!(
@@ -282,6 +283,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
     const COMMANDS: &[&str] = &[
         "show",
         "configure",
+        "clear",
         "upgrade",
         "bash",
         "exit",
@@ -293,6 +295,10 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
     match resolve(words[0], COMMANDS)? {
         "show" => {
             show_command(endpoints, &words[1..]).await?;
+            stay(Mode::Operational)
+        }
+        "clear" => {
+            crate::switching::cmd::clear(&endpoints.syncd, &words[1..]).await?;
             stay(Mode::Operational)
         }
         "upgrade" => {
@@ -320,6 +326,12 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
                 "  show configuration                     running configuration (config/conf ok)"
             );
             println!("  show version                           software / platform");
+            println!("  show vlan [id <set>|summary]           VLAN table");
+            println!("  show mac address-table [...]           MAC table (count, aging-time, filters)");
+            println!("  show storm-control                     storm-control levels and drops");
+            println!("  show mirror                            mirror sessions (monitor session ok)");
+            println!("  clear counters [<interface>]           baseline interface counters");
+            println!("  clear mac-table [vlan <id>] [interface <port>]   flush dynamic MACs");
             println!("  configure | conf                       enter configuration mode");
             println!("  upgrade <image.bin> [force] [reboot]   install an OS image (via mgmtd)");
             println!("  bash                                   drop to the Linux shell");
@@ -374,8 +386,18 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "config",
         "conf",
         "version",
+        "vlan",
+        "mac",
+        "storm-control",
+        "mirror",
+        "monitor",
+        "port-channel",
+        "lacp",
+        "spanning-tree",
+        "igmp",
+        "mld",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -401,6 +423,38 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "version" => {
                 show::version(endpoints.syncd.clone()).await;
                 Ok(())
+            }
+            "vlan" => crate::switching::cmd::show_vlan(&endpoints.syncd, &words[1..]).await,
+            "mac" => crate::switching::cmd::show_mac(&endpoints.syncd, &words[1..]).await,
+            "storm-control" => {
+                crate::switching::cmd::show_storm_control(&endpoints.syncd, &words[1..]).await
+            }
+            "mirror" => crate::switching::cmd::show_mirror(&endpoints.syncd, &words[1..]).await,
+            "port-channel" => {
+                crate::switching::cmd::show_port_channel(
+                    &endpoints.syncd,
+                    &endpoints.orch,
+                    &words[1..],
+                )
+                .await
+            }
+            "lacp" => {
+                crate::switching::cmd::show_lacp(&endpoints.syncd, &endpoints.orch, &words[1..])
+                    .await
+            }
+            "spanning-tree" => {
+                crate::switching::cmd::show_spanning_tree(&endpoints.orch, &words[1..]).await
+            }
+            family @ ("igmp" | "mld") => {
+                crate::switching::cmd::show_snooping(&endpoints.orch, family, &words[1..]).await
+            }
+            "monitor" => {
+                // `show monitor session` is the EOS-habitual alias.
+                let Some(keyword) = words.get(1) else {
+                    return Err("% Usage: show monitor session".into());
+                };
+                resolve(keyword, &["session"])?;
+                crate::switching::cmd::show_mirror(&endpoints.syncd, &words[2..]).await
             }
             _ => unreachable!(),
         }
@@ -478,20 +532,35 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces <port> shutdown | no-shutdown");
             println!("  set interfaces <port> address <ip/prefix>     puts the port in L3 mode");
             println!("  set interfaces Vlan<id> address <ip/prefix>   SVI (in-band management)");
-            println!("  set interfaces <port> switchport mode <access|trunk>");
+            println!("  set interfaces <port> switchport mode <access|trunk|dot1q-tunnel>");
             println!("  set interfaces <port> switchport access vlan <id>");
             println!("  set interfaces <port> switchport trunk vlans <list>   e.g. 10,20,30-32");
             println!("  set interfaces <port> switchport trunk native vlan <id>");
-            println!("  set vlans vlan <id> [description <text>]");
+            println!("  set interfaces <port> channel-group <1-64> mode <active|passive|on>");
+            println!("  set interfaces <port> lacp rate <normal|fast> | port-priority <n>");
+            println!("  set interfaces <port> spanning-tree [portfast|bpduguard|cost <n>|port-priority <n>]");
+            println!("  set interfaces <port> storm-control <class> level <0.00-100.00>");
+            println!("  set interfaces Port-Channel<n> [min-links <0-8> | lacp fallback <static|individual>");
+            println!("                                  | lacp fallback-timeout <1-900> | switchport ...]");
+            println!("  set vlans vlan <id> [description <text> | state <active|suspend>]");
+            println!("  set protocols spanning-tree [mode <mstp|rstp|none>|priority|hello-time|max-age|");
+            println!("                               forward-time|mst name|mst revision|mst instance ...]");
+            println!("  set protocols <igmp-snooping|mld-snooping> [disable|robustness <1-3>|vlan <id> ...]");
+            println!("  set protocols lacp system-priority <0-65535>");
+            println!("  set switching mac-table [aging-time <s> | static <mac> vlan <id> interface <port>|drop]");
+            println!("  set switching mirror session <1-4> [source <port> [rx|tx|both] | destination <port>]");
             println!("  set system ssh                                enable the SSH server");
             println!("  set system ssh authentication local           password logins (PAM)");
             println!("  set system http                               web console over HTTP");
             println!("  set system https                              web console over HTTPS (self-signed cert)");
             println!("  set routing static <prefix> <next-hop>        static route");
-            println!("  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport ...]");
-            println!("  delete vlans vlan <id> [description]");
+            println!("  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport|");
+            println!("                            channel-group|lacp|spanning-tree|storm-control|min-links ...]");
+            println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
             println!("  delete routing [static [<prefix>]]");
+            println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
+            println!("  delete switching [mac-table|mirror ...]");
             println!("  show                      show the candidate configuration");
             println!(
                 "  commit [confirmed <s>]    apply the candidate (auto-rollback unless confirmed)"
@@ -506,28 +575,46 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
     }
 }
 
+/// A boxed edit of one config block's children — the closure shape the
+/// scoped-edit helpers below hand around.
+type BlockEdit = Box<dyn FnOnce(&mut Vec<hemlock_config::Item>) + Send>;
+
 /// Shared body of `set` and `delete`: dispatch on the top-level config
 /// noun.
 async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
     let Some(top) = words.first() else {
         return Err(format!(
-            "% Usage: {verb} <interfaces|system|routing|vlans> ..."
+            "% Usage: {verb} <interfaces|system|routing|vlans|protocols|switching> ..."
         ));
     };
-    match resolve(top, &["interfaces", "system", "routing", "vlans"])? {
+    match resolve(
+        top,
+        &[
+            "interfaces",
+            "system",
+            "routing",
+            "vlans",
+            "protocols",
+            "switching",
+        ],
+    )? {
         "interfaces" => config_interfaces(endpoints, &words[1..], delete).await,
         "system" => config_system(endpoints, &words[1..], delete).await,
         "routing" => config_routing(endpoints, &words[1..], delete).await,
         "vlans" => config_vlans(endpoints, &words[1..], delete).await,
+        "protocols" => config_protocols(endpoints, &words[1..], delete).await,
+        "switching" => config_switching(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
 }
 
-/// `set|delete vlans vlan <id> [description <text>]`.
+/// `set|delete vlans vlan <id> [description <text> | state <active|suspend>]`.
 async fn config_vlans(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
-    let usage = move || format!("% Usage: {verb} vlans vlan <id> [description <text>]");
+    let usage = move || {
+        format!("% Usage: {verb} vlans vlan <id> [description <text> | state <active|suspend>]")
+    };
     if delete && words.is_empty() {
         return edit_config(endpoints, |tree| {
             ConfigTree::remove_block(&mut tree.items, "vlans", &[]);
@@ -570,7 +657,7 @@ async fn config_vlans(endpoints: &Endpoints, words: &[&str], delete: bool) -> Re
         .map_err(fmt_err);
     }
 
-    match resolve(rest[0], &["description"])? {
+    match resolve(rest[0], &["description", "state"])? {
         "description" => {
             if delete {
                 edit_config(endpoints, |tree| {
@@ -589,6 +676,30 @@ async fn config_vlans(endpoints: &Endpoints, words: &[&str], delete: bool) -> Re
                     let vlans = tree.block_mut("vlans");
                     let vlan = ConfigTree::ensure_block(vlans, "vlan", &[&id]);
                     ConfigTree::set_leaf(vlan, "description", vec![text]);
+                })
+                .await
+            }
+        }
+        "state" => {
+            if delete {
+                edit_config(endpoints, |tree| {
+                    let vlans = tree.block_mut("vlans");
+                    if let Some(vlan) = keyed_block_children_mut(vlans, "vlan", &id) {
+                        ConfigTree::remove_leaf(vlan, "state");
+                    }
+                })
+                .await
+            } else {
+                let Some(value) = rest.get(1) else {
+                    return Err(format!(
+                        "% Usage: set vlans vlan {id} state <active|suspend>"
+                    ));
+                };
+                let value = resolve(value, &["active", "suspend"])?.to_string();
+                edit_config(endpoints, |tree| {
+                    let vlans = tree.block_mut("vlans");
+                    let vlan = ConfigTree::ensure_block(vlans, "vlan", &[&id]);
+                    ConfigTree::set_leaf(vlan, "state", vec![value]);
                 })
                 .await
             }
@@ -615,8 +726,9 @@ async fn config_interfaces(
     let Some(raw_port) = words.first() else {
         return Err(usage());
     };
-    let port = match vlan_interface(raw_port) {
-        // SVIs (`Vlan10`) are config-defined, not syncd ports.
+    let port = match vlan_interface(raw_port).or_else(|| port_channel_interface(raw_port)) {
+        // SVIs (`Vlan10`) and port-channels (`Po1`) are config-defined,
+        // not syncd ports.
         Some(name) => name,
         None => {
             let mut known = list_port_names(endpoints).await.map_err(fmt_err)?;
@@ -652,6 +764,11 @@ async fn config_interfaces(
             "no-shutdown",
             "address",
             "switchport",
+            "channel-group",
+            "lacp",
+            "spanning-tree",
+            "storm-control",
+            "min-links",
         ],
     )?;
     // Phase-1 SVIs carry an address and nothing else.
@@ -659,6 +776,43 @@ async fn config_interfaces(
         return Err(format!(
             "% {subcommand} is not supported on VLAN interfaces"
         ));
+    }
+    if port.starts_with("Management")
+        && matches!(
+            subcommand,
+            "channel-group" | "lacp" | "spanning-tree" | "storm-control" | "min-links"
+        )
+    {
+        return Err(format!(
+            "% {subcommand} is not supported on management ports"
+        ));
+    }
+    let is_lag = port.starts_with("Port-Channel");
+    if is_lag && matches!(subcommand, "address" | "channel-group") {
+        return Err(format!(
+            "% {subcommand} is not supported on port-channel interfaces"
+        ));
+    }
+    if !is_lag && subcommand == "min-links" {
+        return Err("% min-links is only supported on port-channel interfaces".into());
+    }
+    match subcommand {
+        "channel-group" => {
+            return config_channel_group(endpoints, &port, &rest[1..], delete).await;
+        }
+        "lacp" => {
+            return config_lacp(endpoints, &port, &rest[1..], delete, is_lag).await;
+        }
+        "spanning-tree" => {
+            return config_port_stp(endpoints, &port, &rest[1..], delete).await;
+        }
+        "storm-control" => {
+            return config_storm_control(endpoints, &port, &rest[1..], delete).await;
+        }
+        "min-links" => {
+            return config_min_links(endpoints, &port, &rest[1..], delete).await;
+        }
+        _ => {}
     }
     match subcommand {
         "description" => {
@@ -741,7 +895,7 @@ async fn config_switchport(
     let verb = if delete { "delete" } else { "set" };
     let usage = move || {
         format!(
-            "% Usage: {verb} interfaces <port> switchport [mode <access|trunk> | access vlan <id> | trunk vlans <list> | trunk native vlan <id>]"
+            "% Usage: {verb} interfaces <port> switchport [mode <access|trunk|dot1q-tunnel> | access vlan <id> | trunk vlans <list> | trunk native vlan <id>]"
         )
     };
     if port.starts_with("Management") {
@@ -777,14 +931,21 @@ async fn config_switchport(
                 let Some(value) = words.get(1) else {
                     return Err(usage());
                 };
-                let value = resolve(value, &["access", "trunk"])?.to_string();
+                let value = resolve(value, &["access", "trunk", "dot1q-tunnel"])?.to_string();
                 let trunk = value == "trunk";
+                let tunnel = value == "dot1q-tunnel";
                 edit_interface(endpoints, port, move |eth| {
                     let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
                     ConfigTree::set_leaf(sp, "mode", vec![value]);
                     if trunk {
                         // A trunk carries no access VLAN.
                         ConfigTree::remove_leaf(sp, "access");
+                    }
+                    if tunnel {
+                        // A tunnel port keeps its access (S-)VLAN and
+                        // carries no trunk config.
+                        ConfigTree::remove_leaf(sp, "trunk");
+                        ConfigTree::remove_leaf(sp, "native");
                     }
                 })
                 .await
@@ -871,6 +1032,303 @@ async fn config_switchport(
     .map_err(fmt_err)
 }
 
+/// `set|delete interfaces <port> channel-group ...` — LAG membership on
+/// an Ethernet member port.
+async fn config_channel_group(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let usage =
+        || format!("% Usage: set interfaces {port} channel-group <1-64> mode <active|passive|on>");
+    if delete {
+        if !words.is_empty() {
+            return Err(format!(
+                "% Usage: delete interfaces {port} channel-group"
+            ));
+        }
+        return edit_interface(endpoints, port, |eth| {
+            ConfigTree::remove_leaf(eth, "channel-group");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(raw_group) = words.first() else {
+        return Err(usage());
+    };
+    let Some(group) = raw_group
+        .parse::<u16>()
+        .ok()
+        .filter(|n| (1..=64).contains(n))
+    else {
+        return Err(format!("% bad channel-group number {raw_group:?} (1..64)"));
+    };
+    let Some(keyword) = words.get(1) else {
+        return Err(usage());
+    };
+    resolve(keyword, &["mode"])?;
+    let Some(mode) = words.get(2) else {
+        return Err(usage());
+    };
+    let mode = resolve(mode, &["active", "passive", "on"])?.to_string();
+    edit_interface(endpoints, port, move |eth| {
+        ConfigTree::set_leaf(
+            eth,
+            "channel-group",
+            vec![group.to_string(), "mode".into(), mode],
+        );
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete interfaces <port> lacp ...` — per-member tuning on
+/// Ethernet ports (`rate`, `port-priority`), fallback behavior on
+/// port-channels (`fallback`, `fallback-timeout`).
+async fn config_lacp(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+    is_lag: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        if is_lag {
+            format!(
+                "% Usage: {verb} interfaces {port} lacp [fallback <static|individual> | fallback-timeout <1-900>]"
+            )
+        } else {
+            format!(
+                "% Usage: {verb} interfaces {port} lacp [rate <normal|fast> | port-priority <0-65535>]"
+            )
+        }
+    };
+    if words.is_empty() {
+        if delete {
+            return edit_interface(endpoints, port, |eth| {
+                ConfigTree::remove_block(eth, "lacp", &[]);
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        return Err(usage());
+    }
+    let keywords: &[&str] = if is_lag {
+        &["fallback", "fallback-timeout"]
+    } else {
+        &["rate", "port-priority"]
+    };
+    let keyword = resolve(words[0], keywords)?;
+    if delete {
+        if words.len() > 1 {
+            return Err(format!("% Invalid input: {:?}", words[1]));
+        }
+        let keyword = keyword.to_string();
+        return edit_interface(endpoints, port, move |eth| {
+            if let Some(lacp) = block_children_mut(eth, "lacp") {
+                ConfigTree::remove_leaf(lacp, &keyword);
+            }
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(value) = words.get(1) else {
+        return Err(usage());
+    };
+    let value = match keyword {
+        "rate" => resolve(value, &["normal", "fast"])?.to_string(),
+        "fallback" => resolve(value, &["static", "individual"])?.to_string(),
+        "port-priority" => value
+            .parse::<u16>()
+            .map(|n| n.to_string())
+            .map_err(|_| format!("% bad port-priority {value:?} (0..65535)"))?,
+        "fallback-timeout" => value
+            .parse::<u16>()
+            .ok()
+            .filter(|n| (1..=900).contains(n))
+            .map(|n| n.to_string())
+            .ok_or_else(|| format!("% bad fallback-timeout {value:?} (1..900)"))?,
+        _ => unreachable!(),
+    };
+    let keyword = keyword.to_string();
+    edit_interface(endpoints, port, move |eth| {
+        let lacp = ConfigTree::ensure_block(eth, "lacp", &[]);
+        ConfigTree::set_leaf(lacp, &keyword, vec![value]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete interfaces <port> spanning-tree ...` — per-port STP
+/// (portfast, bpduguard, cost, port-priority).
+async fn config_port_stp(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} interfaces {port} spanning-tree [portfast | bpduguard | cost <1-200000000> | port-priority <0-240>]"
+        )
+    };
+    if words.is_empty() {
+        if delete {
+            return edit_interface(endpoints, port, |eth| {
+                ConfigTree::remove_block(eth, "spanning-tree", &[]);
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        return Err(usage());
+    }
+    let keyword = resolve(words[0], &["portfast", "bpduguard", "cost", "port-priority"])?;
+    match keyword {
+        marker @ ("portfast" | "bpduguard") => {
+            if words.len() > 1 {
+                return Err(format!("% Invalid input: {:?}", words[1]));
+            }
+            let marker = marker.to_string();
+            edit_interface(endpoints, port, move |eth| {
+                if delete {
+                    if let Some(stp) = block_children_mut(eth, "spanning-tree") {
+                        ConfigTree::remove_leaf(stp, &marker);
+                    }
+                } else {
+                    let stp = ConfigTree::ensure_block(eth, "spanning-tree", &[]);
+                    ConfigTree::set_leaf(stp, &marker, vec![]);
+                }
+            })
+            .await
+        }
+        keyword @ ("cost" | "port-priority") => {
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                let keyword = keyword.to_string();
+                return edit_interface(endpoints, port, move |eth| {
+                    if let Some(stp) = block_children_mut(eth, "spanning-tree") {
+                        ConfigTree::remove_leaf(stp, &keyword);
+                    }
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = words.get(1) else {
+                return Err(usage());
+            };
+            let value = match keyword {
+                "cost" => value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (1..=200_000_000).contains(n))
+                    .map(|n| n.to_string())
+                    .ok_or_else(|| format!("% bad cost {value:?} (1..200000000)"))?,
+                _ => value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| *n <= 240)
+                    .map(|n| n.to_string())
+                    .ok_or_else(|| format!("% bad port-priority {value:?} (0..240)"))?,
+            };
+            let keyword = keyword.to_string();
+            edit_interface(endpoints, port, move |eth| {
+                let stp = ConfigTree::ensure_block(eth, "spanning-tree", &[]);
+                ConfigTree::set_leaf(stp, &keyword, vec![value]);
+            })
+            .await
+        }
+        _ => unreachable!(),
+    }
+    .map_err(fmt_err)
+}
+
+/// `set|delete interfaces <port> storm-control ...`.
+async fn config_storm_control(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} interfaces {port} storm-control <broadcast|multicast|unknown-unicast> level <0.00-100.00>"
+        )
+    };
+    if words.is_empty() {
+        if delete {
+            return edit_interface(endpoints, port, |eth| {
+                ConfigTree::remove_block(eth, "storm-control", &[]);
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        return Err(usage());
+    }
+    let kind = resolve(words[0], &["broadcast", "multicast", "unknown-unicast"])?.to_string();
+    if delete {
+        if words.len() > 1 {
+            return Err(format!("% Invalid input: {:?}", words[1]));
+        }
+        return edit_interface(endpoints, port, move |eth| {
+            if let Some(sc) = block_children_mut(eth, "storm-control") {
+                ConfigTree::remove_leaf(sc, &kind);
+            }
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(keyword) = words.get(1) else {
+        return Err(usage());
+    };
+    resolve(keyword, &["level"])?;
+    let Some(raw_level) = words.get(2) else {
+        return Err(usage());
+    };
+    let level = hemlock_common::net::parse_storm_level(raw_level).map_err(|e| format!("% {e}"))?;
+    edit_interface(endpoints, port, move |eth| {
+        let sc = ConfigTree::ensure_block(eth, "storm-control", &[]);
+        ConfigTree::set_leaf(sc, &kind, vec!["level".into(), level]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete interfaces Port-Channel<n> min-links <0-8>`.
+async fn config_min_links(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if delete {
+        if !words.is_empty() {
+            return Err(format!("% Invalid input: {:?}", words[0]));
+        }
+        return edit_interface(endpoints, port, |eth| {
+            ConfigTree::remove_leaf(eth, "min-links");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(value) = words.first() else {
+        return Err(format!("% Usage: set interfaces {port} min-links <0-8>"));
+    };
+    let Some(value) = value.parse::<u8>().ok().filter(|n| *n <= 8) else {
+        return Err(format!("% bad min-links {value:?} (0..8)"));
+    };
+    edit_interface(endpoints, port, move |eth| {
+        ConfigTree::set_leaf(eth, "min-links", vec![value.to_string()]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
 /// Canonical SVI name from user input: `vlan10`, `Vl10`, `v10` all mean
 /// `Vlan10`. `None` when the input is not a VLAN interface form.
 fn vlan_interface(input: &str) -> Option<String> {
@@ -889,6 +1347,32 @@ fn vlan_interface(input: &str) -> Option<String> {
         .ok()
         .filter(|id| (1..=4094).contains(id))
         .map(|id| format!("Vlan{id}"))
+}
+
+/// Canonical port-channel name from user input: `Po1`, `po1`,
+/// `port-channel1`, `p1` all mean `Port-Channel1`. `None` when the input
+/// is not a port-channel form.
+fn port_channel_interface(input: &str) -> Option<String> {
+    let digit_at = input
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or(input.len());
+    let (alpha, digits) = input.split_at(digit_at);
+    if alpha.is_empty() || digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let needle: String = alpha
+        .chars()
+        .filter(|c| *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    if !"portchannel".starts_with(&needle) {
+        return None;
+    }
+    digits
+        .parse::<u16>()
+        .ok()
+        .filter(|n| (1..=64).contains(n))
+        .map(|n| format!("Port-Channel{n}"))
 }
 
 /// A CLI VLAN id argument, validated and canonicalized.
@@ -1076,6 +1560,844 @@ async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> 
         .await
         .map_err(fmt_err)
     }
+}
+
+/// `set|delete protocols <spanning-tree|igmp-snooping|mld-snooping|lacp> ...`.
+async fn config_protocols(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            ConfigTree::remove_block(&mut tree.items, "protocols", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(format!(
+            "% Usage: {verb} protocols <spanning-tree|igmp-snooping|mld-snooping|lacp> ..."
+        ));
+    };
+    match resolve(
+        first,
+        &["spanning-tree", "igmp-snooping", "mld-snooping", "lacp"],
+    )? {
+        "spanning-tree" => config_stp(endpoints, &words[1..], delete).await,
+        family @ ("igmp-snooping" | "mld-snooping") => {
+            config_snooping(endpoints, family, &words[1..], delete).await
+        }
+        "lacp" => config_lacp_global(endpoints, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete protocols lacp system-priority <0-65535>`.
+async fn config_lacp_global(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            let protocols = tree.block_mut("protocols");
+            ConfigTree::remove_block(protocols, "lacp", &[]);
+            remove_block_if_empty(tree, "protocols");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err("% Usage: set protocols lacp system-priority <0-65535>".into());
+    };
+    resolve(first, &["system-priority"])?;
+    if delete {
+        if words.len() > 1 {
+            return Err(format!("% Invalid input: {:?}", words[1]));
+        }
+        return edit_config(endpoints, |tree| {
+            let protocols = tree.block_mut("protocols");
+            if let Some(lacp) = block_children_mut(protocols, "lacp") {
+                ConfigTree::remove_leaf(lacp, "system-priority");
+                if lacp.is_empty() {
+                    ConfigTree::remove_block(protocols, "lacp", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "protocols");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(value) = words.get(1) else {
+        return Err("% Usage: set protocols lacp system-priority <0-65535>".into());
+    };
+    let value = value
+        .parse::<u16>()
+        .map(|n| n.to_string())
+        .map_err(|_| format!("% bad system-priority {value:?} (0..65535)"))?;
+    edit_config(endpoints, move |tree| {
+        let protocols = tree.block_mut("protocols");
+        let lacp = ConfigTree::ensure_block(protocols, "lacp", &[]);
+        ConfigTree::set_leaf(lacp, "system-priority", vec![value]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete protocols spanning-tree ...` — the global bridge config
+/// and the MST region.
+async fn config_stp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} protocols spanning-tree [mode <mstp|rstp|none> | priority <0-61440> | hello-time <1-10> | max-age <6-40> | forward-time <4-30> | mst ...]"
+        )
+    };
+    if words.is_empty() {
+        if delete {
+            return edit_config(endpoints, |tree| {
+                let protocols = tree.block_mut("protocols");
+                ConfigTree::remove_block(protocols, "spanning-tree", &[]);
+                remove_block_if_empty(tree, "protocols");
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        return Err(usage());
+    }
+    // Scoped editing of `protocols { spanning-tree { ... } }`.
+    let edit_stp = |edit: BlockEdit| async {
+        edit_config(endpoints, move |tree| {
+            let protocols = tree.block_mut("protocols");
+            let stp = ConfigTree::ensure_block(protocols, "spanning-tree", &[]);
+            edit(stp);
+        })
+        .await
+        .map_err(fmt_err)
+    };
+    let delete_in_stp = |edit: BlockEdit| async {
+        edit_config(endpoints, move |tree| {
+            let protocols = tree.block_mut("protocols");
+            if let Some(stp) = block_children_mut(protocols, "spanning-tree") {
+                edit(stp);
+                if stp.is_empty() {
+                    ConfigTree::remove_block(protocols, "spanning-tree", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "protocols");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    let keyword = resolve(
+        words[0],
+        &[
+            "mode",
+            "priority",
+            "hello-time",
+            "max-age",
+            "forward-time",
+            "mst",
+        ],
+    )?;
+    match keyword {
+        "mst" => config_stp_mst(endpoints, &words[1..], delete).await,
+        keyword if delete => {
+            if words.len() > 1 {
+                return Err(format!("% Invalid input: {:?}", words[1]));
+            }
+            let keyword = keyword.to_string();
+            delete_in_stp(Box::new(move |stp| {
+                ConfigTree::remove_leaf(stp, &keyword);
+            }))
+            .await
+        }
+        "mode" => {
+            let Some(value) = words.get(1) else {
+                return Err(usage());
+            };
+            if *value == "rapid-pvst" {
+                return Err("% rapid-pvst is not supported (use mstp or rstp)".into());
+            }
+            let value = resolve(value, &["mstp", "rstp", "none"])?.to_string();
+            edit_stp(Box::new(move |stp| {
+                ConfigTree::set_leaf(stp, "mode", vec![value]);
+            }))
+            .await
+        }
+        keyword @ ("priority" | "hello-time" | "max-age" | "forward-time") => {
+            let Some(value) = words.get(1) else {
+                return Err(usage());
+            };
+            let (range, what): (std::ops::RangeInclusive<u32>, &str) = match keyword {
+                "priority" => (0..=61440, "priority"),
+                "hello-time" => (1..=10, "hello-time"),
+                "max-age" => (6..=40, "max-age"),
+                _ => (4..=30, "forward-time"),
+            };
+            let value = value
+                .parse::<u32>()
+                .ok()
+                .filter(|n| range.contains(n))
+                .map(|n| n.to_string())
+                .ok_or_else(|| {
+                    format!(
+                        "% bad {what} {value:?} ({}..{})",
+                        range.start(),
+                        range.end()
+                    )
+                })?;
+            let keyword = keyword.to_string();
+            edit_stp(Box::new(move |stp| {
+                ConfigTree::set_leaf(stp, &keyword, vec![value]);
+            }))
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete protocols spanning-tree mst ...` — region name/revision
+/// and instance-to-VLAN mappings.
+async fn config_stp_mst(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} protocols spanning-tree mst [name <text> | revision <0-65535> | instance <1-15> vlans <list>]"
+        )
+    };
+    let edit_mst = |edit: BlockEdit| async {
+        edit_config(endpoints, move |tree| {
+            let protocols = tree.block_mut("protocols");
+            let stp = ConfigTree::ensure_block(protocols, "spanning-tree", &[]);
+            let mst = ConfigTree::ensure_block(stp, "mst", &[]);
+            edit(mst);
+        })
+        .await
+        .map_err(fmt_err)
+    };
+    let delete_in_mst = |edit: BlockEdit| async {
+        edit_config(endpoints, move |tree| {
+            let protocols = tree.block_mut("protocols");
+            if let Some(stp) = block_children_mut(protocols, "spanning-tree") {
+                if let Some(mst) = block_children_mut(stp, "mst") {
+                    edit(mst);
+                    if mst.is_empty() {
+                        ConfigTree::remove_block(stp, "mst", &[]);
+                    }
+                }
+                if stp.is_empty() {
+                    ConfigTree::remove_block(protocols, "spanning-tree", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "protocols");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if words.is_empty() {
+        if delete {
+            return delete_in_mst(Box::new(|mst| mst.clear())).await;
+        }
+        return Err(usage());
+    }
+    match resolve(words[0], &["name", "revision", "instance"])? {
+        "name" => {
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                return delete_in_mst(Box::new(|mst| ConfigTree::remove_leaf(mst, "name"))).await;
+            }
+            let text = words[1..].join(" ");
+            if text.is_empty() {
+                return Err(usage());
+            }
+            edit_mst(Box::new(move |mst| {
+                ConfigTree::set_leaf(mst, "name", vec![text]);
+            }))
+            .await
+        }
+        "revision" => {
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                return delete_in_mst(Box::new(|mst| ConfigTree::remove_leaf(mst, "revision")))
+                    .await;
+            }
+            let Some(value) = words.get(1) else {
+                return Err(usage());
+            };
+            let value = value
+                .parse::<u16>()
+                .map(|n| n.to_string())
+                .map_err(|_| format!("% bad revision {value:?} (0..65535)"))?;
+            edit_mst(Box::new(move |mst| {
+                ConfigTree::set_leaf(mst, "revision", vec![value]);
+            }))
+            .await
+        }
+        "instance" => {
+            let Some(raw_id) = words.get(1) else {
+                return Err(usage());
+            };
+            let id = raw_id
+                .parse::<u8>()
+                .ok()
+                .filter(|n| (1..=15).contains(n))
+                .ok_or_else(|| format!("% bad mst instance {raw_id:?} (1..15)"))?
+                .to_string();
+            if delete {
+                if words.len() > 2 {
+                    return Err(format!("% Invalid input: {:?}", words[2]));
+                }
+                return delete_in_mst(Box::new(move |mst| {
+                    remove_leaf_matching(mst, "instance", &[&id]);
+                }))
+                .await;
+            }
+            let Some(keyword) = words.get(2) else {
+                return Err(usage());
+            };
+            resolve(keyword, &["vlans"])?;
+            let Some(list) = words.get(3) else {
+                return Err(usage());
+            };
+            let vlans = parse_vlan_list(list)?;
+            edit_mst(Box::new(move |mst| {
+                remove_leaf_matching(mst, "instance", &[&id]);
+                let mut values = vec![id, "vlans".to_string()];
+                values.extend(vlans);
+                push_leaf(mst, "instance", values);
+            }))
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete protocols <igmp-snooping|mld-snooping> ...` — the two
+/// families share one grammar.
+async fn config_snooping(
+    endpoints: &Endpoints,
+    family: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} protocols {family} [disable | robustness <1-3> | vlan <id> [disable|fast-leave|querier [address <ip>]|mrouter interface <port>]]"
+        )
+    };
+    let family_name = family.to_string();
+    let edit_family = |edit: BlockEdit| {
+        let family = family_name.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let protocols = tree.block_mut("protocols");
+                let block = ConfigTree::ensure_block(protocols, &family, &[]);
+                edit(block);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+    let delete_in_family = |edit: BlockEdit| {
+        let family = family_name.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let protocols = tree.block_mut("protocols");
+                if let Some(block) = block_children_mut(protocols, &family) {
+                    edit(block);
+                    if block.is_empty() {
+                        ConfigTree::remove_block(protocols, &family, &[]);
+                    }
+                }
+                remove_block_if_empty(tree, "protocols");
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+
+    if words.is_empty() {
+        if delete {
+            return delete_in_family(Box::new(|block| block.clear())).await;
+        }
+        return Err(usage());
+    }
+    match resolve(words[0], &["disable", "robustness", "vlan"])? {
+        "disable" => {
+            if words.len() > 1 {
+                return Err(format!("% Invalid input: {:?}", words[1]));
+            }
+            if delete {
+                delete_in_family(Box::new(|block| ConfigTree::remove_leaf(block, "disable"))).await
+            } else {
+                edit_family(Box::new(|block| {
+                    ConfigTree::set_leaf(block, "disable", vec![]);
+                }))
+                .await
+            }
+        }
+        "robustness" => {
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                return delete_in_family(Box::new(|block| {
+                    ConfigTree::remove_leaf(block, "robustness");
+                }))
+                .await;
+            }
+            let Some(value) = words.get(1) else {
+                return Err(usage());
+            };
+            let value = value
+                .parse::<u8>()
+                .ok()
+                .filter(|n| (1..=3).contains(n))
+                .map(|n| n.to_string())
+                .ok_or_else(|| format!("% bad robustness {value:?} (1..3)"))?;
+            edit_family(Box::new(move |block| {
+                ConfigTree::set_leaf(block, "robustness", vec![value]);
+            }))
+            .await
+        }
+        "vlan" => {
+            let Some(raw_id) = words.get(1) else {
+                return Err(usage());
+            };
+            let id = parse_vlan_arg(raw_id)?;
+            let rest = &words[2..];
+            if rest.is_empty() {
+                return if delete {
+                    delete_in_family(Box::new(move |block| {
+                        remove_leaf_matching(block, "vlan", &[&id]);
+                        ConfigTree::remove_block(block, "vlan", &[&id]);
+                    }))
+                    .await
+                } else {
+                    edit_family(Box::new(move |block| {
+                        snoop_vlan_block(block, &id);
+                    }))
+                    .await
+                };
+            }
+            match resolve(rest[0], &["disable", "fast-leave", "querier", "mrouter"])? {
+                marker @ ("disable" | "fast-leave") => {
+                    if rest.len() > 1 {
+                        return Err(format!("% Invalid input: {:?}", rest[1]));
+                    }
+                    let marker = marker.to_string();
+                    if delete {
+                        delete_in_family(Box::new(move |block| {
+                            if let Some(vlan) = keyed_block_children_mut(block, "vlan", &id) {
+                                ConfigTree::remove_leaf(vlan, &marker);
+                            }
+                        }))
+                        .await
+                    } else {
+                        edit_family(Box::new(move |block| {
+                            let vlan = snoop_vlan_block(block, &id);
+                            ConfigTree::set_leaf(vlan, &marker, vec![]);
+                        }))
+                        .await
+                    }
+                }
+                "querier" => {
+                    if delete {
+                        if rest.len() > 1 {
+                            return Err(format!("% Invalid input: {:?}", rest[1]));
+                        }
+                        return delete_in_family(Box::new(move |block| {
+                            if let Some(vlan) = keyed_block_children_mut(block, "vlan", &id) {
+                                ConfigTree::remove_leaf(vlan, "querier");
+                            }
+                        }))
+                        .await;
+                    }
+                    let values = match rest.get(1) {
+                        None => vec![],
+                        Some(keyword) => {
+                            resolve(keyword, &["address"])?;
+                            let Some(address) = rest.get(2) else {
+                                return Err(format!(
+                                    "% Usage: set protocols {family} vlan {id} querier [address <ip>]"
+                                ));
+                            };
+                            let valid = if family == "igmp-snooping" {
+                                address.parse::<std::net::Ipv4Addr>().is_ok()
+                            } else {
+                                address.parse::<std::net::Ipv6Addr>().is_ok()
+                            };
+                            if !valid {
+                                return Err(format!("% bad querier address {address:?}"));
+                            }
+                            vec!["address".to_string(), (*address).to_string()]
+                        }
+                    };
+                    edit_family(Box::new(move |block| {
+                        let vlan = snoop_vlan_block(block, &id);
+                        ConfigTree::set_leaf(vlan, "querier", values);
+                    }))
+                    .await
+                }
+                "mrouter" => {
+                    if delete && rest.len() == 1 {
+                        return delete_in_family(Box::new(move |block| {
+                            if let Some(vlan) = keyed_block_children_mut(block, "vlan", &id) {
+                                ConfigTree::remove_leaf(vlan, "mrouter");
+                            }
+                        }))
+                        .await;
+                    }
+                    let Some(keyword) = rest.get(1) else {
+                        return Err(usage());
+                    };
+                    resolve(keyword, &["interface"])?;
+                    let Some(raw_port) = rest.get(2) else {
+                        return Err(usage());
+                    };
+                    let port = canonical_l2_port(endpoints, raw_port).await?;
+                    if delete {
+                        delete_in_family(Box::new(move |block| {
+                            if let Some(vlan) = keyed_block_children_mut(block, "vlan", &id) {
+                                remove_leaf_matching(vlan, "mrouter", &["interface", &port]);
+                            }
+                        }))
+                        .await
+                    } else {
+                        edit_family(Box::new(move |block| {
+                            let vlan = snoop_vlan_block(block, &id);
+                            remove_leaf_matching(vlan, "mrouter", &["interface", &port]);
+                            push_leaf(vlan, "mrouter", vec!["interface".into(), port]);
+                        }))
+                        .await
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete switching <mac-table|mirror> ...`.
+async fn config_switching(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            ConfigTree::remove_block(&mut tree.items, "switching", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(format!("% Usage: {verb} switching <mac-table|mirror> ..."));
+    };
+    match resolve(first, &["mac-table", "mirror"])? {
+        "mac-table" => config_mac_table(endpoints, &words[1..], delete).await,
+        "mirror" => config_mirror(endpoints, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete switching mac-table ...`.
+async fn config_mac_table(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} switching mac-table [aging-time <0|10-1000000> | static <mac> vlan <id> <interface <port>|drop>]"
+        )
+    };
+    let edit_table = |edit: BlockEdit| async {
+        edit_config(endpoints, move |tree| {
+            let switching = tree.block_mut("switching");
+            let table = ConfigTree::ensure_block(switching, "mac-table", &[]);
+            edit(table);
+        })
+        .await
+        .map_err(fmt_err)
+    };
+    let delete_in_table = |edit: BlockEdit| async {
+        edit_config(endpoints, move |tree| {
+            let switching = tree.block_mut("switching");
+            if let Some(table) = block_children_mut(switching, "mac-table") {
+                edit(table);
+                if table.is_empty() {
+                    ConfigTree::remove_block(switching, "mac-table", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "switching");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if words.is_empty() {
+        if delete {
+            return delete_in_table(Box::new(|table| table.clear())).await;
+        }
+        return Err(usage());
+    }
+    match resolve(words[0], &["aging-time", "static"])? {
+        "aging-time" => {
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                return delete_in_table(Box::new(|table| {
+                    ConfigTree::remove_leaf(table, "aging-time");
+                }))
+                .await;
+            }
+            let Some(value) = words.get(1) else {
+                return Err(usage());
+            };
+            let value = value
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n == 0 || (10..=1_000_000).contains(n))
+                .map(|n| n.to_string())
+                .ok_or_else(|| format!("% bad aging-time {value:?} (0 or 10..1000000)"))?;
+            edit_table(Box::new(move |table| {
+                ConfigTree::set_leaf(table, "aging-time", vec![value]);
+            }))
+            .await
+        }
+        "static" => {
+            if delete && words.len() == 1 {
+                return delete_in_table(Box::new(|table| {
+                    ConfigTree::remove_leaf(table, "static");
+                }))
+                .await;
+            }
+            let Some(raw_mac) = words.get(1) else {
+                return Err(usage());
+            };
+            let mac =
+                hemlock_common::net::parse_unicast_mac(raw_mac).map_err(|e| format!("% {e}"))?;
+            let Some(keyword) = words.get(2) else {
+                return Err(usage());
+            };
+            resolve(keyword, &["vlan"])?;
+            let Some(raw_id) = words.get(3) else {
+                return Err(usage());
+            };
+            let id = parse_vlan_arg(raw_id)?;
+            if delete {
+                if words.len() > 4 {
+                    return Err(format!("% Invalid input: {:?}", words[4]));
+                }
+                return delete_in_table(Box::new(move |table| {
+                    remove_leaf_matching(table, "static", &[&mac, "vlan", &id]);
+                }))
+                .await;
+            }
+            let Some(target) = words.get(4) else {
+                return Err(usage());
+            };
+            let values = match resolve(target, &["interface", "drop"])? {
+                "interface" => {
+                    let Some(raw_port) = words.get(5) else {
+                        return Err(usage());
+                    };
+                    let port = canonical_l2_port(endpoints, raw_port).await?;
+                    vec![mac.clone(), "vlan".into(), id.clone(), "interface".into(), port]
+                }
+                "drop" => vec![mac.clone(), "vlan".into(), id.clone(), "drop".into()],
+                _ => unreachable!(),
+            };
+            edit_table(Box::new(move |table| {
+                remove_leaf_matching(table, "static", &[&mac, "vlan", &id]);
+                push_leaf(table, "static", values);
+            }))
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete switching mirror session <1-4> ...`.
+async fn config_mirror(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} switching mirror session <1-4> [source <port> [rx|tx|both] | destination <port>]"
+        )
+    };
+    if words.is_empty() {
+        if delete {
+            return edit_config(endpoints, |tree| {
+                let switching = tree.block_mut("switching");
+                ConfigTree::remove_block(switching, "mirror", &[]);
+                remove_block_if_empty(tree, "switching");
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        return Err(usage());
+    }
+    resolve(words[0], &["session"])?;
+    let Some(raw_session) = words.get(1) else {
+        return Err(usage());
+    };
+    let session = raw_session
+        .parse::<u8>()
+        .ok()
+        .filter(|n| (1..=4).contains(n))
+        .ok_or_else(|| format!("% bad mirror session {raw_session:?} (1..4)"))?
+        .to_string();
+    let rest = &words[2..];
+
+    let edit_session = |edit: BlockEdit| {
+        let session = session.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let switching = tree.block_mut("switching");
+                let mirror = ConfigTree::ensure_block(switching, "mirror", &[]);
+                let block = ConfigTree::ensure_block(mirror, "session", &[&session]);
+                edit(block);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+    let delete_in_session = |edit: BlockEdit| {
+        let session = session.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let switching = tree.block_mut("switching");
+                if let Some(mirror) = block_children_mut(switching, "mirror") {
+                    if let Some(block) = keyed_block_children_mut(mirror, "session", &session) {
+                        edit(block);
+                        if block.is_empty() {
+                            ConfigTree::remove_block(mirror, "session", &[&session]);
+                        }
+                    }
+                    if mirror.is_empty() {
+                        ConfigTree::remove_block(switching, "mirror", &[]);
+                    }
+                }
+                remove_block_if_empty(tree, "switching");
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+
+    if rest.is_empty() {
+        return if delete {
+            delete_in_session(Box::new(|block| block.clear())).await
+        } else {
+            edit_session(Box::new(|_| {})).await
+        };
+    }
+    match resolve(rest[0], &["source", "destination"])? {
+        "source" => {
+            let Some(raw_port) = rest.get(1) else {
+                return Err(usage());
+            };
+            let port = canonical_l2_port(endpoints, raw_port).await?;
+            if delete {
+                if rest.len() > 2 {
+                    return Err(format!("% Invalid input: {:?}", rest[2]));
+                }
+                return delete_in_session(Box::new(move |block| {
+                    remove_leaf_matching(block, "source", &[&port]);
+                }))
+                .await;
+            }
+            let direction = match rest.get(2) {
+                None => "both",
+                Some(word) => resolve(word, &["rx", "tx", "both"])?,
+            }
+            .to_string();
+            edit_session(Box::new(move |block| {
+                remove_leaf_matching(block, "source", &[&port]);
+                push_leaf(block, "source", vec![port, direction]);
+            }))
+            .await
+        }
+        "destination" => {
+            if delete {
+                if rest.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", rest[1]));
+                }
+                return delete_in_session(Box::new(|block| {
+                    ConfigTree::remove_leaf(block, "destination");
+                }))
+                .await;
+            }
+            let Some(raw_port) = rest.get(1) else {
+                return Err(usage());
+            };
+            // A mirror destination is a physical port, never a LAG.
+            let known = list_port_names(endpoints).await.map_err(fmt_err)?;
+            let port = canonical_port(raw_port, &known)?;
+            edit_session(Box::new(move |block| {
+                ConfigTree::set_leaf(block, "destination", vec![port]);
+            }))
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Canonicalize an L2 interface reference: a syncd port name (aliases
+/// accepted) or a port-channel form (`Po1`).
+async fn canonical_l2_port(endpoints: &Endpoints, input: &str) -> Result<String, String> {
+    if let Some(po) = port_channel_interface(input) {
+        return Ok(po);
+    }
+    let known = list_port_names(endpoints).await.map_err(fmt_err)?;
+    canonical_port(input, &known)
+}
+
+/// Append a leaf without replacing same-named siblings (multi-instance
+/// leaves: `static ...`, `source ...`, `mrouter ...`, `instance ...`).
+fn push_leaf(items: &mut Vec<hemlock_config::Item>, name: &str, values: Vec<String>) {
+    items.push(hemlock_config::Item::Leaf {
+        name: name.to_string(),
+        values,
+    });
+}
+
+/// Remove leaves named `name` whose leading values match `prefix`
+/// exactly (selects one instance among same-named leaves).
+fn remove_leaf_matching(items: &mut Vec<hemlock_config::Item>, name: &str, prefix: &[&str]) {
+    items.retain(|item| match item {
+        hemlock_config::Item::Leaf { name: n, values } if n == name => {
+            !(values.len() >= prefix.len()
+                && values.iter().zip(prefix).all(|(value, want)| value == want))
+        }
+        _ => true,
+    });
+}
+
+/// The per-VLAN block of a snooping family, upgrading the bare
+/// `vlan <id>` leaf form to a block when settings land on it.
+fn snoop_vlan_block<'a>(
+    children: &'a mut Vec<hemlock_config::Item>,
+    id: &str,
+) -> &'a mut Vec<hemlock_config::Item> {
+    remove_leaf_matching(children, "vlan", &[id]);
+    ConfigTree::ensure_block(children, "vlan", &[id])
 }
 
 /// Mutable children of an existing block among `items` (no creation —
@@ -1298,6 +2620,26 @@ mod tests {
         assert_eq!(vlan_interface("e1"), None);
         assert_eq!(vlan_interface("ma1"), None);
         assert_eq!(vlan_interface("vlan"), None);
+    }
+
+    #[test]
+    fn port_channel_interface_names_canonicalize() {
+        assert_eq!(
+            port_channel_interface("Port-Channel1"),
+            Some("Port-Channel1".into())
+        );
+        assert_eq!(
+            port_channel_interface("portchannel1"),
+            Some("Port-Channel1".into())
+        );
+        assert_eq!(port_channel_interface("Po1"), Some("Port-Channel1".into()));
+        assert_eq!(port_channel_interface("po64"), Some("Port-Channel64".into()));
+        assert_eq!(port_channel_interface("p1"), Some("Port-Channel1".into()));
+        assert_eq!(port_channel_interface("po0"), None);
+        assert_eq!(port_channel_interface("po65"), None);
+        assert_eq!(port_channel_interface("Ethernet1"), None);
+        assert_eq!(port_channel_interface("v10"), None);
+        assert_eq!(port_channel_interface("po"), None);
     }
 
     #[test]

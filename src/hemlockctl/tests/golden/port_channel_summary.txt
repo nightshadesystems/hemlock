@@ -1,0 +1,6 @@
+Flags: U - in use    D - down       a - LACP active    p - LACP passive
+       s - suspended F - fallback   ^ - individual     * - static (mode on)
+
+Group  Port-Channel     Protocol   Members
+-----  ---------------  ---------  --------------------------------
+1      Po1(U)           LACP(a)    Et49(B) Et50(B)

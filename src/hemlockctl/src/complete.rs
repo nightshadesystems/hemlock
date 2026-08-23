@@ -39,6 +39,10 @@ const PORT: &str = "\0port";
 /// completion; it only lets deeper levels key off "a number was given".
 const NUM: &str = "\0num";
 
+/// Sentinel meaning "free text goes here" (MAC addresses, VLAN lists).
+/// Accepts any token so deeper levels stay completable; offers nothing.
+const ANY: &str = "\0any";
+
 /// The `show interfaces` subcommand words (the interface argument is
 /// optional and completes separately via [`PORT`]).
 const INTERFACES_SUBCOMMANDS: &[&str] = &[
@@ -97,6 +101,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, []) => &[
             "show",
             "configure",
+            "clear",
             "upgrade",
             "bash",
             "exit",
@@ -104,14 +109,65 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "logout",
             "help",
         ],
-        (CliMode::Operational, ["show"]) => {
-            &["interfaces", "environment", "configuration", "version"]
-        }
+        (CliMode::Operational, ["show"]) => &[
+            "interfaces",
+            "environment",
+            "configuration",
+            "version",
+            "vlan",
+            "mac",
+            "storm-control",
+            "mirror",
+            "monitor",
+            "port-channel",
+            "lacp",
+            "spanning-tree",
+            "igmp",
+            "mld",
+        ],
+        (CliMode::Operational, ["show", "igmp" | "mld"]) => &["snooping"],
+        (CliMode::Operational, ["show", "igmp" | "mld", "snooping"]) => &["groups", "querier"],
         (CliMode::Operational, ["show", "interfaces", rest @ ..]) => interfaces_words(rest),
+        (CliMode::Operational, ["show", "spanning-tree"]) => {
+            &["detail", "blockedports", "mst"]
+        }
+        (CliMode::Operational, ["show", "spanning-tree", "mst"]) => &["configuration"],
+        (CliMode::Operational, ["show", "vlan"]) => &["id", "summary"],
+        (CliMode::Operational, ["show", "port-channel"]) => &["summary", "detail", NUM],
+        (CliMode::Operational, ["show", "port-channel", NUM]) => &["summary", "detail"],
+        (CliMode::Operational, ["show", "lacp"]) => &["neighbor", "counters", "sys-id"],
+        (CliMode::Operational, ["show", "lacp", "neighbor"]) => &["detail"],
+        (CliMode::Operational, ["show", "mac"]) => &["address-table"],
+        (CliMode::Operational, ["show", "mac", "address-table"]) => &[
+            "count",
+            "aging-time",
+            "vlan",
+            "interface",
+            "address",
+            "static",
+            "dynamic",
+        ],
+        (CliMode::Operational, ["show", "mac", "address-table", "vlan"]) => &[NUM],
+        (CliMode::Operational, ["show", "mac", "address-table", "interface"]) => &[PORT],
+        (CliMode::Operational, ["show", "monitor"]) => &["session"],
+        (CliMode::Operational, ["clear"]) => &["counters", "mac-table"],
+        (CliMode::Operational, ["clear", "counters"]) => &[PORT],
+        (CliMode::Operational, ["clear", "mac-table"]) => &["vlan", "interface"],
+        (CliMode::Operational, ["clear", "mac-table", "vlan"]) => &[NUM],
+        (CliMode::Operational, ["clear", "mac-table", "vlan", NUM]) => &["interface"],
+        (CliMode::Operational, ["clear", "mac-table", "vlan", NUM, "interface"]) => &[PORT],
+        (CliMode::Operational, ["clear", "mac-table", "interface"]) => &[PORT],
         (CliMode::Config, []) => &[
             "set", "delete", "show", "commit", "rollback", "discard", "exit", "help",
         ],
-        (CliMode::Config, ["set" | "delete"]) => &["interfaces", "system", "routing", "vlans"],
+        (CliMode::Config, ["set" | "delete"]) => &[
+            "interfaces",
+            "system",
+            "routing",
+            "vlans",
+            "protocols",
+            "switching",
+        ],
         (CliMode::Config, ["set" | "delete", "interfaces"]) => &[PORT],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT]) => &[
             "description",
@@ -119,12 +175,17 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "no-shutdown",
             "address",
             "switchport",
+            "channel-group",
+            "lacp",
+            "spanning-tree",
+            "storm-control",
+            "min-links",
         ],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "switchport"]) => {
             &["mode", "access", "trunk"]
         }
         (CliMode::Config, ["set", "interfaces", PORT, "switchport", "mode"]) => {
-            &["access", "trunk"]
+            &["access", "trunk", "dot1q-tunnel"]
         }
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "switchport", "access"]) => {
             &["vlan"]
@@ -136,13 +197,116 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             CliMode::Config,
             ["set" | "delete", "interfaces", PORT, "switchport", "trunk", "native"],
         ) => &["vlan"],
+        (CliMode::Config, ["set", "interfaces", PORT, "channel-group"]) => &[NUM],
+        (CliMode::Config, ["set", "interfaces", PORT, "channel-group", NUM]) => &["mode"],
+        (CliMode::Config, ["set", "interfaces", PORT, "channel-group", NUM, "mode"]) => {
+            &["active", "passive", "on"]
+        }
+        // The lacp level offers member and port-channel keywords; the
+        // handlers reject the ones that don't fit the interface kind.
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "lacp"]) => {
+            &["rate", "port-priority", "fallback", "fallback-timeout"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "lacp", "rate"]) => &["normal", "fast"],
+        (CliMode::Config, ["set", "interfaces", PORT, "lacp", "fallback"]) => {
+            &["static", "individual"]
+        }
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "spanning-tree"]) => {
+            &["portfast", "bpduguard", "cost", "port-priority"]
+        }
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "storm-control"]) => {
+            &["broadcast", "multicast", "unknown-unicast"]
+        }
+        (
+            CliMode::Config,
+            ["set", "interfaces", PORT, "storm-control", "broadcast" | "multicast" | "unknown-unicast"],
+        ) => &["level"],
         (CliMode::Config, ["set" | "delete", "vlans"]) => &["vlan"],
         (CliMode::Config, ["set" | "delete", "vlans", "vlan"]) => &[NUM],
-        (CliMode::Config, ["set" | "delete", "vlans", "vlan", NUM]) => &["description"],
+        (CliMode::Config, ["set" | "delete", "vlans", "vlan", NUM]) => &["description", "state"],
+        (CliMode::Config, ["set", "vlans", "vlan", NUM, "state"]) => &["active", "suspend"],
         (CliMode::Config, ["set" | "delete", "system"]) => &["ssh", "http", "https"],
         (CliMode::Config, ["set" | "delete", "system", "ssh"]) => &["authentication"],
         (CliMode::Config, ["set", "system", "ssh", "authentication"]) => &["local"],
         (CliMode::Config, ["set" | "delete", "routing"]) => &["static"],
+        (CliMode::Config, ["set" | "delete", "protocols"]) => {
+            &["spanning-tree", "igmp-snooping", "mld-snooping", "lacp"]
+        }
+        (CliMode::Config, ["set" | "delete", "protocols", "spanning-tree"]) => &[
+            "mode",
+            "priority",
+            "hello-time",
+            "max-age",
+            "forward-time",
+            "mst",
+        ],
+        (CliMode::Config, ["set", "protocols", "spanning-tree", "mode"]) => {
+            &["mstp", "rstp", "none"]
+        }
+        (CliMode::Config, ["set" | "delete", "protocols", "spanning-tree", "mst"]) => {
+            &["name", "revision", "instance"]
+        }
+        (CliMode::Config, ["set" | "delete", "protocols", "spanning-tree", "mst", "instance"]) => {
+            &[NUM]
+        }
+        (CliMode::Config, ["set", "protocols", "spanning-tree", "mst", "instance", NUM]) => {
+            &["vlans"]
+        }
+        (CliMode::Config, ["set" | "delete", "protocols", "igmp-snooping" | "mld-snooping"]) => {
+            &["disable", "robustness", "vlan"]
+        }
+        (
+            CliMode::Config,
+            ["set" | "delete", "protocols", "igmp-snooping" | "mld-snooping", "vlan"],
+        ) => &[NUM],
+        (
+            CliMode::Config,
+            ["set" | "delete", "protocols", "igmp-snooping" | "mld-snooping", "vlan", NUM],
+        ) => &["disable", "fast-leave", "querier", "mrouter"],
+        (
+            CliMode::Config,
+            ["set", "protocols", "igmp-snooping" | "mld-snooping", "vlan", NUM, "querier"],
+        ) => &["address"],
+        (
+            CliMode::Config,
+            ["set" | "delete", "protocols", "igmp-snooping" | "mld-snooping", "vlan", NUM, "mrouter"],
+        ) => &["interface"],
+        (
+            CliMode::Config,
+            ["set" | "delete", "protocols", "igmp-snooping" | "mld-snooping", "vlan", NUM, "mrouter", "interface"],
+        ) => &[PORT],
+        (CliMode::Config, ["set" | "delete", "protocols", "lacp"]) => &["system-priority"],
+        (CliMode::Config, ["set" | "delete", "switching"]) => &["mac-table", "mirror"],
+        (CliMode::Config, ["set" | "delete", "switching", "mac-table"]) => {
+            &["aging-time", "static"]
+        }
+        (CliMode::Config, ["set" | "delete", "switching", "mac-table", "static"]) => &[ANY],
+        (CliMode::Config, ["set" | "delete", "switching", "mac-table", "static", ANY]) => &["vlan"],
+        (
+            CliMode::Config,
+            ["set" | "delete", "switching", "mac-table", "static", ANY, "vlan"],
+        ) => &[NUM],
+        (
+            CliMode::Config,
+            ["set", "switching", "mac-table", "static", ANY, "vlan", NUM],
+        ) => &["interface", "drop"],
+        (
+            CliMode::Config,
+            ["set", "switching", "mac-table", "static", ANY, "vlan", NUM, "interface"],
+        ) => &[PORT],
+        (CliMode::Config, ["set" | "delete", "switching", "mirror"]) => &["session"],
+        (CliMode::Config, ["set" | "delete", "switching", "mirror", "session"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "switching", "mirror", "session", NUM]) => {
+            &["source", "destination"]
+        }
+        (
+            CliMode::Config,
+            ["set" | "delete", "switching", "mirror", "session", NUM, "source" | "destination"],
+        ) => &[PORT],
+        (
+            CliMode::Config,
+            ["set", "switching", "mirror", "session", NUM, "source", PORT],
+        ) => &["rx", "tx", "both"],
         (CliMode::Config, ["commit"]) => &["confirmed"],
         _ => &[],
     }
@@ -187,6 +351,24 @@ pub fn match_port(input: &str, known: &[String]) -> PortMatch {
         [] => PortMatch::NoMatch,
         many => PortMatch::Ambiguous(many.iter().map(|s| (*s).clone()).collect()),
     }
+}
+
+/// A config-defined interface form (`Po1`, `port-channel1`, `Vlan10`,
+/// `v10`) that fills a port slot without appearing in the syncd cache.
+fn virtual_port(token: &str) -> bool {
+    let digit_at = token
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or(token.len());
+    let (alpha, digits) = token.split_at(digit_at);
+    if alpha.is_empty() || digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let needle: String = alpha
+        .chars()
+        .filter(|c| *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    "portchannel".starts_with(&needle) || "vlan".starts_with(&needle)
 }
 
 /// Resolve one already-typed word against `words` the way `cli::resolve`
@@ -243,6 +425,9 @@ fn expand(
         let resolved = if level.contains(&PORT) {
             match match_port(token, ports) {
                 PortMatch::One(_) => Some(PORT),
+                // Config-defined interfaces (`Po1`, `Vlan10`) are not in
+                // the syncd cache but still fill a port slot.
+                _ if virtual_port(token) => Some(PORT),
                 _ => resolve_word(token, level.iter().copied().filter(|w| *w != PORT)),
             }
         } else if level.contains(&NUM)
@@ -250,6 +435,8 @@ fn expand(
             && token.chars().all(|c| c.is_ascii_digit())
         {
             Some(NUM)
+        } else if level.contains(&ANY) && !token.is_empty() {
+            Some(ANY)
         } else {
             resolve_word(token, level.iter().copied())
         };
@@ -267,8 +454,8 @@ fn expand(
                 } else {
                     ports.to_vec()
                 }
-            } else if *w == NUM {
-                Vec::new() // free-form number; nothing to offer
+            } else if *w == NUM || *w == ANY {
+                Vec::new() // free-form value; nothing to offer
             } else {
                 vec![(*w).to_string()]
             }
@@ -405,7 +592,12 @@ mod tests {
                 "shutdown".to_string(),
                 "no-shutdown".to_string(),
                 "address".to_string(),
-                "switchport".to_string()
+                "switchport".to_string(),
+                "channel-group".to_string(),
+                "lacp".to_string(),
+                "spanning-tree".to_string(),
+                "storm-control".to_string(),
+                "min-links".to_string(),
             ]
         );
         let c = candidates(
@@ -414,7 +606,14 @@ mod tests {
             "",
             &ports(),
         );
-        assert_eq!(c, vec!["access".to_string(), "trunk".to_string()]);
+        assert_eq!(
+            c,
+            vec![
+                "access".to_string(),
+                "trunk".to_string(),
+                "dot1q-tunnel".to_string()
+            ]
+        );
         // delete shares the path.
         let c = candidates(
             CliMode::Config,
@@ -434,7 +633,9 @@ mod tests {
                 "interfaces".to_string(),
                 "system".to_string(),
                 "routing".to_string(),
-                "vlans".to_string()
+                "vlans".to_string(),
+                "protocols".to_string(),
+                "switching".to_string(),
             ]
         );
         // delete shares the tree.
@@ -537,14 +738,14 @@ mod tests {
         // The id slot is free-form...
         let c = candidates(CliMode::Config, &["set", "vlans", "vlan"], "", &ports());
         assert!(c.is_empty());
-        // ...but a typed number leads to description.
+        // ...but a typed number leads to the vlan settings.
         let c = candidates(
             CliMode::Config,
             &["set", "vlans", "vlan", "10"],
             "",
             &ports(),
         );
-        assert_eq!(c, vec!["description".to_string()]);
+        assert_eq!(c, vec!["description".to_string(), "state".to_string()]);
         // A non-number in the id slot stops completion.
         let c = candidates(
             CliMode::Config,
@@ -553,6 +754,172 @@ mod tests {
             &ports(),
         );
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn switching_suite_interface_paths_complete() {
+        let c = candidates(CliMode::Config, &["set", "interfaces", "Eth1"], "ch", &ports());
+        assert_eq!(c, vec!["channel-group".to_string()]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "channel-group", "1", "mode"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["active", "passive", "on"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "lacp"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["rate", "port-priority", "fallback", "fallback-timeout"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Po1", "lacp", "fallback"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["static", "individual"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "spanning-tree"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["portfast", "bpduguard", "cost", "port-priority"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "storm-control", "broadcast"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["level"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "switchport", "mode"],
+            "d",
+            &ports(),
+        );
+        assert_eq!(c, vec!["dot1q-tunnel"]);
+    }
+
+    #[test]
+    fn protocols_paths_complete() {
+        let c = candidates(CliMode::Config, &["set"], "p", &ports());
+        assert_eq!(c, vec!["protocols".to_string()]);
+        let c = candidates(CliMode::Config, &["set", "protocols"], "", &ports());
+        assert_eq!(
+            c,
+            vec!["spanning-tree", "igmp-snooping", "mld-snooping", "lacp"]
+        );
+        let c = candidates(
+            CliMode::Config,
+            &["set", "protocols", "spanning-tree", "mode"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["mstp", "rstp", "none"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "protocols", "spanning-tree", "mst", "instance", "1"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["vlans"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "protocols", "igmp-snooping", "vlan", "10"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["disable", "fast-leave", "querier", "mrouter"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "protocols", "igmp-snooping", "vlan", "10", "mrouter", "interface"],
+            "Ethernet1",
+            &ports(),
+        );
+        assert_eq!(c, vec!["Ethernet1", "Ethernet10"]);
+        let c = candidates(CliMode::Config, &["set", "protocols", "lacp"], "", &ports());
+        assert_eq!(c, vec!["system-priority"]);
+    }
+
+    #[test]
+    fn switching_paths_complete() {
+        let c = candidates(CliMode::Config, &["set", "switching"], "", &ports());
+        assert_eq!(c, vec!["mac-table", "mirror"]);
+        // The MAC slot is free text; a typed MAC leads to `vlan`.
+        let c = candidates(
+            CliMode::Config,
+            &["set", "switching", "mac-table", "static", "00:50:56:be:ef:01"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["vlan"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "switching", "mac-table", "static", "00:50:56:be:ef:01", "vlan", "10"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["interface", "drop"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "switching", "mirror", "session", "1"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["source", "destination"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "switching", "mirror", "session", "1", "source", "Eth1"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["rx", "tx", "both"]);
+    }
+
+    #[test]
+    fn vlan_state_path_completes() {
+        let c = candidates(
+            CliMode::Config,
+            &["set", "vlans", "vlan", "10"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["description", "state"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "vlans", "vlan", "10", "state"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["active", "suspend"]);
+    }
+
+    #[test]
+    fn port_channel_tokens_fill_port_slots() {
+        // Po1 is not in the syncd cache but still resolves the slot.
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Po1"],
+            "min",
+            &ports(),
+        );
+        assert_eq!(c, vec!["min-links"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "port-channel1", "switchport"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["mode", "access", "trunk"]);
+        assert!(virtual_port("Po1"));
+        assert!(virtual_port("port-channel1"));
+        assert!(virtual_port("Vlan10"));
+        assert!(!virtual_port("Ethernet1"));
+        assert!(!virtual_port("banana"));
     }
 
     #[test]

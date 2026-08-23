@@ -1,0 +1,6 @@
+Vlan  Group            Type      Version  Port-List
+----  ---------------  --------  -------  ------------------
+10    239.1.1.10       Dynamic   v2       Et1, Et3
+10    239.255.255.250  Dynamic   v2       Et1, Et3, Et5
+20    239.20.0.7       Dynamic   v3       Et2
+Total number of groups: 3

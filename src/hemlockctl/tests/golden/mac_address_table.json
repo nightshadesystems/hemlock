@@ -1,0 +1,43 @@
+{
+  "mac_address_table": {
+    "aging_time_secs": 300,
+    "entries": [
+      {
+        "drop": false,
+        "is_static": false,
+        "last_move_secs": 862,
+        "mac": "00:1c:73:0c:aa:01",
+        "moves": 1,
+        "port": "Ethernet1",
+        "vlan": 10
+      },
+      {
+        "drop": false,
+        "is_static": false,
+        "last_move_secs": 3730,
+        "mac": "a0:36:9f:44:be:02",
+        "moves": 2,
+        "port": "Port-Channel1",
+        "vlan": 10
+      },
+      {
+        "drop": false,
+        "is_static": false,
+        "last_move_secs": 14141,
+        "mac": "d4:af:f7:12:9c:01",
+        "moves": 1,
+        "port": "Ethernet2",
+        "vlan": 99
+      },
+      {
+        "drop": false,
+        "is_static": true,
+        "last_move_secs": null,
+        "mac": "00:50:56:be:ef:01",
+        "moves": 0,
+        "port": "Ethernet3",
+        "vlan": 10
+      }
+    ]
+  }
+}

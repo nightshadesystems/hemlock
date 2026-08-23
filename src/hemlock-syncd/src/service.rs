@@ -9,10 +9,13 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tonic::{Request, Response, Status};
 
-use crate::actor::SaiHandle;
+use crate::actor::{FdbNotify, SaiHandle};
 use crate::ifstats::{utilization_pct, RawCounters, SharedEngine, Snapshot};
 use crate::netdev::NetdevSample;
-use crate::state::{L3State, PortState, SwitchportState, VlanState};
+use crate::state::{
+    FdbStaticEntry, L3State, MirrorDir, MirrorState, PortState, StormState, SwitchportState,
+    VlanState,
+};
 
 /// Fallback L2 MTU for front-panel ports, matching the KNET default the
 /// platform loads (`linux-bcm-knet default_mtu=9100`). Used when a port's
@@ -209,10 +212,18 @@ impl SyncdService {
             phy_model: port.def.phy_model.clone().unwrap_or_default(),
             supported_modes: port.def.supported_modes.clone(),
             ip_addresses: port.l3.iter().map(|l3| l3.address.clone()).collect(),
+            errdisable_reason: port.errdisable_reason.clone().unwrap_or_default(),
             ..pb::InterfaceState::default()
         };
         if let Some(sp) = &port.switchport {
-            state.switchport_mode = if sp.trunk { "trunk" } else { "access" }.into();
+            state.switchport_mode = if sp.trunk {
+                "trunk"
+            } else if sp.dot1q_tunnel {
+                "dot1q-tunnel"
+            } else {
+                "access"
+            }
+            .into();
             state.access_vlan = u32::from(sp.access_vlan);
             state.native_vlan = u32::from(sp.native_vlan);
             state.trunk_vlans = sp.trunk_vlans.iter().map(|v| u32::from(*v)).collect();
@@ -467,6 +478,7 @@ impl SyncdService {
                 .or_insert(VlanState {
                     oid: None,
                     name: String::new(),
+                    suspended: false,
                     l3,
                 });
         }
@@ -503,6 +515,388 @@ impl SyncdService {
     }
 }
 
+// gRPC helper fns naturally speak `Status`; its size is tonic's business.
+#[allow(clippy::result_large_err)]
+impl SyncdService {
+    /// A capability gate: commits that need an absent SAI capability
+    /// fail cleanly with the platform error, never silently no-op.
+    fn require_capability(&self, supported: bool, family: &str) -> Result<(), Status> {
+        if supported {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(format!(
+                "{family} is not supported by this platform's SAI"
+            )))
+        }
+    }
+
+    /// A request MAC as bytes, canonicalized.
+    fn mac_bytes(text: &str) -> Result<([u8; 6], String), Status> {
+        let canonical =
+            hemlock_common::net::parse_mac(text).map_err(Status::invalid_argument)?;
+        let mut mac = [0u8; 6];
+        for (i, part) in canonical.split(':').enumerate() {
+            mac[i] = u8::from_str_radix(part, 16)
+                .map_err(|_| Status::invalid_argument(format!("bad MAC {text:?}")))?;
+        }
+        Ok((mac, canonical))
+    }
+
+    /// The backend VLAN reference for FDB programming: None = the
+    /// default VLAN; other VLANs must be defined.
+    fn fdb_vlan_ref(&self, vlan: u16) -> Result<Option<hemlock_sai::Oid>, Status> {
+        if vlan == 1 {
+            return Ok(None);
+        }
+        let vlans = self
+            .handle
+            .vlans
+            .read()
+            .map_err(|_| Status::internal("vlan table poisoned"))?;
+        match vlans.get(&vlan).and_then(|v| v.oid) {
+            Some(oid) => Ok(Some(oid)),
+            None => Err(Status::failed_precondition(format!(
+                "VLAN {vlan} is not defined (set vlans vlan {vlan})"
+            ))),
+        }
+    }
+
+    fn port_sai_id(&self, name: &str) -> Result<hemlock_sai::PortId, Status> {
+        let table = self
+            .handle
+            .ports
+            .read()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        table
+            .get(name)
+            .map(|p| p.sai_id)
+            .ok_or_else(|| Status::not_found(format!("no port {name:?}")))
+    }
+
+    /// A physical port's or a port-channel's port-like SAI id.
+    fn port_like_sai_id(&self, name: &str) -> Result<hemlock_sai::PortId, Status> {
+        if let Some(group) = lag_group_of(name) {
+            let lags = self
+                .handle
+                .lags
+                .read()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            return lags.get(&group).map(|lag| lag.sai_id).ok_or_else(|| {
+                Status::failed_precondition(format!("Port-Channel{group} not created"))
+            });
+        }
+        self.port_sai_id(name)
+    }
+
+    /// Percent level ("10.00") -> hundredths of a percent.
+    fn level_hundredths(level: &str) -> Result<u64, Status> {
+        let canonical = hemlock_common::net::parse_storm_level(level)
+            .map_err(Status::invalid_argument)?;
+        let (whole, frac) = canonical
+            .split_once('.')
+            .ok_or_else(|| Status::internal("level not canonical"))?;
+        let whole: u64 = whole
+            .parse()
+            .map_err(|_| Status::internal("level not canonical"))?;
+        let frac: u64 = frac
+            .parse()
+            .map_err(|_| Status::internal("level not canonical"))?;
+        Ok(whole * 100 + frac)
+    }
+
+    /// A storm level's rate on a port: percent of the port's configured
+    /// speed, in kb/s.
+    fn storm_kbps(speed_mbps: u32, hundredths: u64) -> u64 {
+        u64::from(speed_mbps) * hundredths / 10
+    }
+
+    /// The (vlan, group IP) key of an L2MC RPC, validated.
+    fn l2mc_key(raw_vlan: u32, group: &str) -> Result<(u16, std::net::IpAddr), Status> {
+        let vlan = vlan_id(raw_vlan).map_err(Status::invalid_argument)?;
+        let group_ip: std::net::IpAddr = group
+            .parse()
+            .map_err(|_| Status::invalid_argument(format!("bad group address {group:?}")))?;
+        if !group_ip.is_multicast() {
+            return Err(Status::invalid_argument(format!(
+                "{group_ip} is not a multicast address"
+            )));
+        }
+        Ok((vlan, group_ip))
+    }
+
+    /// Reconcile an L2MC group's output ports declaratively; returns
+    /// the resulting member map.
+    async fn reconcile_l2mc_members(
+        &self,
+        state: crate::state::L2mcGroupState,
+        wanted: &[String],
+    ) -> Result<std::collections::BTreeMap<String, hemlock_sai::Oid>, Status> {
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let mut members = state.members;
+        let stale: Vec<String> = members
+            .keys()
+            .filter(|name| !wanted.contains(name))
+            .cloned()
+            .collect();
+        for name in stale {
+            if let Some(member) = members.remove(&name) {
+                self.handle.remove_l2mc_member(member).await.map_err(sai)?;
+            }
+        }
+        for name in wanted {
+            if members.contains_key(name) {
+                continue;
+            }
+            let port_id = self.port_like_sai_id(name)?;
+            let member = self
+                .handle
+                .add_l2mc_member(state.oid, port_id)
+                .await
+                .map_err(sai)?;
+            members.insert(name.clone(), member);
+        }
+        Ok(members)
+    }
+
+    /// The shared declarative L2 program for a port-like object:
+    /// reconcile VLAN memberships against the wanted mode, settle the
+    /// default VLAN, classify untagged ingress. Returns the resulting
+    /// membership list. VLANs not (yet) defined are skipped — they
+    /// attach when the VLAN is created and the object reprogrammed;
+    /// suspended VLANs are skipped the same way.
+    #[allow(clippy::too_many_arguments)]
+    async fn program_l2(
+        &self,
+        name: &str,
+        sai_id: hemlock_sai::PortId,
+        current: Vec<(u16, hemlock_sai::Oid, bool)>,
+        trunk: bool,
+        access_vlan: u16,
+        native_vlan: u16,
+        trunk_vlans: &[u16],
+    ) -> Result<Vec<(u16, hemlock_sai::Oid, bool)>, Status> {
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let mut desired: Vec<(u16, bool)> = Vec::new();
+        if trunk {
+            if native_vlan != 1 {
+                desired.push((native_vlan, false));
+            }
+            for vlan in trunk_vlans {
+                if *vlan != native_vlan && *vlan != 1 {
+                    desired.push((*vlan, true));
+                }
+            }
+        } else if access_vlan != 1 {
+            desired.push((access_vlan, false));
+        }
+        let desired: Vec<(u16, bool, hemlock_sai::Oid)> = {
+            let vlans = self
+                .handle
+                .vlans
+                .read()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            desired
+                .into_iter()
+                .filter_map(|(vlan, tagged)| match vlans.get(&vlan) {
+                    Some(state) if state.suspended => None,
+                    Some(state) => state.oid.map(|oid| (vlan, tagged, oid)),
+                    None => {
+                        tracing::warn!(
+                            port = %name,
+                            vlan,
+                            "switchport references an undefined VLAN; membership skipped"
+                        );
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        // Reconcile: drop stale memberships, settle the default VLAN,
+        // add what's missing, then classify untagged ingress.
+        let mut members = Vec::new();
+        for (vlan, member, tagged) in current {
+            if desired.iter().any(|(v, t, _)| *v == vlan && *t == tagged) {
+                members.push((vlan, member, tagged));
+            } else {
+                self.handle.remove_vlan_member(member).await.map_err(sai)?;
+            }
+        }
+        let wants_default = if trunk {
+            native_vlan == 1
+        } else {
+            access_vlan == 1
+        };
+        if wants_default {
+            self.handle
+                .restore_port_default_vlan(sai_id)
+                .await
+                .map_err(sai)?;
+        } else {
+            self.handle
+                .remove_port_default_vlan(sai_id)
+                .await
+                .map_err(sai)?;
+        }
+        for (vlan, tagged, oid) in &desired {
+            if !members.iter().any(|(v, _, t)| v == vlan && t == tagged) {
+                let member = self
+                    .handle
+                    .add_vlan_member(*oid, sai_id, *tagged)
+                    .await
+                    .map_err(sai)?;
+                members.push((*vlan, member, *tagged));
+            }
+        }
+        let pvid = if trunk { native_vlan } else { access_vlan };
+        self.handle.set_port_pvid(sai_id, pvid).await.map_err(sai)?;
+        Ok(members)
+    }
+
+    /// Reprogram one port's mirror attachment from the session table:
+    /// its ingress and egress sessions are derived across every session
+    /// (rx in one session and tx in another is legal).
+    async fn reprogram_port_mirror(&self, name: &str) -> Result<(), Status> {
+        let sai_id = self.port_sai_id(name)?;
+        let (ingress, egress) = {
+            let mirrors = self
+                .handle
+                .mirrors
+                .read()
+                .map_err(|_| Status::internal("mirror table poisoned"))?;
+            let mut ingress = None;
+            let mut egress = None;
+            for state in mirrors.values() {
+                if let Some(direction) = state.sources.get(name) {
+                    if matches!(direction, MirrorDir::Rx | MirrorDir::Both) {
+                        ingress = Some(state.oid);
+                    }
+                    if matches!(direction, MirrorDir::Tx | MirrorDir::Both) {
+                        egress = Some(state.oid);
+                    }
+                }
+            }
+            (ingress, egress)
+        };
+        self.handle
+            .set_port_mirror(sai_id, ingress, egress)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))
+    }
+
+    /// Reconcile VLAN memberships when a VLAN's suspend state flips:
+    /// suspending detaches every membership (frames stop forwarding),
+    /// resuming re-adds what the ports' switchport programs want.
+    async fn reconcile_vlan_suspension(&self, id: u16, suspend: bool) -> Result<(), Status> {
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        if suspend {
+            let detach: Vec<hemlock_sai::Oid> = {
+                let table = self
+                    .handle
+                    .ports
+                    .read()
+                    .map_err(|_| Status::internal("port table poisoned"))?;
+                table
+                    .values()
+                    .flat_map(|p| p.switchport.iter())
+                    .flat_map(|sp| sp.members.iter())
+                    .filter(|(v, _, _)| *v == id)
+                    .map(|(_, member, _)| *member)
+                    .collect()
+            };
+            for member in detach {
+                self.handle.remove_vlan_member(member).await.map_err(sai)?;
+            }
+            let mut table = self
+                .handle
+                .ports
+                .write()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            for port in table.values_mut() {
+                if let Some(sp) = &mut port.switchport {
+                    sp.members.retain(|(v, _, _)| *v != id);
+                }
+            }
+        } else {
+            // Resume: re-add the memberships the switchport programs
+            // reference.
+            let vlan_oid = {
+                let vlans = self
+                    .handle
+                    .vlans
+                    .read()
+                    .map_err(|_| Status::internal("vlan table poisoned"))?;
+                vlans.get(&id).and_then(|v| v.oid)
+            };
+            let Some(vlan_oid) = vlan_oid else {
+                return Ok(());
+            };
+            let wanted: Vec<(String, hemlock_sai::PortId, bool)> = {
+                let table = self
+                    .handle
+                    .ports
+                    .read()
+                    .map_err(|_| Status::internal("port table poisoned"))?;
+                table
+                    .values()
+                    .filter_map(|p| {
+                        let sp = p.switchport.as_ref()?;
+                        if sp.members.iter().any(|(v, _, _)| *v == id) {
+                            return None;
+                        }
+                        let tagged = if sp.trunk {
+                            if sp.native_vlan == id {
+                                false
+                            } else if sp.trunk_vlans.contains(&id) {
+                                true
+                            } else {
+                                return None;
+                            }
+                        } else if sp.access_vlan == id {
+                            false
+                        } else {
+                            return None;
+                        };
+                        Some((p.def.name.clone(), p.sai_id, tagged))
+                    })
+                    .collect()
+            };
+            for (name, sai_id, tagged) in wanted {
+                let member = self
+                    .handle
+                    .add_vlan_member(vlan_oid, sai_id, tagged)
+                    .await
+                    .map_err(sai)?;
+                if let Ok(mut table) = self.handle.ports.write() {
+                    if let Some(port) = table.get_mut(&name) {
+                        if let Some(sp) = &mut port.switchport {
+                            sp.members.push((id, member, tagged));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn storm_class_proto(class: hemlock_sai::StormClass) -> pb::StormClass {
+    match class {
+        hemlock_sai::StormClass::Broadcast => pb::StormClass::Broadcast,
+        hemlock_sai::StormClass::Multicast => pb::StormClass::Multicast,
+        hemlock_sai::StormClass::UnknownUnicast => pb::StormClass::UnknownUnicast,
+    }
+}
+
+/// The group number of a port-channel name (`Port-Channel1` -> 1).
+fn lag_group_of(name: &str) -> Option<u16> {
+    let digits = name.strip_prefix("Port-Channel")?;
+    digits
+        .parse::<u16>()
+        .ok()
+        .filter(|group| (1..=64).contains(group) && !digits.starts_with('0'))
+}
+
 /// The VLAN id of an SVI interface name (`Vlan10` -> 10).
 fn svi_vlan_id(name: &str) -> Option<u16> {
     let digits = name.strip_prefix("Vlan")?;
@@ -518,11 +912,23 @@ impl pb::syncd_server::Syncd for SyncdService {
         &self,
         _request: Request<pb::GetSwitchInfoRequest>,
     ) -> Result<Response<pb::SwitchInfo>, Status> {
+        let caps = self.handle.capabilities;
         Ok(Response::new(pb::SwitchInfo {
             platform_id: self.handle.platform_id.clone(),
             backend: self.handle.backend_name.clone(),
             switch_oid: self.handle.switch.oid,
             port_count: self.handle.initial_ports() as u32,
+            capabilities: Some(pb::SwitchCapabilities {
+                lag: caps.lag,
+                stp: caps.stp,
+                fdb_flush: caps.fdb_flush,
+                fdb_aging: caps.fdb_aging,
+                l2mc: caps.l2mc,
+                storm_control: caps.storm_control,
+                mirror: caps.mirror,
+                mirror_sessions_max: caps.mirror_sessions_max,
+                port_tpid: caps.port_tpid,
+            }),
         }))
     }
 
@@ -653,9 +1059,72 @@ impl pb::syncd_server::Syncd for SyncdService {
                 }
             }
         }
+        // Port-channels are interfaces too: oper up when any enabled
+        // member is up, bandwidth the sum of the bundled members.
+        {
+            let lags = self
+                .handle
+                .lags
+                .read()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            let ports = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            for lag in lags.values() {
+                let name = format!("Port-Channel{}", lag.group);
+                if !wanted(&name) {
+                    continue;
+                }
+                let mut members: Vec<&String> = lag.members.keys().collect();
+                members.sort();
+                let bundled: Vec<(&String, &PortState)> = lag
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.enabled)
+                    .filter_map(|(n, _)| ports.get(n).map(|p| (n, p)))
+                    .filter(|(_, p)| p.oper_up)
+                    .collect();
+                let speed: u64 = bundled
+                    .iter()
+                    .map(|(_, p)| u64::from(p.def.speed_mbps))
+                    .sum();
+                let mut state = pb::InterfaceState {
+                    name,
+                    kind: "port-channel".into(),
+                    admin_state: if lag.admin_up {
+                        pb::AdminState::Up
+                    } else {
+                        pb::AdminState::Down
+                    } as i32,
+                    oper_status: if lag.admin_up && !bundled.is_empty() {
+                        pb::OperStatus::Up
+                    } else {
+                        pb::OperStatus::Down
+                    } as i32,
+                    mac: self.inventory.mac.clone().unwrap_or_default(),
+                    bia_mac: self.inventory.mac.clone().unwrap_or_default(),
+                    description: lag.description.clone(),
+                    mtu: PORT_MTU,
+                    speed_mbps: speed,
+                    duplex: "full".into(),
+                    members: members.into_iter().cloned().collect(),
+                    ..pb::InterfaceState::default()
+                };
+                if let Some(sp) = &lag.switchport {
+                    state.switchport_mode = if sp.trunk { "trunk" } else { "access" }.into();
+                    state.access_vlan = u32::from(sp.access_vlan);
+                    state.native_vlan = u32::from(sp.native_vlan);
+                    state.trunk_vlans = sp.trunk_vlans.iter().map(|v| u32::from(*v)).collect();
+                }
+                interfaces.push(state);
+            }
+        }
+
         // Every VLAN is an interface too (Vlan1 always; a kernel netdev
         // with the same name, should one ever exist, wins).
-        let (active_vlans, vlan_names) = {
+        let (active_vlans, vlan_names, suspended_vlans) = {
             let table = self
                 .handle
                 .ports
@@ -686,13 +1155,23 @@ impl pb::syncd_server::Syncd for SyncdService {
                 .filter(|(_, v)| !v.name.is_empty())
                 .map(|(id, v)| (u32::from(*id), v.name.clone()))
                 .collect();
-            (ids.iter().map(|id| u32::from(*id)).collect(), names)
+            let suspended = vlans
+                .iter()
+                .filter(|(_, v)| v.suspended)
+                .map(|(id, _)| u32::from(*id))
+                .collect();
+            (
+                ids.iter().map(|id| u32::from(*id)).collect(),
+                names,
+                suspended,
+            )
         };
         Ok(Response::new(pb::GetInterfacesResponse {
             interfaces,
             platform_model: self.inventory.platform_model.clone(),
             active_vlans,
             vlan_names,
+            suspended_vlans,
         }))
     }
 
@@ -845,12 +1324,17 @@ impl pb::syncd_server::Syncd for SyncdService {
     ) -> Result<Response<pb::EnsureVlanResponse>, Status> {
         let req = request.into_inner();
         let id = vlan_id(req.id).map_err(Status::invalid_argument)?;
-        let exists = self
-            .handle
-            .vlans
-            .read()
-            .map_err(|_| Status::internal("vlan table poisoned"))?
-            .contains_key(&id);
+        let (exists, was_suspended) = {
+            let vlans = self
+                .handle
+                .vlans
+                .read()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            match vlans.get(&id) {
+                Some(state) => (true, state.suspended),
+                None => (false, false),
+            }
+        };
         // The default VLAN always exists in hardware; only non-default
         // VLANs are created. Drive the ASIC outside the lock.
         let oid = if exists || id == 1 {
@@ -863,19 +1347,31 @@ impl pb::syncd_server::Syncd for SyncdService {
                     .map_err(|e| Status::internal(format!("SAI: {e}")))?,
             )
         };
-        let mut vlans = self
-            .handle
-            .vlans
-            .write()
-            .map_err(|_| Status::internal("vlan table poisoned"))?;
-        vlans
-            .entry(id)
-            .and_modify(|v| v.name = req.name.clone())
-            .or_insert(VlanState {
-                oid,
-                name: req.name,
-                l3: None,
-            });
+        {
+            let mut vlans = self
+                .handle
+                .vlans
+                .write()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            vlans
+                .entry(id)
+                .and_modify(|v| {
+                    v.name = req.name.clone();
+                    v.suspended = req.suspend;
+                })
+                .or_insert(VlanState {
+                    oid,
+                    name: req.name,
+                    suspended: req.suspend,
+                    l3: None,
+                });
+        }
+        // A suspend flip reconciles memberships: suspending detaches
+        // them (frames stop forwarding), resuming re-adds what the
+        // ports' switchport programs want.
+        if exists && was_suspended != req.suspend {
+            self.reconcile_vlan_suspension(id, req.suspend).await?;
+        }
         Ok(Response::new(pb::EnsureVlanResponse {}))
     }
 
@@ -953,11 +1449,17 @@ impl pb::syncd_server::Syncd for SyncdService {
     ) -> Result<Response<pb::SetPortSwitchportResponse>, Status> {
         let req = request.into_inner();
         let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
-        let trunk = match pb::SwitchportMode::try_from(req.mode) {
-            Ok(pb::SwitchportMode::Trunk) => true,
-            Ok(pb::SwitchportMode::Access) => false,
+        // dot1q-tunnel programs access-like membership (the S-VLAN is
+        // the access VLAN); its TPID treatment rides on top.
+        let (trunk, dot1q_tunnel) = match pb::SwitchportMode::try_from(req.mode) {
+            Ok(pb::SwitchportMode::Trunk) => (true, false),
+            Ok(pb::SwitchportMode::Access) => (false, false),
+            Ok(pb::SwitchportMode::Dot1qTunnel) => (false, true),
             _ => return Err(Status::invalid_argument("unspecified switchport mode")),
         };
+        if dot1q_tunnel {
+            self.require_capability(self.handle.capabilities.port_tpid, "dot1q-tunnel")?;
+        }
         let access_vlan = default_vlan_id(req.access_vlan).map_err(Status::invalid_argument)?;
         let native_vlan = default_vlan_id(req.native_vlan).map_err(Status::invalid_argument)?;
         let mut trunk_vlans: Vec<u16> = req
@@ -969,7 +1471,61 @@ impl pb::syncd_server::Syncd for SyncdService {
         trunk_vlans.sort_unstable();
         trunk_vlans.dedup();
 
-        let (sai_id, current) = {
+        // Port-channels take the same declarative program; only the
+        // state store differs.
+        if let Some(group) = lag_group_of(&req.name) {
+            if dot1q_tunnel {
+                return Err(Status::invalid_argument(
+                    "dot1q-tunnel is not supported on port-channel interfaces",
+                ));
+            }
+            let (sai_id, current) = {
+                let lags = self
+                    .handle
+                    .lags
+                    .read()
+                    .map_err(|_| Status::internal("lag table poisoned"))?;
+                let lag = lags.get(&group).ok_or_else(|| {
+                    Status::failed_precondition(format!("Port-Channel{group} not created"))
+                })?;
+                (
+                    lag.sai_id,
+                    lag.switchport
+                        .as_ref()
+                        .map(|sp| sp.members.clone())
+                        .unwrap_or_default(),
+                )
+            };
+            let members = self
+                .program_l2(
+                    &req.name,
+                    sai_id,
+                    current,
+                    trunk,
+                    access_vlan,
+                    native_vlan,
+                    &trunk_vlans,
+                )
+                .await?;
+            let mut lags = self
+                .handle
+                .lags
+                .write()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            if let Some(lag) = lags.get_mut(&group) {
+                lag.switchport = Some(SwitchportState {
+                    trunk,
+                    dot1q_tunnel: false,
+                    access_vlan,
+                    trunk_vlans,
+                    native_vlan,
+                    members,
+                });
+            }
+            return Ok(Response::new(pb::SetPortSwitchportResponse {}));
+        }
+
+        let (sai_id, current, was_tunnel) = {
             let table = self
                 .handle
                 .ports
@@ -990,87 +1546,33 @@ impl pb::syncd_server::Syncd for SyncdService {
                     .as_ref()
                     .map(|sp| sp.members.clone())
                     .unwrap_or_default(),
+                port.switchport
+                    .as_ref()
+                    .map(|sp| sp.dot1q_tunnel)
+                    .unwrap_or(false),
             )
         };
+        let members = self
+            .program_l2(
+                &req.name,
+                sai_id,
+                current,
+                trunk,
+                access_vlan,
+                native_vlan,
+                &trunk_vlans,
+            )
+            .await?;
 
-        // Desired non-default memberships; VLANs not (yet) defined are
-        // skipped â€” they attach when the VLAN is created and the port
-        // reprogrammed.
-        let mut desired: Vec<(u16, bool)> = Vec::new();
-        if trunk {
-            if native_vlan != 1 {
-                desired.push((native_vlan, false));
-            }
-            for vlan in &trunk_vlans {
-                if *vlan != native_vlan && *vlan != 1 {
-                    desired.push((*vlan, true));
-                }
-            }
-        } else if access_vlan != 1 {
-            desired.push((access_vlan, false));
-        }
-        let desired: Vec<(u16, bool, hemlock_sai::Oid)> = {
-            let vlans = self
-                .handle
-                .vlans
-                .read()
-                .map_err(|_| Status::internal("vlan table poisoned"))?;
-            desired
-                .into_iter()
-                .filter_map(
-                    |(vlan, tagged)| match vlans.get(&vlan).and_then(|v| v.oid) {
-                        Some(oid) => Some((vlan, tagged, oid)),
-                        None => {
-                            tracing::warn!(
-                                port = %req.name,
-                                vlan,
-                                "switchport references an undefined VLAN; membership skipped"
-                            );
-                            None
-                        }
-                    },
-                )
-                .collect()
-        };
-
-        // Reconcile: drop stale memberships, settle the default VLAN,
-        // add what's missing, then classify untagged ingress.
-        let mut members = Vec::new();
-        for (vlan, member, tagged) in current {
-            if desired.iter().any(|(v, t, _)| *v == vlan && *t == tagged) {
-                members.push((vlan, member, tagged));
-            } else {
-                self.handle.remove_vlan_member(member).await.map_err(sai)?;
-            }
-        }
-        let wants_default = if trunk {
-            native_vlan == 1
-        } else {
-            access_vlan == 1
-        };
-        if wants_default {
+        // QinQ: a tunnel port carries the 0x88a8 outer TPID so customer
+        // 0x8100 tags ride through as payload; leaving tunnel mode
+        // restores the default.
+        if dot1q_tunnel != was_tunnel {
             self.handle
-                .restore_port_default_vlan(sai_id)
-                .await
-                .map_err(sai)?;
-        } else {
-            self.handle
-                .remove_port_default_vlan(sai_id)
+                .set_port_tpid(sai_id, if dot1q_tunnel { 0x88a8 } else { 0x8100 })
                 .await
                 .map_err(sai)?;
         }
-        for (vlan, tagged, oid) in &desired {
-            if !members.iter().any(|(v, _, t)| v == vlan && t == tagged) {
-                let member = self
-                    .handle
-                    .add_vlan_member(*oid, sai_id, *tagged)
-                    .await
-                    .map_err(sai)?;
-                members.push((*vlan, member, *tagged));
-            }
-        }
-        let pvid = if trunk { native_vlan } else { access_vlan };
-        self.handle.set_port_pvid(sai_id, pvid).await.map_err(sai)?;
 
         let mut table = self
             .handle
@@ -1080,6 +1582,7 @@ impl pb::syncd_server::Syncd for SyncdService {
         if let Some(port) = table.get_mut(&req.name) {
             port.switchport = Some(SwitchportState {
                 trunk,
+                dot1q_tunnel,
                 access_vlan,
                 trunk_vlans,
                 native_vlan,
@@ -1097,6 +1600,35 @@ impl pb::syncd_server::Syncd for SyncdService {
     ) -> Result<Response<pb::ClearPortSwitchportResponse>, Status> {
         let req = request.into_inner();
         let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        if let Some(group) = lag_group_of(&req.name) {
+            let existing = {
+                let lags = self
+                    .handle
+                    .lags
+                    .read()
+                    .map_err(|_| Status::internal("lag table poisoned"))?;
+                lags.get(&group).map(|lag| (lag.sai_id, lag.switchport.clone()))
+            };
+            let Some((sai_id, Some(sp))) = existing else {
+                return Ok(Response::new(pb::ClearPortSwitchportResponse {}));
+            };
+            for (_, member, _) in sp.members {
+                self.handle.remove_vlan_member(member).await.map_err(sai)?;
+            }
+            self.handle
+                .restore_port_default_vlan(sai_id)
+                .await
+                .map_err(sai)?;
+            let mut lags = self
+                .handle
+                .lags
+                .write()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            if let Some(lag) = lags.get_mut(&group) {
+                lag.switchport = None;
+            }
+            return Ok(Response::new(pb::ClearPortSwitchportResponse {}));
+        }
         let (sai_id, existing) = {
             let table = self
                 .handle
@@ -1114,6 +1646,12 @@ impl pb::syncd_server::Syncd for SyncdService {
         for (_, member, _) in sp.members {
             self.handle.remove_vlan_member(member).await.map_err(sai)?;
         }
+        if sp.dot1q_tunnel {
+            self.handle
+                .set_port_tpid(sai_id, 0x8100)
+                .await
+                .map_err(sai)?;
+        }
         self.handle
             .restore_port_default_vlan(sai_id)
             .await
@@ -1129,6 +1667,1321 @@ impl pb::syncd_server::Syncd for SyncdService {
         drop(table);
         self.reconcile_svi_bridges();
         Ok(Response::new(pb::ClearPortSwitchportResponse {}))
+    }
+
+    async fn set_fdb_aging_time(
+        &self,
+        request: Request<pb::SetFdbAgingTimeRequest>,
+    ) -> Result<Response<pb::SetFdbAgingTimeResponse>, Status> {
+        self.require_capability(self.handle.capabilities.fdb_aging, "mac-table aging")?;
+        let secs = request.into_inner().seconds;
+        self.handle
+            .set_fdb_aging(secs)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        if let Ok(mut fdb) = self.handle.fdb.write() {
+            fdb.aging_secs = secs;
+        }
+        Ok(Response::new(pb::SetFdbAgingTimeResponse {}))
+    }
+
+    async fn add_static_fdb(
+        &self,
+        request: Request<pb::AddStaticFdbRequest>,
+    ) -> Result<Response<pb::AddStaticFdbResponse>, Status> {
+        let req = request.into_inner();
+        let (mac, canonical) = Self::mac_bytes(&req.mac)?;
+        let vlan = vlan_id(req.vlan).map_err(Status::invalid_argument)?;
+        let vlan_ref = self.fdb_vlan_ref(vlan)?;
+        let (action, port) = if req.drop {
+            (hemlock_sai::FdbAction::Drop, None)
+        } else {
+            let sai_id = self.port_like_sai_id(&req.port)?;
+            (hemlock_sai::FdbAction::Forward(sai_id), Some(req.port))
+        };
+        self.handle
+            .add_fdb_entry(vlan_ref, mac, action)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        if let Ok(mut fdb) = self.handle.fdb.write() {
+            let key = (vlan, canonical);
+            fdb.dynamics.remove(&key);
+            fdb.statics.insert(key, FdbStaticEntry { port });
+        }
+        Ok(Response::new(pb::AddStaticFdbResponse {}))
+    }
+
+    async fn remove_static_fdb(
+        &self,
+        request: Request<pb::RemoveStaticFdbRequest>,
+    ) -> Result<Response<pb::RemoveStaticFdbResponse>, Status> {
+        let req = request.into_inner();
+        let (mac, canonical) = Self::mac_bytes(&req.mac)?;
+        let vlan = vlan_id(req.vlan).map_err(Status::invalid_argument)?;
+        let key = (vlan, canonical);
+        let exists = self
+            .handle
+            .fdb
+            .read()
+            .map_err(|_| Status::internal("fdb table poisoned"))?
+            .statics
+            .contains_key(&key);
+        if !exists {
+            return Ok(Response::new(pb::RemoveStaticFdbResponse {}));
+        }
+        let vlan_ref = self.fdb_vlan_ref(vlan)?;
+        self.handle
+            .remove_fdb_entry(vlan_ref, mac)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        if let Ok(mut fdb) = self.handle.fdb.write() {
+            fdb.statics.remove(&key);
+        }
+        Ok(Response::new(pb::RemoveStaticFdbResponse {}))
+    }
+
+    async fn flush_fdb(
+        &self,
+        request: Request<pb::FlushFdbRequest>,
+    ) -> Result<Response<pb::FlushFdbResponse>, Status> {
+        self.require_capability(self.handle.capabilities.fdb_flush, "mac-table flush")?;
+        let req = request.into_inner();
+        let vlan = match req.vlan {
+            0 => None,
+            raw => Some(vlan_id(raw).map_err(Status::invalid_argument)?),
+        };
+        let vlan_ref = match vlan {
+            None => None,
+            Some(1) => Some(hemlock_sai::Oid(self.handle.default_vlan_oid)),
+            Some(id) => self.fdb_vlan_ref(id)?,
+        };
+        let port_ref = match req.port.as_str() {
+            "" => None,
+            name => Some(self.port_sai_id(name)?),
+        };
+        self.handle
+            .flush_fdb(vlan_ref, port_ref)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        // Drop the matching dynamics from the software mirror and tell
+        // the watchers (backends may also send FLUSHED events; removal
+        // is idempotent).
+        let flushed: Vec<(u16, String, String)> = {
+            let mut fdb = self
+                .handle
+                .fdb
+                .write()
+                .map_err(|_| Status::internal("fdb table poisoned"))?;
+            let matching: Vec<(u16, String)> = fdb
+                .dynamics
+                .iter()
+                .filter(|((v, _), entry)| {
+                    vlan.is_none_or(|wanted| *v == wanted)
+                        && (req.port.is_empty() || entry.port == req.port)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            matching
+                .into_iter()
+                .filter_map(|key| {
+                    fdb.dynamics
+                        .remove(&key)
+                        .map(|entry| (key.0, key.1, entry.port))
+                })
+                .collect()
+        };
+        for (vlan, mac, port) in &flushed {
+            let _ = self.handle.fdb_events.send(FdbNotify {
+                kind: hemlock_sai::FdbEventKind::Flushed,
+                vlan: *vlan,
+                mac: mac.clone(),
+                port: Some(port.clone()),
+            });
+        }
+        Ok(Response::new(pb::FlushFdbResponse {
+            flushed: flushed.len() as u32,
+        }))
+    }
+
+    async fn dump_fdb(
+        &self,
+        request: Request<pb::DumpFdbRequest>,
+    ) -> Result<Response<pb::DumpFdbResponse>, Status> {
+        let req = request.into_inner();
+        let mac_filter = if req.mac.is_empty() {
+            None
+        } else {
+            Some(hemlock_common::net::parse_mac(&req.mac).map_err(Status::invalid_argument)?)
+        };
+        let fdb = self
+            .handle
+            .fdb
+            .read()
+            .map_err(|_| Status::internal("fdb table poisoned"))?;
+        let wanted = |vlan: u16, mac: &str, port: Option<&str>, is_static: bool| {
+            (req.vlan == 0 || u32::from(vlan) == req.vlan)
+                && (req.port.is_empty() || port == Some(req.port.as_str()))
+                && mac_filter.as_deref().is_none_or(|m| m == mac)
+                && match req.kind {
+                    k if k == pb::FdbEntryKind::Static as i32 => is_static,
+                    k if k == pb::FdbEntryKind::Dynamic as i32 => !is_static,
+                    _ => true,
+                }
+        };
+        // Dynamics first, then statics, each in (vlan, mac) order — the
+        // order `show mac address-table` prints.
+        let now = Instant::now();
+        let mut entries: Vec<pb::FdbEntryState> = Vec::new();
+        for ((vlan, mac), entry) in &fdb.dynamics {
+            if wanted(*vlan, mac, Some(entry.port.as_str()), false) {
+                entries.push(pb::FdbEntryState {
+                    vlan: u32::from(*vlan),
+                    mac: mac.clone(),
+                    port: entry.port.clone(),
+                    drop: false,
+                    is_static: false,
+                    moves: entry.moves,
+                    seconds_since_move: entry
+                        .last_move
+                        .map(|at| now.saturating_duration_since(at).as_secs()),
+                });
+            }
+        }
+        for ((vlan, mac), entry) in &fdb.statics {
+            if wanted(*vlan, mac, entry.port.as_deref(), true) {
+                entries.push(pb::FdbEntryState {
+                    vlan: u32::from(*vlan),
+                    mac: mac.clone(),
+                    port: entry.port.clone().unwrap_or_default(),
+                    drop: entry.port.is_none(),
+                    is_static: true,
+                    moves: 0,
+                    seconds_since_move: None,
+                });
+            }
+        }
+        let total = entries.len() as u32;
+        let offset: usize = req.page_token.parse().unwrap_or(0);
+        let mut next_page_token = String::new();
+        let entries = if req.page_size > 0 {
+            let end = offset.saturating_add(req.page_size as usize).min(entries.len());
+            if end < entries.len() {
+                next_page_token = end.to_string();
+            }
+            entries
+                .get(offset..end)
+                .map(<[pb::FdbEntryState]>::to_vec)
+                .unwrap_or_default()
+        } else {
+            entries
+        };
+        Ok(Response::new(pb::DumpFdbResponse {
+            entries,
+            next_page_token,
+            total,
+            aging_time_secs: fdb.aging_secs,
+        }))
+    }
+
+    type WatchFdbEventsStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::FdbEventMessage, Status>> + Send>>;
+
+    async fn watch_fdb_events(
+        &self,
+        _request: Request<pb::WatchFdbEventsRequest>,
+    ) -> Result<Response<Self::WatchFdbEventsStream>, Status> {
+        let stream =
+            BroadcastStream::new(self.handle.fdb_events.subscribe()).filter_map(|item| match item {
+                Ok(event) => Some(Ok(pb::FdbEventMessage {
+                    kind: match event.kind {
+                        hemlock_sai::FdbEventKind::Learned => {
+                            pb::fdb_event_message::Kind::Learned
+                        }
+                        hemlock_sai::FdbEventKind::Aged => pb::fdb_event_message::Kind::Aged,
+                        hemlock_sai::FdbEventKind::Moved => pb::fdb_event_message::Kind::Moved,
+                        hemlock_sai::FdbEventKind::Flushed => {
+                            pb::fdb_event_message::Kind::Flushed
+                        }
+                    } as i32,
+                    vlan: u32::from(event.vlan),
+                    mac: event.mac,
+                    port: event.port.unwrap_or_default(),
+                })),
+                Err(BroadcastStreamRecvError::Lagged(_)) => None,
+            });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn set_port_storm_control(
+        &self,
+        request: Request<pb::SetPortStormControlRequest>,
+    ) -> Result<Response<pb::SetPortStormControlResponse>, Status> {
+        self.require_capability(self.handle.capabilities.storm_control, "storm-control")?;
+        let req = request.into_inner();
+        let class = match pb::StormClass::try_from(req.class) {
+            Ok(pb::StormClass::Broadcast) => hemlock_sai::StormClass::Broadcast,
+            Ok(pb::StormClass::Multicast) => hemlock_sai::StormClass::Multicast,
+            Ok(pb::StormClass::UnknownUnicast) => hemlock_sai::StormClass::UnknownUnicast,
+            _ => return Err(Status::invalid_argument("unspecified storm class")),
+        };
+        // A port-channel's levels apply per member (each metered at the
+        // level's share of its own speed; the aggregate rate is their
+        // sum).
+        if let Some(group) = lag_group_of(&req.name) {
+            let lag = {
+                let lags = self
+                    .handle
+                    .lags
+                    .read()
+                    .map_err(|_| Status::internal("lag table poisoned"))?;
+                lags.get(&group).cloned().ok_or_else(|| {
+                    Status::failed_precondition(format!("Port-Channel{group} not created"))
+                })?
+            };
+            let level = match &req.level {
+                Some(level) => Some(
+                    hemlock_common::net::parse_storm_level(level)
+                        .map_err(Status::invalid_argument)?,
+                ),
+                None => None,
+            };
+            for name in lag.members.keys() {
+                let (port_id, speed) = {
+                    let table = self
+                        .handle
+                        .ports
+                        .read()
+                        .map_err(|_| Status::internal("port table poisoned"))?;
+                    let port = table
+                        .get(name)
+                        .ok_or_else(|| Status::not_found(format!("no port {name:?}")))?;
+                    (port.sai_id, port.def.speed_mbps)
+                };
+                let kbps = match &level {
+                    Some(level) => {
+                        Some(Self::storm_kbps(speed, Self::level_hundredths(level)?))
+                    }
+                    None => None,
+                };
+                self.handle
+                    .set_port_storm(port_id, class, kbps)
+                    .await
+                    .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+            }
+            let mut lags = self
+                .handle
+                .lags
+                .write()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            if let Some(lag) = lags.get_mut(&group) {
+                match level {
+                    Some(level) => {
+                        lag.storm.insert(class, StormState { level, kbps: 0 });
+                    }
+                    None => {
+                        lag.storm.remove(&class);
+                    }
+                }
+            }
+            return Ok(Response::new(pb::SetPortStormControlResponse {}));
+        }
+
+        let (sai_id, speed_mbps) = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let port = table
+                .get(&req.name)
+                .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+            (port.sai_id, port.def.speed_mbps)
+        };
+        let program = match &req.level {
+            Some(level) => {
+                let hundredths = Self::level_hundredths(level)?;
+                let kbps = Self::storm_kbps(speed_mbps, hundredths);
+                Some((
+                    hemlock_common::net::parse_storm_level(level)
+                        .map_err(Status::invalid_argument)?,
+                    kbps,
+                ))
+            }
+            None => None,
+        };
+        self.handle
+            .set_port_storm(sai_id, class, program.as_ref().map(|(_, kbps)| *kbps))
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        let mut table = self
+            .handle
+            .ports
+            .write()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        if let Some(port) = table.get_mut(&req.name) {
+            match program {
+                Some((level, kbps)) => {
+                    port.storm.insert(class, StormState { level, kbps });
+                }
+                None => {
+                    port.storm.remove(&class);
+                }
+            }
+        }
+        Ok(Response::new(pb::SetPortStormControlResponse {}))
+    }
+
+    async fn get_storm_control(
+        &self,
+        _request: Request<pb::GetStormControlRequest>,
+    ) -> Result<Response<pb::GetStormControlResponse>, Status> {
+        let rows: Vec<(String, hemlock_sai::PortId, hemlock_sai::StormClass, StormState, bool)> = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let mut ports: Vec<&PortState> = table.values().collect();
+            ports.sort_by_key(|p| p.def.index);
+            ports
+                .iter()
+                .flat_map(|p| {
+                    p.storm.iter().map(|(class, state)| {
+                        (
+                            p.def.name.clone(),
+                            p.sai_id,
+                            *class,
+                            state.clone(),
+                            p.oper_up,
+                        )
+                    })
+                })
+                .collect()
+        };
+        let mut entries = Vec::with_capacity(rows.len());
+        for (name, sai_id, class, state, active) in rows {
+            let drops = self
+                .handle
+                .port_storm_drops(sai_id, class)
+                .await
+                .unwrap_or(0);
+            entries.push(pb::StormControlEntry {
+                name,
+                class: storm_class_proto(class) as i32,
+                level: state.level,
+                rate_kbps: state.kbps,
+                drops,
+                active,
+            });
+        }
+        // Port-channel rows aggregate over their members: the rate is
+        // the sum of the member rates, the drops the sum of the member
+        // policers' drops.
+        let lag_rows: Vec<(String, hemlock_sai::StormClass, String, Vec<String>)> = {
+            let lags = self
+                .handle
+                .lags
+                .read()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            lags.values()
+                .flat_map(|lag| {
+                    lag.storm.iter().map(|(class, state)| {
+                        (
+                            format!("Port-Channel{}", lag.group),
+                            *class,
+                            state.level.clone(),
+                            lag.members.keys().cloned().collect(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        for (name, class, level, members) in lag_rows {
+            let hundredths = Self::level_hundredths(&level)?;
+            let mut rate_kbps = 0;
+            let mut drops = 0;
+            let mut active = false;
+            for member in &members {
+                let (sai_id, speed, up) = {
+                    let table = self
+                        .handle
+                        .ports
+                        .read()
+                        .map_err(|_| Status::internal("port table poisoned"))?;
+                    match table.get(member) {
+                        Some(port) => (port.sai_id, port.def.speed_mbps, port.oper_up),
+                        None => continue,
+                    }
+                };
+                rate_kbps += Self::storm_kbps(speed, hundredths);
+                drops += self.handle.port_storm_drops(sai_id, class).await.unwrap_or(0);
+                active |= up;
+            }
+            entries.push(pb::StormControlEntry {
+                name,
+                class: storm_class_proto(class) as i32,
+                level,
+                rate_kbps,
+                drops,
+                active,
+            });
+        }
+        Ok(Response::new(pb::GetStormControlResponse { entries }))
+    }
+
+    async fn create_mirror_session(
+        &self,
+        request: Request<pb::CreateMirrorSessionRequest>,
+    ) -> Result<Response<pb::CreateMirrorSessionResponse>, Status> {
+        self.require_capability(self.handle.capabilities.mirror, "mirror")?;
+        let req = request.into_inner();
+        if req.session == 0 || req.session > self.handle.capabilities.mirror_sessions_max {
+            return Err(Status::invalid_argument(format!(
+                "mirror session {} out of range (1..{})",
+                req.session, self.handle.capabilities.mirror_sessions_max
+            )));
+        }
+        let monitor = self.port_sai_id(&req.destination)?;
+        let existing = {
+            let mirrors = self
+                .handle
+                .mirrors
+                .read()
+                .map_err(|_| Status::internal("mirror table poisoned"))?;
+            mirrors.get(&req.session).cloned()
+        };
+        if let Some(state) = &existing {
+            if state.destination == req.destination {
+                return Ok(Response::new(pb::CreateMirrorSessionResponse {}));
+            }
+            // Destination change: detach sources, swap the session
+            // object, reattach.
+            let sources: Vec<String> = state.sources.keys().cloned().collect();
+            {
+                let mut mirrors = self
+                    .handle
+                    .mirrors
+                    .write()
+                    .map_err(|_| Status::internal("mirror table poisoned"))?;
+                if let Some(state) = mirrors.get_mut(&req.session) {
+                    state.sources.clear();
+                }
+            }
+            for source in &sources {
+                self.reprogram_port_mirror(source).await?;
+            }
+            self.handle
+                .remove_mirror_session(state.oid)
+                .await
+                .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+            let oid = self
+                .handle
+                .create_mirror_session(monitor)
+                .await
+                .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+            {
+                let mut mirrors = self
+                    .handle
+                    .mirrors
+                    .write()
+                    .map_err(|_| Status::internal("mirror table poisoned"))?;
+                mirrors.insert(
+                    req.session,
+                    MirrorState {
+                        destination: req.destination,
+                        oid,
+                        sources: state.sources.clone(),
+                    },
+                );
+            }
+            for source in &sources {
+                self.reprogram_port_mirror(source).await?;
+            }
+            return Ok(Response::new(pb::CreateMirrorSessionResponse {}));
+        }
+        let oid = self
+            .handle
+            .create_mirror_session(monitor)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        let mut mirrors = self
+            .handle
+            .mirrors
+            .write()
+            .map_err(|_| Status::internal("mirror table poisoned"))?;
+        mirrors.insert(
+            req.session,
+            MirrorState {
+                destination: req.destination,
+                oid,
+                sources: std::collections::BTreeMap::new(),
+            },
+        );
+        Ok(Response::new(pb::CreateMirrorSessionResponse {}))
+    }
+
+    async fn remove_mirror_session(
+        &self,
+        request: Request<pb::RemoveMirrorSessionRequest>,
+    ) -> Result<Response<pb::RemoveMirrorSessionResponse>, Status> {
+        let req = request.into_inner();
+        let existing = {
+            let mut mirrors = self
+                .handle
+                .mirrors
+                .write()
+                .map_err(|_| Status::internal("mirror table poisoned"))?;
+            mirrors.remove(&req.session)
+        };
+        let Some(state) = existing else {
+            return Ok(Response::new(pb::RemoveMirrorSessionResponse {}));
+        };
+        for source in state.sources.keys() {
+            self.reprogram_port_mirror(source).await?;
+        }
+        self.handle
+            .remove_mirror_session(state.oid)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        Ok(Response::new(pb::RemoveMirrorSessionResponse {}))
+    }
+
+    async fn set_port_mirror(
+        &self,
+        request: Request<pb::SetPortMirrorRequest>,
+    ) -> Result<Response<pb::SetPortMirrorResponse>, Status> {
+        self.require_capability(self.handle.capabilities.mirror, "mirror")?;
+        let req = request.into_inner();
+        self.port_sai_id(&req.name)?;
+        let direction = match pb::MirrorDirection::try_from(req.direction) {
+            Ok(pb::MirrorDirection::None) => None,
+            Ok(pb::MirrorDirection::Rx) => Some(MirrorDir::Rx),
+            Ok(pb::MirrorDirection::Tx) => Some(MirrorDir::Tx),
+            Ok(pb::MirrorDirection::Both) => Some(MirrorDir::Both),
+            _ => return Err(Status::invalid_argument("unspecified mirror direction")),
+        };
+        {
+            let mut mirrors = self
+                .handle
+                .mirrors
+                .write()
+                .map_err(|_| Status::internal("mirror table poisoned"))?;
+            let session = mirrors.get_mut(&req.session).ok_or_else(|| {
+                Status::failed_precondition(format!("mirror session {} not created", req.session))
+            })?;
+            match direction {
+                Some(direction) => {
+                    session.sources.insert(req.name.clone(), direction);
+                }
+                None => {
+                    session.sources.remove(&req.name);
+                }
+            }
+        }
+        self.reprogram_port_mirror(&req.name).await?;
+        Ok(Response::new(pb::SetPortMirrorResponse {}))
+    }
+
+    async fn get_mirror_sessions(
+        &self,
+        _request: Request<pb::GetMirrorSessionsRequest>,
+    ) -> Result<Response<pb::GetMirrorSessionsResponse>, Status> {
+        let mirrors = self
+            .handle
+            .mirrors
+            .read()
+            .map_err(|_| Status::internal("mirror table poisoned"))?;
+        let ports = self
+            .handle
+            .ports
+            .read()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        let sessions = mirrors
+            .iter()
+            .map(|(session, state)| pb::MirrorSessionState {
+                session: *session,
+                destination: state.destination.clone(),
+                destination_up: ports
+                    .get(&state.destination)
+                    .map(|p| p.oper_up)
+                    .unwrap_or(false),
+                sources: state
+                    .sources
+                    .iter()
+                    .map(|(name, direction)| pb::MirrorSourceState {
+                        name: name.clone(),
+                        direction: match direction {
+                            MirrorDir::Rx => pb::MirrorDirection::Rx,
+                            MirrorDir::Tx => pb::MirrorDirection::Tx,
+                            MirrorDir::Both => pb::MirrorDirection::Both,
+                        } as i32,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(Response::new(pb::GetMirrorSessionsResponse { sessions }))
+    }
+
+    async fn create_lag(
+        &self,
+        request: Request<pb::CreateLagRequest>,
+    ) -> Result<Response<pb::CreateLagResponse>, Status> {
+        self.require_capability(self.handle.capabilities.lag, "port-channel")?;
+        let req = request.into_inner();
+        let group = u16::try_from(req.group)
+            .ok()
+            .filter(|g| (1..=64).contains(g))
+            .ok_or_else(|| Status::invalid_argument(format!("bad group {}", req.group)))?;
+        let exists = self
+            .handle
+            .lags
+            .read()
+            .map_err(|_| Status::internal("lag table poisoned"))?
+            .contains_key(&group);
+        let sai_id = if exists {
+            None
+        } else {
+            Some(
+                self.handle
+                    .create_lag()
+                    .await
+                    .map_err(|e| Status::internal(format!("SAI: {e}")))?,
+            )
+        };
+        let mut lags = self
+            .handle
+            .lags
+            .write()
+            .map_err(|_| Status::internal("lag table poisoned"))?;
+        match lags.get_mut(&group) {
+            Some(lag) => {
+                lag.description = req.description;
+                lag.admin_up = req.admin_up;
+            }
+            None => {
+                lags.insert(
+                    group,
+                    crate::state::LagState {
+                        group,
+                        sai_id: sai_id.unwrap_or(hemlock_sai::PortId(0)),
+                        description: req.description,
+                        admin_up: req.admin_up,
+                        members: std::collections::BTreeMap::new(),
+                        switchport: None,
+                        storm: std::collections::BTreeMap::new(),
+                    },
+                );
+            }
+        }
+        Ok(Response::new(pb::CreateLagResponse {}))
+    }
+
+    async fn remove_lag(
+        &self,
+        request: Request<pb::RemoveLagRequest>,
+    ) -> Result<Response<pb::RemoveLagResponse>, Status> {
+        let req = request.into_inner();
+        let group = u16::try_from(req.group)
+            .ok()
+            .filter(|g| (1..=64).contains(g))
+            .ok_or_else(|| Status::invalid_argument(format!("bad group {}", req.group)))?;
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let existing = {
+            let lags = self
+                .handle
+                .lags
+                .read()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            lags.get(&group).cloned()
+        };
+        let Some(lag) = existing else {
+            return Ok(Response::new(pb::RemoveLagResponse {}));
+        };
+        // Member storm policers, switchport memberships, then members,
+        // then the LAG object.
+        for class in lag.storm.keys() {
+            for name in lag.members.keys() {
+                let port_id = self.port_sai_id(name)?;
+                self.handle
+                    .set_port_storm(port_id, *class, None)
+                    .await
+                    .map_err(sai)?;
+            }
+        }
+        if let Some(sp) = &lag.switchport {
+            for (_, member, _) in &sp.members {
+                self.handle.remove_vlan_member(*member).await.map_err(sai)?;
+            }
+            self.handle
+                .restore_port_default_vlan(lag.sai_id)
+                .await
+                .map_err(sai)?;
+        }
+        for (port, member) in &lag.members {
+            let port_id = self.port_sai_id(port)?;
+            self.handle
+                .remove_lag_member(member.oid, port_id)
+                .await
+                .map_err(sai)?;
+        }
+        self.handle.remove_lag(lag.sai_id).await.map_err(sai)?;
+        self.handle
+            .lags
+            .write()
+            .map_err(|_| Status::internal("lag table poisoned"))?
+            .remove(&group);
+        Ok(Response::new(pb::RemoveLagResponse {}))
+    }
+
+    async fn set_lag_members(
+        &self,
+        request: Request<pb::SetLagMembersRequest>,
+    ) -> Result<Response<pb::SetLagMembersResponse>, Status> {
+        let req = request.into_inner();
+        let group = u16::try_from(req.group)
+            .ok()
+            .filter(|g| (1..=64).contains(g))
+            .ok_or_else(|| Status::invalid_argument(format!("bad group {}", req.group)))?;
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let lag = {
+            let lags = self
+                .handle
+                .lags
+                .read()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            lags.get(&group).cloned().ok_or_else(|| {
+                Status::failed_precondition(format!("Port-Channel{group} not created"))
+            })?
+        };
+        let wanted: std::collections::BTreeMap<String, bool> = req
+            .members
+            .iter()
+            .map(|m| (m.port.clone(), m.enabled))
+            .collect();
+
+        let mut members = lag.members.clone();
+        // Remove stale members (they return to standalone default L2).
+        let stale: Vec<String> = members
+            .keys()
+            .filter(|name| !wanted.contains_key(*name))
+            .cloned()
+            .collect();
+        for name in stale {
+            let port_id = self.port_sai_id(&name)?;
+            let member = members.remove(&name).expect("key from members");
+            // The LAG's storm levels leave with the member.
+            for class in lag.storm.keys() {
+                self.handle
+                    .set_port_storm(port_id, *class, None)
+                    .await
+                    .map_err(sai)?;
+            }
+            self.handle
+                .remove_lag_member(member.oid, port_id)
+                .await
+                .map_err(sai)?;
+        }
+        // Add missing members and settle the gates.
+        for (name, enabled) in &wanted {
+            match members.get_mut(name) {
+                Some(member) => {
+                    if member.enabled != *enabled {
+                        self.handle
+                            .set_lag_member_state(member.oid, *enabled)
+                            .await
+                            .map_err(sai)?;
+                        member.enabled = *enabled;
+                    }
+                }
+                None => {
+                    let port_id = self.port_sai_id(name)?;
+                    {
+                        let table = self
+                            .handle
+                            .ports
+                            .read()
+                            .map_err(|_| Status::internal("port table poisoned"))?;
+                        if let Some(port) = table.get(name) {
+                            if port.l3.is_some() {
+                                return Err(Status::failed_precondition(format!(
+                                    "{name} is routed; delete its address before channel-group"
+                                )));
+                            }
+                        }
+                    }
+                    let oid = self
+                        .handle
+                        .add_lag_member(lag.sai_id, port_id)
+                        .await
+                        .map_err(sai)?;
+                    if *enabled {
+                        self.handle
+                            .set_lag_member_state(oid, true)
+                            .await
+                            .map_err(sai)?;
+                    }
+                    members.insert(
+                        name.clone(),
+                        crate::state::LagMemberState {
+                            oid,
+                            enabled: *enabled,
+                        },
+                    );
+                }
+            }
+        }
+        // Membership changed: re-derive the LAG's per-member storm
+        // policers so every member carries the levels.
+        let storm = lag.storm.clone();
+        for (class, state) in &storm {
+            for name in wanted.keys() {
+                let (port_id, speed) = {
+                    let table = self
+                        .handle
+                        .ports
+                        .read()
+                        .map_err(|_| Status::internal("port table poisoned"))?;
+                    let port = table
+                        .get(name)
+                        .ok_or_else(|| Status::not_found(format!("no port {name:?}")))?;
+                    (port.sai_id, port.def.speed_mbps)
+                };
+                let hundredths = Self::level_hundredths(&state.level)?;
+                self.handle
+                    .set_port_storm(port_id, *class, Some(Self::storm_kbps(speed, hundredths)))
+                    .await
+                    .map_err(sai)?;
+            }
+        }
+        let mut lags = self
+            .handle
+            .lags
+            .write()
+            .map_err(|_| Status::internal("lag table poisoned"))?;
+        if let Some(lag) = lags.get_mut(&group) {
+            lag.members = members;
+        }
+        Ok(Response::new(pb::SetLagMembersResponse {}))
+    }
+
+    async fn get_lags(
+        &self,
+        _request: Request<pb::GetLagsRequest>,
+    ) -> Result<Response<pb::GetLagsResponse>, Status> {
+        let lags = self
+            .handle
+            .lags
+            .read()
+            .map_err(|_| Status::internal("lag table poisoned"))?;
+        let ports = self
+            .handle
+            .ports
+            .read()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        let lags = lags
+            .values()
+            .map(|lag| pb::LagState {
+                group: u32::from(lag.group),
+                description: lag.description.clone(),
+                admin_up: lag.admin_up,
+                members: lag
+                    .members
+                    .iter()
+                    .map(|(name, member)| pb::LagMemberState {
+                        port: name.clone(),
+                        enabled: member.enabled,
+                        oper_up: ports.get(name).map(|p| p.oper_up).unwrap_or(false),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(Response::new(pb::GetLagsResponse { lags }))
+    }
+
+    async fn create_stp_instance(
+        &self,
+        request: Request<pb::CreateStpInstanceRequest>,
+    ) -> Result<Response<pb::CreateStpInstanceResponse>, Status> {
+        self.require_capability(self.handle.capabilities.stp, "spanning-tree")?;
+        let req = request.into_inner();
+        let instance = u8::try_from(req.instance)
+            .ok()
+            .filter(|i| (1..=15).contains(i))
+            .ok_or_else(|| Status::invalid_argument(format!("bad instance {}", req.instance)))?;
+        let exists = self
+            .handle
+            .stps
+            .read()
+            .map_err(|_| Status::internal("stp table poisoned"))?
+            .contains_key(&instance);
+        if exists {
+            return Ok(Response::new(pb::CreateStpInstanceResponse {}));
+        }
+        let oid = self
+            .handle
+            .create_stp_instance()
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        self.handle
+            .stps
+            .write()
+            .map_err(|_| Status::internal("stp table poisoned"))?
+            .insert(
+                instance,
+                crate::state::StpInstanceState {
+                    oid,
+                    vlans: Vec::new(),
+                },
+            );
+        Ok(Response::new(pb::CreateStpInstanceResponse {}))
+    }
+
+    async fn remove_stp_instance(
+        &self,
+        request: Request<pb::RemoveStpInstanceRequest>,
+    ) -> Result<Response<pb::RemoveStpInstanceResponse>, Status> {
+        let req = request.into_inner();
+        let instance = u8::try_from(req.instance)
+            .ok()
+            .filter(|i| (1..=15).contains(i))
+            .ok_or_else(|| Status::invalid_argument(format!("bad instance {}", req.instance)))?;
+        let existing = {
+            let stps = self
+                .handle
+                .stps
+                .read()
+                .map_err(|_| Status::internal("stp table poisoned"))?;
+            stps.get(&instance).cloned()
+        };
+        let Some(state) = existing else {
+            return Ok(Response::new(pb::RemoveStpInstanceResponse {}));
+        };
+        // Its VLANs move back to the default instance first.
+        for vlan in &state.vlans {
+            let vlan_ref = self.fdb_vlan_ref(*vlan).ok().flatten();
+            self.handle
+                .set_vlan_stp_instance(vlan_ref, None)
+                .await
+                .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        }
+        self.handle
+            .remove_stp_instance(state.oid)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        self.handle
+            .stps
+            .write()
+            .map_err(|_| Status::internal("stp table poisoned"))?
+            .remove(&instance);
+        Ok(Response::new(pb::RemoveStpInstanceResponse {}))
+    }
+
+    async fn set_stp_instance_vlans(
+        &self,
+        request: Request<pb::SetStpInstanceVlansRequest>,
+    ) -> Result<Response<pb::SetStpInstanceVlansResponse>, Status> {
+        let req = request.into_inner();
+        let instance = u8::try_from(req.instance)
+            .ok()
+            .filter(|i| (1..=15).contains(i))
+            .ok_or_else(|| Status::invalid_argument(format!("bad instance {}", req.instance)))?;
+        let mut wanted = Vec::with_capacity(req.vlans.len());
+        for raw in &req.vlans {
+            wanted.push(vlan_id(*raw).map_err(Status::invalid_argument)?);
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let state = {
+            let stps = self
+                .handle
+                .stps
+                .read()
+                .map_err(|_| Status::internal("stp table poisoned"))?;
+            stps.get(&instance).cloned().ok_or_else(|| {
+                Status::failed_precondition(format!("stp instance {instance} not created"))
+            })?
+        };
+        // Dropped VLANs return to the default instance; added ones move
+        // in (VLANs not yet created attach when they appear and the
+        // mapping is reprogrammed).
+        for vlan in &state.vlans {
+            if !wanted.contains(vlan) {
+                if let Ok(vlan_ref) = self.fdb_vlan_ref(*vlan) {
+                    self.handle
+                        .set_vlan_stp_instance(vlan_ref, None)
+                        .await
+                        .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+                }
+            }
+        }
+        let mut applied = Vec::with_capacity(wanted.len());
+        for vlan in &wanted {
+            match self.fdb_vlan_ref(*vlan) {
+                Ok(vlan_ref) => {
+                    self.handle
+                        .set_vlan_stp_instance(vlan_ref, Some(state.oid))
+                        .await
+                        .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+                    applied.push(*vlan);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        instance,
+                        vlan,
+                        "mst instance references an undefined VLAN; mapping deferred"
+                    );
+                    applied.push(*vlan);
+                }
+            }
+        }
+        if let Ok(mut stps) = self.handle.stps.write() {
+            if let Some(state) = stps.get_mut(&instance) {
+                state.vlans = applied;
+            }
+        }
+        Ok(Response::new(pb::SetStpInstanceVlansResponse {}))
+    }
+
+    async fn set_port_stp_state(
+        &self,
+        request: Request<pb::SetPortStpStateRequest>,
+    ) -> Result<Response<pb::SetPortStpStateResponse>, Status> {
+        self.require_capability(self.handle.capabilities.stp, "spanning-tree")?;
+        let req = request.into_inner();
+        let state = match pb::StpState::try_from(req.state) {
+            Ok(pb::StpState::Blocking) => hemlock_sai::StpPortState::Blocking,
+            Ok(pb::StpState::Learning) => hemlock_sai::StpPortState::Learning,
+            Ok(pb::StpState::Forwarding) => hemlock_sai::StpPortState::Forwarding,
+            _ => return Err(Status::invalid_argument("unspecified stp state")),
+        };
+        let sai_id = self.port_like_sai_id(&req.name)?;
+        let instances: Vec<Option<hemlock_sai::Oid>> = if req.instance == 0 {
+            // The default instance plus every created MST instance (one
+            // shared state machine drives them all).
+            let stps = self
+                .handle
+                .stps
+                .read()
+                .map_err(|_| Status::internal("stp table poisoned"))?;
+            std::iter::once(None)
+                .chain(stps.values().map(|s| Some(s.oid)))
+                .collect()
+        } else {
+            let instance = u8::try_from(req.instance)
+                .ok()
+                .filter(|i| (1..=15).contains(i))
+                .ok_or_else(|| {
+                    Status::invalid_argument(format!("bad instance {}", req.instance))
+                })?;
+            let stps = self
+                .handle
+                .stps
+                .read()
+                .map_err(|_| Status::internal("stp table poisoned"))?;
+            vec![Some(
+                stps.get(&instance)
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "stp instance {instance} not created"
+                        ))
+                    })?
+                    .oid,
+            )]
+        };
+        for stp in instances {
+            self.handle
+                .set_stp_port_state(stp, sai_id, state)
+                .await
+                .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        }
+        Ok(Response::new(pb::SetPortStpStateResponse {}))
+    }
+
+    async fn set_port_errdisable(
+        &self,
+        request: Request<pb::SetPortErrdisableRequest>,
+    ) -> Result<Response<pb::SetPortErrdisableResponse>, Status> {
+        let req = request.into_inner();
+        let sai_id = self.port_sai_id(&req.name)?;
+        let disable = !req.reason.is_empty();
+        self.handle
+            .set_admin_state(sai_id, !disable)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        let mut table = self
+            .handle
+            .ports
+            .write()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        if let Some(port) = table.get_mut(&req.name) {
+            port.admin_up = !disable;
+            port.errdisable_reason = disable.then(|| req.reason.clone());
+        }
+        Ok(Response::new(pb::SetPortErrdisableResponse {}))
+    }
+
+    async fn ensure_l2mc_group(
+        &self,
+        request: Request<pb::EnsureL2mcGroupRequest>,
+    ) -> Result<Response<pb::EnsureL2mcGroupResponse>, Status> {
+        self.require_capability(self.handle.capabilities.l2mc, "igmp-snooping")?;
+        let req = request.into_inner();
+        let (vlan, group_ip) = Self::l2mc_key(req.vlan, &req.group)?;
+        let key = (vlan, group_ip.to_string());
+        let exists = self
+            .handle
+            .l2mc
+            .read()
+            .map_err(|_| Status::internal("l2mc table poisoned"))?
+            .contains_key(&key);
+        if exists {
+            return Ok(Response::new(pb::EnsureL2mcGroupResponse {}));
+        }
+        let vlan_ref = self.fdb_vlan_ref(vlan)?;
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let oid = self.handle.create_l2mc_group().await.map_err(sai)?;
+        if let Err(err) = self
+            .handle
+            .set_l2mc_entry(vlan_ref, group_ip, Some(oid))
+            .await
+        {
+            let _ = self.handle.remove_l2mc_group(oid).await;
+            return Err(sai(err));
+        }
+        self.handle
+            .l2mc
+            .write()
+            .map_err(|_| Status::internal("l2mc table poisoned"))?
+            .insert(
+                key,
+                crate::state::L2mcGroupState {
+                    oid,
+                    members: std::collections::BTreeMap::new(),
+                },
+            );
+        Ok(Response::new(pb::EnsureL2mcGroupResponse {}))
+    }
+
+    async fn set_l2mc_members(
+        &self,
+        request: Request<pb::SetL2mcMembersRequest>,
+    ) -> Result<Response<pb::SetL2mcMembersResponse>, Status> {
+        let req = request.into_inner();
+        let (vlan, group_ip) = Self::l2mc_key(req.vlan, &req.group)?;
+        let key = (vlan, group_ip.to_string());
+        let state = {
+            let l2mc = self
+                .handle
+                .l2mc
+                .read()
+                .map_err(|_| Status::internal("l2mc table poisoned"))?;
+            l2mc.get(&key).cloned().ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "no L2MC group for {group_ip} in VLAN {vlan}"
+                ))
+            })?
+        };
+        let members = self
+            .reconcile_l2mc_members(state, &req.ports)
+            .await?;
+        if let Ok(mut l2mc) = self.handle.l2mc.write() {
+            if let Some(state) = l2mc.get_mut(&key) {
+                state.members = members;
+            }
+        }
+        Ok(Response::new(pb::SetL2mcMembersResponse {}))
+    }
+
+    async fn remove_l2mc_group(
+        &self,
+        request: Request<pb::RemoveL2mcGroupRequest>,
+    ) -> Result<Response<pb::RemoveL2mcGroupResponse>, Status> {
+        let req = request.into_inner();
+        let (vlan, group_ip) = Self::l2mc_key(req.vlan, &req.group)?;
+        let key = (vlan, group_ip.to_string());
+        let existing = {
+            let mut l2mc = self
+                .handle
+                .l2mc
+                .write()
+                .map_err(|_| Status::internal("l2mc table poisoned"))?;
+            l2mc.remove(&key)
+        };
+        let Some(state) = existing else {
+            return Ok(Response::new(pb::RemoveL2mcGroupResponse {}));
+        };
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        // Entry first (it references the group), then members, then the
+        // group itself.
+        let vlan_ref = self.fdb_vlan_ref(vlan).ok().flatten();
+        let _ = self.handle.set_l2mc_entry(vlan_ref, group_ip, None).await;
+        for member in state.members.values() {
+            self.handle.remove_l2mc_member(*member).await.map_err(sai)?;
+        }
+        self.handle.remove_l2mc_group(state.oid).await.map_err(sai)?;
+        Ok(Response::new(pb::RemoveL2mcGroupResponse {}))
+    }
+
+    async fn set_vlan_unknown_mcast(
+        &self,
+        request: Request<pb::SetVlanUnknownMcastRequest>,
+    ) -> Result<Response<pb::SetVlanUnknownMcastResponse>, Status> {
+        self.require_capability(self.handle.capabilities.l2mc, "igmp-snooping")?;
+        let req = request.into_inner();
+        let vlan = vlan_id(req.vlan).map_err(Status::invalid_argument)?;
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let vlan_ref = self.fdb_vlan_ref(vlan)?;
+        let existing = {
+            let table = self
+                .handle
+                .unknown_mcast
+                .read()
+                .map_err(|_| Status::internal("unknown-mcast table poisoned"))?;
+            table.get(&vlan).cloned()
+        };
+        if !req.restrict {
+            // Back to flood-all; drop the restriction group if present.
+            self.handle
+                .set_vlan_unknown_mcast(vlan_ref, None)
+                .await
+                .map_err(sai)?;
+            if let Some(state) = existing {
+                for member in state.members.values() {
+                    self.handle.remove_l2mc_member(*member).await.map_err(sai)?;
+                }
+                self.handle.remove_l2mc_group(state.oid).await.map_err(sai)?;
+                if let Ok(mut table) = self.handle.unknown_mcast.write() {
+                    table.remove(&vlan);
+                }
+            }
+            return Ok(Response::new(pb::SetVlanUnknownMcastResponse {}));
+        }
+        let state = match existing {
+            Some(state) => state,
+            None => {
+                let oid = self.handle.create_l2mc_group().await.map_err(sai)?;
+                let state = crate::state::L2mcGroupState {
+                    oid,
+                    members: std::collections::BTreeMap::new(),
+                };
+                if let Ok(mut table) = self.handle.unknown_mcast.write() {
+                    table.insert(vlan, state.clone());
+                }
+                state
+            }
+        };
+        let oid = state.oid;
+        let members = self.reconcile_l2mc_members(state, &req.ports).await?;
+        self.handle
+            .set_vlan_unknown_mcast(vlan_ref, Some(oid))
+            .await
+            .map_err(sai)?;
+        if let Ok(mut table) = self.handle.unknown_mcast.write() {
+            if let Some(state) = table.get_mut(&vlan) {
+                state.members = members;
+            }
+        }
+        Ok(Response::new(pb::SetVlanUnknownMcastResponse {}))
     }
 }
 
@@ -1398,6 +3251,7 @@ lanes = [1, 2]
             service.ensure_vlan(Request::new(pb::EnsureVlanRequest {
                 id,
                 name: name.into(),
+                suspend: false,
             }))
         };
         ensure(10, "Management").await.unwrap();
@@ -1507,6 +3361,495 @@ lanes = [1, 2]
         assert!(handle.vlans.read().unwrap().is_empty());
     }
 
+    /// The switching-suite families over the mock data-plane: FDB
+    /// statics + dynamics (injected events), scoped flush, storm
+    /// control with derived rates, mirror sessions, dot1q-tunnel mode,
+    /// and VLAN suspend reconciliation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_suite_over_mock_sai() {
+        let platform = test_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let injector = mock.event_injector();
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        // The capability probe is surfaced through GetSwitchInfo.
+        let info = service
+            .get_switch_info(Request::new(pb::GetSwitchInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(info.capabilities.unwrap().storm_control);
+
+        // FDB: aging, statics on the default VLAN and a created VLAN.
+        service
+            .set_fdb_aging_time(Request::new(pb::SetFdbAgingTimeRequest { seconds: 600 }))
+            .await
+            .unwrap();
+        service
+            .ensure_vlan(Request::new(pb::EnsureVlanRequest {
+                id: 10,
+                name: "USERS".into(),
+                suspend: false,
+            }))
+            .await
+            .unwrap();
+        service
+            .add_static_fdb(Request::new(pb::AddStaticFdbRequest {
+                mac: "00:50:56:BE:EF:01".into(),
+                vlan: 10,
+                port: "Ethernet1".into(),
+                drop: false,
+            }))
+            .await
+            .unwrap();
+        service
+            .add_static_fdb(Request::new(pb::AddStaticFdbRequest {
+                mac: "0050.56be.ef02".into(),
+                vlan: 1,
+                port: String::new(),
+                drop: true,
+            }))
+            .await
+            .unwrap();
+        // Statics on an undefined VLAN are rejected.
+        let err = service
+            .add_static_fdb(Request::new(pb::AddStaticFdbRequest {
+                mac: "00:50:56:be:ef:03".into(),
+                vlan: 20,
+                port: "Ethernet1".into(),
+                drop: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        // Dynamics arrive as SAI events; a re-learn on another port is a
+        // move.
+        let e1_id = handle.ports.read().unwrap()["Ethernet1"].sai_id;
+        let e2_id = handle.ports.read().unwrap()["Ethernet2"].sai_id;
+        let mac = [0x00u8, 0x1c, 0x73, 0x0c, 0xaa, 0x01];
+        let bv_id = handle.vlans.read().unwrap()[&10].oid.unwrap().0;
+        injector
+            .send(hemlock_sai::SaiEvent::Fdb {
+                kind: hemlock_sai::FdbEventKind::Learned,
+                bv_id,
+                mac,
+                port: Some(e1_id),
+            })
+            .unwrap();
+        injector
+            .send(hemlock_sai::SaiEvent::Fdb {
+                kind: hemlock_sai::FdbEventKind::Moved,
+                bv_id,
+                mac,
+                port: Some(e2_id),
+            })
+            .unwrap();
+        // The pump applies events asynchronously; wait for them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let dump = service
+                .dump_fdb(Request::new(pb::DumpFdbRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            let dynamic_moved = dump
+                .entries
+                .iter()
+                .any(|e| !e.is_static && e.port == "Ethernet2" && e.moves == 2);
+            if dynamic_moved {
+                assert_eq!(dump.total, 3, "one dynamic + two statics");
+                assert_eq!(dump.aging_time_secs, 600);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "FDB events not applied");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Filters and paging.
+        let statics = service
+            .dump_fdb(Request::new(pb::DumpFdbRequest {
+                kind: pb::FdbEntryKind::Static as i32,
+                ..pb::DumpFdbRequest::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(statics.entries.len(), 2);
+        let page = service
+            .dump_fdb(Request::new(pb::DumpFdbRequest {
+                page_size: 2,
+                ..pb::DumpFdbRequest::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.entries.len(), 2);
+        assert!(!page.next_page_token.is_empty());
+        let rest = service
+            .dump_fdb(Request::new(pb::DumpFdbRequest {
+                page_size: 2,
+                page_token: page.next_page_token,
+                ..pb::DumpFdbRequest::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(rest.entries.len(), 1);
+        assert!(rest.next_page_token.is_empty());
+
+        // A scoped flush drops the dynamic but not the statics.
+        let flushed = service
+            .flush_fdb(Request::new(pb::FlushFdbRequest {
+                vlan: 10,
+                port: "Ethernet2".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(flushed.flushed, 1);
+        let dump = service
+            .dump_fdb(Request::new(pb::DumpFdbRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(dump.total, 2);
+        assert!(dump.entries.iter().all(|e| e.is_static));
+
+        // Storm control: 10% of a 1G port = 100 Mb/s.
+        service
+            .set_port_storm_control(Request::new(pb::SetPortStormControlRequest {
+                name: "Ethernet1".into(),
+                class: pb::StormClass::Broadcast as i32,
+                level: Some("10".into()),
+            }))
+            .await
+            .unwrap();
+        let storm = service
+            .get_storm_control(Request::new(pb::GetStormControlRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(storm.entries.len(), 1);
+        assert_eq!(storm.entries[0].level, "10.00");
+        assert_eq!(storm.entries[0].rate_kbps, 100_000);
+        service
+            .set_port_storm_control(Request::new(pb::SetPortStormControlRequest {
+                name: "Ethernet1".into(),
+                class: pb::StormClass::Broadcast as i32,
+                level: None,
+            }))
+            .await
+            .unwrap();
+        assert!(service
+            .get_storm_control(Request::new(pb::GetStormControlRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .is_empty());
+
+        // Mirroring: session, sources, teardown.
+        service
+            .create_mirror_session(Request::new(pb::CreateMirrorSessionRequest {
+                session: 1,
+                destination: "Ethernet2".into(),
+            }))
+            .await
+            .unwrap();
+        service
+            .set_port_mirror(Request::new(pb::SetPortMirrorRequest {
+                name: "Ethernet1".into(),
+                session: 1,
+                direction: pb::MirrorDirection::Both as i32,
+            }))
+            .await
+            .unwrap();
+        let sessions = service
+            .get_mirror_sessions(Request::new(pb::GetMirrorSessionsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(sessions.sessions.len(), 1);
+        assert_eq!(sessions.sessions[0].destination, "Ethernet2");
+        assert_eq!(sessions.sessions[0].sources.len(), 1);
+        // Detach + remove; removing again is a no-op.
+        service
+            .set_port_mirror(Request::new(pb::SetPortMirrorRequest {
+                name: "Ethernet1".into(),
+                session: 1,
+                direction: pb::MirrorDirection::None as i32,
+            }))
+            .await
+            .unwrap();
+        service
+            .remove_mirror_session(Request::new(pb::RemoveMirrorSessionRequest { session: 1 }))
+            .await
+            .unwrap();
+        service
+            .remove_mirror_session(Request::new(pb::RemoveMirrorSessionRequest { session: 1 }))
+            .await
+            .unwrap();
+
+        // dot1q-tunnel: access-like membership on the S-VLAN, surfaced
+        // as its own mode.
+        service
+            .set_port_switchport(Request::new(pb::SetPortSwitchportRequest {
+                name: "Ethernet1".into(),
+                mode: pb::SwitchportMode::Dot1qTunnel as i32,
+                access_vlan: 10,
+                trunk_vlans: vec![],
+                native_vlan: 0,
+            }))
+            .await
+            .unwrap();
+        let response = service
+            .get_interfaces(Request::new(pb::GetInterfacesRequest {
+                names: vec!["Ethernet1".into()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.interfaces[0].switchport_mode, "dot1q-tunnel");
+
+        // Suspending the VLAN detaches its memberships; resuming
+        // re-adds them.
+        service
+            .ensure_vlan(Request::new(pb::EnsureVlanRequest {
+                id: 10,
+                name: "USERS".into(),
+                suspend: true,
+            }))
+            .await
+            .unwrap();
+        {
+            let table = handle.ports.read().unwrap();
+            let sp = table["Ethernet1"].switchport.as_ref().unwrap();
+            assert!(sp.members.is_empty(), "suspended VLAN detaches members");
+        }
+        let response = service
+            .get_interfaces(Request::new(pb::GetInterfacesRequest { names: vec![] }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.suspended_vlans, [10]);
+        service
+            .ensure_vlan(Request::new(pb::EnsureVlanRequest {
+                id: 10,
+                name: "USERS".into(),
+                suspend: false,
+            }))
+            .await
+            .unwrap();
+        {
+            let table = handle.ports.read().unwrap();
+            let sp = table["Ethernet1"].switchport.as_ref().unwrap();
+            assert_eq!(sp.members.len(), 1, "resume re-adds the membership");
+        }
+    }
+
+    /// Port-channel lifecycle over the mock data-plane: create, member
+    /// reconcile with gates, LAG switchport, storm aggregation, teardown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lag_lifecycle_over_mock_sai() {
+        let platform = test_platform();
+        let backend = Box::new(hemlock_sai::mock::MockSai::new(platform.ports.clone()));
+        let handle = Arc::new(SaiActor::spawn(backend, &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        service
+            .create_lag(Request::new(pb::CreateLagRequest {
+                group: 1,
+                description: "uplink to core".into(),
+                admin_up: true,
+            }))
+            .await
+            .unwrap();
+        // Members join gated closed unless asked otherwise.
+        service
+            .set_lag_members(Request::new(pb::SetLagMembersRequest {
+                group: 1,
+                members: vec![
+                    pb::LagMemberSpec {
+                        port: "Ethernet1".into(),
+                        enabled: false,
+                    },
+                    pb::LagMemberSpec {
+                        port: "Ethernet2".into(),
+                        enabled: true,
+                    },
+                ],
+            }))
+            .await
+            .unwrap();
+        {
+            let lags = handle.lags.read().unwrap();
+            let lag = &lags[&1];
+            assert_eq!(lag.members.len(), 2);
+            assert!(!lag.members["Ethernet1"].enabled);
+            assert!(lag.members["Ethernet2"].enabled);
+        }
+
+        // The LAG takes a switchport program by name.
+        service
+            .ensure_vlan(Request::new(pb::EnsureVlanRequest {
+                id: 10,
+                name: String::new(),
+                suspend: false,
+            }))
+            .await
+            .unwrap();
+        service
+            .set_port_switchport(Request::new(pb::SetPortSwitchportRequest {
+                name: "Port-Channel1".into(),
+                mode: pb::SwitchportMode::Trunk as i32,
+                access_vlan: 0,
+                trunk_vlans: vec![10],
+                native_vlan: 0,
+            }))
+            .await
+            .unwrap();
+        assert!(handle.lags.read().unwrap()[&1].switchport.is_some());
+
+        // Storm control on the Po applies per member; the row aggregates.
+        service
+            .set_port_storm_control(Request::new(pb::SetPortStormControlRequest {
+                name: "Port-Channel1".into(),
+                class: pb::StormClass::Broadcast as i32,
+                level: Some("10.00".into()),
+            }))
+            .await
+            .unwrap();
+        let storm = service
+            .get_storm_control(Request::new(pb::GetStormControlRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let po_row = storm
+            .entries
+            .iter()
+            .find(|e| e.name == "Port-Channel1")
+            .unwrap();
+        assert_eq!(po_row.rate_kbps, 200_000, "10% of two 1G members");
+
+        // GetInterfaces surfaces the Po with its members.
+        let response = service
+            .get_interfaces(Request::new(pb::GetInterfacesRequest {
+                names: vec!["Port-Channel1".into()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let po = &response.interfaces[0];
+        assert_eq!(po.kind, "port-channel");
+        assert_eq!(po.members, ["Ethernet1", "Ethernet2"]);
+        assert_eq!(po.oper_status, pb::OperStatus::Up as i32);
+        assert_eq!(po.speed_mbps, 1000, "one bundled 1G member");
+        assert_eq!(po.switchport_mode, "trunk");
+
+        // Statics can target the Po once it exists.
+        service
+            .add_static_fdb(Request::new(pb::AddStaticFdbRequest {
+                mac: "00:50:56:be:ef:09".into(),
+                vlan: 10,
+                port: "Port-Channel1".into(),
+                drop: false,
+            }))
+            .await
+            .unwrap();
+
+        // A shrunk member list restores the dropped port.
+        service
+            .set_lag_members(Request::new(pb::SetLagMembersRequest {
+                group: 1,
+                members: vec![pb::LagMemberSpec {
+                    port: "Ethernet2".into(),
+                    enabled: true,
+                }],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(handle.lags.read().unwrap()[&1].members.len(), 1);
+
+        // Teardown unwinds members, memberships, and policers.
+        service
+            .remove_lag(Request::new(pb::RemoveLagRequest { group: 1 }))
+            .await
+            .unwrap();
+        assert!(handle.lags.read().unwrap().is_empty());
+        service
+            .remove_lag(Request::new(pb::RemoveLagRequest { group: 1 }))
+            .await
+            .unwrap();
+    }
+
+    /// A commit needing an absent SAI capability fails with the exact
+    /// platform error, never a silent no-op.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn absent_capabilities_fail_cleanly() {
+        let platform = test_platform();
+        let mut mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        mock.set_capabilities(hemlock_sai::SaiCapabilities {
+            storm_control: false,
+            port_tpid: false,
+            fdb_flush: false,
+            ..hemlock_sai::SaiCapabilities::all()
+        });
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle,
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+        let err = service
+            .set_port_storm_control(Request::new(pb::SetPortStormControlRequest {
+                name: "Ethernet1".into(),
+                class: pb::StormClass::Broadcast as i32,
+                level: Some("10.00".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "storm-control is not supported by this platform's SAI"
+        );
+        let err = service
+            .set_port_switchport(Request::new(pb::SetPortSwitchportRequest {
+                name: "Ethernet1".into(),
+                mode: pb::SwitchportMode::Dot1qTunnel as i32,
+                access_vlan: 10,
+                trunk_vlans: vec![],
+                native_vlan: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "dot1q-tunnel is not supported by this platform's SAI"
+        );
+        let err = service
+            .flush_fdb(Request::new(pb::FlushFdbRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "mac-table flush is not supported by this platform's SAI"
+        );
+    }
+
     /// SVI lifecycle over the mock data-plane: default-VLAN SVI, a
     /// created VLAN's SVI, address surfaced via GetInterfaces, teardown
     /// on clear and on VLAN removal.
@@ -1573,6 +3916,7 @@ lanes = [1, 2]
             .ensure_vlan(Request::new(pb::EnsureVlanRequest {
                 id: 10,
                 name: String::new(),
+                suspend: false,
             }))
             .await
             .unwrap();

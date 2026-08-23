@@ -173,6 +173,76 @@ mod status_tests {
 #[derive(Debug, Clone, Copy)]
 pub struct SwitchInfo {
     pub oid: u64,
+    /// The default 802.1Q VLAN's object id, so FDB events on it (their
+    /// `bv_id`) can be mapped back to VLAN 1.
+    pub default_vlan_oid: u64,
+}
+
+/// What the platform's SAI supports, probed once at `create_switch`.
+/// The pinned Helix4 libsaibcm (8.4.50.0 / SAI v1.11.0) predates several
+/// optional families; a commit that needs an absent capability must fail
+/// cleanly, never silently no-op.
+#[derive(Debug, Clone, Copy)]
+pub struct SaiCapabilities {
+    pub lag: bool,
+    pub stp: bool,
+    pub fdb_flush: bool,
+    pub fdb_aging: bool,
+    pub l2mc: bool,
+    pub storm_control: bool,
+    pub mirror: bool,
+    /// Sessions the ASIC can host concurrently (0 = unsupported).
+    pub mirror_sessions_max: u32,
+    pub port_tpid: bool,
+}
+
+impl SaiCapabilities {
+    /// Everything supported — the mock's default posture.
+    pub fn all() -> Self {
+        Self {
+            lag: true,
+            stp: true,
+            fdb_flush: true,
+            fdb_aging: true,
+            l2mc: true,
+            storm_control: true,
+            mirror: true,
+            mirror_sessions_max: 4,
+            port_tpid: true,
+        }
+    }
+}
+
+/// Storm-control traffic class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StormClass {
+    Broadcast,
+    Multicast,
+    UnknownUnicast,
+}
+
+/// Where a static FDB entry sends its frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdbAction {
+    Forward(PortId),
+    Drop,
+}
+
+/// What happened to a dynamic FDB entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdbEventKind {
+    Learned,
+    Aged,
+    Moved,
+    Flushed,
+}
+
+/// A port's forwarding state within one spanning-tree instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StpPortState {
+    Blocking,
+    Learning,
+    Forwarding,
 }
 
 /// A port as the ASIC reports it. Correlated with the platform port table
@@ -189,7 +259,20 @@ pub struct SaiPort {
 /// Asynchronous SAI notifications, delivered off the vendor callback thread.
 #[derive(Debug, Clone)]
 pub enum SaiEvent {
-    PortOperStatus { port: PortId, up: bool },
+    PortOperStatus {
+        port: PortId,
+        up: bool,
+    },
+    /// A dynamic FDB entry changed. `bv_id` is the raw bridge/VLAN
+    /// object id from the notification; syncd maps it back to a VLAN
+    /// number (via [`SwitchInfo::default_vlan_oid`] and its VLAN table).
+    Fdb {
+        kind: FdbEventKind,
+        bv_id: u64,
+        mac: [u8; 6],
+        /// The entry's port; None on age/flush without one.
+        port: Option<PortId>,
+    },
 }
 
 /// Cumulative hardware counters for one port, as the ASIC reports them
@@ -328,4 +411,151 @@ pub trait SaiBackend: Send {
     /// Put the port back to default L2: untagged default-VLAN member
     /// with matching PVID. Idempotent.
     fn restore_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError>;
+
+    // --- Capability probe --------------------------------------------------
+
+    /// What this SAI supports. Valid after `create_switch`.
+    fn capabilities(&mut self) -> Result<SaiCapabilities, SaiError>;
+
+    // --- MAC address table (FDB) -------------------------------------------
+
+    /// Dynamic-entry aging time in seconds; 0 disables aging.
+    fn set_fdb_aging(&mut self, secs: u32) -> Result<(), SaiError>;
+
+    /// Install a static FDB entry. `vlan` is the VLAN's object id
+    /// (None = the default VLAN). Replaces an existing entry for the
+    /// same (vlan, mac).
+    fn add_fdb_entry(
+        &mut self,
+        vlan: Option<Oid>,
+        mac: [u8; 6],
+        action: FdbAction,
+    ) -> Result<(), SaiError>;
+
+    fn remove_fdb_entry(&mut self, vlan: Option<Oid>, mac: [u8; 6]) -> Result<(), SaiError>;
+
+    /// Flush dynamic FDB entries, optionally scoped to a VLAN and/or a
+    /// port. Static entries stay.
+    fn flush_fdb(&mut self, vlan: Option<Oid>, port: Option<PortId>) -> Result<(), SaiError>;
+
+    // --- Storm control -----------------------------------------------------
+
+    /// Meter a traffic class on a port to `kbps`; None removes the
+    /// policer. The backend owns policer object lifecycle.
+    fn set_port_storm_control(
+        &mut self,
+        port: PortId,
+        class: StormClass,
+        kbps: Option<u64>,
+    ) -> Result<(), SaiError>;
+
+    /// Cumulative packets a storm-control policer dropped (red-marked);
+    /// 0 when no policer is attached.
+    fn port_storm_drops(&mut self, port: PortId, class: StormClass) -> Result<u64, SaiError>;
+
+    // --- Port mirroring ----------------------------------------------------
+
+    /// Create a local (SPAN) mirror session towards `monitor`.
+    fn create_mirror_session(&mut self, monitor: PortId) -> Result<Oid, SaiError>;
+
+    /// Remove a mirror session; ports must be detached first.
+    fn remove_mirror_session(&mut self, session: Oid) -> Result<(), SaiError>;
+
+    /// Attach a port's ingress/egress mirroring to a session (None
+    /// detaches that direction).
+    fn set_port_mirror(
+        &mut self,
+        port: PortId,
+        ingress: Option<Oid>,
+        egress: Option<Oid>,
+    ) -> Result<(), SaiError>;
+
+    // --- QinQ --------------------------------------------------------------
+
+    /// The port's outer TPID. 0x8100 is the default; a dot1q-tunnel
+    /// port carries 0x88a8 so customer 0x8100 tags ride through as
+    /// payload.
+    fn set_port_tpid(&mut self, port: PortId, tpid: u16) -> Result<(), SaiError>;
+
+    // --- Link aggregation --------------------------------------------------
+
+    /// Create a LAG. The returned id is port-like: the VLAN-membership
+    /// and PVID calls accept it (the backend fronts the LAG with its
+    /// own bridge port and dispatches PVID to the LAG attribute).
+    fn create_lag(&mut self) -> Result<PortId, SaiError>;
+
+    /// Remove a LAG; its members and VLAN memberships must be gone.
+    fn remove_lag(&mut self, lag: PortId) -> Result<(), SaiError>;
+
+    /// Add `port` to `lag`. The port leaves the 802.1Q bridge (its
+    /// traffic rides the LAG's bridge port); the member starts gated
+    /// closed (not collecting/distributing).
+    fn add_lag_member(&mut self, lag: PortId, port: PortId) -> Result<Oid, SaiError>;
+
+    /// Remove a member and restore the port's standalone default L2
+    /// bridging.
+    fn remove_lag_member(&mut self, member: Oid, port: PortId) -> Result<(), SaiError>;
+
+    /// The collect/distribute gate: an enabled member forwards, a
+    /// disabled one only speaks LACP.
+    fn set_lag_member_state(&mut self, member: Oid, enabled: bool) -> Result<(), SaiError>;
+
+    // --- Spanning tree -----------------------------------------------------
+
+    /// Create an STP instance (an MST instance beyond the always-present
+    /// default one).
+    fn create_stp_instance(&mut self) -> Result<Oid, SaiError>;
+
+    /// Remove an STP instance; its VLANs must have moved elsewhere.
+    fn remove_stp_instance(&mut self, stp: Oid) -> Result<(), SaiError>;
+
+    /// Assign a VLAN (None = the default VLAN) to an STP instance
+    /// (None = the default instance).
+    fn set_vlan_stp_instance(
+        &mut self,
+        vlan: Option<Oid>,
+        stp: Option<Oid>,
+    ) -> Result<(), SaiError>;
+
+    /// A (port-like) object's forwarding state within an instance
+    /// (None = the default instance). The backend owns the stp-port
+    /// object lifecycle.
+    fn set_stp_port_state(
+        &mut self,
+        stp: Option<Oid>,
+        port: PortId,
+        state: StpPortState,
+    ) -> Result<(), SaiError>;
+
+    // --- L2 multicast (IGMP/MLD snooping) ----------------------------------
+
+    /// Create an empty L2MC output group.
+    fn create_l2mc_group(&mut self) -> Result<Oid, SaiError>;
+
+    /// Remove an L2MC group; members and referencing entries must be
+    /// gone.
+    fn remove_l2mc_group(&mut self, group: Oid) -> Result<(), SaiError>;
+
+    /// Add a (port-like) output to an L2MC group.
+    fn add_l2mc_member(&mut self, group: Oid, port: PortId) -> Result<Oid, SaiError>;
+
+    fn remove_l2mc_member(&mut self, member: Oid) -> Result<(), SaiError>;
+
+    /// Point a VLAN's (*, G) forwarding entry at an L2MC group (None
+    /// removes the entry).
+    fn set_l2mc_entry(
+        &mut self,
+        vlan: Option<Oid>,
+        group_ip: std::net::IpAddr,
+        l2mc: Option<Oid>,
+    ) -> Result<(), SaiError>;
+
+    /// Where a VLAN floods unknown multicast: None = everywhere (the
+    /// default); Some(group) = only that L2MC group (snooping sends it
+    /// to the mrouter ports).
+    fn set_vlan_unknown_mcast_group(
+        &mut self,
+        vlan: Option<Oid>,
+        l2mc: Option<Oid>,
+    ) -> Result<(), SaiError>;
 }

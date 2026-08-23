@@ -16,6 +16,7 @@ mod api;
 mod auth;
 mod edit;
 mod maint;
+mod switching_edit;
 mod tls;
 mod users;
 
@@ -36,6 +37,10 @@ struct Args {
     /// mgmtd endpoint (running config, service state).
     #[arg(long)]
     mgmtd: Option<String>,
+
+    /// orch endpoint (LACP/STP/snooping runtime state).
+    #[arg(long)]
+    orch: Option<String>,
 
     /// syncd endpoint (interface and VLAN state).
     #[arg(long)]
@@ -193,9 +198,14 @@ async fn main() -> Result<()> {
         warn!(assets = %args.assets.display(), "no web UI build found; only /api will respond");
     }
 
+    let orch: hemlock_common::ipc::IpcEndpoint = match &args.orch {
+        Some(s) => s.parse()?,
+        None => hemlock_common::ipc::Daemon::Orch.default_endpoint(),
+    };
     let state: api::SharedState = Arc::new(api::AppState {
         mgmtd,
         syncd,
+        orch,
         sessions: auth::Sessions::new(),
         dev_auth,
         // Cookies are marked Secure only when no plaintext listener

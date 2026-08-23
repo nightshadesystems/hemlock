@@ -15,6 +15,7 @@ mod motd;
 mod pager;
 mod platform;
 mod show;
+mod switching;
 mod upgrade;
 
 #[derive(Parser)]
@@ -31,6 +32,10 @@ struct Cli {
     /// Override the mgmtd endpoint.
     #[arg(long, global = true)]
     mgmtd: Option<String>,
+
+    /// Override the orch endpoint.
+    #[arg(long, global = true)]
+    orch: Option<String>,
 
     /// Run a POSIX shell command and exit. hemlockctl is the operator
     /// account's login shell; sshd invokes remote commands and the sftp
@@ -186,6 +191,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             syncd: endpoint(&cli.syncd, Daemon::Syncd)?,
             pmon: endpoint(&cli.pmon, Daemon::Pmon)?,
             mgmtd: endpoint(&cli.mgmtd, Daemon::Mgmtd)?,
+            orch: endpoint(&cli.orch, Daemon::Orch)?,
         })
         .await;
     };

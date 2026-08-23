@@ -1,10 +1,31 @@
-// hemlock-orch: netlink/FRR -> SAI orchestration. Phase 1 is a seam stub;
-// L3/VLAN/LAG/EVPN services will extend this file.
+// hemlock-orch: the control-plane protocol engines (LACP now; STP and
+// IGMP/MLD snooping to follow). mgmtd pushes desired state after every
+// commit (and at boot replay); the engines drive syncd and serve their
+// runtime state to `show`.
 syntax = "proto3";
 package hemlock.v1;
 
 service Orch {
   rpc GetStatus(GetOrchStatusRequest) returns (OrchStatus);
+
+  // Full desired LAG/LACP state (declarative: replaces the previous
+  // push; an empty list tears every LAG's protocol state down).
+  rpc SetLagConfigs(SetLagConfigsRequest) returns (SetLagConfigsResponse);
+
+  // LACP runtime state for `show lacp ...` / `show port-channel ...`.
+  rpc GetLacpState(GetLacpStateRequest) returns (GetLacpStateResponse);
+
+  // Full desired spanning-tree state (declarative).
+  rpc SetStpConfig(SetStpConfigRequest) returns (SetStpConfigResponse);
+
+  // Spanning-tree runtime state for `show spanning-tree ...`.
+  rpc GetStpState(GetStpStateRequest) returns (GetStpStateResponse);
+
+  // Full desired snooping state for one family (declarative).
+  rpc SetSnoopingConfig(SetSnoopingConfigRequest) returns (SetSnoopingConfigResponse);
+
+  // Snooping runtime state for `show igmp|mld snooping ...`.
+  rpc GetSnoopingState(GetSnoopingStateRequest) returns (GetSnoopingStateResponse);
 }
 
 message GetOrchStatusRequest {}
@@ -12,4 +33,200 @@ message GetOrchStatusRequest {}
 message OrchStatus {
   bool running = 1;
   string detail = 2;
+}
+
+enum LacpConfigMode {
+  LACP_CONFIG_MODE_UNSPECIFIED = 0;
+  LACP_CONFIG_MODE_ACTIVE = 1;
+  LACP_CONFIG_MODE_PASSIVE = 2;
+  // Static aggregation, no LACP.
+  LACP_CONFIG_MODE_ON = 3;
+}
+
+enum LagFallbackMode {
+  LAG_FALLBACK_MODE_UNSPECIFIED = 0;
+  LAG_FALLBACK_MODE_NONE = 1;
+  LAG_FALLBACK_MODE_STATIC = 2;
+  LAG_FALLBACK_MODE_INDIVIDUAL = 3;
+}
+
+message LacpMemberConfig {
+  string port = 1;
+  LacpConfigMode mode = 2;
+  // Fast = 1s LACPDUs; default (false) = 30s.
+  bool rate_fast = 3;
+  // 0 = default (32768).
+  uint32 port_priority = 4;
+}
+
+message LagConfig {
+  uint32 group = 1;              // 1..64
+  uint32 min_links = 2;          // 0 = no minimum
+  LagFallbackMode fallback = 3;
+  uint32 fallback_timeout_secs = 4;  // 0 = default (90)
+  repeated LacpMemberConfig members = 5;
+}
+
+message SetLagConfigsRequest {
+  repeated LagConfig lags = 1;
+  // 0 = default (32768).
+  uint32 system_priority = 2;
+}
+
+message SetLagConfigsResponse {}
+
+message GetLacpStateRequest {}
+
+message MemberLacpState {
+  string port = 1;
+  // "bundled" | "standby" | "down" | "individual"
+  string status = 2;
+  bool rate_fast = 3;
+  // IEEE 802.1AX actor/partner state octets.
+  uint32 actor_state = 4;
+  uint32 partner_state = 5;
+  // Partner identity; empty system = no partner heard (defaulted).
+  string partner_system = 6;   // "32768,d4:af:f7:12:9c:00"
+  uint32 partner_port = 7;
+  uint32 partner_key = 8;
+  uint32 partner_priority = 9;
+  uint64 pdus_rx = 10;
+  uint64 pdus_tx = 11;
+  // Times the member's mux state churned.
+  uint32 churn = 12;
+}
+
+message LagLacpState {
+  uint32 group = 1;
+  // False = static (`mode on`).
+  bool lacp = 2;
+  bool active_mode = 3;
+  uint32 bundled = 4;
+  uint32 total = 5;
+  bool up = 6;
+  uint32 min_links = 7;
+  // "" (off) | "static" | "individual"
+  string fallback_mode = 8;
+  uint32 fallback_timeout_secs = 9;
+  bool fallback_active = 10;
+  repeated MemberLacpState members = 11;
+}
+
+message GetLacpStateResponse {
+  // "32768,2c:dd:e9:4a:1b:00"
+  string system_id = 1;
+  repeated LagLacpState lags = 2;
+}
+
+// --- Spanning tree ---------------------------------------------------
+
+message StpPortConfig {
+  string port = 1;
+  bool portfast = 2;
+  bool bpduguard = 3;
+  uint32 cost = 4;      // 0 = derive from link speed
+  uint32 priority = 5;  // 0 = default (128)
+}
+
+message MstInstanceMap {
+  uint32 instance = 1;
+  repeated uint32 vlans = 2;
+}
+
+message SetStpConfigRequest {
+  string mode = 1;  // "mstp" | "rstp" | "none"
+  uint32 priority = 2;      // 0 = default (32768)
+  uint32 hello_time = 3;    // 0 = default (2)
+  uint32 max_age = 4;       // 0 = default (20)
+  uint32 forward_time = 5;  // 0 = default (15)
+  string mst_name = 6;
+  uint32 mst_revision = 7;
+  repeated MstInstanceMap instances = 8;
+  repeated StpPortConfig ports = 9;
+}
+
+message SetStpConfigResponse {}
+
+message GetStpStateRequest {}
+
+message StpPortStateInfo {
+  string port = 1;
+  string role = 2;   // designated | root | alternate | disabled
+  string state = 3;  // discarding | learning | forwarding
+  uint32 cost = 4;
+  uint32 priority = 5;
+  bool portfast = 6;
+  bool bpduguard = 7;
+  uint64 bpdus_rx = 8;
+  uint64 bpdus_tx = 9;
+  bool errdisabled = 10;
+}
+
+// --- IGMP/MLD snooping -----------------------------------------------
+
+message SnoopingVlanConfig {
+  uint32 vlan = 1;
+  bool disabled = 2;
+  bool fast_leave = 3;
+  bool querier = 4;
+  string querier_address = 5;  // "" = derive (unspecified address)
+  repeated string mrouters = 6;
+}
+
+message SetSnoopingConfigRequest {
+  string family = 1;  // "igmp" | "mld"
+  bool disabled = 2;
+  uint32 robustness = 3;  // 0 = default (2)
+  repeated SnoopingVlanConfig vlans = 4;
+}
+
+message SetSnoopingConfigResponse {}
+
+message GetSnoopingStateRequest {
+  string family = 1;
+}
+
+message SnoopingGroupState {
+  string group = 1;
+  uint32 version = 2;
+  repeated string ports = 3;
+}
+
+message SnoopingVlanState {
+  uint32 vlan = 1;
+  bool enabled = 2;
+  bool fast_leave = 3;
+  bool querier_enabled = 4;
+  string querier_address = 5;
+  bool querier_active = 6;
+  repeated string static_mrouters = 7;
+  repeated string dynamic_mrouters = 8;
+  repeated SnoopingGroupState groups = 9;
+}
+
+message GetSnoopingStateResponse {
+  bool enabled = 1;
+  uint32 robustness = 2;
+  repeated SnoopingVlanState vlans = 3;
+}
+
+message GetStpStateResponse {
+  string mode = 1;
+  uint32 bridge_priority = 2;
+  string bridge_mac = 3;  // colon-separated lowercase
+  uint32 root_priority = 4;
+  string root_mac = 5;
+  bool is_root = 6;
+  uint32 root_cost = 7;
+  string root_port = 8;
+  uint32 hello_time = 9;
+  uint32 max_age = 10;
+  uint32 forward_time = 11;
+  string mst_name = 12;
+  uint32 mst_revision = 13;
+  repeated MstInstanceMap instances = 14;
+  uint32 topology_changes = 15;
+  optional uint64 seconds_since_tc = 16;
+  string last_tc_port = 17;
+  repeated StpPortStateInfo ports = 18;
 }

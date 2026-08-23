@@ -1,2 +1,3 @@
 Port       Name                          Status       Reason
 Et7                                      errdisabled  link-flap
+Et8                                      errdisabled  bpduguard

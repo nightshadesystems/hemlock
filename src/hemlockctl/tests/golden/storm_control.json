@@ -1,0 +1,28 @@
+{
+  "storm_control": [
+    {
+      "active": true,
+      "drops": 1284,
+      "kind": "broadcast",
+      "level": "10.00",
+      "port": "Ethernet1",
+      "rate_kbps": 100000
+    },
+    {
+      "active": true,
+      "drops": 0,
+      "kind": "unknown-unicast",
+      "level": "5.00",
+      "port": "Ethernet1",
+      "rate_kbps": 50000
+    },
+    {
+      "active": true,
+      "drops": 0,
+      "kind": "broadcast",
+      "level": "10.00",
+      "port": "Port-Channel1",
+      "rate_kbps": 2000000
+    }
+  ]
+}

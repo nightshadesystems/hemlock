@@ -1,0 +1,5 @@
+Name                 Blocked Interfaces List
+-------------------- ------------------------------------
+MST0                 Et3
+
+Number of blocked ports (segments) in the system : 1

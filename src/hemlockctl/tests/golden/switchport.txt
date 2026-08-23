@@ -30,5 +30,20 @@ Static Trunk Groups:
 Dynamic Trunk Groups:
 Source interface filtering: enabled
 
+Name: Et6
+Switchport: Enabled
+Administrative Mode: dot1q-tunnel
+Operational Mode: dot1q-tunnel
+MAC Address Learning: enabled
+Dot1q ethertype/TPID: 0x88a8 (active)
+Dot1q Source Port Filter: Disabled
+Access Mode VLAN: 100
+Trunking Native Mode VLAN: 1 (default)
+Administrative Native VLAN tagging: disabled
+Trunking VLANs Enabled: ALL
+Static Trunk Groups:
+Dynamic Trunk Groups:
+Source interface filtering: enabled
+
 Name: Ma1
 Switchport: Disabled

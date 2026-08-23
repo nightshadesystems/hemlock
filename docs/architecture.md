@@ -5,8 +5,8 @@ Broadcom XGS ASICs exclusively through the vendor's SAI library — never the
 raw Broadcom SDK, OpenNSL, or switchdev — on a Debian 13 base with systemd,
 installed via per-platform ONIE images.
 
-This document describes the phase-1 system: platform layer, SAI layer, the
-four daemons, the configuration model, and the image/installer pipeline.
+This document describes the system: platform layer, SAI layer, the
+daemons, the configuration model, and the image/installer pipeline.
 
 ## Design principles
 
@@ -36,19 +36,19 @@ four daemons, the configuration model, and the image/installer pipeline.
             ┌─────────────────────┴──────┬───────┘
             │            │               │
             ▼            ▼               ▼
-      ┌───────────┐ ┌──────────┐  ┌─────────────┐     ┌─────────────┐
-      │hemlock-   │ │ hemlock- │  │ hemlock-    │     │ hemlock-orch│
-      │mgmtd      │ │ pmon     │  │ syncd       │◄────┤ (phase-1    │
-      │commit     │ │ fans/    │  │ owns the    │     │  stub)      │
-      │engine     │ │ thermal/ │  │ ASIC via    │     └─────────────┘
-      └─────┬─────┘ │ SFP/PSU  │  │ SaiBackend  │
-            │       └────┬─────┘  └──────┬──────┘
-            │ gRPC       │ sysfs/i2c     │ dlopen
-            └───────────►│               ▼
-              (apply     │        ┌─────────────┐
-               intents)  ▼        │ libsai.so   │ vendor blob, pinned
-                     hardware     │ (or MockSai)│ per platform
-                                  └─────────────┘
+      ┌───────────┐ ┌──────────┐  ┌─────────────┐      ┌─────────────┐
+      │hemlock-   │ │ hemlock- │  │ hemlock-    │◄─────┤ hemlock-orch│
+      │mgmtd      │ │ pmon     │  │ syncd       │      │ LACP / STP /│
+      │commit     │ │ fans/    │  │ owns the    │      │ IGMP-MLD    │
+      │engine     │ │ thermal/ │  │ ASIC via    │      │ snooping    │
+      └─────┬─────┘ │ SFP/PSU  │  │ SaiBackend  │      │ engines     │
+            │       └────┬─────┘  └──────┬──────┘      └──────▲──────┘
+            │ gRPC       │ sysfs/i2c     │ dlopen             │
+            └───────────►│               ▼        mgmtd pushes protocol
+              (apply     │        ┌─────────────┐ config to orch; orch
+               intents)  ▼        │ libsai.so   │ programs LAG gates /
+                     hardware     │ (or MockSai)│ STP states / L2MC
+                                  └─────────────┘ into syncd
 ```
 
 - All IPC is tonic gRPC. Production endpoints are unix domain sockets under
@@ -59,7 +59,8 @@ four daemons, the configuration model, and the image/installer pipeline.
   service per daemon (`Syncd`, `Pmon`, `Mgmt`, `Orch`) plus shared enums.
   Generated types are re-exported as `hemlock_common::proto::v1`.
 - `hemlockctl` talks to whichever daemon owns the state it needs: syncd for
-  interfaces, pmon for environment, mgmtd for the config lifecycle.
+  interfaces/VLANs/FDB, orch for protocol state (LACP, spanning tree,
+  snooping), pmon for environment, mgmtd for the config lifecycle.
 
 ## Crate map
 
@@ -71,7 +72,7 @@ four daemons, the configuration model, and the image/installer pipeline.
 | `hemlock-syncd` | bin | The only ASIC owner: switch create, port bring-up, port state gRPC |
 | `hemlock-pmon` | bin | Manifest-driven environment monitoring + fan control |
 | `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring |
-| `hemlock-orch` | bin | Phase-1 stub; future netlink/FRR → SAI orchestration |
+| `hemlock-orch` | bin | L2 protocol engines: LACP, spanning tree, IGMP/MLD snooping; packet I/O; future netlink/FRR → SAI orchestration |
 | `hemlock-webd` | bin | Web console: serves the exported Next.js UI (`web/`) + JSON API over HTTP/HTTPS; config-driven via `set system http`/`https` |
 | `hemlock-config` | lib | Curly-brace config language: lexer, parser, tree |
 | `hemlockctl` | bin | Operator CLI |
@@ -123,9 +124,22 @@ pub trait SaiBackend: Send {
 }
 ```
 
-Phase 1 deliberately exposes only: switch create, port enumeration, admin
-state, and oper-status notifications. New object families (VLAN, LAG, L3)
-extend this trait in later phases.
+Phase 1 exposed only switch create, port enumeration, admin state, and
+oper-status notifications. The switching suite grew the trait — always
+mock and vendor in lockstep — with VLAN/switchport programming, the FDB
+(aging, static entries incl. drop, flush, and `SaiEvent::Fdb`
+learn/age/move notifications), storm-control policers, mirror sessions,
+LAGs (a LAG is created *as a `PortId`*, so VLAN membership, PVID, FDB and
+storm calls take LAG ids transparently), STP instances + per-port STP
+state, and L2MC groups for snooping-constrained multicast.
+
+The vendor backend also answers a **capability probe**
+(`SaiBackend::capabilities`, via `sai_query_attribute_capability`): which
+of LAG, STP, FDB flush/aging, L2MC, storm policers, mirroring, and
+outer-TPID rewrite this platform's SAI actually implements. syncd runs
+the probe once at startup and every RPC that needs a missing capability
+fails cleanly with `% <feature> is not supported by this platform's SAI`
+— configuration is never silently dropped on the floor.
 
 **Mock backend** (`mock-sai`, default feature): pure Rust, constructed from
 the platform port table. Links follow admin state and emit the same
@@ -159,11 +173,18 @@ Startup sequence:
    with no ASIC match are a fatal error; ASIC ports not in the manifest
    (internal/backplane links) are logged and left untouched.
 4. Bring every mapped port to its default admin state (phase 1: up).
-5. Run `quirks.post_asic_init`; serve gRPC.
+5. Run the SAI **capability probe** and cache the answers for the L2 RPC
+   surface.
+6. Run `quirks.post_asic_init`; serve gRPC.
 
 At runtime the async side sends commands to the actor over a channel;
 oper-status events flow out through a broadcast channel that updates the
-shared port table and feeds `WatchPortEvents` streams.
+shared port table and feeds `WatchPortEvents` streams. FDB notifications
+flow the same way and maintain a **software FDB mirror** (dynamic entries
+with move counters plus configured statics) — `show mac address-table`
+and the paged `DumpFdb` RPC serve from the mirror rather than dumping the
+ASIC. syncd also re-derives storm-control policer rates on link-speed
+changes, since levels are configured as a percentage of link speed.
 
 ## hemlock-pmon
 
@@ -173,6 +194,45 @@ drives all fans to the PWM given by linear interpolation over the curve
 tach + PSU status. A slower loop scans transceiver EEPROMs (SFF-8472
 identity fields). All hardware access goes through the `HwBackend` trait:
 `sysfs` for real hwmon/i2c paths, `mock` for CI and development.
+
+## hemlock-orch
+
+orch hosts the L2 protocol engines — the state machines that need packet
+I/O and timers, which neither mgmtd (config lifecycle) nor syncd (ASIC
+owner) should carry:
+
+- **LACP** (`lacp.rs`) — per-member actor/partner mux machines, LACPDU
+  tx/rx at the partner's rate, 3× timeout expiry, static (`mode on`) and
+  LACP fallback, min-links. Its output is per-member **gate** decisions.
+- **Spanning tree** (`stp.rs`) — a single CIST state machine driving all
+  MST instances (the config surface has no per-instance priorities, so
+  one machine is sufficient), RST BPDUs, root/designated/alternate roles,
+  portfast, and BPDU guard → errdisable.
+- **IGMP/MLD snooping** (`snoop.rs`) — one generic engine instantiated
+  per family: group membership with timers, fast-leave, querier election,
+  dynamic mrouter learning from queries, and optional local querier.
+
+Each engine is a pure state machine spawned with mpsc channels (links and
+packets in; frames and state updates out), so engine tests wire two
+engines back-to-back with no sockets involved. mgmtd pushes the desired
+protocol config to orch at commit (`SetLagConfigs`, `SetStpConfig`,
+`SetSnoopingConfig` — a commit fails if orch is down); orch alone writes
+the results into syncd: LAG membership + collect/distribute gates
+(`SetLagMembers`), per-port STP states, errdisable, L2MC groups and
+unknown-multicast flood restriction. Keeping orch the *only* writer of
+LAG membership avoids a dual-writer race with mgmtd, which only creates
+and removes the LAG object itself.
+
+**Packet I/O decision**: engines exchange PDUs over Linux `AF_PACKET`
+sockets (`transport.rs`, via the `nix` crate — bound with `getifaddrs`
+link addresses so no `unsafe` sockaddr construction is needed, keeping
+the workspace-wide `unsafe_code = deny` intact). One reader dispatches by
+frame type: EtherType 0x8809 → LACP, the STP multicast DA → STP, and
+IGMP/ICMPv6-MLD → snooping, with VLAN classification from the port's
+PVID. The transport is `cfg(target_os = "linux")`; on other hosts (and
+in CI) the engines run against injected frames only. This rides the
+kernel netdevs that the ASIC's CPU port exposes — no SAI hostif plumbing
+is required for the current feature set.
 
 ## Configuration model
 
@@ -198,12 +258,19 @@ commit.
   intents, and cross-checks interface names against syncd before accepting
   the candidate.
 - **Commit** — diff the candidate's *intents* against running's, push only
-  the changes to syncd, then rotate the ring and promote the candidate.
-  Phase 1 has one intent family (interface admin-state + description);
-  each future family is a pure function from config tree to typed intents
-  plus an apply step, slotting into `intents.rs` without touching the
-  lifecycle machinery. An interface removed from the config reverts to
-  defaults (admin up, no description).
+  the changes to syncd (and, for protocol families, orch), then rotate the
+  ring and promote the candidate. Each intent family is a pure function
+  from config tree to typed intents plus an apply step, slotting into
+  `intents.rs` without touching the lifecycle machinery. The families so
+  far: interface admin-state/description/addresses, VLANs (including
+  `state suspend`), switchport modes (access/trunk/dot1q-tunnel), static
+  routes, system (hostname, users, http/https), and the switching suite —
+  LAGs + LACP, spanning tree, MAC table (aging + statics), IGMP/MLD
+  snooping, storm control, and mirror sessions. Cross-object validation
+  (e.g. "a LAG member's L2 config lives on the Port-Channel", mirror
+  destination exclusivity) runs at load/commit before anything is pushed.
+  An interface removed from the config reverts to defaults (admin up, no
+  description).
 - **Commit-confirm** — `commit --confirm N` arms a timer holding the
   pre-commit running text; `hemlockctl confirm` disarms it, expiry
   re-applies the old config automatically.
@@ -298,14 +365,15 @@ flash-backed state dir, then calls the RPC) and the CLI —
 There is no A/B slot — recovery from a bad image is a reinstall from
 ONIE.
 
-## Phase-1 boundaries and seams
+## Boundaries and seams
 
-Explicitly out of scope in phase 1: FRR integration, L3/routing
-orchestration, VLANs/LAG, EVPN, licensing, telemetry streaming. The seams
-they will land on already exist:
+Still out of scope: FRR integration, dynamic routing, EVPN, licensing,
+telemetry streaming. The seams they will land on already exist:
 
-- `hemlock-orch` runs and serves a stub `Orch` service; routing state will
-  flow netlink/FRR → orch → syncd gRPC.
-- New SAI object families extend `SaiBackend` + the mock in lockstep.
+- `hemlock-orch` already hosts protocol engines with packet I/O; routing
+  state will flow netlink/FRR → orch → syncd gRPC on the same pattern.
+- New SAI object families extend `SaiBackend` + the mock in lockstep, and
+  gate on the startup capability probe when support varies by platform.
 - New config families add an intent extractor + apply step in mgmtd.
-- Telemetry can subscribe to syncd's event broadcast and pmon's state.
+- Telemetry can subscribe to syncd's event broadcasts (port and FDB) and
+  pmon's state.

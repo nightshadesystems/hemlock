@@ -16,5 +16,9 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }
 
+# LACPDU transport over the member ports' hostif netdevs.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["socket", "net"] }
+
 [lints]
 workspace = true

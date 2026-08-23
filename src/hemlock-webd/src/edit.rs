@@ -11,10 +11,12 @@ use hemlock_config::{ConfigTree, Item};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Mode {
     Access,
     Trunk,
+    /// QinQ tunnel port; the S-VLAN is the access VLAN.
+    Dot1qTunnel,
     Routed,
 }
 
@@ -55,7 +57,12 @@ pub fn apply_interface_edit(tree: &mut ConfigTree, edit: &InterfaceEdit) -> Resu
         if !(name.starts_with("Ethernet") || name.starts_with("Management")) {
             return Err(format!("{name}: not an editable interface"));
         }
-        if name.starts_with("Management") && matches!(edit.mode, Some(Mode::Access | Mode::Trunk)) {
+        if name.starts_with("Management")
+            && matches!(
+                edit.mode,
+                Some(Mode::Access | Mode::Trunk | Mode::Dot1qTunnel)
+            )
+        {
             return Err(format!("{name}: management ports are not switchports"));
         }
     }
@@ -110,19 +117,25 @@ fn apply_one(eth: &mut Vec<Item>, edit: &InterfaceEdit) {
         Some(Mode::Routed) => {
             ConfigTree::remove_block(eth, "switchport", &[]);
         }
-        Some(mode @ (Mode::Access | Mode::Trunk)) => {
+        Some(mode @ (Mode::Access | Mode::Trunk | Mode::Dot1qTunnel)) => {
             ConfigTree::remove_leaf(eth, "address");
-            let trunk = mode == Mode::Trunk;
             let sp = ConfigTree::ensure_block(eth, "switchport", &[]);
             ConfigTree::set_leaf(
                 sp,
                 "mode",
-                vec![if trunk { "trunk" } else { "access" }.to_string()],
+                vec![match mode {
+                    Mode::Trunk => "trunk",
+                    Mode::Dot1qTunnel => "dot1q-tunnel",
+                    _ => "access",
+                }
+                .to_string()],
             );
-            if trunk {
+            if mode == Mode::Trunk {
                 // A trunk carries no access VLAN (mirrors the CLI).
                 ConfigTree::remove_leaf(sp, "access");
             } else {
+                // Access and dot1q-tunnel carry no trunk config; the
+                // tunnel's S-VLAN is the access VLAN.
                 ConfigTree::remove_leaf(sp, "trunk");
                 ConfigTree::remove_leaf(sp, "native");
             }

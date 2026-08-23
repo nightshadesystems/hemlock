@@ -165,7 +165,7 @@ fn parse(words: &[&str]) -> Result<Cmd, String> {
 }
 
 /// Strip a trailing `| json` (or `|json`), EOS pipe style.
-fn take_json(words: &mut Vec<&str>) -> Result<bool, String> {
+pub(crate) fn take_json(words: &mut Vec<&str>) -> Result<bool, String> {
     match words.as_slice() {
         [.., "|"] => Err("% Incomplete command: | json".into()),
         [.., "|", last] => {

@@ -246,10 +246,20 @@ fn convert(state: &pb::InterfaceState, platform_model: &str) -> Option<Interface
                 ..Switchport::default()
             }
         } else {
-            let mode = if trunk { "trunk" } else { "static access" };
+            let mode = match state.switchport_mode.as_str() {
+                "trunk" => "trunk",
+                "dot1q-tunnel" => "dot1q-tunnel",
+                _ => "static access",
+            };
             Switchport {
                 admin_mode: mode.into(),
                 oper_mode: mode.into(),
+                // Tunnel ports carry the QinQ outer TPID.
+                tpid: if mode == "dot1q-tunnel" {
+                    "0x88a8".into()
+                } else {
+                    "0x8100".into()
+                },
                 access_vlan,
                 native_vlan: if state.native_vlan == 0 {
                     1

@@ -1,0 +1,15 @@
+{
+  "mirror_sessions": [
+    {
+      "both": [
+        "Ethernet1",
+        "Ethernet2"
+      ],
+      "destination": "Ethernet4",
+      "destination_active": true,
+      "rx": [],
+      "session": 1,
+      "tx": []
+    }
+  ]
+}

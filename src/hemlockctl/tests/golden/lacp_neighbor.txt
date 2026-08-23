@@ -1,0 +1,4 @@
+Port    Flags    Partner Sys-ID            Port#   Key    Prio   State
+------  -------  ------------------------  ------  -----  -----  --------
+Et49    FA       32768,d4:af:f7:12:9c:00   49      1      32768  ACDS----
+Et50    FA       32768,d4:af:f7:12:9c:00   50      1      32768  ACDS----

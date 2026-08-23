@@ -1,0 +1,7 @@
+VLAN  Name                             Status    Ports
+----- -------------------------------- --------- ----------------------------
+1     default                          active    Et2, Et3, Et4, Et5, Po1
+10    LAN-USERS                        active    Et1, Et2, Po1
+20    VOICE                            suspend   Et2, Po1
+30    VLAN0030                         active    Et2, Po1
+99    VLAN0099                         active    Et2, Po1

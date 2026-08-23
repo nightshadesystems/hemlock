@@ -1,0 +1,49 @@
+{
+  "port_channels": [
+    {
+      "active_mode": true,
+      "admin_up": true,
+      "bundled": 2,
+      "description": "uplink to core",
+      "fallback_active": false,
+      "fallback_mode": "individual",
+      "fallback_timeout_secs": 90,
+      "group": 1,
+      "lacp": true,
+      "mac": "2c:dd:e9:4a:1b:31",
+      "members": [
+        {
+          "actor_state": 59,
+          "churn": 2,
+          "id": "Ethernet49",
+          "partner_key": 1,
+          "partner_port": 49,
+          "partner_priority": 32768,
+          "partner_state": 59,
+          "partner_system": "32768,d4:af:f7:12:9c:00",
+          "pdus_rx": 118,
+          "pdus_tx": 120,
+          "rate_fast": true,
+          "status": "bundled"
+        },
+        {
+          "actor_state": 59,
+          "churn": 2,
+          "id": "Ethernet50",
+          "partner_key": 1,
+          "partner_port": 50,
+          "partner_priority": 32768,
+          "partner_state": 59,
+          "partner_system": "32768,d4:af:f7:12:9c:00",
+          "pdus_rx": 117,
+          "pdus_tx": 119,
+          "rate_fast": true,
+          "status": "bundled"
+        }
+      ],
+      "min_links": 1,
+      "total": 2,
+      "up": true
+    }
+  ]
+}

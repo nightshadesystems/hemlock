@@ -19,6 +19,12 @@ const SIDE_NAV = {
     items: [
       { id: '/switching/interfaces/', label: 'Interfaces', icon: 'network-settings' },
       { id: '/switching/vlans/', label: 'VLANs', icon: 'network-globe' },
+      { id: '/switching/lag/', label: 'Link Aggregation', icon: 'link' },
+      { id: '/switching/spanning-tree/', label: 'Spanning Tree', icon: 'tree-view' },
+      { id: '/switching/mac-table/', label: 'MAC Table', icon: 'view-list' },
+      { id: '/switching/snooping/', label: 'IGMP/MLD Snooping', icon: 'rss' },
+      { id: '/switching/storm-control/', label: 'Storm Control', icon: 'cloud-network' },
+      { id: '/switching/mirror/', label: 'Mirroring', icon: 'copy' },
     ],
   },
   '/routing': {
