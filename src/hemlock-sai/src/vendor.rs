@@ -229,6 +229,49 @@ impl VendorSai {
         self.switch_oid.ok_or(SaiError::NoSwitch)
     }
 
+    /// Bench diag shell. Broadcom's SAI runs its `BCM.0>` shell *inside*
+    /// a blocking `set_switch_attribute(SWITCH_SHELL_ENABLE, true)` call
+    /// (the attribute is not honored at create_switch) — the set only
+    /// returns when the operator types `exit`. Mirror SONiC syncd: a
+    /// dedicated thread re-invokes it in a loop so `exit` reopens the
+    /// prompt; the vendor library's internal locking lets normal SAI
+    /// calls proceed on the actor thread meanwhile.
+    fn spawn_diag_shell(&self, switch: ffi::sai_object_id_t) -> Result<(), SaiError> {
+        // SAFETY: valid switch api table from sai_api_query; fn pointers
+        // are Copy + Send.
+        let set = unsafe {
+            (*self.switch_api)
+                .set_switch_attribute
+                .ok_or(SaiError::Other(
+                    "switch api lacks set_switch_attribute".into(),
+                ))?
+        };
+        std::thread::Builder::new()
+            .name("sai-diag-shell".into())
+            .spawn(move || {
+                tracing::info!("vendor diag shell on this terminal (`exit` reopens it)");
+                loop {
+                    let mut attr = Self::zeroed_attr(
+                        ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_SWITCH_SHELL_ENABLE,
+                    );
+                    attr.value.booldata = true;
+                    // SAFETY: attr outlives the call; blocks this thread
+                    // for the shell session's lifetime.
+                    let status = unsafe { set(switch, &attr) };
+                    if status != 0 {
+                        tracing::warn!(
+                            status,
+                            "diag shell set_switch_attribute failed; shell unavailable"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            })
+            .map_err(|e| SaiError::Other(format!("spawning sai-diag-shell: {e}")))?;
+        Ok(())
+    }
+
     fn zeroed_attr(id: u32) -> ffi::sai_attribute_t {
         // SAFETY: sai_attribute_t is POD; an all-zero value is a valid
         // starting point before the union field is assigned.
@@ -269,15 +312,6 @@ impl SaiBackend for VendorSai {
         notify_attr.value.ptr = notify_cb as *mut c_void;
 
         let mut attrs = vec![init_attr, profile_attr, notify_attr];
-        if self.diag_shell {
-            // Bench bring-up: Broadcom's SAI serves its diag shell on our
-            // stdin/stdout (`BCM.0>` prompt) — run syncd in the
-            // foreground to use it.
-            let mut shell_attr =
-                Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_SWITCH_SHELL_ENABLE);
-            shell_attr.value.booldata = true;
-            attrs.push(shell_attr);
-        }
         if let Some(mac) = self.src_mac {
             // Without this, Broadcom's SAI tries to discover a "local MAC
             // address" itself and fails create_switch on boards where that
@@ -303,6 +337,10 @@ impl SaiBackend for VendorSai {
         }
         self.switch_oid = Some(oid);
         tracing::info!(oid = format_args!("{oid:#x}"), "SAI switch created");
+
+        if self.diag_shell {
+            self.spawn_diag_shell(oid)?;
+        }
         Ok(SwitchInfo { oid })
     }
 

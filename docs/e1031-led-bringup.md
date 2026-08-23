@@ -26,16 +26,23 @@ LEDs — but 0x0208/0x0209 may gate them; check both.
 
 - Real E1031 with the vendor artifacts installed
   (`vendor/fetch-vendor.sh cel-e1031` / a full image).
-- Root shell on the switch. Stop the production daemon first:
+- Root shell on the switch (`bash` from the CLI, then sudo). Stop the
+  production daemon first:
 
 ```sh
-systemctl stop hemlock-syncd
+sudo systemctl stop hemlock-syncd
 ```
 
-- Start syncd manually in the foreground with the vendor diag shell:
+- Start syncd manually in the foreground with the vendor diag shell.
+  Mirror the systemd unit: the binary is in `/usr/sbin` (not in operator
+  PATHs), the platform manifest directory on a switch is
+  `/hemlock/platform` (passed directly as `--platform`), and Broadcom's
+  SAI writes its SyncDB state relative to the working directory — run
+  from the service's state dir so it finds/keeps the same files:
 
 ```sh
-hemlock-syncd --platform cel-e1031 --platforms-dir /hemlock --diag-shell
+cd /var/lib/hemlock
+sudo /usr/sbin/hemlock-syncd --platform /hemlock/platform --diag-shell
 ```
 
   After `create_switch` finishes, Broadcom's `BCM.0>` prompt appears on
