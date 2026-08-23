@@ -9,16 +9,17 @@ export default function StaticRoutesPage() {
   const [routes, setRoutes] = useState(null);
   const [error, setError] = useState(null);
 
-  useEffect(() => {
+  const refresh = () => {
     api('/api/routes')
       .then((r) => setRoutes(r.static_routes))
       .catch((e) => setError(e.message));
-  }, []);
+  };
+  useEffect(refresh, []);
 
   return (
     <Shell>
       <div className="page-header">
-        <h2>Static routes</h2>
+        <h2>Static Routes</h2>
       </div>
       {error && <Alert status="danger" style={{ marginBottom: 16 }}>{error}</Alert>}
       {!routes && !error && (
@@ -27,9 +28,10 @@ export default function StaticRoutesPage() {
       {routes && (
         <Datagrid
           rowKey={(r) => r.prefix}
+          onRefresh={refresh}
           columns={[
             { key: 'prefix', label: 'Prefix', sortable: true, render: (r) => <span className="cell-mono">{r.prefix}</span> },
-            { key: 'next_hop', label: 'Next hop', render: (r) => <span className="cell-mono">{r.next_hop}</span> },
+            { key: 'next_hop', label: 'Next Hop', render: (r) => <span className="cell-mono">{r.next_hop}</span> },
           ]}
           rows={routes}
           placeholder="No static routes configured. Add one with: set routing static <prefix> <next-hop>"

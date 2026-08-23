@@ -24,8 +24,60 @@ export function FormField({label,helper,error,success,required,htmlFor,children,
 
 export function Select({options,children,className='',...rest}){
   return <div className="clr-select-wrapper"><select className={'clr-select '+className} {...rest}>
-    {options?options.map(o=>typeof o==='string'?<option key={o} value={o}>{o}</option>:<option key={o.value} value={o.value}>{o.label}</option>):children}
+    {options?options.map(o=>typeof o==='string'?<option key={o} value={o}>{o}</option>:<option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>):children}
   </select></div>;
+}
+
+/// Searchable multi-select: a select-styled trigger opening a dropdown
+/// with a filter box and a checkbox per option. `values` is the array of
+/// selected option values; `onChange` receives the new array.
+export function MultiSelect({options,values,onChange,placeholder='Select…',disabled,maxHeight=220,className='',...rest}){
+  const [open,setOpen]=React.useState(false);
+  const [query,setQuery]=React.useState('');
+  const rootRef=React.useRef(null);
+  const searchRef=React.useRef(null);
+  React.useEffect(()=>{
+    if(!open)return;
+    setQuery('');
+    const onDown=e=>{if(rootRef.current&&!rootRef.current.contains(e.target))setOpen(false);};
+    const onKey=e=>{if(e.key==='Escape')setOpen(false);};
+    document.addEventListener('mousedown',onDown);
+    document.addEventListener('keydown',onKey);
+    const t=setTimeout(()=>searchRef.current&&searchRef.current.focus(),0);
+    return()=>{document.removeEventListener('mousedown',onDown);document.removeEventListener('keydown',onKey);clearTimeout(t);};
+  },[open]);
+  const selected=new Set(values||[]);
+  const toggle=v=>{
+    const next=new Set(selected);
+    next.has(v)?next.delete(v):next.add(v);
+    onChange([...options.filter(o=>next.has(o.value)).map(o=>o.value)]);
+  };
+  const shown=options.filter(o=>!query||String(o.label).toLowerCase().includes(query.toLowerCase()));
+  const summary=values&&values.length
+    ?options.filter(o=>selected.has(o.value)).map(o=>o.label).join(', ')
+    :'';
+  return <div ref={rootRef} className={'clr-multiselect '+className} {...rest}>
+    <button type="button" className="clr-select clr-multiselect-trigger" disabled={disabled}
+      onClick={()=>setOpen(o=>!o)} aria-expanded={open}>
+      <span className={summary?'':'clr-multiselect-placeholder'}>{summary||placeholder}</span>
+    </button>
+    {open&&<div className="clr-multiselect-menu">
+      <input ref={searchRef} className="clr-input clr-multiselect-search" value={query}
+        placeholder="Search…" onChange={e=>setQuery(e.target.value)}/>
+      <div className="clr-multiselect-options" style={{maxHeight}}>
+        {shown.map(o=><label key={o.value} className={'clr-multiselect-option'+(o.disabled?' disabled':'')}>
+          <input type="checkbox" checked={selected.has(o.value)} disabled={o.disabled}
+            onChange={()=>toggle(o.value)}/>
+          <span>{o.label}</span>
+        </label>)}
+        {shown.length===0&&<div className="clr-multiselect-empty">No matches.</div>}
+      </div>
+      {values&&values.length>0&&<div className="clr-multiselect-footer">
+        <button type="button" onClick={()=>onChange([])}>Clear</button>
+        <span>{values.length} selected</span>
+      </div>}
+    </div>}
+  </div>;
 }
 
 export function Checkbox({label,indeterminate,className='',...rest}){

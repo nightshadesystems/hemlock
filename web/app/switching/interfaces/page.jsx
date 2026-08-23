@@ -1,12 +1,12 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Shell from '@/components/Shell';
-import { api, formatSpeed, compareNames, parseVlanList } from '@/lib/api';
+import { api, formatSpeed, compareNames } from '@/lib/api';
 import { Alert } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
-import { FormField, Input, Select } from '@/components/ds/forms';
+import { FormField, Input, Select, MultiSelect } from '@/components/ds/forms';
 import { OperLabel, AdminLabel, ModeLabel } from '@/components/status';
 
 const NO_CHANGE = '';
@@ -22,15 +22,15 @@ function deriveMode(iface) {
 function vlanSummary(r) {
   if (r.kind !== 'ethernet' || (r.addresses && r.addresses.length > 0)) return '—';
   if (r.switchport_mode === 'trunk') {
-    const vlans = (r.trunk_vlans || []).join(',') || '—';
-    return `${vlans} · native ${r.native_vlan || 1}`;
+    const vlans = (r.trunk_vlans || []).join(', ') || '—';
+    return r.native_vlan ? `${vlans} · native ${r.native_vlan}` : vlans;
   }
   return String(r.access_vlan || 1);
 }
 
 /// Single- and bulk-edit dialog. In bulk mode every field defaults to
 /// "no change" and only chosen fields are sent.
-function EditModal({ open, targets, onClose, onSaved }) {
+function EditModal({ open, targets, vlans, onClose, onSaved }) {
   const single = targets.length === 1;
   const target = single ? targets[0] : null;
   const management = single && target.kind === 'management';
@@ -40,7 +40,7 @@ function EditModal({ open, targets, onClose, onSaved }) {
   const [mode, setMode] = useState(NO_CHANGE);
   const [description, setDescription] = useState('');
   const [accessVlan, setAccessVlan] = useState('');
-  const [trunkVlans, setTrunkVlans] = useState('');
+  const [trunkVlans, setTrunkVlans] = useState([]);
   const [nativeVlan, setNativeVlan] = useState('');
   const [address, setAddress] = useState('');
   const [error, setError] = useState(null);
@@ -55,15 +55,15 @@ function EditModal({ open, targets, onClose, onSaved }) {
       setAdmin(target.admin_up ? 'up' : 'down');
       setMode(deriveMode(target));
       setAccessVlan(String(target.access_vlan || 1));
-      setTrunkVlans((target.trunk_vlans || []).join(','));
-      setNativeVlan(String(target.native_vlan || 1));
+      setTrunkVlans(target.trunk_vlans || []);
+      setNativeVlan(target.native_vlan ? String(target.native_vlan) : '');
       setAddress((target.addresses && target.addresses[0]) || '');
     } else {
       setDescription('');
       setAdmin(NO_CHANGE);
       setMode(NO_CHANGE);
       setAccessVlan('');
-      setTrunkVlans('');
+      setTrunkVlans([]);
       setNativeVlan('');
       setAddress('');
     }
@@ -97,7 +97,7 @@ function EditModal({ open, targets, onClose, onSaved }) {
           body.access_vlan = parseVlanField(accessVlan, mode === 'access' ? 'Access VLAN' : 'S-VLAN');
         }
         if (mode === 'trunk') {
-          if (trunkVlans !== '') body.trunk_vlans = parseVlanList(trunkVlans);
+          if (single || trunkVlans.length > 0) body.trunk_vlans = trunkVlans;
           if (nativeVlan !== '') body.native_vlan = parseVlanField(nativeVlan, 'Native VLAN');
         }
         if (mode === 'routed') {
@@ -119,14 +119,18 @@ function EditModal({ open, targets, onClose, onSaved }) {
     }
   };
 
-  const title = single ? `Edit ${target.name}` : `Edit ${targets.length} interfaces`;
+  const title = single ? `Edit ${target.name}` : `Edit ${targets.length} Interfaces`;
   const modeOptions = [
-    ...(single ? [] : [{ value: NO_CHANGE, label: 'No change' }]),
+    ...(single ? [] : [{ value: NO_CHANGE, label: 'No Change' }]),
     { value: 'access', label: 'Access' },
     { value: 'trunk', label: 'Trunk' },
-    { value: 'dot1q-tunnel', label: 'Dot1q tunnel (QinQ)' },
+    { value: 'dot1q-tunnel', label: 'Dot1q Tunnel (QinQ)' },
     { value: 'routed', label: 'Routed' },
   ];
+  const vlanOptions = (vlans || []).map((v) => ({
+    value: v.id,
+    label: v.name ? `${v.id} — ${v.name}` : String(v.id),
+  }));
 
   return (
     <Modal
@@ -137,7 +141,7 @@ function EditModal({ open, targets, onClose, onSaved }) {
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
           <Button variant="primary" onClick={submit} loading={busy} disabled={busy}>
-            Commit changes
+            Commit Changes
           </Button>
         </>
       }
@@ -155,10 +159,10 @@ function EditModal({ open, targets, onClose, onSaved }) {
               onChange={(e) => setDescription(e.target.value)} style={{ maxWidth: 'none' }} />
           </FormField>
         )}
-        <FormField label="Admin state" htmlFor="if-admin">
+        <FormField label="Admin State" htmlFor="if-admin">
           <Select id="if-admin" value={admin} onChange={(e) => setAdmin(e.target.value)}
             options={[
-              ...(single ? [] : [{ value: NO_CHANGE, label: 'No change' }]),
+              ...(single ? [] : [{ value: NO_CHANGE, label: 'No Change' }]),
               { value: 'up', label: 'Enabled' },
               { value: 'down', label: 'Shutdown' },
             ]} />
@@ -191,14 +195,16 @@ function EditModal({ open, targets, onClose, onSaved }) {
             )}
             {mode === 'trunk' && (
               <>
-                <FormField label="Trunk VLANs" htmlFor="if-trunk-vlans" helper="e.g. 10,20,30-32">
-                  <Input id="if-trunk-vlans" className="mono" value={trunkVlans}
-                    placeholder={single ? undefined : 'unchanged'}
-                    onChange={(e) => setTrunkVlans(e.target.value)} />
+                <FormField label="Trunk VLANs" htmlFor="if-trunk-vlans"
+                  helper={vlanOptions.length ? undefined : 'No VLANs configured yet — create them on the VLANs page.'}>
+                  <MultiSelect options={vlanOptions} values={trunkVlans}
+                    onChange={setTrunkVlans}
+                    placeholder={single ? 'Select VLANs…' : 'Unchanged'} />
                 </FormField>
-                <FormField label="Native VLAN" htmlFor="if-native-vlan">
+                <FormField label="Native VLAN" htmlFor="if-native-vlan"
+                  helper="Untagged VLAN; empty leaves it unset">
                   <Input id="if-native-vlan" className="mono" value={nativeVlan}
-                    placeholder={single ? undefined : 'unchanged'}
+                    placeholder="unset"
                     onChange={(e) => setNativeVlan(e.target.value)} style={{ maxWidth: 120 }} />
                 </FormField>
               </>
@@ -218,6 +224,7 @@ function EditModal({ open, targets, onClose, onSaved }) {
 
 export default function InterfacesPage() {
   const [interfaces, setInterfaces] = useState(null);
+  const [vlans, setVlans] = useState(null);
   const [error, setError] = useState(null);
   const [applied, setApplied] = useState(null);
   const [editing, setEditing] = useState(null); // array of iface rows
@@ -227,6 +234,7 @@ export default function InterfacesPage() {
     api('/api/interfaces')
       .then((r) => setInterfaces(r.interfaces.filter((i) => i.kind !== 'vlan')))
       .catch((e) => setError(e.message));
+    api('/api/vlans').then((r) => setVlans(r.vlans)).catch(() => {});
   }, []);
   useEffect(refresh, [refresh]);
 
@@ -254,12 +262,13 @@ export default function InterfacesPage() {
         <Datagrid
           selectable
           rowKey={(r) => r.name}
+          onRefresh={refresh}
           actionBar={({ selected, clear }) => {
             clearSel.current = clear;
             return (
               <Button sm disabled={selected.size === 0}
                 onClick={() => setEditing(interfaces.filter((i) => selected.has(i.name)))}>
-                Edit selected{selected.size > 0 ? ` (${selected.size})` : ''}
+                Edit Selected{selected.size > 0 ? ` (${selected.size})` : ''}
               </Button>
             );
           }}
@@ -294,6 +303,7 @@ export default function InterfacesPage() {
       <EditModal
         open={!!editing}
         targets={editing || []}
+        vlans={vlans}
         onClose={() => setEditing(null)}
         onSaved={onSaved}
       />

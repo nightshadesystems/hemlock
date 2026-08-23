@@ -67,7 +67,7 @@ function VlanModal({ open, vlan, onClose, onSaved }) {
     >
       {error && <Alert status="danger" sm style={{ marginBottom: 12 }}>{error}</Alert>}
       <div className="clr-form-compact">
-        <FormField label="VLAN id" required htmlFor="vlan-id" helper="1..4094">
+        <FormField label="VLAN ID" required htmlFor="vlan-id" helper="1..4094">
           <Input id="vlan-id" className="mono" value={id} disabled={editing} autoFocus={!editing}
             onChange={(e) => setId(e.target.value)} style={{ maxWidth: 120 }} />
         </FormField>
@@ -169,6 +169,7 @@ export default function VlansPage() {
         <Datagrid
           selectable
           rowKey={(r) => r.id}
+          onRefresh={refresh}
           actionBar={({ selected, clear }) => {
             clearSel.current = clear;
             const deletable = [...selected].filter((id) => id !== 1);
@@ -179,7 +180,7 @@ export default function VlansPage() {
                 </Button>
                 <Button variant="danger-outline" sm disabled={deletable.length === 0}
                   onClick={() => setModal({ kind: 'delete', ids: deletable.sort((a, b) => a - b) })}>
-                  Delete selected{deletable.length > 0 ? ` (${deletable.length})` : ''}
+                  Delete Selected{deletable.length > 0 ? ` (${deletable.length})` : ''}
                 </Button>
               </>
             );
@@ -191,7 +192,7 @@ export default function VlansPage() {
               render: (r) => (
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, whiteSpace: 'nowrap' }}>
                   {r.name || <span className="dim">—</span>}
-                  {r.id === 1 && <Label>default</Label>}
+                  {r.id === 1 && <Label>Default</Label>}
                 </span>
               ),
             },
@@ -208,8 +209,8 @@ export default function VlansPage() {
                   <span className="dim">—</span>
                 ),
             },
-            { key: 'untagged', label: 'Untagged ports', render: (r) => <PortList ports={r.untagged} /> },
-            { key: 'tagged', label: 'Tagged ports', render: (r) => <PortList ports={r.tagged} /> },
+            { key: 'untagged', label: 'Untagged Ports', render: (r) => <PortList ports={r.untagged} /> },
+            { key: 'tagged', label: 'Tagged Ports', render: (r) => <PortList ports={r.tagged} /> },
             {
               key: 'actions', label: '', width: 80,
               render: (r) => (

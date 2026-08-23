@@ -51,7 +51,7 @@ function AddUserModal({ open, onClose, onSaved }) {
   return (
     <Modal
       open={open}
-      title="Add user"
+      title="Add User"
       size="sm"
       onClose={onClose}
       footer={
@@ -59,7 +59,7 @@ function AddUserModal({ open, onClose, onSaved }) {
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
           <Button variant="primary" onClick={submit} loading={busy}
             disabled={busy || !username || !password}>
-            Add user
+            Add User
           </Button>
         </>
       }
@@ -75,7 +75,7 @@ function AddUserModal({ open, onClose, onSaved }) {
           <Password id="new-password" autoComplete="new-password" value={password}
             onChange={(e) => setPassword(e.target.value)} style={{ maxWidth: 'none' }} />
         </FormField>
-        <FormField label="Confirm password" required htmlFor="new-confirm"
+        <FormField label="Confirm Password" required htmlFor="new-confirm"
           error={confirm && confirm !== password ? 'Passwords do not match' : undefined}>
           <Password id="new-confirm" autoComplete="new-password" value={confirm}
             onChange={(e) => setConfirm(e.target.value)} style={{ maxWidth: 'none' }} />
@@ -119,9 +119,10 @@ export default function UsersPage() {
       {users && (
         <Datagrid
           rowKey={(r) => r.username}
+          onRefresh={refresh}
           actionBar={() => (
             <Button variant="primary" sm icon="plus" onClick={() => setAdding(true)}>
-              Add user
+              Add User
             </Button>
           )}
           columns={[

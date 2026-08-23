@@ -229,15 +229,28 @@ fn apply_ssh(ssh: &SshIntent) {
 }
 
 fn apply_web(web: &WebIntent) {
-    if web.enabled() {
-        run("systemctl", &["enable", WEBD_UNIT]);
-        // Restart (not just enable --now): a listener-set change (http
-        // added/removed alongside https) needs webd to re-read the
-        // running config. On boot replay this simply starts it.
-        run("systemctl", &["restart", WEBD_UNIT]);
-    } else {
-        run("systemctl", &["disable", "--now", WEBD_UNIT]);
-    }
+    // Stopping or restarting webd must NOT happen synchronously inside
+    // the commit: when the commit came from the web console, webd is
+    // blocked waiting on this very Commit RPC, and a synchronous
+    // `systemctl restart/stop` waits for webd to finish that request —
+    // a deadlock that wedges mgmtd (and every later commit) until
+    // systemd's stop timeout force-kills webd. Defer the unit change to
+    // a detached thread with a short grace delay so the commit returns
+    // and webd flushes its response first.
+    let enabled = web.enabled();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if enabled {
+            run("systemctl", &["enable", WEBD_UNIT]);
+            // Restart (not just enable --now): a listener-set change
+            // (http added/removed alongside https) needs webd to
+            // re-read the running config. On boot replay this simply
+            // starts it.
+            run("systemctl", &["restart", WEBD_UNIT]);
+        } else {
+            run("systemctl", &["disable", "--now", WEBD_UNIT]);
+        }
+    });
 }
 
 fn remove_dropin() {

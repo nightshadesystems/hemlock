@@ -43,15 +43,29 @@ impl Engine {
         }
     }
 
+    /// One commit runs behind the engine mutex, so a hung dependency
+    /// would wedge every later RPC until a daemon restart. All of
+    /// mgmtd's calls are unary; a per-request deadline turns a hung
+    /// syncd/orch into a failed commit instead.
+    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     async fn syncd_client(
         &self,
     ) -> Result<pb::syncd_client::SyncdClient<tonic::transport::Channel>> {
-        let channel = self.syncd.connect().await.context("connecting to syncd")?;
+        let channel = self
+            .syncd
+            .connect_with_request_timeout(Self::RPC_TIMEOUT)
+            .await
+            .context("connecting to syncd")?;
         Ok(pb::syncd_client::SyncdClient::new(channel))
     }
 
     async fn orch_client(&self) -> Result<pb::orch_client::OrchClient<tonic::transport::Channel>> {
-        let channel = self.orch.connect().await.context("connecting to orch")?;
+        let channel = self
+            .orch
+            .connect_with_request_timeout(Self::RPC_TIMEOUT)
+            .await
+            .context("connecting to orch")?;
         Ok(pb::orch_client::OrchClient::new(channel))
     }
 
@@ -244,7 +258,6 @@ impl Engine {
                 }
             }
         }
-        self.os.apply(&os_changes);
 
         // Switching-suite families: the mac-table, storm-control and
         // mirror deltas apply through syncd; the protocol families (LAG/
@@ -321,6 +334,15 @@ impl Engine {
                 .await
                 .context("pushing mld-snooping config to orch")?;
         }
+
+        // The kernel-side apply runs LAST, after every fallible step:
+        // it is best-effort (never fails the commit), so were it to run
+        // earlier a later syncd/orch failure would leave the kernel
+        // changed (management address gone, say) while running kept the
+        // old text — and the re-add would then diff to nothing, leaving
+        // the box unreachable until a replay. Fallible first, then the
+        // infallible OS pass, then persist.
+        self.os.apply(&os_changes);
 
         self.store.commit(
             new_text,

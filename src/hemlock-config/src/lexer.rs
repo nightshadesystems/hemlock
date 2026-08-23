@@ -47,9 +47,10 @@ pub enum LexError {
 }
 
 /// True for characters that may appear in a bare (unquoted) word. Covers
-/// interface names, IPs/prefixes, paths, and dashed keywords.
+/// interface names, IPs/prefixes, paths, dashed keywords, and
+/// comma-separated list items (`10,`).
 pub fn is_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '*' | '@' | '+')
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '*' | '@' | '+' | ',')
 }
 
 pub fn lex(input: &str) -> Result<Vec<Spanned>, LexError> {

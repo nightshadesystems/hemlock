@@ -96,7 +96,7 @@ function SessionModal({ open, session, sessions, interfaces, lags, onClose, onSa
   };
 
   return (
-    <Modal open={open} title={editing ? `Edit session ${session.session}` : 'New mirror session'}
+    <Modal open={open} title={editing ? `Edit Session ${session.session}` : 'New Mirror Session'}
       onClose={onClose}
       footer={
         <>
@@ -133,7 +133,7 @@ function SessionModal({ open, session, sessions, interfaces, lags, onClose, onSa
               })),
             ]} />
         </FormField>
-        <FormField label="Source ports">
+        <FormField label="Source Ports">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {sources.map((source, i) => (
               <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -149,7 +149,7 @@ function SessionModal({ open, session, sessions, interfaces, lags, onClose, onSa
                   onClick={() => setSources(sources.filter((_, n) => n !== i))} />
               </div>
             ))}
-            <Button variant="outline" sm icon="plus" onClick={addSource}>Add source</Button>
+            <Button variant="outline" sm icon="plus" onClick={addSource}>Add Source</Button>
           </div>
         </FormField>
       </div>
@@ -199,7 +199,7 @@ export default function MirrorPage() {
         <h2>Mirroring</h2>
         <Button variant="primary" sm icon="plus" onClick={() => setModal({ kind: 'new' })}
           disabled={sessions && sessions.length >= 4}>
-          New session
+          New Session
         </Button>
       </div>
       {error && <Alert status="danger" style={{ marginBottom: 16 }}>{error}</Alert>}
@@ -216,7 +216,7 @@ export default function MirrorPage() {
       {sessions && sessions.map((session) => (
         <Card key={session.session} style={{ marginBottom: 16 }}
           header={
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', gap: 16 }}>
               <span>Session {session.session}</span>
               <span style={{ display: 'inline-flex', gap: 2 }}>
                 <Button variant="link-neutral" sm icon="pencil"
@@ -234,7 +234,7 @@ export default function MirrorPage() {
                 <span className="cell-mono">{shortName(session.destination) || '—'}</span>
                 {session.destination && (
                   <Badge status={session.destination_up ? 'success' : 'danger'}>
-                    {session.destination_up ? 'active' : 'down'}
+                    {session.destination_up ? 'Active' : 'Down'}
                   </Badge>
                 )}
               </span>

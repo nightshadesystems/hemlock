@@ -27,7 +27,9 @@
 .datagrid-expandable-caret button{all:unset;cursor:pointer;color:var(--cds-alias-object-interaction-color);width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;border-radius:4px}
 .datagrid-expandable-caret button:hover{background:var(--cds-alias-object-interaction-background-active);color:var(--cds-alias-object-interaction-color-hover)}
 .datagrid-detail-row .datagrid-cell{background:var(--cds-alias-object-container-background-tint);padding:12px 16px;color:var(--cds-alias-typography-color-300)}
-.datagrid-action-bar{display:flex;gap:8px;padding:8px 12px;border-bottom:1px solid var(--cds-alias-object-container-border-color)}
+.datagrid-action-bar{display:flex;gap:8px;padding:8px 12px;border-bottom:1px solid var(--cds-alias-object-container-border-color);justify-content:flex-end;align-items:center}
+.datagrid-refresh{all:unset;cursor:pointer;width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;border-radius:4px;color:var(--cds-alias-object-interaction-color)}
+.datagrid-refresh:hover{background:var(--cds-alias-object-interaction-background-active);color:var(--cds-alias-object-interaction-color-hover)}
 .datagrid-footer{display:flex;align-items:center;justify-content:flex-end;gap:16px;padding:6px 12px;border-top:1px solid var(--cds-alias-object-container-border-color);background:var(--cds-alias-object-container-background-shade);font-size:12px;color:var(--cds-alias-typography-color-300);min-height:32px}
 .datagrid-footer-description{margin-right:auto}
 .datagrid-pagination{display:flex;align-items:center;gap:4px}

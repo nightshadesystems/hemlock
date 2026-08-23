@@ -158,12 +158,20 @@ fn apply_one(eth: &mut Vec<Item>, edit: &InterfaceEdit) {
                 let mut sorted = vlans.clone();
                 sorted.sort_unstable();
                 sorted.dedup();
-                ConfigTree::set_phrase(
-                    sp,
-                    "trunk",
-                    "vlans",
-                    sorted.iter().map(u16::to_string).collect(),
-                );
+                // Comma-words render as `trunk vlans 10, 20, 30` (the
+                // same shape the CLI stores).
+                let words = sorted
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        if i + 1 < sorted.len() {
+                            format!("{id},")
+                        } else {
+                            id.to_string()
+                        }
+                    })
+                    .collect();
+                ConfigTree::set_phrase(sp, "trunk", "vlans", words);
             }
         }
     }
@@ -324,10 +332,11 @@ mod tests {
         )
         .unwrap();
         let text = t.to_text();
-        // Trunk replaced the address; the list is sorted + deduplicated.
+        // Trunk replaced the address; the list is sorted, deduplicated,
+        // and rendered comma-separated.
         assert!(!text.contains("address"));
         assert!(text.contains("mode trunk"));
-        assert!(text.contains("trunk vlans 10 20"));
+        assert!(text.contains("trunk vlans 10, 20"));
         assert!(text.contains("native vlan 5"));
 
         // Back to routed: the switchport block goes away.

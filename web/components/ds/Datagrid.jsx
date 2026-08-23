@@ -1,6 +1,6 @@
 'use client';
 import React from 'react';
-export function Datagrid({columns,rows,rowKey,selectable,expandable,renderDetail,pageSize=0,actionBar,placeholder='No items found.',footerText,compact,className=''}){
+export function Datagrid({columns,rows,rowKey,selectable,expandable,renderDetail,pageSize=0,actionBar,onRefresh,placeholder='No items found.',footerText,compact,className=''}){
   const [sort,setSort]=React.useState(null);
   const [sel,setSel]=React.useState(()=>new Set());
   const [open,setOpen]=React.useState(()=>new Set());
@@ -24,7 +24,10 @@ export function Datagrid({columns,rows,rowKey,selectable,expandable,renderDetail
   const clearSel=()=>setSel(new Set());
   const rh=compact?'var(--clr-base-dg-compact-row-height)':undefined;
   return <div className={'datagrid '+className} style={{fontSize:compact?12:undefined}}>
-    {actionBar&&<div className="datagrid-action-bar">{actionBar({selected:sel,clear:clearSel})}</div>}
+    {(actionBar||onRefresh)&&<div className="datagrid-action-bar">
+      {actionBar&&actionBar({selected:sel,clear:clearSel})}
+      {onRefresh&&<button className="datagrid-refresh" onClick={onRefresh} aria-label="Refresh" title="Refresh"><clr-icon shape="refresh" size="14"></clr-icon></button>}
+    </div>}
     <table className="datagrid-table">
       <thead><tr className="datagrid-row">
         {selectable&&<th className="datagrid-column datagrid-select"><div className="clr-checkbox-wrapper"><input type="checkbox" checked={allSel} onChange={toggleAll} aria-label="Select all"/></div></th>}

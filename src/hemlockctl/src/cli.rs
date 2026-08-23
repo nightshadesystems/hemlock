@@ -1420,7 +1420,20 @@ fn parse_vlan_list(text: &str) -> Result<Vec<String>, String> {
     if out.is_empty() {
         return Err("% empty VLAN list".into());
     }
-    Ok(out.into_iter().map(|id| id.to_string()).collect())
+    // All but the last word carry a trailing comma so the stored config
+    // renders as `trunk vlans 10, 20, 30`.
+    let ids: Vec<u16> = out.into_iter().collect();
+    Ok(ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            if i + 1 < ids.len() {
+                format!("{id},")
+            } else {
+                id.to_string()
+            }
+        })
+        .collect())
 }
 
 /// `set|delete system <ssh|http|https> ...` — each service is on

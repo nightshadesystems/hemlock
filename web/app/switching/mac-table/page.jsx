@@ -49,7 +49,7 @@ function StaticModal({ open, onClose, onSaved }) {
   };
 
   return (
-    <Modal open={open} title="Add static MAC" size="sm" onClose={onClose}
+    <Modal open={open} title="Add Static MAC" size="sm" onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
@@ -61,7 +61,7 @@ function StaticModal({ open, onClose, onSaved }) {
       }>
       {error && <Alert status="danger" sm style={{ marginBottom: 12 }}>{error}</Alert>}
       <div className="clr-form-compact">
-        <FormField label="MAC address" required htmlFor="mac-addr" helper="unicast, any common form">
+        <FormField label="MAC Address" required htmlFor="mac-addr" helper="unicast, any common form">
           <Input id="mac-addr" className="mono" value={mac} placeholder="00:50:56:be:ef:01"
             autoFocus onChange={(e) => setMac(e.target.value)} />
         </FormField>
@@ -116,12 +116,12 @@ function AgingModal({ open, current, onClose, onSaved }) {
   };
 
   return (
-    <Modal open={open} title="Aging time" size="sm" onClose={onClose}
+    <Modal open={open} title="Aging Time" size="sm" onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
           <Button variant="outline" onClick={() => submit(true)} disabled={busy}>
-            Restore default (300)
+            Restore Default (300)
           </Button>
           <Button variant="primary" onClick={() => submit(false)} loading={busy}
             disabled={busy || aging === ''}>
@@ -130,7 +130,7 @@ function AgingModal({ open, current, onClose, onSaved }) {
         </>
       }>
       {error && <Alert status="danger" sm style={{ marginBottom: 12 }}>{error}</Alert>}
-      <FormField label="Aging time" htmlFor="mac-aging" helper="Seconds; 0 disables aging (10..1000000 otherwise)">
+      <FormField label="Aging Time" htmlFor="mac-aging" helper="Seconds; 0 disables aging (10..1000000 otherwise)">
         <Input id="mac-aging" className="mono" value={aging}
           onChange={(e) => setAging(e.target.value)} style={{ maxWidth: 160 }} />
       </FormField>
@@ -217,20 +217,10 @@ export default function MacTablePage() {
           onChange={(e) => setPort(e.target.value)} style={{ maxWidth: 200 }} />
         <Select value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Filter type"
           options={[
-            { value: '', label: 'All types' },
+            { value: '', label: 'All Types' },
             { value: 'dynamic', label: 'Dynamic' },
             { value: 'static', label: 'Static' },
           ]} />
-        <span style={{ flex: 1 }} />
-        <Button variant="primary" sm icon="plus" onClick={() => setModal({ kind: 'static' })}>
-          Add static
-        </Button>
-        <Button variant="outline" sm onClick={() => setModal({ kind: 'aging' })}>
-          Aging time
-        </Button>
-        <Button variant="danger-outline" sm onClick={flush}>
-          Flush dynamic{vlan || port ? ' (filtered)' : ''}
-        </Button>
       </div>
       {!table && !error && (
         <div className="page-loading"><span className="spinner spinner-md"></span>Loading…</div>
@@ -238,17 +228,31 @@ export default function MacTablePage() {
       {table && (
         <Datagrid
           rowKey={(r) => `${r.vlan}-${r.mac}`}
+          onRefresh={refresh}
+          actionBar={() => (
+            <>
+              <Button variant="primary" sm icon="plus" onClick={() => setModal({ kind: 'static' })}>
+                Add Static
+              </Button>
+              <Button variant="outline" sm onClick={() => setModal({ kind: 'aging' })}>
+                Aging Time
+              </Button>
+              <Button variant="danger-outline" sm onClick={flush}>
+                Flush Dynamic{vlan || port ? ' (Filtered)' : ''}
+              </Button>
+            </>
+          )}
           columns={[
             { key: 'vlan', label: 'VLAN', sortable: true, render: (r) => <span className="cell-mono">{r.vlan}</span> },
-            { key: 'mac', label: 'MAC address', render: (r) => <span className="cell-mono">{r.mac}</span> },
+            { key: 'mac', label: 'MAC Address', render: (r) => <span className="cell-mono">{r.mac}</span> },
             {
               key: 'type', label: 'Type',
-              render: (r) => <Label>{r.is_static ? 'static' : 'dynamic'}</Label>,
+              render: (r) => <Label>{r.is_static ? 'Static' : 'Dynamic'}</Label>,
             },
             {
               key: 'port', label: 'Port',
               render: (r) => r.drop
-                ? <Badge status="danger">drop</Badge>
+                ? <Badge status="danger">Drop</Badge>
                 : <span className="cell-mono">{shortName(r.port)}</span>,
             },
             {

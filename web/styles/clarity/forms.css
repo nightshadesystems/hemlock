@@ -18,6 +18,23 @@
 .clr-select-wrapper .clr-select{appearance:none;padding-right:28px}
 .clr-select-wrapper::after{content:"";position:absolute;right:10px;top:50%;margin-top:-3px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--cds-alias-object-interaction-color);pointer-events:none}
 .clr-select option{background:var(--cds-alias-object-overlay-background);color:var(--cds-alias-typography-color-450)}
+/* searchable multi-select */
+.clr-multiselect{position:relative;display:inline-block;width:100%;max-width:320px}
+.clr-multiselect-trigger{text-align:left;cursor:pointer;display:flex;align-items:center;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding-right:28px}
+.clr-multiselect-trigger>span{overflow:hidden;text-overflow:ellipsis}
+.clr-multiselect::after{content:"";position:absolute;right:10px;top:16px;margin-top:-3px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--cds-alias-object-interaction-color);pointer-events:none}
+.clr-multiselect-placeholder{color:var(--cds-alias-typography-color-200)}
+.clr-multiselect-menu{position:absolute;z-index:60;top:calc(100% + 4px);left:0;right:0;background:var(--cds-alias-object-overlay-background);border:1px solid var(--cds-alias-object-border-color);border-radius:var(--clr-base-border-radius-s);box-shadow:var(--cds-alias-object-shadow-200,0 4px 16px rgba(0,0,0,.4));padding:8px}
+.clr-multiselect-search{max-width:none;margin-bottom:8px}
+.clr-multiselect-options{overflow-y:auto;display:flex;flex-direction:column}
+.clr-multiselect-option{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:4px;cursor:pointer;font-size:var(--cds-alias-typography-body-font-size);color:var(--cds-alias-typography-color-400)}
+.clr-multiselect-option:hover{background:var(--cds-alias-object-interaction-background-hover)}
+.clr-multiselect-option.disabled{color:var(--cds-alias-typography-disabled);cursor:not-allowed}
+.clr-multiselect-option input{accent-color:var(--cds-alias-interaction-action)}
+.clr-multiselect-empty{padding:8px 6px;font-size:12px;color:var(--cds-alias-typography-color-200)}
+.clr-multiselect-footer{display:flex;justify-content:space-between;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid var(--cds-alias-object-border-subtle);font-size:12px;color:var(--cds-alias-typography-color-300)}
+.clr-multiselect-footer button{all:unset;cursor:pointer;color:var(--cds-alias-interaction-action);font-size:12px}
+.clr-multiselect-footer button:hover{text-decoration:underline}
 /* input group */
 .clr-input-group{display:inline-flex;align-items:stretch;max-width:320px;width:100%}
 .clr-input-group .clr-input{border-radius:0;max-width:none}

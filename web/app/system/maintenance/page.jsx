@@ -5,7 +5,7 @@ import { api, uploadFile, downloadText } from '@/lib/api';
 import { Alert, Card, CardBlock, Label } from '@/components/ds/misc';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
-import { FormField, Input, Textarea, Checkbox } from '@/components/ds/forms';
+import { FormField, Input, Checkbox } from '@/components/ds/forms';
 
 const MONO = { fontFamily: 'var(--ns-font-mono)', letterSpacing: '0.06em' };
 
@@ -46,6 +46,26 @@ function RebootingOverlay({ at }) {
         {at ? 'The switch is rebooting.' : 'The switch is going down for a reboot.'}
         {' '}This page reconnects automatically when it is back.
       </div>
+    </div>
+  );
+}
+
+/// Plain-text editor with a scroll-synced line-number gutter.
+function NumberedEditor({ value, onChange, rows = 14 }) {
+  const gutterRef = useRef(null);
+  const lineCount = Math.max(1, value.split('\n').length);
+  const sync = (e) => {
+    if (gutterRef.current) gutterRef.current.scrollTop = e.target.scrollTop;
+  };
+  return (
+    <div className="numbered-editor">
+      <div ref={gutterRef} className="numbered-editor-gutter" aria-hidden="true">
+        {Array.from({ length: lineCount }, (_, i) => (
+          <div key={i}>{i + 1}</div>
+        ))}
+      </div>
+      <textarea className="clr-textarea numbered-editor-text" rows={rows} value={value}
+        spellCheck={false} wrap="off" onChange={onChange} onScroll={sync} />
     </div>
   );
 }
@@ -93,14 +113,14 @@ function RestoreModal({ open, onClose, onRestored }) {
   return (
     <Modal
       open={open}
-      title="Restore configuration"
+      title="Restore Configuration"
       size="lg"
       onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
           <Button variant="danger" onClick={submit} loading={busy} disabled={busy || !text.trim()}>
-            Validate & apply
+            Validate & Apply
           </Button>
         </>
       }
@@ -110,20 +130,24 @@ function RestoreModal({ open, onClose, onRestored }) {
         This replaces the entire running configuration. The current config is kept in the
         rollback history, but a bad restore can take the switch off the network.
       </Alert>
+      {text.trim() !== '' && !/\bhttps?\b/.test(text) && (
+        <Alert status="danger" sm style={{ marginBottom: 12 }}>
+          This configuration has no <span className="mono">system http/https</span> service —
+          applying it shuts down the web console, including this session.
+        </Alert>
+      )}
       <input ref={fileRef} type="file" accept=".conf,.txt,text/plain" hidden onChange={pick} />
       <div className="clr-form-compact">
-        <FormField label="Configuration file" htmlFor="restore-file">
+        <FormField label="Configuration File" htmlFor="restore-file">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <Button sm icon="folder-open" onClick={() => fileRef.current && fileRef.current.click()}>
-              Choose file…
+              Choose File…
             </Button>
             <span className="cell-mono dim">{filename || 'no file selected'}</span>
           </div>
         </FormField>
         <FormField label="Contents" helper="Review (and edit if needed) before applying.">
-          <Textarea rows={14} value={text} spellCheck={false}
-            onChange={(e) => setText(e.target.value)}
-            style={{ maxWidth: 'none', width: '100%', fontFamily: 'var(--ns-font-mono)', fontSize: 12 }} />
+          <NumberedEditor rows={14} value={text} onChange={(e) => setText(e.target.value)} />
         </FormField>
       </div>
     </Modal>
@@ -153,13 +177,13 @@ function RebootNowModal({ open, onClose, onRebooting }) {
   return (
     <Modal
       open={open}
-      title="Reboot switch"
+      title="Reboot Switch"
       size="sm"
       onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
-          <Button variant="danger" onClick={submit} loading={busy} disabled={busy}>Reboot now</Button>
+          <Button variant="danger" onClick={submit} loading={busy} disabled={busy}>Reboot Now</Button>
         </>
       }
     >
@@ -199,7 +223,7 @@ function ScheduleRebootModal({ open, onClose, onScheduled }) {
   return (
     <Modal
       open={open}
-      title="Schedule reboot"
+      title="Schedule Reboot"
       size="sm"
       onClose={onClose}
       footer={
@@ -258,7 +282,7 @@ function InstallModal({ open, staged, onClose, onInstalled }) {
   return (
     <Modal
       open={open}
-      title="Install software image"
+      title="Install Software Image"
       size="sm"
       onClose={busy ? undefined : onClose}
       footer={
@@ -399,7 +423,7 @@ export default function MaintenancePage() {
       )}
       {scheduled && (
         <Alert status="warning" style={{ marginBottom: 16 }}
-          actions={[{ label: 'Cancel reboot', onClick: cancelReboot }]}>
+          actions={[{ label: 'Cancel Reboot', onClick: cancelReboot }]}>
           {scheduled.mode === 'reboot' ? 'Reboot' : 'Shutdown'} scheduled
           for {formatWhen(scheduled.at_unix)}.
         </Alert>
@@ -414,7 +438,7 @@ export default function MaintenancePage() {
               text="Save the running configuration as a file, or restore a previously saved one. A restore is validated by the switch before it replaces the running config." />
             <CardBlock>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <Button sm icon="download" onClick={downloadConfig}>Download config</Button>
+                <Button sm icon="download" onClick={downloadConfig}>Download Config</Button>
                 <Button sm icon="upload" variant="warning-outline" onClick={() => setModal('restore')}>
                   Restore…
                 </Button>
@@ -428,10 +452,10 @@ export default function MaintenancePage() {
             <CardBlock>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <Button sm icon="power" variant="danger-outline" onClick={() => setModal('reboot')}>
-                  Reboot now
+                  Reboot Now
                 </Button>
                 <Button sm icon="clock" onClick={() => setModal('schedule')} disabled={!!scheduled}>
-                  Schedule reboot…
+                  Schedule Reboot…
                 </Button>
               </div>
             </CardBlock>
@@ -440,9 +464,9 @@ export default function MaintenancePage() {
           <Card header="Software">
             <CardBlock>
               <div className="kv">
-                <div className="k">Running version</div>
+                <div className="k">Running Version</div>
                 <div className="v mono">{data.version}</div>
-                <div className="k">Staged image</div>
+                <div className="k">Staged Image</div>
                 <div className="v">
                   {staged ? (
                     <>
@@ -456,7 +480,7 @@ export default function MaintenancePage() {
                       )}
                     </>
                   ) : (
-                    <span className="dim">none</span>
+                    <span className="dim">None</span>
                   )}
                 </div>
               </div>
@@ -484,7 +508,7 @@ export default function MaintenancePage() {
                 </div>
               ) : (
                 <Button sm icon="upload-cloud" onClick={() => fileRef.current && fileRef.current.click()}>
-                  Upload image…
+                  Upload Image…
                 </Button>
               )}
             </CardBlock>

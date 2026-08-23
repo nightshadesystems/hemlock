@@ -1,7 +1,7 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Shell from '@/components/Shell';
-import { api, shortName, compareNames, formatSpeed } from '@/lib/api';
+import { api, shortName, compareNames, formatSpeed, capitalize } from '@/lib/api';
 import { Alert, Badge } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
@@ -92,7 +92,7 @@ function StormModal({ open, targets, interfaces, onClose, onSaved }) {
       <div className="clr-form-compact">
         {KINDS.map((kind) => (
           <div key={kind}>
-            <FormField label={kind} htmlFor={`storm-${kind}`}
+            <FormField label={capitalize(kind)} htmlFor={`storm-${kind}`}
               helper={preview(kind) || 'Percent of link speed, 0.00..100.00; empty leaves unchanged'}>
               <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
                 <Input id={`storm-${kind}`} className="mono" value={levels[kind]}
@@ -160,6 +160,7 @@ export default function StormControlPage() {
         <Datagrid
           selectable
           rowKey={(r) => `${r.name}-${r.kind}`}
+          onRefresh={refresh}
           actionBar={({ selected, clear }) => {
             clearSel.current = clear;
             const names = [...new Set([...selected].map((key) => key.replace(/-[a-z-]+$/, '')))];
@@ -168,18 +169,18 @@ export default function StormControlPage() {
                 <Button variant="primary" sm icon="plus"
                   onClick={() => setModal({ targets: portNames })}
                   disabled={portNames.length === 0}>
-                  Bulk apply…
+                  Bulk Apply…
                 </Button>
                 <Button variant="outline" sm disabled={names.length === 0}
                   onClick={() => setModal({ targets: names })}>
-                  Edit selected{names.length > 0 ? ` (${names.length})` : ''}
+                  Edit Selected{names.length > 0 ? ` (${names.length})` : ''}
                 </Button>
               </>
             );
           }}
           columns={[
             { key: 'name', label: 'Port', sortable: true, render: (r) => <span className="cell-mono">{shortName(r.name)}</span> },
-            { key: 'kind', label: 'Type', render: (r) => r.kind },
+            { key: 'kind', label: 'Type', render: (r) => capitalize(r.kind) },
             { key: 'level', label: 'Level', render: (r) => <span className="cell-mono">{r.level}%</span> },
             {
               key: 'rate', label: 'Rate',
@@ -195,7 +196,7 @@ export default function StormControlPage() {
               key: 'active', label: 'Status',
               render: (r) => (
                 <Badge status={r.active ? 'success' : undefined}>
-                  {r.active ? 'active' : 'inactive'}
+                  {r.active ? 'Active' : 'Inactive'}
                 </Badge>
               ),
             },

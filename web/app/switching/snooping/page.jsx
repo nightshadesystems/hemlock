@@ -122,7 +122,7 @@ function VlanModal({ open, family, vlan, onClose, onSaved }) {
 
   return (
     <Modal open={open}
-      title={editing ? `${family.toUpperCase()} snooping · VLAN ${vlan.vlan}` : 'Add VLAN settings'}
+      title={editing ? `${family.toUpperCase()} Snooping · VLAN ${vlan.vlan}` : 'Add VLAN Settings'}
       onClose={onClose}
       footer={
         <>
@@ -140,18 +140,18 @@ function VlanModal({ open, family, vlan, onClose, onSaved }) {
         </FormField>
         <Checkbox label="Disable snooping on this VLAN" checked={disabled}
           onChange={(e) => setDisabled(e.target.checked)} />
-        <Checkbox label="Fast-leave" checked={fastLeave}
+        <Checkbox label="Fast-Leave" checked={fastLeave}
           onChange={(e) => setFastLeave(e.target.checked)} />
-        <Checkbox label="Local querier" checked={querier}
+        <Checkbox label="Local Querier" checked={querier}
           onChange={(e) => setQuerier(e.target.checked)} />
         {querier && (
-          <FormField label="Querier address" htmlFor="snoop-querier-address"
+          <FormField label="Querier Address" htmlFor="snoop-querier-address"
             helper={family === 'igmp' ? 'IPv4; empty derives' : 'IPv6; empty derives'}>
             <Input id="snoop-querier-address" className="mono" value={querierAddress}
               onChange={(e) => setQuerierAddress(e.target.value)} />
           </FormField>
         )}
-        <FormField label="Static mrouter ports" htmlFor="snoop-mrouters"
+        <FormField label="Static Mrouter Ports" htmlFor="snoop-mrouters"
           helper="Comma-separated full names, e.g. Port-Channel1,Ethernet5">
           <Input id="snoop-mrouters" className="mono" value={mrouters}
             onChange={(e) => setMrouters(e.target.value)} style={{ maxWidth: 'none' }} />
@@ -224,11 +224,11 @@ export default function SnoopingPage() {
         <>
           <Card
             header={
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>
-                  Global{' '}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', gap: 16 }}>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12 }}>
+                  Global
                   <Badge status={state.enabled ? 'success' : 'danger'}>
-                    {state.enabled ? 'enabled' : 'disabled'}
+                    {state.enabled ? 'Enabled' : 'Disabled'}
                   </Badge>
                 </span>
                 <Button variant="outline" sm icon="pencil"
@@ -239,14 +239,15 @@ export default function SnoopingPage() {
             }
             style={{ marginBottom: 16 }}
           >
-            <CardBlock title="Robustness variable" text={String(state.robustness)} />
+            <CardBlock title="Robustness Variable" text={String(state.robustness)} />
           </Card>
 
           <Datagrid
             rowKey={(r) => r.vlan}
+            onRefresh={refresh}
             actionBar={() => (
               <Button variant="primary" sm icon="plus" onClick={() => setModal({ kind: 'vlan' })}>
-                Add VLAN settings
+                Add VLAN Settings
               </Button>
             )}
             columns={[
@@ -255,7 +256,7 @@ export default function SnoopingPage() {
                 key: 'enabled', label: 'Snooping',
                 render: (r) => (
                   <Badge status={r.enabled ? 'success' : 'danger'}>
-                    {r.enabled ? 'enabled' : 'disabled'}
+                    {r.enabled ? 'Enabled' : 'Disabled'}
                   </Badge>
                 ),
               },
@@ -265,7 +266,7 @@ export default function SnoopingPage() {
                   ? (
                     <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
                       <Badge status={r.querier_active ? 'success' : 'warning'}>
-                        {r.querier_active ? 'active' : 'suppressed'}
+                        {r.querier_active ? 'Active' : 'Suppressed'}
                       </Badge>
                       {r.querier_address && <span className="cell-mono">{r.querier_address}</span>}
                     </span>
@@ -273,11 +274,11 @@ export default function SnoopingPage() {
                   : <span className="dim">—</span>,
               },
               {
-                key: 'fast_leave', label: 'Fast-leave',
-                render: (r) => r.fast_leave ? <Label>on</Label> : <span className="dim">—</span>,
+                key: 'fast_leave', label: 'Fast-Leave',
+                render: (r) => r.fast_leave ? <Label>On</Label> : <span className="dim">—</span>,
               },
               {
-                key: 'mrouters', label: 'Mrouter ports',
+                key: 'mrouters', label: 'Mrouter Ports',
                 render: (r) => {
                   const all = [
                     ...(r.static_mrouters || []).map((p) => `${shortName(p)} (static)`),
@@ -309,6 +310,7 @@ export default function SnoopingPage() {
           <h3 style={{ margin: '24px 0 12px' }}>Groups</h3>
           <Datagrid
             rowKey={(r) => `${r.vlan}-${r.group}`}
+            onRefresh={refresh}
             columns={[
               { key: 'vlan', label: 'VLAN', sortable: true, render: (r) => <span className="cell-mono">{r.vlan}</span> },
               { key: 'group', label: 'Group', render: (r) => <span className="cell-mono">{r.group}</span> },

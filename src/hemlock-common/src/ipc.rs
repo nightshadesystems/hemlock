@@ -181,32 +181,68 @@ impl IpcEndpoint {
         }
     }
 
-    /// Connect a tonic channel to this endpoint.
+    /// Connect a tonic channel to this endpoint. Connecting is bounded
+    /// (10s) so a hung peer surfaces as an error instead of blocking the
+    /// caller forever; individual RPCs have no deadline (streams stay
+    /// open indefinitely) — callers that only make unary calls and must
+    /// never wedge use [`Self::connect_with_request_timeout`].
     pub async fn connect(&self) -> Result<tonic::transport::Channel, HemlockError> {
+        self.connect_inner(None).await
+    }
+
+    /// Like [`Self::connect`], but every RPC on the channel also gets a
+    /// per-request deadline. Only for clients that make unary calls —
+    /// the deadline would kill long-lived streaming RPCs.
+    pub async fn connect_with_request_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<tonic::transport::Channel, HemlockError> {
+        self.connect_inner(Some(timeout)).await
+    }
+
+    async fn connect_inner(
+        &self,
+        request_timeout: Option<std::time::Duration>,
+    ) -> Result<tonic::transport::Channel, HemlockError> {
+        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let apply = |endpoint: tonic::transport::Endpoint| {
+            let endpoint = endpoint.connect_timeout(CONNECT_TIMEOUT);
+            match request_timeout {
+                Some(t) => endpoint.timeout(t),
+                None => endpoint,
+            }
+        };
+        let bounded = |future| tokio::time::timeout(CONNECT_TIMEOUT, future);
         match self {
             IpcEndpoint::Tcp(addr) => {
                 let uri = format!("http://{addr}");
-                tonic::transport::Endpoint::try_from(uri)
-                    .map_err(|e| HemlockError::Ipc(e.to_string()))?
-                    .connect()
+                let endpoint = apply(
+                    tonic::transport::Endpoint::try_from(uri)
+                        .map_err(|e| HemlockError::Ipc(e.to_string()))?,
+                );
+                bounded(endpoint.connect())
                     .await
+                    .map_err(|_| HemlockError::Ipc(format!("connect {self}: timed out")))?
                     .map_err(|e| HemlockError::Ipc(format!("connect {self}: {}", root_cause(&e))))
             }
             #[cfg(unix)]
             IpcEndpoint::Unix(path) => {
                 let path = path.clone();
                 // The URI is required by the API but unused for unix sockets.
-                tonic::transport::Endpoint::try_from("http://hemlock.invalid")
-                    .map_err(|e| HemlockError::Ipc(e.to_string()))?
-                    .connect_with_connector(tower::service_fn(move |_| {
-                        let path = path.clone();
-                        async move {
-                            let stream = tokio::net::UnixStream::connect(path).await?;
-                            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-                        }
-                    }))
-                    .await
-                    .map_err(|e| HemlockError::Ipc(format!("connect {self}: {}", root_cause(&e))))
+                let endpoint = apply(
+                    tonic::transport::Endpoint::try_from("http://hemlock.invalid")
+                        .map_err(|e| HemlockError::Ipc(e.to_string()))?,
+                );
+                bounded(endpoint.connect_with_connector(tower::service_fn(move |_| {
+                    let path = path.clone();
+                    async move {
+                        let stream = tokio::net::UnixStream::connect(path).await?;
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                })))
+                .await
+                .map_err(|_| HemlockError::Ipc(format!("connect {self}: timed out")))?
+                .map_err(|e| HemlockError::Ipc(format!("connect {self}: {}", root_cause(&e))))
             }
             #[cfg(not(unix))]
             IpcEndpoint::Unix(path) => Err(HemlockError::Ipc(format!(

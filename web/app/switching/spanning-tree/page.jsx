@@ -1,7 +1,7 @@
 'use client';
 import { useCallback, useEffect, useState } from 'react';
 import Shell from '@/components/Shell';
-import { api, shortName, compareNames, parseVlanList } from '@/lib/api';
+import { api, shortName, compareNames, capitalize, parseVlanList } from '@/lib/api';
 import { Alert, Badge, Card, CardBlock, Label } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
@@ -68,7 +68,7 @@ function GlobalModal({ open, stp, onClose, onSaved }) {
   };
 
   return (
-    <Modal open={open} title="Spanning tree settings" onClose={onClose}
+    <Modal open={open} title="Spanning Tree Settings" onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
@@ -85,27 +85,27 @@ function GlobalModal({ open, stp, onClose, onSaved }) {
               { value: 'none', label: 'Disabled' },
             ]} />
         </FormField>
-        <FormField label="Bridge priority" htmlFor="stp-priority" helper="0..61440, steps of 4096">
+        <FormField label="Bridge Priority" htmlFor="stp-priority" helper="0..61440, steps of 4096">
           <Input id="stp-priority" className="mono" value={priority}
             onChange={(e) => setPriority(e.target.value)} style={{ maxWidth: 120 }} />
         </FormField>
-        <FormField label="Hello time" htmlFor="stp-hello" helper="1..10 s">
+        <FormField label="Hello Time" htmlFor="stp-hello" helper="1..10 s">
           <Input id="stp-hello" className="mono" value={hello}
             onChange={(e) => setHello(e.target.value)} style={{ maxWidth: 120 }} />
         </FormField>
-        <FormField label="Max age" htmlFor="stp-max-age" helper="6..40 s">
+        <FormField label="Max Age" htmlFor="stp-max-age" helper="6..40 s">
           <Input id="stp-max-age" className="mono" value={maxAge}
             onChange={(e) => setMaxAge(e.target.value)} style={{ maxWidth: 120 }} />
         </FormField>
-        <FormField label="Forward delay" htmlFor="stp-forward" helper="4..30 s">
+        <FormField label="Forward Delay" htmlFor="stp-forward" helper="4..30 s">
           <Input id="stp-forward" className="mono" value={forward}
             onChange={(e) => setForward(e.target.value)} style={{ maxWidth: 120 }} />
         </FormField>
-        <FormField label="MST region name" htmlFor="stp-mst-name">
+        <FormField label="MST Region Name" htmlFor="stp-mst-name">
           <Input id="stp-mst-name" value={mstName}
             onChange={(e) => setMstName(e.target.value)} />
         </FormField>
-        <FormField label="MST revision" htmlFor="stp-mst-revision">
+        <FormField label="MST Revision" htmlFor="stp-mst-revision">
           <Input id="stp-mst-revision" className="mono" value={mstRevision}
             onChange={(e) => setMstRevision(e.target.value)} style={{ maxWidth: 120 }} />
         </FormField>
@@ -161,7 +161,7 @@ function InstancesModal({ open, stp, onClose, onSaved }) {
   };
 
   return (
-    <Modal open={open} title="MST instances" onClose={onClose}
+    <Modal open={open} title="MST Instances" onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
@@ -189,7 +189,7 @@ function InstancesModal({ open, stp, onClose, onSaved }) {
         ))}
         <Button variant="outline" sm icon="plus"
           onClick={() => setRows([...rows, { instance: '', vlans: '' }])}>
-          Add instance
+          Add Instance
         </Button>
       </div>
     </Modal>
@@ -241,7 +241,7 @@ function PortModal({ open, port, onClose, onSaved }) {
 
   if (!port) return null;
   return (
-    <Modal open={open} title={`Spanning tree · ${port.port}`} size="sm" onClose={onClose}
+    <Modal open={open} title={`Spanning Tree · ${port.port}`} size="sm" onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
@@ -259,7 +259,7 @@ function PortModal({ open, port, onClose, onSaved }) {
           <Input id="stp-port-cost" className="mono" value={cost} placeholder="unchanged"
             onChange={(e) => setCost(e.target.value)} style={{ maxWidth: 140 }} />
         </FormField>
-        <FormField label="Port priority" htmlFor="stp-port-priority"
+        <FormField label="Port Priority" htmlFor="stp-port-priority"
           helper={`Current ${port.priority}; steps of 16, 0 restores 128`}>
           <Input id="stp-port-priority" className="mono" value={priority} placeholder="unchanged"
             onChange={(e) => setPriority(e.target.value)} style={{ maxWidth: 140 }} />
@@ -331,12 +331,12 @@ export default function SpanningTreePage() {
         <>
           <Card
             header={
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>
-                  Bridge{' '}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', gap: 16 }}>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12 }}>
+                  Bridge
                   {stp.is_root
-                    ? <Label status="success">root bridge</Label>
-                    : <Label>root is {stp.root_priority},{stp.root_mac}</Label>}
+                    ? <Label status="success">Root Bridge</Label>
+                    : <Label>Root is {stp.root_priority},{stp.root_mac}</Label>}
                 </span>
                 <Button variant="outline" sm icon="pencil" onClick={() => setModal({ kind: 'global' })}>
                   Settings
@@ -346,40 +346,41 @@ export default function SpanningTreePage() {
             style={{ marginBottom: 16 }}
           >
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: 16 }}>
-              <CardBlock title="Mode" text={stp.mode} />
+              <CardBlock title="Mode"
+                text={stp.mode === 'none' ? 'Disabled' : (stp.mode || '').toUpperCase()} />
               <CardBlock title="Bridge ID"
                 text={`${stp.bridge_priority}, ${stp.bridge_mac}`} />
               <CardBlock title="Timers"
                 text={`hello ${stp.hello_time}s · max age ${stp.max_age}s · fwd ${stp.forward_time}s`} />
-              <CardBlock title="Topology changes"
+              <CardBlock title="Topology Changes"
                 text={`${stp.topology_changes}${stp.last_tc_port ? ` (last: ${stp.last_tc_port})` : ''}`} />
             </div>
           </Card>
 
           <Card
             header={
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>
-                  MST region{' '}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', gap: 16 }}>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12 }}>
+                  MST Region
                   <span className="mono">
-                    {stp.mst_name ? `${stp.mst_name} (rev ${stp.mst_revision})` : 'unnamed'}
+                    {stp.mst_name ? `${stp.mst_name} (rev ${stp.mst_revision})` : 'Unnamed'}
                   </span>
                 </span>
                 <Button variant="outline" sm icon="pencil" onClick={() => setModal({ kind: 'instances' })}>
-                  Edit instances
+                  Edit Instances
                 </Button>
               </div>
             }
             style={{ marginBottom: 16 }}
           >
-            <table className="table">
+            <table className="table table-noborder">
               <thead>
-                <tr><th style={{ width: 120 }}>Instance</th><th>VLANs mapped</th></tr>
+                <tr><th style={{ width: 120 }}>Instance</th><th>VLANs Mapped</th></tr>
               </thead>
               <tbody>
                 <tr>
                   <td className="cell-mono">0</td>
-                  <td className="dim">all unmapped VLANs</td>
+                  <td className="dim">All Unmapped VLANs</td>
                 </tr>
                 {stp.instances.map((m) => (
                   <tr key={m.instance}>
@@ -393,17 +394,18 @@ export default function SpanningTreePage() {
 
           <Datagrid
             rowKey={(r) => r.port}
+            onRefresh={refresh}
             columns={[
               {
                 key: 'port', label: 'Port', sortable: true,
                 render: (r) => <span className="cell-mono">{shortName(r.port)}</span>,
               },
-              { key: 'role', label: 'Role', render: (r) => r.role },
+              { key: 'role', label: 'Role', render: (r) => capitalize(r.role) },
               {
                 key: 'state', label: 'State',
                 render: (r) => r.errdisabled
-                  ? <Badge status="danger">errdisabled</Badge>
-                  : <Badge status={STATE_BADGE[r.state]}>{r.state}</Badge>,
+                  ? <Badge status="danger">Errdisabled</Badge>
+                  : <Badge status={STATE_BADGE[r.state]}>{capitalize(r.state)}</Badge>,
               },
               { key: 'cost', label: 'Cost', render: (r) => <span className="cell-mono">{r.cost}</span> },
               { key: 'priority', label: 'Priority', render: (r) => <span className="cell-mono">{r.priority}</span> },
@@ -411,8 +413,8 @@ export default function SpanningTreePage() {
                 key: 'flags', label: 'Features',
                 render: (r) => (
                   <span style={{ display: 'inline-flex', gap: 6 }}>
-                    {r.portfast && <Label>portfast</Label>}
-                    {r.bpduguard && <Label>bpduguard</Label>}
+                    {r.portfast && <Label>Portfast</Label>}
+                    {r.bpduguard && <Label>BPDU Guard</Label>}
                     {!r.portfast && !r.bpduguard && <span className="dim">—</span>}
                   </span>
                 ),

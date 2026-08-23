@@ -1,12 +1,12 @@
 'use client';
 import { useCallback, useEffect, useState } from 'react';
 import Shell from '@/components/Shell';
-import { api, shortName, compareNames, parseVlanList } from '@/lib/api';
+import { api, shortName, compareNames, capitalize } from '@/lib/api';
 import { Alert, Badge } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
-import { FormField, Input, Select, Checkbox } from '@/components/ds/forms';
+import { FormField, Input, Select, Checkbox, MultiSelect } from '@/components/ds/forms';
 
 const MEMBER_STATUS = {
   bundled: 'success',
@@ -16,8 +16,8 @@ const MEMBER_STATUS = {
 };
 
 function protocolLabel(lag) {
-  if (!lag.lacp) return 'Static (mode on)';
-  return `LACP ${lag.active_mode ? 'active' : 'passive'}`;
+  if (!lag.lacp) return 'Static (Mode On)';
+  return `LACP ${lag.active_mode ? 'Active' : 'Passive'}`;
 }
 
 /// Per-member LACP runtime, shown from the summary row.
@@ -37,13 +37,13 @@ function DetailModal({ open, lag, onClose }) {
       </div>
       <table className="table">
         <thead>
-          <tr><th>Member</th><th>Status</th><th>Partner</th><th>Partner port</th></tr>
+          <tr><th>Member</th><th>Status</th><th>Partner</th><th>Partner Port</th></tr>
         </thead>
         <tbody>
           {lag.members.map((m) => (
             <tr key={m.port}>
               <td className="cell-mono">{shortName(m.port)}</td>
-              <td><Badge status={MEMBER_STATUS[m.status] || undefined}>{m.status}</Badge></td>
+              <td><Badge status={MEMBER_STATUS[m.status] || undefined}>{capitalize(m.status)}</Badge></td>
               <td className="cell-mono">{m.partner_system || '—'}</td>
               <td className="cell-mono">{m.partner_system ? m.partner_port : '—'}</td>
             </tr>
@@ -55,7 +55,7 @@ function DetailModal({ open, lag, onClose }) {
 }
 
 /// Create ("New port-channel") and edit share one dialog.
-function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
+function LagModal({ open, lag, interfaces, lags, vlans, onClose, onSaved }) {
   const editing = !!lag;
   const [group, setGroup] = useState('');
   const [description, setDescription] = useState('');
@@ -66,7 +66,7 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
   const [fallback, setFallback] = useState('');
   const [fallbackTimeout, setFallbackTimeout] = useState('90');
   const [mode, setMode] = useState('');
-  const [trunkVlans, setTrunkVlans] = useState('');
+  const [trunkVlans, setTrunkVlans] = useState([]);
   const [accessVlan, setAccessVlan] = useState('');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -82,7 +82,7 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
     setFallback(editing ? lag.fallback_mode || '' : '');
     setFallbackTimeout(editing ? String(lag.fallback_timeout_secs || 90) : '90');
     setMode('');
-    setTrunkVlans('');
+    setTrunkVlans([]);
     setAccessVlan('');
     setError(null);
     setBusy(false);
@@ -98,11 +98,6 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
   const candidates = (interfaces || [])
     .filter((i) => i.kind === 'ethernet')
     .sort((a, b) => compareNames(a.name, b.name));
-
-  const toggleMember = (name) =>
-    setMembers((have) =>
-      have.includes(name) ? have.filter((m) => m !== name) : [...have, name],
-    );
 
   const submit = async () => {
     const parsed = parseInt(group, 10);
@@ -139,7 +134,7 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
       if (fallback) set.fallback_timeout = parseInt(fallbackTimeout, 10) || 90;
       if (mode) {
         set.mode = mode;
-        if (mode === 'trunk' && trunkVlans !== '') set.trunk_vlans = parseVlanList(trunkVlans);
+        if (mode === 'trunk' && trunkVlans.length > 0) set.trunk_vlans = trunkVlans;
         if (mode === 'access' && accessVlan !== '') set.access_vlan = parseInt(accessVlan, 10);
       }
       const result = await api('/api/lags/edit', {
@@ -154,7 +149,7 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
   };
 
   return (
-    <Modal open={open} title={editing ? `Edit Port-Channel${lag.group}` : 'New port-channel'}
+    <Modal open={open} title={editing ? `Edit Port-Channel${lag.group}` : 'New Port-Channel'}
       onClose={onClose}
       footer={
         <>
@@ -177,9 +172,9 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
         <FormField label="Protocol" htmlFor="lag-protocol">
           <Select id="lag-protocol" value={protocol} onChange={(e) => setProtocol(e.target.value)}
             options={[
-              { value: 'active', label: 'LACP active' },
-              { value: 'passive', label: 'LACP passive' },
-              { value: 'on', label: 'Static (mode on)' },
+              { value: 'active', label: 'LACP Active' },
+              { value: 'passive', label: 'LACP Passive' },
+              { value: 'on', label: 'Static (Mode On)' },
             ]} />
         </FormField>
         {protocol !== 'on' && (
@@ -187,20 +182,23 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
             onChange={(e) => setRateFast(e.target.checked)} />
         )}
         <FormField label="Members" helper="Up to 8 Ethernet ports; all run the same mode.">
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: 4 }}>
-            {candidates.map((i) => {
+          <MultiSelect
+            placeholder="Select member ports…"
+            options={candidates.map((i) => {
               const owner = memberTaken(i.name);
-              return (
-                <Checkbox key={i.name}
-                  label={shortName(i.name) + (owner ? ` (${owner})` : '')}
-                  checked={members.includes(i.name)}
-                  disabled={!!owner || i.addresses.length > 0}
-                  onChange={() => toggleMember(i.name)} />
-              );
+              const routed = i.addresses.length > 0;
+              return {
+                value: i.name,
+                label: shortName(i.name)
+                  + (owner ? ` (${owner})` : '')
+                  + (routed ? ' (routed)' : ''),
+                disabled: !!owner || routed,
+              };
             })}
-          </div>
+            values={members}
+            onChange={setMembers} />
         </FormField>
-        <FormField label="Min links" htmlFor="lag-min-links" helper="0..8; empty keeps current">
+        <FormField label="Min Links" htmlFor="lag-min-links" helper="0..8; empty keeps current">
           <Input id="lag-min-links" className="mono" value={minLinks}
             onChange={(e) => setMinLinks(e.target.value)} style={{ maxWidth: 120 }} />
         </FormField>
@@ -213,7 +211,7 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
             ]} />
         </FormField>
         {fallback && (
-          <FormField label="Fallback timeout" htmlFor="lag-fallback-timeout" helper="1..900 seconds">
+          <FormField label="Fallback Timeout" htmlFor="lag-fallback-timeout" helper="1..900 seconds">
             <Input id="lag-fallback-timeout" className="mono" value={fallbackTimeout}
               onChange={(e) => setFallbackTimeout(e.target.value)} style={{ maxWidth: 120 }} />
           </FormField>
@@ -221,7 +219,7 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
         <FormField label="Switchport" htmlFor="lag-mode" helper="Optional; empty keeps current">
           <Select id="lag-mode" value={mode} onChange={(e) => setMode(e.target.value)}
             options={[
-              { value: '', label: 'No change' },
+              { value: '', label: 'No Change' },
               { value: 'access', label: 'Access' },
               { value: 'trunk', label: 'Trunk' },
             ]} />
@@ -233,9 +231,15 @@ function LagModal({ open, lag, interfaces, lags, onClose, onSaved }) {
           </FormField>
         )}
         {mode === 'trunk' && (
-          <FormField label="Trunk VLANs" htmlFor="lag-trunk-vlans" helper="e.g. 10,20,30-32">
-            <Input id="lag-trunk-vlans" className="mono" value={trunkVlans}
-              onChange={(e) => setTrunkVlans(e.target.value)} />
+          <FormField label="Trunk VLANs">
+            <MultiSelect
+              placeholder="Select VLANs…"
+              options={(vlans || []).map((v) => ({
+                value: v.id,
+                label: v.name ? `${v.id} — ${v.name}` : String(v.id),
+              }))}
+              values={trunkVlans}
+              onChange={setTrunkVlans} />
           </FormField>
         )}
       </div>
@@ -282,6 +286,7 @@ function DeleteModal({ open, group, onClose, onSaved }) {
 export default function LagPage() {
   const [lags, setLags] = useState(null);
   const [interfaces, setInterfaces] = useState(null);
+  const [vlans, setVlans] = useState(null);
   const [error, setError] = useState(null);
   const [applied, setApplied] = useState(null);
   const [modal, setModal] = useState(null);
@@ -289,6 +294,7 @@ export default function LagPage() {
   const refresh = useCallback(() => {
     api('/api/lags').then((r) => setLags(r.lags)).catch((e) => setError(e.message));
     api('/api/interfaces').then((r) => setInterfaces(r.interfaces)).catch(() => {});
+    api('/api/vlans').then((r) => setVlans(r.vlans)).catch(() => {});
   }, []);
   useEffect(refresh, [refresh]);
 
@@ -314,9 +320,10 @@ export default function LagPage() {
       {lags && (
         <Datagrid
           rowKey={(r) => r.group}
+          onRefresh={refresh}
           actionBar={() => (
             <Button variant="primary" sm icon="plus" onClick={() => setModal({ kind: 'new' })}>
-              New port-channel
+              New Port-Channel
             </Button>
           )}
           columns={[
@@ -328,7 +335,7 @@ export default function LagPage() {
               key: 'state', label: 'State',
               render: (r) => (
                 <Badge status={r.up ? 'success' : 'danger'}>
-                  {r.up ? 'up' : 'down'}{r.fallback_active ? ' (fallback)' : ''}
+                  {r.up ? 'Up' : 'Down'}{r.fallback_active ? ' (Fallback)' : ''}
                 </Badge>
               ),
             },
@@ -338,7 +345,7 @@ export default function LagPage() {
               render: (r) => <span className="cell-mono">{r.bundled} / {r.total}</span>,
             },
             {
-              key: 'min_links', label: 'Min links',
+              key: 'min_links', label: 'Min Links',
               render: (r) => <span className="cell-mono">{r.min_links || '—'}</span>,
             },
             {
@@ -375,7 +382,7 @@ export default function LagPage() {
         onClose={() => setModal(null)} />
       <LagModal open={!!modal && (modal.kind === 'new' || modal.kind === 'edit')}
         lag={modal && modal.kind === 'edit' ? modal.lag : null}
-        interfaces={interfaces} lags={lags}
+        interfaces={interfaces} lags={lags} vlans={vlans}
         onClose={() => setModal(null)} onSaved={onSaved} />
       <DeleteModal open={!!modal && modal.kind === 'delete'}
         group={modal && modal.kind === 'delete' ? modal.group : 0}

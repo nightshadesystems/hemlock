@@ -786,8 +786,12 @@ fn switchport(children: &[Item], name: &str) -> Result<Option<SwitchportIntent>,
     let trunk_values = ConfigTree::phrase_values(sp, "trunk", "vlans")
         .or_else(|| ConfigTree::leaf_values(sp, "trunk-vlans"));
     if let Some(values) = trunk_values {
+        // Lists render as `10, 20, 30`; each word may carry a trailing
+        // comma, and hand-written `10 20 30` / `10,20,30` still parse.
         for value in values {
-            trunk_vlans.push(parse_vlan_id(value).map_err(&bad)?);
+            for part in value.split(',').filter(|p| !p.is_empty()) {
+                trunk_vlans.push(parse_vlan_id(part).map_err(&bad)?);
+            }
         }
         trunk_vlans.sort_unstable();
         trunk_vlans.dedup();
@@ -1894,15 +1898,15 @@ impl VlanChange {
         match &self.ensure {
             Some(vlan) => {
                 let mut text = match &vlan.description {
-                    Some(name) if !name.is_empty() => format!("vlan {} ({name})", self.id),
-                    _ => format!("vlan {}", self.id),
+                    Some(name) if !name.is_empty() => format!("VLAN {} ({name})", self.id),
+                    _ => format!("VLAN {}", self.id),
                 };
                 if vlan.suspended {
                     text.push_str(" suspended");
                 }
                 text
             }
-            None => format!("vlan {} removed", self.id),
+            None => format!("VLAN {} removed", self.id),
         }
     }
 }
@@ -1948,11 +1952,14 @@ impl SwitchportChange {
                     .map(u16::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
+                let native = match sp.native_vlan {
+                    Some(vlan) => format!(" native {vlan}"),
+                    None => String::new(),
+                };
                 format!(
-                    "{}: switchport trunk vlans {} native {}",
+                    "{}: switchport trunk vlans {}{native}",
                     self.name,
                     if vlans.is_empty() { "-".into() } else { vlans },
-                    sp.native_vlan.unwrap_or(1)
                 )
             }
             Some(sp) if sp.mode == SwitchportMode::Dot1qTunnel => format!(

@@ -98,6 +98,9 @@ export const formatUptime = (secs) => {
   return `${m} min`;
 };
 
+// "forwarding" → "Forwarding" — display case for status/role words.
+export const capitalize = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
 // "Ethernet12" → "Eth12", "Management1" → "Mgmt1" — for dense port lists.
 export const shortName = (name) =>
   name.replace(/^Ethernet/, 'Eth').replace(/^Management/, 'Mgmt');
