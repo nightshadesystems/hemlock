@@ -14,7 +14,9 @@
 
 mod api;
 mod auth;
+mod edit;
 mod tls;
+mod users;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;

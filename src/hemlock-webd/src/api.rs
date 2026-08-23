@@ -36,9 +36,13 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/session", get(session))
         .route("/api/interfaces", get(interfaces))
+        .route("/api/interfaces/edit", post(interfaces_edit))
         .route("/api/vlans", get(vlans))
+        .route("/api/vlans/edit", post(vlans_edit))
         .route("/api/routes", get(routes))
         .route("/api/system", get(system))
+        .route("/api/users", get(users))
+        .route("/api/users/add", post(users_add))
         .route("/api/config", get(config))
         .with_state(state)
 }
@@ -106,6 +110,13 @@ async fn syncd_client(
 ) -> anyhow::Result<pb::syncd_client::SyncdClient<tonic::transport::Channel>> {
     let channel = state.syncd.connect().await?;
     Ok(pb::syncd_client::SyncdClient::new(channel))
+}
+
+async fn mgmtd_client(
+    state: &AppState,
+) -> anyhow::Result<pb::mgmt_client::MgmtClient<tonic::transport::Channel>> {
+    let channel = state.mgmtd.connect().await?;
+    Ok(pb::mgmt_client::MgmtClient::new(channel))
 }
 
 /// The running config text from mgmtd (also used at startup for the
@@ -214,6 +225,8 @@ struct InterfaceJson {
     access_vlan: u32,
     native_vlan: u32,
     trunk_vlans: Vec<u32>,
+    /// Physical media for display, e.g. "1000BASE-T", "SFP+".
+    media: String,
 }
 
 fn interface_json(i: &pb::InterfaceState) -> InterfaceJson {
@@ -232,6 +245,7 @@ fn interface_json(i: &pb::InterfaceState) -> InterfaceJson {
         access_vlan: i.access_vlan,
         native_vlan: i.native_vlan,
         trunk_vlans: i.trunk_vlans.clone(),
+        media: i.media.clone(),
     }
 }
 
@@ -330,6 +344,97 @@ async fn vlans(
 
     let vlans: Vec<VlanJson> = vlans.into_values().collect();
     Ok(Json(json!({ "vlans": vlans })))
+}
+
+// ----------------------------------------------------------------- edits
+
+/// Run one config edit through mgmtd: base on the running config, apply
+/// the tree edit, SetCandidate (validation), Commit. Rejections come
+/// back as 422 with the validator's messages; the response carries the
+/// commit's applied-changes list.
+async fn commit_edit(
+    state: &AppState,
+    apply: impl FnOnce(&mut ConfigTree) -> Result<(), String>,
+) -> Result<Response, ApiError> {
+    let invalid = |errors: Vec<String>| {
+        Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "errors": errors })),
+        )
+            .into_response())
+    };
+
+    let text = running_config(&state.mgmtd).await?;
+    let mut tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    tree.normalize_interfaces();
+    if let Err(message) = apply(&mut tree) {
+        return invalid(vec![message]);
+    }
+
+    let mut client = mgmtd_client(state).await?;
+    let response = client
+        .set_candidate(pb::ConfigText {
+            text: tree.to_text(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    if !response.valid {
+        return invalid(response.errors);
+    }
+    let commit = client
+        .commit(pb::CommitRequest {
+            comment: "web console".to_string(),
+            confirm_timeout_secs: 0,
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    tracing::info!(commit_id = commit.commit_id, "web console commit");
+    Ok(Json(json!({
+        "commit_id": commit.commit_id,
+        "applied": commit.applied_changes,
+    }))
+    .into_response())
+}
+
+async fn interfaces_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::edit::InterfaceEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, |tree| {
+        crate::edit::apply_interface_edit(tree, &edit)
+    })
+    .await
+}
+
+async fn vlans_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::edit::VlanEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, |tree| crate::edit::apply_vlan_edit(tree, &edit)).await
+}
+
+async fn users(_op: Operator, State(state): State<SharedState>) -> Response {
+    Json(json!({ "users": crate::users::list(state.dev_auth.as_ref()) })).into_response()
+}
+
+async fn users_add(
+    _op: Operator,
+    State(_state): State<SharedState>,
+    Json(request): Json<crate::users::AddUserRequest>,
+) -> Response {
+    match crate::users::add(&request).await {
+        Ok(()) => Json(json!({ "username": request.username })).into_response(),
+        Err(message) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "errors": [message] })),
+        )
+            .into_response(),
+    }
 }
 
 async fn routes(

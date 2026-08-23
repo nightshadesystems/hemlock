@@ -8,17 +8,28 @@ import { VerticalNav } from '@/components/ds/VerticalNav';
 const TABS = [
   { label: 'Dashboard', href: '/dashboard/' },
   { label: 'Switching', href: '/switching/interfaces/', root: '/switching' },
-  { label: 'Routing', href: '/routing/' },
-  { label: 'System', href: '/system/' },
+  { label: 'Routing', href: '/routing/static/', root: '/routing' },
+  { label: 'System', href: '/system/general/', root: '/system' },
 ];
 
-// Left-hand navigation per tab; only Switching has one for now.
+// Left-hand navigation per tab.
 const SIDE_NAV = {
   '/switching': {
     label: 'Switching',
     items: [
       { id: '/switching/interfaces/', label: 'Interfaces', icon: 'network-settings' },
       { id: '/switching/vlans/', label: 'VLANs', icon: 'network-globe' },
+    ],
+  },
+  '/routing': {
+    label: 'Routing',
+    items: [{ id: '/routing/static/', label: 'Static routes', icon: 'map' }],
+  },
+  '/system': {
+    label: 'System',
+    items: [
+      { id: '/system/general/', label: 'General', icon: 'cog' },
+      { id: '/system/users/', label: 'Users', icon: 'users' },
     ],
   },
 };

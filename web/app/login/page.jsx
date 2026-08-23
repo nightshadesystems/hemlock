@@ -51,22 +51,15 @@ export default function LoginPage() {
     <div className="login-wrapper">
       <div className="login-brand">
         <img src="/brand/nightshade-symbol-on-dark.svg" alt="Nightshade Systems" />
-        <div className="login-brand-title">
-          The whole switch,
-          <br />
-          one console.
-        </div>
-        <div className="login-brand-sub">
-          Hemlock NOS puts interfaces, VLANs, and routing in front of you. You commit the config;
-          the switch keeps it on every boot.
+        <div className="login-brand-sub" style={{ fontSize: 16, lineHeight: '24px' }}>
+          Hemlock is a Rust-based network operating system for whitebox Ethernet switches.
         </div>
       </div>
       <form className="login" onSubmit={submit}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
-          <img src="/brand/nightshade-symbol-primary.svg" alt="" style={{ height: 28 }} />
+          <img src="/brand/nightshade-symbol-on-dark.svg" alt="" style={{ height: 28 }} />
           <Wordmark size={22} color="var(--cds-alias-typography-color-450)" />
         </div>
-        <div className="title">Console</div>
         <div className="subtitle">Sign in with a switch operator account</div>
         {error && (
           <Alert status="danger" className="error">

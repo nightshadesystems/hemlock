@@ -27,6 +27,7 @@ export async function api(path, options = {}) {
     try {
       const body = await res.json();
       if (body && body.error) message = body.error;
+      else if (body && Array.isArray(body.errors)) message = body.errors.join('; ');
     } catch {
       /* non-JSON error body */
     }
@@ -48,4 +49,34 @@ export const formatUptime = (secs) => {
   if (d > 0) return `${d} d ${h} h`;
   if (h > 0) return `${h} h ${m} min`;
   return `${m} min`;
+};
+
+// "Ethernet12" → "Eth12", "Management1" → "Mgmt1" — for dense port lists.
+export const shortName = (name) =>
+  name.replace(/^Ethernet/, 'Eth').replace(/^Management/, 'Mgmt');
+
+// Natural interface-name order: alphabetic prefix, then numeric suffix
+// (Ethernet2 before Ethernet10).
+export const compareNames = (a, b) => {
+  const parse = (n) => {
+    const m = /^(\D*)(\d*)$/.exec(n) || [];
+    return [m[1] || n, m[2] ? parseInt(m[2], 10) : -1];
+  };
+  const [ap, an] = parse(a);
+  const [bp, bn] = parse(b);
+  return ap === bp ? an - bn : ap < bp ? -1 : 1;
+};
+
+// "10,20,30-32" → [10, 20, 30, 31, 32]; throws on junk.
+export const parseVlanList = (text) => {
+  const out = new Set();
+  for (const part of text.split(',').map((p) => p.trim()).filter(Boolean)) {
+    const m = /^(\d+)(?:-(\d+))?$/.exec(part);
+    if (!m) throw new Error(`bad VLAN list entry "${part}"`);
+    const from = parseInt(m[1], 10);
+    const to = m[2] ? parseInt(m[2], 10) : from;
+    if (from < 1 || to > 4094 || from > to) throw new Error(`bad VLAN range "${part}"`);
+    for (let id = from; id <= to; id++) out.add(id);
+  }
+  return [...out].sort((a, b) => a - b);
 };

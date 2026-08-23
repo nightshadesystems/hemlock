@@ -1,23 +1,30 @@
 'use client';
 import React from 'react';
-export function Datagrid({columns,rows,selectable,expandable,renderDetail,pageSize=0,actionBar,placeholder='No items found.',footerText,compact,className=''}){
+export function Datagrid({columns,rows,rowKey,selectable,expandable,renderDetail,pageSize=0,actionBar,placeholder='No items found.',footerText,compact,className=''}){
   const [sort,setSort]=React.useState(null);
   const [sel,setSel]=React.useState(()=>new Set());
   const [open,setOpen]=React.useState(()=>new Set());
   const [page,setPage]=React.useState(0);
-  let data=[...rows];
-  if(sort)data.sort((a,b)=>{const x=a[sort.key],y=b[sort.key];return (x>y?1:x<y?-1:0)*(sort.dir==='asc'?1:-1);});
+  const keyOf=rowKey||((r,i)=>i);
+  let data=rows.map((r,i)=>[keyOf(r,i),r]);
+  if(sort){
+    const col=columns.find(c=>c.key===sort.key);
+    const dir=sort.dir==='asc'?1:-1;
+    const cmp=col&&col.compare?col.compare:(x,y)=>{const a=x[sort.key],b=y[sort.key];return a>b?1:a<b?-1:0;};
+    data.sort(([,a],[,b])=>cmp(a,b)*dir);
+  }
   const pages=pageSize?Math.max(1,Math.ceil(data.length/pageSize)):1;
   const view=pageSize?data.slice(page*pageSize,(page+1)*pageSize):data;
   const nCols=columns.length+(selectable?1:0)+(expandable?1:0);
   const toggleSort=c=>{if(!c.sortable)return;setSort(s=>s&&s.key===c.key?{key:c.key,dir:s.dir==='asc'?'desc':'asc'}:{key:c.key,dir:'asc'});};
-  const allSel=view.length>0&&view.every((_,i)=>sel.has(page*pageSize+i));
-  const toggleAll=()=>setSel(s=>{const n=new Set(s);view.forEach((_,i)=>{const k=page*pageSize+i;allSel?n.delete(k):n.add(k);});return n;});
+  const allSel=view.length>0&&view.every(([k])=>sel.has(k));
+  const toggleAll=()=>setSel(s=>{const n=new Set(s);view.forEach(([k])=>{allSel?n.delete(k):n.add(k);});return n;});
   const toggleRow=k=>setSel(s=>{const n=new Set(s);n.has(k)?n.delete(k):n.add(k);return n;});
   const toggleOpen=k=>setOpen(s=>{const n=new Set(s);n.has(k)?n.delete(k):n.add(k);return n;});
+  const clearSel=()=>setSel(new Set());
   const rh=compact?'var(--clr-base-dg-compact-row-height)':undefined;
   return <div className={'datagrid '+className} style={{fontSize:compact?12:undefined}}>
-    {actionBar&&<div className="datagrid-action-bar">{actionBar(sel)}</div>}
+    {actionBar&&<div className="datagrid-action-bar">{actionBar({selected:sel,clear:clearSel})}</div>}
     <table className="datagrid-table">
       <thead><tr className="datagrid-row">
         {selectable&&<th className="datagrid-column datagrid-select"><div className="clr-checkbox-wrapper"><input type="checkbox" checked={allSel} onChange={toggleAll} aria-label="Select all"/></div></th>}
@@ -27,7 +34,7 @@ export function Datagrid({columns,rows,selectable,expandable,renderDetail,pageSi
         </th>)}
       </tr></thead>
       <tbody>
-      {view.map((r,i)=>{const k=page*pageSize+i;const isOpen=open.has(k);
+      {view.map(([k,r])=>{const isOpen=open.has(k);
         return <React.Fragment key={k}>
         <tr className={'datagrid-row'+(sel.has(k)?' datagrid-selected':'')}>
           {selectable&&<td className="datagrid-cell datagrid-select" style={{height:rh}}><div className="clr-checkbox-wrapper"><input type="checkbox" checked={sel.has(k)} onChange={()=>toggleRow(k)} aria-label="Select row"/></div></td>}

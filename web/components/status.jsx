@@ -28,9 +28,9 @@ export function ServiceLabel({ on }) {
 }
 
 export function ModeLabel({ iface }) {
-  if (iface.kind === 'management') return <Label>management</Label>;
-  if (iface.kind === 'vlan') return <Label>svi</Label>;
-  if (iface.addresses && iface.addresses.length > 0) return <Label accent>routed</Label>;
-  if (iface.switchport_mode === 'trunk') return <Label>trunk</Label>;
-  return <Label>access</Label>;
+  if (iface.kind === 'management') return <Label>Management</Label>;
+  if (iface.kind === 'vlan') return <Label>SVI</Label>;
+  if (iface.addresses && iface.addresses.length > 0) return <Label accent>Routed</Label>;
+  if (iface.switchport_mode === 'trunk') return <Label>Trunk</Label>;
+  return <Label>Access</Label>;
 }

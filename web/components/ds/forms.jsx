@@ -22,6 +22,12 @@ export function FormField({label,helper,error,success,required,htmlFor,children,
   </div>;
 }
 
+export function Select({options,children,className='',...rest}){
+  return <div className="clr-select-wrapper"><select className={'clr-select '+className} {...rest}>
+    {options?options.map(o=>typeof o==='string'?<option key={o} value={o}>{o}</option>:<option key={o.value} value={o.value}>{o.label}</option>):children}
+  </select></div>;
+}
+
 export function Checkbox({label,indeterminate,className='',...rest}){
   const ref=React.useRef();
   React.useEffect(()=>{if(ref.current)ref.current.indeterminate=!!indeterminate;},[indeterminate]);
