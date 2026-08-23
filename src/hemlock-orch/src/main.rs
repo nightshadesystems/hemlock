@@ -58,10 +58,7 @@ impl OrchService {
 
 /// `"32768,2c:dd:e9:4a:1b:00"`.
 fn system_id(priority: u16, mac: [u8; 6]) -> String {
-    format!(
-        "{priority},{}",
-        mac.map(|b| format!("{b:02x}")).join(":")
-    )
+    format!("{priority},{}", mac.map(|b| format!("{b:02x}")).join(":"))
 }
 
 #[tonic::async_trait]
@@ -89,8 +86,9 @@ impl Orch for OrchService {
         let req = request.into_inner();
         let system_priority = match req.system_priority {
             0 => 32768,
-            other => u16::try_from(other)
-                .map_err(|_| Status::invalid_argument("bad system-priority"))?,
+            other => {
+                u16::try_from(other).map_err(|_| Status::invalid_argument("bad system-priority"))?
+            }
         };
         let mut configs = Vec::with_capacity(req.lags.len());
         for lag in req.lags {
@@ -113,9 +111,8 @@ impl Orch for OrchService {
                         rate_fast: member.rate_fast,
                         port_priority: match member.port_priority {
                             0 => 32768,
-                            other => u16::try_from(other).map_err(|_| {
-                                Status::invalid_argument("bad port-priority")
-                            })?,
+                            other => u16::try_from(other)
+                                .map_err(|_| Status::invalid_argument("bad port-priority"))?,
                         },
                     },
                 );
@@ -185,10 +182,18 @@ impl Orch for OrchService {
         }
         self.stp.set_config(stp::Config {
             mode,
-            priority: u16::try_from(if req.priority == 0 { 32768 } else { req.priority })
-                .map_err(|_| Status::invalid_argument("bad priority"))?,
-            hello_time: u8::try_from(if req.hello_time == 0 { 2 } else { req.hello_time })
-                .map_err(|_| Status::invalid_argument("bad hello-time"))?,
+            priority: u16::try_from(if req.priority == 0 {
+                32768
+            } else {
+                req.priority
+            })
+            .map_err(|_| Status::invalid_argument("bad priority"))?,
+            hello_time: u8::try_from(if req.hello_time == 0 {
+                2
+            } else {
+                req.hello_time
+            })
+            .map_err(|_| Status::invalid_argument("bad hello-time"))?,
             max_age: u8::try_from(if req.max_age == 0 { 20 } else { req.max_age })
                 .map_err(|_| Status::invalid_argument("bad max-age"))?,
             forward_time: u8::try_from(if req.forward_time == 0 {
@@ -294,8 +299,12 @@ impl Orch for OrchService {
         }
         engine.set_config(snoop::Config {
             disabled: req.disabled,
-            robustness: u8::try_from(if req.robustness == 0 { 2 } else { req.robustness })
-                .map_err(|_| Status::invalid_argument("bad robustness"))?,
+            robustness: u8::try_from(if req.robustness == 0 {
+                2
+            } else {
+                req.robustness
+            })
+            .map_err(|_| Status::invalid_argument("bad robustness"))?,
             vlans,
             ..snoop::Config::default()
         });
@@ -732,8 +741,8 @@ async fn watch_vlans(syncd: IpcEndpoint, igmp: snoop::Engine, mld: snoop::Engine
                     } else {
                         iface.access_vlan
                     };
-                    let untagged = u16::try_from(if untagged == 0 { 1 } else { untagged })
-                        .unwrap_or(1);
+                    let untagged =
+                        u16::try_from(if untagged == 0 { 1 } else { untagged }).unwrap_or(1);
                     pvids.insert(iface.name.clone(), untagged);
                     vlan_ports
                         .entry(untagged)
@@ -742,10 +751,7 @@ async fn watch_vlans(syncd: IpcEndpoint, igmp: snoop::Engine, mld: snoop::Engine
                     if iface.switchport_mode == "trunk" {
                         for vlan in &iface.trunk_vlans {
                             if let Ok(vlan) = u16::try_from(*vlan) {
-                                vlan_ports
-                                    .entry(vlan)
-                                    .or_default()
-                                    .push(iface.name.clone());
+                                vlan_ports.entry(vlan).or_default().push(iface.name.clone());
                             }
                         }
                     }

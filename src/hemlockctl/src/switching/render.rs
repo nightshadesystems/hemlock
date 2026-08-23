@@ -42,11 +42,12 @@ pub fn vlan(rows: &[VlanRow]) -> String {
 pub fn vlan_summary(rows: &[VlanRow]) -> String {
     let user = rows.iter().filter(|r| r.id != 1).count();
     let mut out = Text::new();
-    out.line(format!("{:<33}: {}", "Number of existing VLANs", rows.len()));
     out.line(format!(
         "{:<33}: {}",
-        "Number of existing user VLANs", user
+        "Number of existing VLANs",
+        rows.len()
     ));
+    out.line(format!("{:<33}: {}", "Number of existing user VLANs", user));
     out.finish()
 }
 
@@ -68,7 +69,10 @@ pub fn mac_address_table(table: &MacTable) -> String {
     out.line("          Mac Address Table");
     out.line("-".repeat(66));
     out.blank();
-    out.row(&COLS, &["Vlan", "Mac Address", "Type", "Ports", "Moves", "Last Move"]);
+    out.row(
+        &COLS,
+        &["Vlan", "Mac Address", "Type", "Ports", "Moves", "Last Move"],
+    );
     out.row(
         &COLS,
         &["----", "-----------", "----", "-----", "-----", "---------"],
@@ -187,10 +191,7 @@ pub fn spanning_tree(bridge: &StpBridge) -> String {
         return out.finish();
     }
     out.line(stp_header(bridge));
-    out.line(format!(
-        "  Spanning tree enabled protocol {}",
-        bridge.mode
-    ));
+    out.line(format!("  Spanning tree enabled protocol {}", bridge.mode));
     out.line(format!(
         "  {:<11}{:<12}{}",
         "Root ID", "Priority", bridge.root_priority
@@ -235,7 +236,10 @@ pub fn spanning_tree(bridge: &StpBridge) -> String {
         Col::left(11),
         Col::left(10),
     ];
-    out.row(&COLS, &["Interface", "Role", "State", "Cost", "Prio.Nbr", "Type"]);
+    out.row(
+        &COLS,
+        &["Interface", "Role", "State", "Cost", "Prio.Nbr", "Type"],
+    );
     out.row(
         &COLS,
         &[
@@ -340,7 +344,10 @@ pub fn spanning_tree_blockedports(bridge: &StpBridge) -> String {
     out.row(&COLS, &["Name", "Blocked Interfaces List"]);
     out.row(
         &COLS,
-        &["--------------------", "------------------------------------"],
+        &[
+            "--------------------",
+            "------------------------------------",
+        ],
     );
     let blocked: Vec<String> = bridge
         .ports
@@ -469,7 +476,10 @@ pub fn port_channel_detail(lags: &[PortChannel]) -> String {
         out.line(label(
             "Protocol",
             if lag.lacp {
-                format!("LACP {}", if lag.active_mode { "active" } else { "passive" })
+                format!(
+                    "LACP {}",
+                    if lag.active_mode { "active" } else { "passive" }
+                )
             } else {
                 "static (mode on)".into()
             },
@@ -524,7 +534,15 @@ pub fn lacp_neighbor(lags: &[PortChannel]) -> String {
     let mut out = Text::new();
     out.row(
         &COLS,
-        &["Port", "Flags", "Partner Sys-ID", "Port#", "Key", "Prio", "State"],
+        &[
+            "Port",
+            "Flags",
+            "Partner Sys-ID",
+            "Port#",
+            "Key",
+            "Prio",
+            "State",
+        ],
     );
     out.row(
         &COLS,
@@ -589,7 +607,10 @@ pub fn lacp_neighbor_detail(lags: &[PortChannel]) -> String {
                 out.line(label("Partner Sys-ID", member.partner_system.clone()));
                 out.line(label("Partner Port", member.partner_port.to_string()));
                 out.line(label("Partner Key", member.partner_key.to_string()));
-                out.line(label("Partner Priority", member.partner_priority.to_string()));
+                out.line(label(
+                    "Partner Priority",
+                    member.partner_priority.to_string(),
+                ));
                 out.line(label(
                     "Partner State",
                     lacp_state_word(member.partner_state),
@@ -655,7 +676,10 @@ pub fn snooping(view: &SnoopingView) -> String {
         format!("{} snooping", view.family),
         enabled_word(view.enabled)
     ));
-    out.line(format!("{:<24}: {}", "Robustness variable", view.robustness));
+    out.line(format!(
+        "{:<24}: {}",
+        "Robustness variable", view.robustness
+    ));
     for vlan in &view.vlans {
         out.blank();
         let header = format!("Vlan {} :", vlan.vlan);

@@ -639,7 +639,10 @@ impl Engine {
                             })
                             .await
                             .with_context(|| {
-                                format!("detaching mirror source {port} (session {})", change.session)
+                                format!(
+                                    "detaching mirror source {port} (session {})",
+                                    change.session
+                                )
                             })?;
                     }
                 }
@@ -661,7 +664,10 @@ impl Engine {
                     })
                     .await
                     .with_context(|| {
-                        format!("attaching mirror source {port} (session {})", change.session)
+                        format!(
+                            "attaching mirror source {port} (session {})",
+                            change.session
+                        )
                     })?;
             }
         }

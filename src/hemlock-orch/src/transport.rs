@@ -70,10 +70,7 @@ pub fn register_snoop(
 }
 
 async fn transmit(port: &str, frame: Vec<u8>) {
-    let fd = sockets()
-        .lock()
-        .ok()
-        .and_then(|map| map.get(port).cloned());
+    let fd = sockets().lock().ok().and_then(|map| map.get(port).cloned());
     let Some(fd) = fd else { return };
     let Ok(clone) = fd.try_clone() else { return };
     let port = port.to_string();
@@ -237,8 +234,7 @@ fn spawn_reader(
                             if let Ok(sinks) = snoop_sinks().read() {
                                 for (wanted, sink) in sinks.iter() {
                                     if *wanted == ethertype {
-                                        let _ =
-                                            sink.send((port.clone(), vlan, frame.to_vec()));
+                                        let _ = sink.send((port.clone(), vlan, frame.to_vec()));
                                     }
                                 }
                             }

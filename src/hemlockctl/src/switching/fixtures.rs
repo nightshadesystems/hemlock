@@ -177,20 +177,21 @@ pub fn lacp_system() -> LacpSystem {
 /// The seed bridge as the root: Et1 a guarded edge, Et2 a trunk, Po1
 /// the uplink LAG.
 pub fn stp_bridge() -> StpBridge {
-    let port = |id: InterfaceId, role: &str, state: &str, cost: u32, portfast, bpduguard, tx, rx| {
-        StpPortRow {
-            id,
-            role: role.into(),
-            state: state.into(),
-            cost,
-            priority: 128,
-            portfast,
-            bpduguard,
-            bpdus_tx: tx,
-            bpdus_rx: rx,
-            errdisabled: false,
-        }
-    };
+    let port =
+        |id: InterfaceId, role: &str, state: &str, cost: u32, portfast, bpduguard, tx, rx| {
+            StpPortRow {
+                id,
+                role: role.into(),
+                state: state.into(),
+                cost,
+                priority: 128,
+                portfast,
+                bpduguard,
+                bpdus_tx: tx,
+                bpdus_rx: rx,
+                errdisabled: false,
+            }
+        };
     StpBridge {
         mode: "mstp".into(),
         bridge_priority: 32768,
@@ -210,9 +211,36 @@ pub fn stp_bridge() -> StpBridge {
         seconds_since_tc: Some(862),
         last_tc_port: Some("Ethernet2".into()),
         ports: vec![
-            port(et(1), "designated", "forwarding", 20000, true, true, 1284, 2),
-            port(et(2), "designated", "forwarding", 20000, false, false, 1200, 3),
-            port(po(1), "designated", "forwarding", 10000, false, false, 900, 1),
+            port(
+                et(1),
+                "designated",
+                "forwarding",
+                20000,
+                true,
+                true,
+                1284,
+                2,
+            ),
+            port(
+                et(2),
+                "designated",
+                "forwarding",
+                20000,
+                false,
+                false,
+                1200,
+                3,
+            ),
+            port(
+                po(1),
+                "designated",
+                "forwarding",
+                10000,
+                false,
+                false,
+                900,
+                1,
+            ),
         ],
     }
 }

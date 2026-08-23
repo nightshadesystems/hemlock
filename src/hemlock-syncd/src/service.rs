@@ -532,8 +532,7 @@ impl SyncdService {
 
     /// A request MAC as bytes, canonicalized.
     fn mac_bytes(text: &str) -> Result<([u8; 6], String), Status> {
-        let canonical =
-            hemlock_common::net::parse_mac(text).map_err(Status::invalid_argument)?;
+        let canonical = hemlock_common::net::parse_mac(text).map_err(Status::invalid_argument)?;
         let mut mac = [0u8; 6];
         for (i, part) in canonical.split(':').enumerate() {
             mac[i] = u8::from_str_radix(part, 16)
@@ -590,8 +589,8 @@ impl SyncdService {
 
     /// Percent level ("10.00") -> hundredths of a percent.
     fn level_hundredths(level: &str) -> Result<u64, Status> {
-        let canonical = hemlock_common::net::parse_storm_level(level)
-            .map_err(Status::invalid_argument)?;
+        let canonical =
+            hemlock_common::net::parse_storm_level(level).map_err(Status::invalid_argument)?;
         let (whole, frac) = canonical
             .split_once('.')
             .ok_or_else(|| Status::internal("level not canonical"))?;
@@ -1607,7 +1606,8 @@ impl pb::syncd_server::Syncd for SyncdService {
                     .lags
                     .read()
                     .map_err(|_| Status::internal("lag table poisoned"))?;
-                lags.get(&group).map(|lag| (lag.sai_id, lag.switchport.clone()))
+                lags.get(&group)
+                    .map(|lag| (lag.sai_id, lag.switchport.clone()))
             };
             let Some((sai_id, Some(sp))) = existing else {
                 return Ok(Response::new(pb::ClearPortSwitchportResponse {}));
@@ -1864,7 +1864,9 @@ impl pb::syncd_server::Syncd for SyncdService {
         let offset: usize = req.page_token.parse().unwrap_or(0);
         let mut next_page_token = String::new();
         let entries = if req.page_size > 0 {
-            let end = offset.saturating_add(req.page_size as usize).min(entries.len());
+            let end = offset
+                .saturating_add(req.page_size as usize)
+                .min(entries.len());
             if end < entries.len() {
                 next_page_token = end.to_string();
             }
@@ -1883,32 +1885,35 @@ impl pb::syncd_server::Syncd for SyncdService {
         }))
     }
 
-    type WatchFdbEventsStream =
-        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::FdbEventMessage, Status>> + Send>>;
+    type WatchFdbEventsStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::FdbEventMessage, Status>> + Send>,
+    >;
 
     async fn watch_fdb_events(
         &self,
         _request: Request<pb::WatchFdbEventsRequest>,
     ) -> Result<Response<Self::WatchFdbEventsStream>, Status> {
         let stream =
-            BroadcastStream::new(self.handle.fdb_events.subscribe()).filter_map(|item| match item {
-                Ok(event) => Some(Ok(pb::FdbEventMessage {
-                    kind: match event.kind {
-                        hemlock_sai::FdbEventKind::Learned => {
-                            pb::fdb_event_message::Kind::Learned
-                        }
-                        hemlock_sai::FdbEventKind::Aged => pb::fdb_event_message::Kind::Aged,
-                        hemlock_sai::FdbEventKind::Moved => pb::fdb_event_message::Kind::Moved,
-                        hemlock_sai::FdbEventKind::Flushed => {
-                            pb::fdb_event_message::Kind::Flushed
-                        }
-                    } as i32,
-                    vlan: u32::from(event.vlan),
-                    mac: event.mac,
-                    port: event.port.unwrap_or_default(),
-                })),
-                Err(BroadcastStreamRecvError::Lagged(_)) => None,
-            });
+            BroadcastStream::new(self.handle.fdb_events.subscribe()).filter_map(
+                |item| match item {
+                    Ok(event) => Some(Ok(pb::FdbEventMessage {
+                        kind: match event.kind {
+                            hemlock_sai::FdbEventKind::Learned => {
+                                pb::fdb_event_message::Kind::Learned
+                            }
+                            hemlock_sai::FdbEventKind::Aged => pb::fdb_event_message::Kind::Aged,
+                            hemlock_sai::FdbEventKind::Moved => pb::fdb_event_message::Kind::Moved,
+                            hemlock_sai::FdbEventKind::Flushed => {
+                                pb::fdb_event_message::Kind::Flushed
+                            }
+                        } as i32,
+                        vlan: u32::from(event.vlan),
+                        mac: event.mac,
+                        port: event.port.unwrap_or_default(),
+                    })),
+                    Err(BroadcastStreamRecvError::Lagged(_)) => None,
+                },
+            );
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -1958,9 +1963,7 @@ impl pb::syncd_server::Syncd for SyncdService {
                     (port.sai_id, port.def.speed_mbps)
                 };
                 let kbps = match &level {
-                    Some(level) => {
-                        Some(Self::storm_kbps(speed, Self::level_hundredths(level)?))
-                    }
+                    Some(level) => Some(Self::storm_kbps(speed, Self::level_hundredths(level)?)),
                     None => None,
                 };
                 self.handle
@@ -2035,7 +2038,13 @@ impl pb::syncd_server::Syncd for SyncdService {
         &self,
         _request: Request<pb::GetStormControlRequest>,
     ) -> Result<Response<pb::GetStormControlResponse>, Status> {
-        let rows: Vec<(String, hemlock_sai::PortId, hemlock_sai::StormClass, StormState, bool)> = {
+        let rows: Vec<(
+            String,
+            hemlock_sai::PortId,
+            hemlock_sai::StormClass,
+            StormState,
+            bool,
+        )> = {
             let table = self
                 .handle
                 .ports
@@ -2114,7 +2123,11 @@ impl pb::syncd_server::Syncd for SyncdService {
                     }
                 };
                 rate_kbps += Self::storm_kbps(speed, hundredths);
-                drops += self.handle.port_storm_drops(sai_id, class).await.unwrap_or(0);
+                drops += self
+                    .handle
+                    .port_storm_drops(sai_id, class)
+                    .await
+                    .unwrap_or(0);
                 active |= up;
             }
             entries.push(pb::StormControlEntry {
@@ -2781,9 +2794,7 @@ impl pb::syncd_server::Syncd for SyncdService {
             vec![Some(
                 stps.get(&instance)
                     .ok_or_else(|| {
-                        Status::failed_precondition(format!(
-                            "stp instance {instance} not created"
-                        ))
+                        Status::failed_precondition(format!("stp instance {instance} not created"))
                     })?
                     .oid,
             )]
@@ -2876,14 +2887,10 @@ impl pb::syncd_server::Syncd for SyncdService {
                 .read()
                 .map_err(|_| Status::internal("l2mc table poisoned"))?;
             l2mc.get(&key).cloned().ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "no L2MC group for {group_ip} in VLAN {vlan}"
-                ))
+                Status::failed_precondition(format!("no L2MC group for {group_ip} in VLAN {vlan}"))
             })?
         };
-        let members = self
-            .reconcile_l2mc_members(state, &req.ports)
-            .await?;
+        let members = self.reconcile_l2mc_members(state, &req.ports).await?;
         if let Ok(mut l2mc) = self.handle.l2mc.write() {
             if let Some(state) = l2mc.get_mut(&key) {
                 state.members = members;
@@ -2918,7 +2925,10 @@ impl pb::syncd_server::Syncd for SyncdService {
         for member in state.members.values() {
             self.handle.remove_l2mc_member(*member).await.map_err(sai)?;
         }
-        self.handle.remove_l2mc_group(state.oid).await.map_err(sai)?;
+        self.handle
+            .remove_l2mc_group(state.oid)
+            .await
+            .map_err(sai)?;
         Ok(Response::new(pb::RemoveL2mcGroupResponse {}))
     }
 
@@ -2949,7 +2959,10 @@ impl pb::syncd_server::Syncd for SyncdService {
                 for member in state.members.values() {
                     self.handle.remove_l2mc_member(*member).await.map_err(sai)?;
                 }
-                self.handle.remove_l2mc_group(state.oid).await.map_err(sai)?;
+                self.handle
+                    .remove_l2mc_group(state.oid)
+                    .await
+                    .map_err(sai)?;
                 if let Ok(mut table) = self.handle.unknown_mcast.write() {
                     table.remove(&vlan);
                 }
@@ -3468,7 +3481,10 @@ lanes = [1, 2]
                 assert_eq!(dump.aging_time_secs, 600);
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "FDB events not applied");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "FDB events not applied"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 

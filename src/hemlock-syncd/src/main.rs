@@ -372,8 +372,7 @@ async fn reprogram_storm_rates(handle: &actor::SaiHandle, name: &str) {
         let Some((whole, frac)) = level.split_once('.') else {
             continue;
         };
-        let hundredths =
-            whole.parse::<u64>().unwrap_or(0) * 100 + frac.parse::<u64>().unwrap_or(0);
+        let hundredths = whole.parse::<u64>().unwrap_or(0) * 100 + frac.parse::<u64>().unwrap_or(0);
         let kbps = speed_mbps * hundredths / 10;
         if let Err(e) = handle.set_port_storm(sai_id, class, Some(kbps)).await {
             tracing::warn!(port = name, error = %e, "storm-control rate re-derivation failed");

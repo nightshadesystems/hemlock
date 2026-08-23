@@ -144,8 +144,8 @@ pub async fn show_mac(syncd: &IpcEndpoint, args: &[&str]) -> Result<(), String> 
                 let Some(raw) = rest.get(1) else {
                     return Err(format!("% Incomplete command: {USAGE}"));
                 };
-                let id = name::parse_one(raw)
-                    .ok_or_else(|| format!("% No such interface {raw:?}"))?;
+                let id =
+                    name::parse_one(raw).ok_or_else(|| format!("% No such interface {raw:?}"))?;
                 port = Some(id.full_name());
                 rest = &rest[1..];
             }
@@ -153,9 +153,7 @@ pub async fn show_mac(syncd: &IpcEndpoint, args: &[&str]) -> Result<(), String> 
                 let Some(raw) = rest.get(1) else {
                     return Err(format!("% Incomplete command: {USAGE}"));
                 };
-                mac = Some(
-                    hemlock_common::net::parse_mac(raw).map_err(|e| format!("% {e}"))?,
-                );
+                mac = Some(hemlock_common::net::parse_mac(raw).map_err(|e| format!("% {e}"))?);
                 rest = &rest[1..];
             }
             _ => unreachable!(),
@@ -333,11 +331,7 @@ pub async fn show_spanning_tree(orch: &IpcEndpoint, args: &[&str]) -> Result<(),
 }
 
 /// `show igmp|mld snooping [groups|querier] [| json]`.
-pub async fn show_snooping(
-    orch: &IpcEndpoint,
-    family: &str,
-    args: &[&str],
-) -> Result<(), String> {
+pub async fn show_snooping(orch: &IpcEndpoint, family: &str, args: &[&str]) -> Result<(), String> {
     let mut words: Vec<&str> = args.to_vec();
     let json = take_json(&mut words)?;
     let Some(first) = words.first() else {

@@ -238,17 +238,18 @@ pub async fn port_channels(syncd: &IpcEndpoint, orch: &IpcEndpoint) -> Result<Ve
             group: lag.group,
             description: lag.description.clone(),
             admin_up: lag.admin_up,
-            up: state.map(|s| s.up).unwrap_or_else(|| {
-                lag.members.iter().any(|m| m.enabled && m.oper_up)
-            }),
+            up: state
+                .map(|s| s.up)
+                .unwrap_or_else(|| lag.members.iter().any(|m| m.enabled && m.oper_up)),
             lacp: state.map(|s| s.lacp).unwrap_or(true),
             active_mode: state.map(|s| s.active_mode).unwrap_or(false),
             bundled: state.map(|s| s.bundled).unwrap_or_else(|| {
-                lag.members.iter().filter(|m| m.enabled && m.oper_up).count() as u32
+                lag.members
+                    .iter()
+                    .filter(|m| m.enabled && m.oper_up)
+                    .count() as u32
             }),
-            total: state
-                .map(|s| s.total)
-                .unwrap_or(lag.members.len() as u32),
+            total: state.map(|s| s.total).unwrap_or(lag.members.len() as u32),
             min_links: state.map(|s| s.min_links).unwrap_or(0),
             fallback_mode: state.map(|s| s.fallback_mode.clone()).unwrap_or_default(),
             fallback_timeout_secs: state.map(|s| s.fallback_timeout_secs).unwrap_or(90),
@@ -315,10 +316,7 @@ pub async fn stp_bridge(orch: &IpcEndpoint) -> Result<super::model::StpBridge> {
 }
 
 /// One snooping family's view from orch.
-pub async fn snooping(
-    orch: &IpcEndpoint,
-    family: &str,
-) -> Result<super::model::SnoopingView> {
+pub async fn snooping(orch: &IpcEndpoint, family: &str) -> Result<super::model::SnoopingView> {
     let state = orch_client(orch)
         .await?
         .get_snooping_state(pb::GetSnoopingStateRequest {

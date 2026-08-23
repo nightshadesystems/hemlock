@@ -245,7 +245,9 @@ impl Engine {
             inner: inner.clone(),
             wake: wake_tx,
         };
-        tokio::spawn(run(inner, links_rx, pdu_in_rx, pdu_out_tx, gates_tx, wake_rx));
+        tokio::spawn(run(
+            inner, links_rx, pdu_in_rx, pdu_out_tx, gates_tx, wake_rx,
+        ));
         (
             engine,
             EngineIo {
@@ -267,8 +269,7 @@ impl Engine {
             let now = Instant::now();
             inner.system_priority = system_priority;
             let link_states = inner.link_states.clone();
-            let wanted: std::collections::BTreeSet<u16> =
-                configs.iter().map(|c| c.group).collect();
+            let wanted: std::collections::BTreeSet<u16> = configs.iter().map(|c| c.group).collect();
             inner.lags.retain(|group, _| wanted.contains(group));
             for config in configs {
                 let group = config.group;
@@ -296,8 +297,7 @@ impl Engine {
                         for (name, member_config) in &config.members {
                             let mut member =
                                 Member::new(member_config.clone(), port_number_of(name));
-                            member.link_up =
-                                link_states.get(name).copied().unwrap_or(false);
+                            member.link_up = link_states.get(name).copied().unwrap_or(false);
                             members.insert(name.clone(), member);
                         }
                         inner.lags.insert(
@@ -316,9 +316,7 @@ impl Engine {
             inner.port_to_lag = inner
                 .lags
                 .iter()
-                .flat_map(|(group, lag)| {
-                    lag.members.keys().map(move |name| (name.clone(), *group))
-                })
+                .flat_map(|(group, lag)| lag.members.keys().map(move |name| (name.clone(), *group)))
                 .collect();
         }
         let _ = self.wake.send(());
@@ -355,16 +353,18 @@ impl Engine {
                         .next()
                         .map(|m| m.mode == Mode::Active)
                         .unwrap_or(false);
-                    let bundled =
-                        lag.members.values().filter(|m| m.bundled && !m.individual).count() as u32;
+                    let bundled = lag
+                        .members
+                        .values()
+                        .filter(|m| m.bundled && !m.individual)
+                        .count() as u32;
                     LagSnapshot {
                         group: lag.config.group,
                         lacp,
                         active_mode,
                         bundled,
                         total: lag.members.len() as u32,
-                        up: bundled > 0
-                            || lag.members.values().any(|m| m.bundled && m.individual),
+                        up: bundled > 0 || lag.members.values().any(|m| m.bundled && m.individual),
                         min_links: lag.config.min_links,
                         fallback: lag.config.fallback,
                         fallback_timeout: lag.config.fallback_timeout,
@@ -387,10 +387,7 @@ impl Engine {
                                     },
                                     rate_fast: member.config.rate_fast,
                                     actor_state: actor_state_bits(member, current),
-                                    partner_state: member
-                                        .partner
-                                        .map(|p| p.state)
-                                        .unwrap_or(0),
+                                    partner_state: member.partner.map(|p| p.state).unwrap_or(0),
                                     partner_system: member
                                         .partner
                                         .filter(|_| current)
@@ -468,7 +465,7 @@ fn encode_pdu(
     frame.extend_from_slice(&LACP_ETHERTYPE.to_be_bytes());
     frame.push(0x01); // subtype: LACP
     frame.push(0x01); // version
-    // Actor TLV.
+                      // Actor TLV.
     frame.push(0x01);
     frame.push(20);
     frame.extend_from_slice(&system_priority.to_be_bytes());
@@ -772,7 +769,10 @@ mod tests {
 
     /// Wire two engines back-to-back: every frame engine A emits on a
     /// port arrives at engine B on the same port name, and vice versa.
-    fn cross_connect(mut a: EngineIo, mut b: EngineIo) -> (
+    fn cross_connect(
+        mut a: EngineIo,
+        mut b: EngineIo,
+    ) -> (
         mpsc::UnboundedSender<LinkEvent>,
         mpsc::UnboundedSender<LinkEvent>,
         mpsc::UnboundedReceiver<GateUpdate>,
@@ -814,8 +814,14 @@ mod tests {
         let (b, b_io) = Engine::spawn([0x02, 0, 0, 0, 0, 0xbb]);
         let (a_links, b_links, mut a_gates, _b_gates) = cross_connect(a_io, b_io);
 
-        a.set_configs(32768, vec![lag(1, Mode::Active, &["Ethernet49", "Ethernet50"])]);
-        b.set_configs(32768, vec![lag(1, Mode::Active, &["Ethernet49", "Ethernet50"])]);
+        a.set_configs(
+            32768,
+            vec![lag(1, Mode::Active, &["Ethernet49", "Ethernet50"])],
+        );
+        b.set_configs(
+            32768,
+            vec![lag(1, Mode::Active, &["Ethernet49", "Ethernet50"])],
+        );
         for links in [&a_links, &b_links] {
             for port in ["Ethernet49", "Ethernet50"] {
                 links
@@ -841,7 +847,10 @@ mod tests {
         let gates = latest_gates(&mut a_gates);
         assert_eq!(
             gates[&1].members,
-            vec![("Ethernet49".to_string(), true), ("Ethernet50".to_string(), true)]
+            vec![
+                ("Ethernet49".to_string(), true),
+                ("Ethernet50".to_string(), true)
+            ]
         );
 
         // Partner loses a link: that member unbundles on both sides.
@@ -889,7 +898,10 @@ mod tests {
         let mut config = lag(1, Mode::Active, &["Ethernet49", "Ethernet50"]);
         config.min_links = 2;
         a.set_configs(32768, vec![config.clone()]);
-        b.set_configs(32768, vec![lag(1, Mode::Active, &["Ethernet49", "Ethernet50"])]);
+        b.set_configs(
+            32768,
+            vec![lag(1, Mode::Active, &["Ethernet49", "Ethernet50"])],
+        );
         // Only one link is up: below min-links, nothing forwards.
         for links in [&a_links, &b_links] {
             links
@@ -936,8 +948,16 @@ mod tests {
         let lag_state = &snapshot.lags[0];
         assert!(lag_state.fallback_active);
         assert!(lag_state.up, "individual member forwards");
-        let m49 = lag_state.members.iter().find(|m| m.port == "Ethernet49").unwrap();
-        let m50 = lag_state.members.iter().find(|m| m.port == "Ethernet50").unwrap();
+        let m49 = lag_state
+            .members
+            .iter()
+            .find(|m| m.port == "Ethernet49")
+            .unwrap();
+        let m50 = lag_state
+            .members
+            .iter()
+            .find(|m| m.port == "Ethernet50")
+            .unwrap();
         assert_eq!(m49.status, "individual", "lowest port number wins");
         assert_eq!(m50.status, "standby");
     }

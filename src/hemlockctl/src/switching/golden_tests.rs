@@ -184,4 +184,3 @@ fn snooping() {
         include_str!("../../tests/golden/snooping.json"),
     );
 }
-

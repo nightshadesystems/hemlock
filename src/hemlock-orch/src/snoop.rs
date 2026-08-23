@@ -238,9 +238,7 @@ impl Engine {
             let enabled = !inner.config.disabled && !config.disabled;
             let other_querier = state
                 .and_then(|s| s.other_querier)
-                .is_some_and(|(_, at)| {
-                    now.saturating_duration_since(at) < inner.querier_hold()
-                });
+                .is_some_and(|(_, at)| now.saturating_duration_since(at) < inner.querier_hold());
             vlans.push(VlanSnapshot {
                 vlan,
                 enabled,
@@ -277,8 +275,7 @@ impl Engine {
 impl Inner {
     /// How long group membership lasts without a refresh.
     fn membership_hold(&self) -> Duration {
-        self.config.query_interval * u32::from(self.config.robustness)
-            + Duration::from_secs(10)
+        self.config.query_interval * u32::from(self.config.robustness) + Duration::from_secs(10)
     }
 
     /// How long a dynamic mrouter / foreign querier stays valid.
@@ -442,8 +439,7 @@ fn step(
                 let leave_expired = member
                     .pending_leave
                     .is_some_and(|at| now.saturating_duration_since(at) >= last_member);
-                let aged =
-                    now.saturating_duration_since(member.last_report) >= membership_hold;
+                let aged = now.saturating_duration_since(member.last_report) >= membership_hold;
                 !(leave_expired || aged)
             });
         }
@@ -497,7 +493,14 @@ fn step(
         // when the VLAN actually has one (or runs our querier).
         let config = inner.config.vlans.get(&vlan).cloned().unwrap_or_default();
         let restrict = enabled && (!mrouter_set.is_empty() || config.querier);
-        let push = (restrict, if restrict { mrouter_set.clone() } else { Vec::new() });
+        let push = (
+            restrict,
+            if restrict {
+                mrouter_set.clone()
+            } else {
+                Vec::new()
+            },
+        );
         if state.pushed_mrouters.as_ref() != Some(&push) {
             state.pushed_mrouters = Some(push.clone());
             let _ = mrouters_out.send(MrouterUpdate {
@@ -652,8 +655,10 @@ fn parse_mld(frame: &[u8]) -> Vec<Message> {
                 }
                 let record_type = icmp[record_at];
                 let aux_len = usize::from(icmp[record_at + 1]) * 4;
-                let sources =
-                    usize::from(u16::from_be_bytes([icmp[record_at + 2], icmp[record_at + 3]]));
+                let sources = usize::from(u16::from_be_bytes([
+                    icmp[record_at + 2],
+                    icmp[record_at + 3],
+                ]));
                 let group = group_at(record_at + 4);
                 match record_type {
                     1 | 3 if sources == 0 => out.push(Message::Leave { group }),
@@ -818,10 +823,18 @@ mod tests {
 
         // Two hosts join on different ports.
         io.packet_in
-            .send(("Ethernet1".into(), 10, v2_report("10.0.10.5".parse().unwrap(), group)))
+            .send((
+                "Ethernet1".into(),
+                10,
+                v2_report("10.0.10.5".parse().unwrap(), group),
+            ))
             .unwrap();
         io.packet_in
-            .send(("Ethernet3".into(), 10, v2_report("10.0.10.6".parse().unwrap(), group)))
+            .send((
+                "Ethernet3".into(),
+                10,
+                v2_report("10.0.10.6".parse().unwrap(), group),
+            ))
             .unwrap();
         tokio::time::sleep(Duration::from_millis(800)).await;
         let snapshot = engine.snapshot().unwrap();
@@ -836,7 +849,11 @@ mod tests {
 
         // Fast-leave drops the member immediately.
         io.packet_in
-            .send(("Ethernet1".into(), 10, v2_leave("10.0.10.5".parse().unwrap(), group)))
+            .send((
+                "Ethernet1".into(),
+                10,
+                v2_leave("10.0.10.5".parse().unwrap(), group),
+            ))
             .unwrap();
         tokio::time::sleep(Duration::from_millis(800)).await;
         let snapshot = engine.snapshot().unwrap();
@@ -870,9 +887,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1600)).await;
         let (port, frame) = io.packet_out.try_recv().unwrap();
         assert_eq!(port, "Ethernet2");
-        assert_eq!(parse(Family::Igmp, &frame), vec![Message::Query {
-            source: "10.0.20.1".parse().unwrap()
-        }]);
+        assert_eq!(
+            parse(Family::Igmp, &frame),
+            vec![Message::Query {
+                source: "10.0.20.1".parse().unwrap()
+            }]
+        );
         assert!(engine.snapshot().unwrap().vlans[0].querier_active);
 
         // A lower-addressed querier appears: we yield, and its port
@@ -882,7 +902,9 @@ mod tests {
             [0x02, 0, 0, 0, 0, 9],
             "10.0.20.0".parse().unwrap(),
         );
-        io.packet_in.send(("Ethernet7".into(), 20, foreign)).unwrap();
+        io.packet_in
+            .send(("Ethernet7".into(), 20, foreign))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(800)).await;
         let snapshot = engine.snapshot().unwrap();
         let vlan = &snapshot.vlans[0];
@@ -901,7 +923,11 @@ mod tests {
         // Members' l2mc outputs include the mrouter port.
         let group: Ipv4Addr = "239.20.0.7".parse().unwrap();
         io.packet_in
-            .send(("Ethernet2".into(), 20, v2_report("10.0.20.9".parse().unwrap(), group)))
+            .send((
+                "Ethernet2".into(),
+                20,
+                v2_report("10.0.20.9".parse().unwrap(), group),
+            ))
             .unwrap();
         tokio::time::sleep(Duration::from_millis(800)).await;
         let updates = drain_groups(&mut io.groups);

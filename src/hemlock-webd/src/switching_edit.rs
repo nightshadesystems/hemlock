@@ -205,11 +205,9 @@ pub fn apply_lag_edit(tree: &mut ConfigTree, edit: &LagEdit) -> Result<(), Strin
                         ConfigTree::remove_leaf(lacp, "rate");
                     }
                     match member.port_priority {
-                        Some(priority) => ConfigTree::set_leaf(
-                            lacp,
-                            "port-priority",
-                            vec![priority.to_string()],
-                        ),
+                        Some(priority) => {
+                            ConfigTree::set_leaf(lacp, "port-priority", vec![priority.to_string()])
+                        }
                         None => ConfigTree::remove_leaf(lacp, "port-priority"),
                     }
                 } else {
@@ -407,9 +405,8 @@ pub fn apply_stp_edit(tree: &mut ConfigTree, edit: &StpEdit) -> Result<(), Strin
         numeric(stp, "hello-time", edit.hello_time.map(u32::from));
         numeric(stp, "max-age", edit.max_age.map(u32::from));
         numeric(stp, "forward-time", edit.forward_time.map(u32::from));
-        let wants_mst = edit.mst_name.is_some()
-            || edit.mst_revision.is_some()
-            || edit.instances.is_some();
+        let wants_mst =
+            edit.mst_name.is_some() || edit.mst_revision.is_some() || edit.instances.is_some();
         if wants_mst {
             let mst = ConfigTree::ensure_block(stp, "mst", &[]);
             if let Some(name) = &edit.mst_name {
@@ -512,7 +509,10 @@ pub struct MacTableEdit {
 }
 
 pub fn apply_mac_table_edit(tree: &mut ConfigTree, edit: &MacTableEdit) -> Result<(), String> {
-    if edit.aging_time.is_none() && !edit.clear_aging && edit.set.is_empty() && edit.delete.is_empty()
+    if edit.aging_time.is_none()
+        && !edit.clear_aging
+        && edit.set.is_empty()
+        && edit.delete.is_empty()
     {
         return Err("nothing to change".into());
     }
@@ -729,7 +729,10 @@ pub fn apply_storm_edit(tree: &mut ConfigTree, edit: &StormEdit) -> Result<(), S
         if !(set.name.starts_with("Ethernet") || set.name.starts_with("Port-Channel")) {
             return Err(format!("{}: not a storm-control port", set.name));
         }
-        if !matches!(set.kind.as_str(), "broadcast" | "multicast" | "unknown-unicast") {
+        if !matches!(
+            set.kind.as_str(),
+            "broadcast" | "multicast" | "unknown-unicast"
+        ) {
             return Err(format!("bad traffic class {:?}", set.kind));
         }
         if !set.level.is_empty() {

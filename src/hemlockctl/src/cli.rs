@@ -327,9 +327,13 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             );
             println!("  show version                           software / platform");
             println!("  show vlan [id <set>|summary]           VLAN table");
-            println!("  show mac address-table [...]           MAC table (count, aging-time, filters)");
+            println!(
+                "  show mac address-table [...]           MAC table (count, aging-time, filters)"
+            );
             println!("  show storm-control                     storm-control levels and drops");
-            println!("  show mirror                            mirror sessions (monitor session ok)");
+            println!(
+                "  show mirror                            mirror sessions (monitor session ok)"
+            );
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear mac-table [vlan <id>] [interface <port>]   flush dynamic MACs");
             println!("  configure | conf                       enter configuration mode");
@@ -543,7 +547,9 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces Port-Channel<n> [min-links <0-8> | lacp fallback <static|individual>");
             println!("                                  | lacp fallback-timeout <1-900> | switchport ...]");
             println!("  set vlans vlan <id> [description <text> | state <active|suspend>]");
-            println!("  set protocols spanning-tree [mode <mstp|rstp|none>|priority|hello-time|max-age|");
+            println!(
+                "  set protocols spanning-tree [mode <mstp|rstp|none>|priority|hello-time|max-age|"
+            );
             println!("                               forward-time|mst name|mst revision|mst instance ...]");
             println!("  set protocols <igmp-snooping|mld-snooping> [disable|robustness <1-3>|vlan <id> ...]");
             println!("  set protocols lacp system-priority <0-65535>");
@@ -554,7 +560,9 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set system http                               web console over HTTP");
             println!("  set system https                              web console over HTTPS (self-signed cert)");
             println!("  set routing static <prefix> <next-hop>        static route");
-            println!("  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport|");
+            println!(
+                "  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport|"
+            );
             println!("                            channel-group|lacp|spanning-tree|storm-control|min-links ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
@@ -1044,9 +1052,7 @@ async fn config_channel_group(
         || format!("% Usage: set interfaces {port} channel-group <1-64> mode <active|passive|on>");
     if delete {
         if !words.is_empty() {
-            return Err(format!(
-                "% Usage: delete interfaces {port} channel-group"
-            ));
+            return Err(format!("% Usage: delete interfaces {port} channel-group"));
         }
         return edit_interface(endpoints, port, |eth| {
             ConfigTree::remove_leaf(eth, "channel-group");
@@ -1185,7 +1191,10 @@ async fn config_port_stp(
         }
         return Err(usage());
     }
-    let keyword = resolve(words[0], &["portfast", "bpduguard", "cost", "port-priority"])?;
+    let keyword = resolve(
+        words[0],
+        &["portfast", "bpduguard", "cost", "port-priority"],
+    )?;
     match keyword {
         marker @ ("portfast" | "bpduguard") => {
             if words.len() > 1 {
@@ -2218,7 +2227,13 @@ async fn config_mac_table(
                         return Err(usage());
                     };
                     let port = canonical_l2_port(endpoints, raw_port).await?;
-                    vec![mac.clone(), "vlan".into(), id.clone(), "interface".into(), port]
+                    vec![
+                        mac.clone(),
+                        "vlan".into(),
+                        id.clone(),
+                        "interface".into(),
+                        port,
+                    ]
                 }
                 "drop" => vec![mac.clone(), "vlan".into(), id.clone(), "drop".into()],
                 _ => unreachable!(),
@@ -2633,7 +2648,10 @@ mod tests {
             Some("Port-Channel1".into())
         );
         assert_eq!(port_channel_interface("Po1"), Some("Port-Channel1".into()));
-        assert_eq!(port_channel_interface("po64"), Some("Port-Channel64".into()));
+        assert_eq!(
+            port_channel_interface("po64"),
+            Some("Port-Channel64".into())
+        );
         assert_eq!(port_channel_interface("p1"), Some("Port-Channel1".into()));
         assert_eq!(port_channel_interface("po0"), None);
         assert_eq!(port_channel_interface("po65"), None);

@@ -744,7 +744,11 @@ mod tests {
 
     /// A full-mesh wiring harness: (bridge index, port) pairs connected
     /// pairwise; frames sent by one side arrive at the other.
-    fn connect(mut io_a: EngineIo, a_map: BTreeMap<String, (usize, String)>, targets: Vec<mpsc::UnboundedSender<(String, Vec<u8>)>>) {
+    fn connect(
+        mut io_a: EngineIo,
+        a_map: BTreeMap<String, (usize, String)>,
+        targets: Vec<mpsc::UnboundedSender<(String, Vec<u8>)>>,
+    ) {
         tokio::spawn(async move {
             while let Some((port, frame)) = io_a.bpdu_out.recv().await {
                 if let Some((peer, peer_port)) = a_map.get(&port) {
@@ -777,21 +781,32 @@ mod tests {
         // Port wiring: X's Ethernet<n> connects to peer n.
         // A: Et2 -> B.Et1, Et3 -> C.Et1; B: Et1 -> A.Et2, Et3 -> C.Et2;
         // C: Et1 -> A.Et3, Et2 -> B.Et3.
-        let map =
-            |pairs: &[(&str, usize, &str)]| -> BTreeMap<String, (usize, String)> {
-                pairs
-                    .iter()
-                    .map(|(port, peer, peer_port)| {
-                        ((*port).to_string(), (*peer, (*peer_port).to_string()))
-                    })
-                    .collect()
-            };
+        let map = |pairs: &[(&str, usize, &str)]| -> BTreeMap<String, (usize, String)> {
+            pairs
+                .iter()
+                .map(|(port, peer, peer_port)| {
+                    ((*port).to_string(), (*peer, (*peer_port).to_string()))
+                })
+                .collect()
+        };
         let links_a = io_a.links.clone();
         let links_b = io_b.links.clone();
         let links_c = io_c.links.clone();
-        connect(io_a, map(&[("Ethernet2", 1, "Ethernet1"), ("Ethernet3", 2, "Ethernet1")]), ins.clone());
-        connect(io_b, map(&[("Ethernet1", 0, "Ethernet2"), ("Ethernet3", 2, "Ethernet2")]), ins.clone());
-        connect(io_c, map(&[("Ethernet1", 0, "Ethernet3"), ("Ethernet2", 1, "Ethernet3")]), ins.clone());
+        connect(
+            io_a,
+            map(&[("Ethernet2", 1, "Ethernet1"), ("Ethernet3", 2, "Ethernet1")]),
+            ins.clone(),
+        );
+        connect(
+            io_b,
+            map(&[("Ethernet1", 0, "Ethernet2"), ("Ethernet3", 2, "Ethernet2")]),
+            ins.clone(),
+        );
+        connect(
+            io_c,
+            map(&[("Ethernet1", 0, "Ethernet3"), ("Ethernet2", 1, "Ethernet3")]),
+            ins.clone(),
+        );
 
         for port in ["Ethernet2", "Ethernet3"] {
             links_a.send(link(port, true)).unwrap();

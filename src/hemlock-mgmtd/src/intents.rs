@@ -51,7 +51,6 @@ pub struct Intents {
     pub warnings: Vec<String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SviIntent {
     /// Interface address in CIDR form; gives the VLAN a router
@@ -167,7 +166,6 @@ pub enum LagFallback {
     Individual,
 }
 
-
 /// `protocols { lacp { system-priority <n> } }`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LacpGlobalIntent {
@@ -202,7 +200,6 @@ pub enum StpMode {
     Rstp,
     None,
 }
-
 
 /// Per-port spanning-tree config.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -285,7 +282,6 @@ pub enum MirrorDirection {
     #[default]
     Both,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MgmtIntent {
@@ -692,10 +688,7 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
             if let Some(cg) = &port.channel_group {
                 return Err(IntentError::BadMirror {
                     session: *session,
-                    reason: format!(
-                        "destination {dest} is a member of Port-Channel{}",
-                        cg.group
-                    ),
+                    reason: format!("destination {dest} is a member of Port-Channel{}", cg.group),
                 });
             }
             if port.address.is_some() {
@@ -774,7 +767,7 @@ fn switchport(children: &[Item], name: &str) -> Result<Option<SwitchportIntent>,
             || ConfigTree::leaf_value(sp, "native-vlan").is_some())
     {
         return Err(bad(
-            "dot1q-tunnel mode excludes trunk configuration".to_string(),
+            "dot1q-tunnel mode excludes trunk configuration".to_string()
         ));
     }
     // Phrase forms (`access vlan 10`), with the hyphenated legacy leaves
@@ -1227,7 +1220,7 @@ fn stp(items: &[Item]) -> Result<StpIntent, IntentError> {
         Some("none") => StpMode::None,
         Some("rapid-pvst") => {
             return Err(bad(
-                "mode rapid-pvst is not supported (use mstp or rstp)".into(),
+                "mode rapid-pvst is not supported (use mstp or rstp)".into()
             ));
         }
         Some(other) => {
@@ -1497,8 +1490,7 @@ fn mirror(items: &[Item]) -> Result<BTreeMap<u8, MirrorIntent>, IntentError> {
                 "unrecognized block {n:?}"
             )));
         }
-        let session = parse_int(key, 1u8..=4, "session")
-            .map_err(IntentError::BadMirrorBlock)?;
+        let session = parse_int(key, 1u8..=4, "session").map_err(IntentError::BadMirrorBlock)?;
         let bad = |reason: String| IntentError::BadMirror { session, reason };
         let mut intent = MirrorIntent::default();
         for item in children {
@@ -2028,12 +2020,7 @@ impl LagChange {
     pub fn describe(&self) -> String {
         match &self.ensure {
             Some(ensure) => {
-                let members = ensure
-                    .members
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let members = ensure.members.keys().cloned().collect::<Vec<_>>().join(",");
                 let mode = ensure
                     .members
                     .values()
@@ -2145,7 +2132,10 @@ pub fn diff_stp(running: &Intents, candidate: &Intents) -> Option<StpState> {
 
 /// Snooping delta for one family (IGMP or MLD): the full wanted state
 /// exactly when it changed.
-pub fn diff_snooping(running: &SnoopingIntent, candidate: &SnoopingIntent) -> Option<SnoopingIntent> {
+pub fn diff_snooping(
+    running: &SnoopingIntent,
+    candidate: &SnoopingIntent,
+) -> Option<SnoopingIntent> {
     (running != candidate).then(|| candidate.clone())
 }
 
@@ -2191,7 +2181,10 @@ impl MacTableChanges {
 /// Diff the MAC-table family, candidate against running.
 pub fn diff_mac_table(running: &Intents, candidate: &Intents) -> MacTableChanges {
     let mut changes = MacTableChanges::default();
-    let now = running.mac_table.aging_time.unwrap_or(DEFAULT_FDB_AGING_SECS);
+    let now = running
+        .mac_table
+        .aging_time
+        .unwrap_or(DEFAULT_FDB_AGING_SECS);
     let want = candidate
         .mac_table
         .aging_time
@@ -2201,9 +2194,7 @@ pub fn diff_mac_table(running: &Intents, candidate: &Intents) -> MacTableChanges
     }
     for (key, target) in &candidate.mac_table.statics {
         if running.mac_table.statics.get(key) != Some(target) {
-            changes
-                .add
-                .push((key.0.clone(), key.1, target.clone()));
+            changes.add.push((key.0.clone(), key.1, target.clone()));
         }
     }
     for key in running.mac_table.statics.keys() {
@@ -2227,7 +2218,11 @@ pub struct StormChange {
 impl StormChange {
     pub fn describe(&self) -> String {
         match &self.level {
-            Some(level) => format!("{}: storm-control {} level {level}", self.name, self.kind.word()),
+            Some(level) => format!(
+                "{}: storm-control {} level {level}",
+                self.name,
+                self.kind.word()
+            ),
             None => format!("{}: storm-control {} removed", self.name, self.kind.word()),
         }
     }
@@ -2303,16 +2298,15 @@ impl MirrorChange {
     pub fn describe(&self) -> String {
         match &self.ensure {
             Some(mirror) => {
-                let sources = mirror
-                    .sources
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let sources = mirror.sources.keys().cloned().collect::<Vec<_>>().join(",");
                 format!(
                     "mirror session {}: sources {} -> {}",
                     self.session,
-                    if sources.is_empty() { "-".into() } else { sources },
+                    if sources.is_empty() {
+                        "-".into()
+                    } else {
+                        sources
+                    },
                     mirror.destination.as_deref().unwrap_or("-"),
                 )
             }
@@ -3034,19 +3028,17 @@ switching {
     #[test]
     fn channel_group_semantics() {
         // Member ports carry no switchport of their own.
-        let tree = parse(
-            "interfaces { Ethernet1 { channel-group 1 mode active\nswitchport { } } }",
-        )
-        .unwrap();
+        let tree =
+            parse("interfaces { Ethernet1 { channel-group 1 mode active\nswitchport { } } }")
+                .unwrap();
         assert!(matches!(
             extract(&tree),
             Err(IntentError::MemberConfigConflict { .. })
         ));
         // Address and channel-group are mutually exclusive.
-        let tree = parse(
-            "interfaces { Ethernet1 { channel-group 1 mode active\naddress 10.0.0.1/24 } }",
-        )
-        .unwrap();
+        let tree =
+            parse("interfaces { Ethernet1 { channel-group 1 mode active\naddress 10.0.0.1/24 } }")
+                .unwrap();
         assert!(matches!(
             extract(&tree),
             Err(IntentError::AddressChannelGroupConflict { .. })
@@ -3079,10 +3071,9 @@ switching {
         let intents = intents_of("interfaces { Port-Channel2 { } }");
         assert_eq!(intents.warnings, ["Port-Channel2 has no member ports"]);
         // The exact member-conflict message from the spec.
-        let tree = parse(
-            "interfaces { Ethernet49 { channel-group 1 mode active\nswitchport { } } }",
-        )
-        .unwrap();
+        let tree =
+            parse("interfaces { Ethernet49 { channel-group 1 mode active\nswitchport { } } }")
+                .unwrap();
         assert_eq!(
             extract(&tree).unwrap_err().to_string(),
             "Ethernet49: member of Port-Channel1; configure the Port-Channel"
@@ -3137,11 +3128,9 @@ switching {
         .unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadStp(_))));
         // Instance ids are 1..15 (0 is implicit).
-        let tree =
-            parse("protocols { spanning-tree { mst { instance 0 vlans 10 } } }").unwrap();
+        let tree = parse("protocols { spanning-tree { mst { instance 0 vlans 10 } } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadStp(_))));
-        let tree =
-            parse("protocols { spanning-tree { mst { instance 16 vlans 10 } } }").unwrap();
+        let tree = parse("protocols { spanning-tree { mst { instance 16 vlans 10 } } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadStp(_))));
         // Timer ranges.
         let tree = parse("protocols { spanning-tree { hello-time 11 } }").unwrap();
@@ -3151,19 +3140,27 @@ switching {
         // Port-level: priority must be a multiple of 16.
         let tree =
             parse("interfaces { Ethernet1 { spanning-tree { port-priority 100 } } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadPortStp { .. })));
-        let intents =
-            intents_of("interfaces { Ethernet1 { spanning-tree { port-priority 112\ncost 20000 } } }");
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadPortStp { .. })
+        ));
+        let intents = intents_of(
+            "interfaces { Ethernet1 { spanning-tree { port-priority 112\ncost 20000 } } }",
+        );
         let stp = intents.ports["Ethernet1"].spanning_tree.as_ref().unwrap();
         assert_eq!(stp.port_priority, Some(112));
         assert_eq!(stp.cost, Some(20000));
         // rstp and none parse.
         assert_eq!(
-            intents_of("protocols { spanning-tree { mode rstp } }").stp.mode,
+            intents_of("protocols { spanning-tree { mode rstp } }")
+                .stp
+                .mode,
             StpMode::Rstp
         );
         assert_eq!(
-            intents_of("protocols { spanning-tree { mode none } }").stp.mode,
+            intents_of("protocols { spanning-tree { mode none } }")
+                .stp
+                .mode,
             StpMode::None
         );
     }
@@ -3182,14 +3179,13 @@ switching {
         assert!(parse_storm_level("banana").is_err());
         assert!(parse_storm_level("").is_err());
 
-        let tree = parse("interfaces { Ethernet1 { storm-control { broadcast level 101 } } }")
-            .unwrap();
+        let tree =
+            parse("interfaces { Ethernet1 { storm-control { broadcast level 101 } } }").unwrap();
         assert!(matches!(
             extract(&tree),
             Err(IntentError::BadStormControl { .. })
         ));
-        let tree =
-            parse("interfaces { Ethernet1 { storm-control { banana level 10 } } }").unwrap();
+        let tree = parse("interfaces { Ethernet1 { storm-control { banana level 10 } } }").unwrap();
         assert!(matches!(
             extract(&tree),
             Err(IntentError::BadStormControl { .. })
@@ -3203,14 +3199,23 @@ switching {
         assert!(intents.igmp_snooping.disabled);
         assert_eq!(intents.igmp_snooping.robustness, Some(3));
         let tree = parse("protocols { igmp-snooping { robustness 4 } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadSnooping { .. })));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadSnooping { .. })
+        ));
         // Querier addresses must match the family.
         let tree =
             parse("protocols { igmp-snooping { vlan 10 { querier address banana } } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadSnooping { .. })));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadSnooping { .. })
+        ));
         let tree =
             parse("protocols { mld-snooping { vlan 10 { querier address 10.0.0.1 } } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadSnooping { .. })));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadSnooping { .. })
+        ));
         let intents =
             intents_of("protocols { mld-snooping { vlan 10 { querier address fe80::1 } } }");
         assert_eq!(
@@ -3247,9 +3252,7 @@ switching {
         let tree = parse("switching { mac-table { aging-time 1000001 } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadMacTable(_))));
         // Statics normalize their MACs; drop targets parse.
-        let intents = intents_of(
-            "switching { mac-table { static 0050.56BE.EF01 vlan 10 drop } }",
-        );
+        let intents = intents_of("switching { mac-table { static 0050.56BE.EF01 vlan 10 drop } }");
         assert_eq!(
             intents.mac_table.statics[&("00:50:56:be:ef:01".into(), 10)],
             FdbTarget::Drop
@@ -3286,7 +3289,10 @@ switching {
     fn mirror_validation() {
         // Session ids are 1..4.
         let tree = parse("switching { mirror { session 5 { } } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadMirrorBlock(_))));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadMirrorBlock(_))
+        ));
         // A destination may not be a source anywhere.
         let tree = parse(
             "switching { mirror { session 1 { source Ethernet1\ndestination Ethernet2 }\nsession 2 { source Ethernet2\ndestination Ethernet3 } } }",
@@ -3339,10 +3345,9 @@ switching {
         assert_eq!(sp.mode, SwitchportMode::Dot1qTunnel);
         assert_eq!(sp.access_vlan, Some(100));
         // Trunk leaves are excluded under dot1q-tunnel.
-        let tree = parse(
-            "interfaces { Ethernet1 { switchport { mode dot1q-tunnel\ntrunk vlans 10 } } }",
-        )
-        .unwrap();
+        let tree =
+            parse("interfaces { Ethernet1 { switchport { mode dot1q-tunnel\ntrunk vlans 10 } } }")
+                .unwrap();
         assert!(matches!(
             extract(&tree),
             Err(IntentError::BadSwitchport { .. })
@@ -3372,10 +3377,7 @@ switching {
         assert_eq!(changes[0].group, 1);
         let ensure = changes[0].ensure.as_ref().unwrap();
         assert_eq!(ensure.lag.min_links, Some(1));
-        assert_eq!(
-            ensure.members.keys().collect::<Vec<_>>(),
-            ["Ethernet49"]
-        );
+        assert_eq!(ensure.members.keys().collect::<Vec<_>>(), ["Ethernet49"]);
         assert_eq!(
             changes[0].describe(),
             "Port-Channel1: members Ethernet49 mode active"
@@ -3421,9 +3423,7 @@ switching {
         let back = diff_stp(&candidate, &running).unwrap();
         assert_eq!(back, StpState::default());
         // A Po's port config joins under its display name.
-        let with_po = intents_of(
-            "interfaces { Port-Channel1 { spanning-tree { cost 10000 } } }",
-        );
+        let with_po = intents_of("interfaces { Port-Channel1 { spanning-tree { cost 10000 } } }");
         let state = diff_stp(&running, &with_po).unwrap();
         assert_eq!(state.ports["Port-Channel1"].cost, Some(10000));
     }

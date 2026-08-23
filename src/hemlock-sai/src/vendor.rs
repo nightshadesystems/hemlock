@@ -96,10 +96,7 @@ unsafe extern "C" fn profile_get_next_value(
     }
 }
 
-unsafe extern "C" fn on_fdb_event(
-    count: u32,
-    data: *const ffi::sai_fdb_event_notification_data_t,
-) {
+unsafe extern "C" fn on_fdb_event(count: u32, data: *const ffi::sai_fdb_event_notification_data_t) {
     let Some(tx) = EVENT_TX.get() else { return };
     if data.is_null() {
         return;
@@ -910,7 +907,9 @@ impl VendorSai {
             let mut attr =
                 Self::zeroed_attr(ffi::_sai_bridge_port_attr_t::SAI_BRIDGE_PORT_ATTR_PORT_ID);
             // SAFETY: single-attr get; non-PORT bridge ports may reject it.
-            let port = unsafe { (get_bridge_port(bridge_port, 1, &mut attr) == 0).then(|| attr.value.oid) };
+            let port = unsafe {
+                (get_bridge_port(bridge_port, 1, &mut attr) == 0).then_some(attr.value.oid)
+            };
             if let Some(port) = port {
                 index.insert(bridge_port, port);
             }
@@ -940,11 +939,7 @@ impl VendorSai {
         }
     }
 
-    fn fdb_entry(
-        &self,
-        vlan: Option<Oid>,
-        mac: [u8; 6],
-    ) -> Result<ffi::sai_fdb_entry_t, SaiError> {
+    fn fdb_entry(&self, vlan: Option<Oid>, mac: [u8; 6]) -> Result<ffi::sai_fdb_entry_t, SaiError> {
         Ok(ffi::sai_fdb_entry_t {
             switch_id: self.switch_oid()?,
             mac_address: mac,
@@ -976,7 +971,10 @@ impl VendorSai {
             let set = (*self.port_api)
                 .set_port_attribute
                 .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
-            check("set_port_attribute(STORM_CONTROL_POLICER_ID)", set(port.0, &a))
+            check(
+                "set_port_attribute(STORM_CONTROL_POLICER_ID)",
+                set(port.0, &a),
+            )
         }
     }
 }
@@ -1940,7 +1938,7 @@ impl SaiBackend for VendorSai {
                 // Rate change: update CIR in place.
                 let mut attr = Self::zeroed_attr(ffi::_sai_policer_attr_t::SAI_POLICER_ATTR_CIR);
                 attr.value.u64_ = kbps * 1000 / 8; // bytes/sec
-                // SAFETY: valid policer api table; attr outlives the call.
+                                                   // SAFETY: valid policer api table; attr outlives the call.
                 unsafe {
                     let set = (*self.policer_api)
                         .set_policer_attribute
@@ -2314,14 +2312,11 @@ impl SaiBackend for VendorSai {
         let state_value = match state {
             StpPortState::Blocking => ffi::_sai_stp_port_state_t::SAI_STP_PORT_STATE_BLOCKING,
             StpPortState::Learning => ffi::_sai_stp_port_state_t::SAI_STP_PORT_STATE_LEARNING,
-            StpPortState::Forwarding => {
-                ffi::_sai_stp_port_state_t::SAI_STP_PORT_STATE_FORWARDING
-            }
+            StpPortState::Forwarding => ffi::_sai_stp_port_state_t::SAI_STP_PORT_STATE_FORWARDING,
         } as i32;
 
         if let Some(existing) = self.stp_ports.get(&(stp_oid, port.0)).copied() {
-            let mut attr =
-                Self::zeroed_attr(ffi::_sai_stp_port_attr_t::SAI_STP_PORT_ATTR_STATE);
+            let mut attr = Self::zeroed_attr(ffi::_sai_stp_port_attr_t::SAI_STP_PORT_ATTR_STATE);
             attr.value.s32 = state_value;
             // SAFETY: valid stp api table; attr outlives the call.
             return unsafe {

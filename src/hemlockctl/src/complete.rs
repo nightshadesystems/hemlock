@@ -128,9 +128,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, ["show", "igmp" | "mld"]) => &["snooping"],
         (CliMode::Operational, ["show", "igmp" | "mld", "snooping"]) => &["groups", "querier"],
         (CliMode::Operational, ["show", "interfaces", rest @ ..]) => interfaces_words(rest),
-        (CliMode::Operational, ["show", "spanning-tree"]) => {
-            &["detail", "blockedports", "mst"]
-        }
+        (CliMode::Operational, ["show", "spanning-tree"]) => &["detail", "blockedports", "mst"],
         (CliMode::Operational, ["show", "spanning-tree", "mst"]) => &["configuration"],
         (CliMode::Operational, ["show", "vlan"]) => &["id", "summary"],
         (CliMode::Operational, ["show", "port-channel"]) => &["summary", "detail", NUM],
@@ -282,14 +280,12 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         }
         (CliMode::Config, ["set" | "delete", "switching", "mac-table", "static"]) => &[ANY],
         (CliMode::Config, ["set" | "delete", "switching", "mac-table", "static", ANY]) => &["vlan"],
-        (
-            CliMode::Config,
-            ["set" | "delete", "switching", "mac-table", "static", ANY, "vlan"],
-        ) => &[NUM],
-        (
-            CliMode::Config,
-            ["set", "switching", "mac-table", "static", ANY, "vlan", NUM],
-        ) => &["interface", "drop"],
+        (CliMode::Config, ["set" | "delete", "switching", "mac-table", "static", ANY, "vlan"]) => {
+            &[NUM]
+        }
+        (CliMode::Config, ["set", "switching", "mac-table", "static", ANY, "vlan", NUM]) => {
+            &["interface", "drop"]
+        }
         (
             CliMode::Config,
             ["set", "switching", "mac-table", "static", ANY, "vlan", NUM, "interface"],
@@ -303,10 +299,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             CliMode::Config,
             ["set" | "delete", "switching", "mirror", "session", NUM, "source" | "destination"],
         ) => &[PORT],
-        (
-            CliMode::Config,
-            ["set", "switching", "mirror", "session", NUM, "source", PORT],
-        ) => &["rx", "tx", "both"],
+        (CliMode::Config, ["set", "switching", "mirror", "session", NUM, "source", PORT]) => {
+            &["rx", "tx", "both"]
+        }
         (CliMode::Config, ["commit"]) => &["confirmed"],
         _ => &[],
     }
@@ -758,7 +753,12 @@ mod tests {
 
     #[test]
     fn switching_suite_interface_paths_complete() {
-        let c = candidates(CliMode::Config, &["set", "interfaces", "Eth1"], "ch", &ports());
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1"],
+            "ch",
+            &ports(),
+        );
         assert_eq!(c, vec!["channel-group".to_string()]);
         let c = candidates(
             CliMode::Config,
@@ -773,7 +773,10 @@ mod tests {
             "",
             &ports(),
         );
-        assert_eq!(c, vec!["rate", "port-priority", "fallback", "fallback-timeout"]);
+        assert_eq!(
+            c,
+            vec!["rate", "port-priority", "fallback", "fallback-timeout"]
+        );
         let c = candidates(
             CliMode::Config,
             &["set", "interfaces", "Po1", "lacp", "fallback"],
@@ -836,7 +839,15 @@ mod tests {
         assert_eq!(c, vec!["disable", "fast-leave", "querier", "mrouter"]);
         let c = candidates(
             CliMode::Config,
-            &["set", "protocols", "igmp-snooping", "vlan", "10", "mrouter", "interface"],
+            &[
+                "set",
+                "protocols",
+                "igmp-snooping",
+                "vlan",
+                "10",
+                "mrouter",
+                "interface",
+            ],
             "Ethernet1",
             &ports(),
         );
@@ -852,14 +863,28 @@ mod tests {
         // The MAC slot is free text; a typed MAC leads to `vlan`.
         let c = candidates(
             CliMode::Config,
-            &["set", "switching", "mac-table", "static", "00:50:56:be:ef:01"],
+            &[
+                "set",
+                "switching",
+                "mac-table",
+                "static",
+                "00:50:56:be:ef:01",
+            ],
             "",
             &ports(),
         );
         assert_eq!(c, vec!["vlan"]);
         let c = candidates(
             CliMode::Config,
-            &["set", "switching", "mac-table", "static", "00:50:56:be:ef:01", "vlan", "10"],
+            &[
+                "set",
+                "switching",
+                "mac-table",
+                "static",
+                "00:50:56:be:ef:01",
+                "vlan",
+                "10",
+            ],
             "",
             &ports(),
         );
@@ -873,7 +898,15 @@ mod tests {
         assert_eq!(c, vec!["source", "destination"]);
         let c = candidates(
             CliMode::Config,
-            &["set", "switching", "mirror", "session", "1", "source", "Eth1"],
+            &[
+                "set",
+                "switching",
+                "mirror",
+                "session",
+                "1",
+                "source",
+                "Eth1",
+            ],
             "",
             &ports(),
         );

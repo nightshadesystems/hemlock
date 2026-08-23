@@ -18,7 +18,9 @@ use hemlock_sai::{
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::state::{name_for, FdbDynamicEntry, PortState, SharedFdb, SharedPorts, SharedVlans, SwitchMeta};
+use crate::state::{
+    name_for, FdbDynamicEntry, PortState, SharedFdb, SharedPorts, SharedVlans, SwitchMeta,
+};
 
 /// One port's stat sweep result.
 pub struct PortStatsSample {
@@ -1002,9 +1004,8 @@ async fn pump_events(
                     debug!(bv_id, "FDB event on unknown VLAN; dropped");
                     continue;
                 };
-                let port_name = port.and_then(|id| {
-                    ports.read().ok().and_then(|table| name_for(&table, id))
-                });
+                let port_name =
+                    port.and_then(|id| ports.read().ok().and_then(|table| name_for(&table, id)));
                 let mac_text = format_mac(mac);
 
                 // Apply to the software mirror.

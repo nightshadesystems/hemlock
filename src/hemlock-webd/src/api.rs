@@ -47,7 +47,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/lags/edit", post(lags_edit))
         .route("/api/spanning-tree", get(spanning_tree))
         .route("/api/spanning-tree/edit", post(spanning_tree_edit))
-        .route("/api/spanning-tree/clear-errdisable", post(clear_errdisable))
+        .route(
+            "/api/spanning-tree/clear-errdisable",
+            post(clear_errdisable),
+        )
         .route("/api/mac-table", get(mac_table))
         .route("/api/mac-table/edit", post(mac_table_edit))
         .route("/api/mac-table/flush", post(mac_table_flush))
