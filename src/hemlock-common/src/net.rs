@@ -47,7 +47,7 @@ pub fn validate_route(prefix: &str, next_hop: &str) -> Result<String, String> {
 }
 
 /// The network address of `addr/len` (host bits cleared).
-fn network(addr: IpAddr, len: u8) -> IpAddr {
+pub fn network(addr: IpAddr, len: u8) -> IpAddr {
     match addr {
         IpAddr::V4(v4) => {
             let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };

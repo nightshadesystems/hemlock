@@ -16,7 +16,7 @@
 
 use tracing::warn;
 
-use crate::intents::{Intents, MgmtChange, OsChanges, RouteChange, SshIntent};
+use crate::intents::{Intents, NetdevChange, OsChanges, RouteChange, SshIntent};
 
 /// mgmtd's sshd drop-in (`10-hemlock-motd.conf` is the image's).
 const SSHD_DROPIN: &str = "/etc/ssh/sshd_config.d/20-hemlock.conf";
@@ -70,6 +70,10 @@ impl OsApplier {
         for change in &changes.management {
             self.apply_management(change);
         }
+        for change in &changes.ports {
+            // A front-panel port's hostif netdev is named after it.
+            apply_netdev(change, &change.name);
+        }
         for route in &changes.routes {
             apply_route(route);
         }
@@ -84,12 +88,25 @@ impl OsApplier {
             return;
         }
         for (name, intent) in &intents.management {
-            self.apply_management(&MgmtChange {
+            self.apply_management(&NetdevChange {
                 name: name.clone(),
                 admin_up: intent.admin_up,
                 set_address: intent.address.clone(),
                 del_address: None,
             });
+        }
+        for (name, intent) in &intents.ports {
+            if intent.address.is_some() {
+                apply_netdev(
+                    &NetdevChange {
+                        name: name.clone(),
+                        admin_up: None,
+                        set_address: intent.address.clone(),
+                        del_address: None,
+                    },
+                    name,
+                );
+            }
         }
         for (prefix, next_hop) in &intents.routes {
             apply_route(&RouteChange {
@@ -101,28 +118,32 @@ impl OsApplier {
         apply_ssh(&intents.ssh);
     }
 
-    fn apply_management(&self, change: &MgmtChange) {
+    fn apply_management(&self, change: &NetdevChange) {
         let Some(dev) = self.os_device(&change.name) else {
             warn!(interface = %change.name, "no OS netdev known; management change skipped");
             return;
         };
-        if let Some(old) = &change.del_address {
-            run("ip", &["addr", "del", old, "dev", dev]);
+        apply_netdev(change, dev);
+    }
+}
+
+fn apply_netdev(change: &NetdevChange, dev: &str) {
+    if let Some(old) = &change.del_address {
+        run("ip", &["addr", "del", old, "dev", dev]);
+    }
+    if let Some(cidr) = &change.set_address {
+        run("ip", &["addr", "replace", cidr, "dev", dev]);
+        // An address implies the link should carry traffic, unless the
+        // config says disabled outright.
+        if change.admin_up != Some(false) {
+            run("ip", &["link", "set", "dev", dev, "up"]);
         }
-        if let Some(cidr) = &change.set_address {
-            run("ip", &["addr", "replace", cidr, "dev", dev]);
-            // An address implies the link should carry traffic, unless
-            // the config says disabled outright.
-            if change.admin_up != Some(false) {
-                run("ip", &["link", "set", "dev", dev, "up"]);
-            }
-        }
-        if let Some(up) = change.admin_up {
-            run(
-                "ip",
-                &["link", "set", "dev", dev, if up { "up" } else { "down" }],
-            );
-        }
+    }
+    if let Some(up) = change.admin_up {
+        run(
+            "ip",
+            &["link", "set", "dev", dev, if up { "up" } else { "down" }],
+        );
     }
 }
 

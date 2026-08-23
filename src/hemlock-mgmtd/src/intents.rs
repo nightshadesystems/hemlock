@@ -31,6 +31,10 @@ pub struct InterfaceIntent {
     /// None = leave the daemon default (up) untouched.
     pub admin_up: Option<bool>,
     pub description: Option<String>,
+    /// Interface address in CIDR form; puts the port in L3 mode
+    /// (router interface + routes in the ASIC, address on the port's
+    /// hostif netdev).
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -63,9 +67,6 @@ pub enum IntentError {
 
     #[error("interface {name}: bad address: {reason}")]
     BadAddress { name: String, reason: String },
-
-    #[error("interface {name}: address is only supported on Management interfaces")]
-    AddressUnsupported { name: String },
 
     #[error("system ssh: {0}")]
     BadSsh(String),
@@ -132,35 +133,32 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
             None => None,
         };
 
+        let address = match ConfigTree::leaf_value(children, "address") {
+            Some(value) => {
+                hemlock_common::net::parse_cidr(value).map_err(|reason| {
+                    IntentError::BadAddress {
+                        name: ifname.clone(),
+                        reason,
+                    }
+                })?;
+                Some(value.to_string())
+            }
+            None => None,
+        };
+
         match kind {
             Kind::Port => {
-                if ConfigTree::leaf_value(children, "address").is_some() {
-                    return Err(IntentError::AddressUnsupported {
-                        name: ifname.clone(),
-                    });
-                }
                 let intent = InterfaceIntent {
                     admin_up,
                     description: ConfigTree::leaf_value(children, "description")
                         .map(str::to_string),
+                    address,
                 };
                 if intents.ports.insert(ifname.clone(), intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
                 }
             }
             Kind::Management => {
-                let address = match ConfigTree::leaf_value(children, "address") {
-                    Some(value) => {
-                        hemlock_common::net::parse_cidr(value).map_err(|reason| {
-                            IntentError::BadAddress {
-                                name: ifname.clone(),
-                                reason,
-                            }
-                        })?;
-                        Some(value.to_string())
-                    }
-                    None => None,
-                };
                 let intent = MgmtIntent { admin_up, address };
                 if intents.management.insert(ifname.clone(), intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
@@ -344,9 +342,10 @@ pub fn diff(
     changes
 }
 
-/// One management-interface change for the OS applier.
+/// One kernel-netdev change for the OS applier (a management interface,
+/// or the kernel side of a front-panel port's address).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MgmtChange {
+pub struct NetdevChange {
     pub name: String,
     pub admin_up: Option<bool>,
     pub set_address: Option<String>,
@@ -356,7 +355,7 @@ pub struct MgmtChange {
     pub del_address: Option<String>,
 }
 
-impl MgmtChange {
+impl NetdevChange {
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         if let Some(up) = self.admin_up {
@@ -394,7 +393,11 @@ impl RouteChange {
 /// The OS-side delta of one commit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OsChanges {
-    pub management: Vec<MgmtChange>,
+    pub management: Vec<NetdevChange>,
+    /// Front-panel address changes: the ASIC side goes to syncd
+    /// (router interface + routes); the kernel side is the same
+    /// `ip addr` treatment on the port's hostif netdev.
+    pub ports: Vec<NetdevChange>,
     pub routes: Vec<RouteChange>,
     /// The full wanted SSH state, present exactly when it changed.
     pub ssh: Option<SshIntent>,
@@ -402,7 +405,10 @@ pub struct OsChanges {
 
 impl OsChanges {
     pub fn is_empty(&self) -> bool {
-        self.management.is_empty() && self.routes.is_empty() && self.ssh.is_none()
+        self.management.is_empty()
+            && self.ports.is_empty()
+            && self.routes.is_empty()
+            && self.ssh.is_none()
     }
 
     pub fn describe(&self) -> Vec<String> {
@@ -418,12 +424,28 @@ impl OsChanges {
                 "ssh disabled".into()
             }
         });
-        self.management
+        self.ports
             .iter()
-            .map(MgmtChange::describe)
+            .chain(&self.management)
+            .map(NetdevChange::describe)
             .chain(self.routes.iter().map(RouteChange::describe))
             .chain(ssh)
             .collect()
+    }
+}
+
+/// Address delta of one interface (used for both management netdevs and
+/// front-panel ports).
+fn address_delta(
+    wanted: Option<&String>,
+    current: Option<&String>,
+) -> (Option<String>, Option<String>) {
+    match (wanted, current) {
+        (Some(w), Some(n)) if w == n => (None, None),
+        (Some(w), Some(n)) => (Some(w.clone()), Some(n.clone())),
+        (Some(w), None) => (Some(w.clone()), None),
+        (None, Some(n)) => (None, Some(n.clone())),
+        (None, None) => (None, None),
     }
 }
 
@@ -434,7 +456,6 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
     for (name, wanted) in &candidate.management {
         let current = running.management.get(name);
         let admin_now = current.and_then(|c| c.admin_up);
-        let addr_now = current.and_then(|c| c.address.clone());
 
         let admin_up = match (wanted.admin_up, admin_now) {
             (Some(w), Some(n)) if w == n => None,
@@ -443,16 +464,13 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
             (None, Some(false)) => Some(true),
             (None, _) => None,
         };
-        let (set_address, del_address) = match (&wanted.address, &addr_now) {
-            (Some(w), Some(n)) if w == n => (None, None),
-            (Some(w), Some(n)) => (Some(w.clone()), Some(n.clone())),
-            (Some(w), None) => (Some(w.clone()), None),
-            (None, Some(n)) => (None, Some(n.clone())),
-            (None, None) => (None, None),
-        };
+        let (set_address, del_address) = address_delta(
+            wanted.address.as_ref(),
+            current.and_then(|c| c.address.as_ref()),
+        );
 
         if admin_up.is_some() || set_address.is_some() || del_address.is_some() {
-            changes.management.push(MgmtChange {
+            changes.management.push(NetdevChange {
                 name: name.clone(),
                 admin_up,
                 set_address,
@@ -467,11 +485,42 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
         let admin_up = matches!(had.admin_up, Some(false)).then_some(true);
         let del_address = had.address.clone();
         if admin_up.is_some() || del_address.is_some() {
-            changes.management.push(MgmtChange {
+            changes.management.push(NetdevChange {
                 name: name.clone(),
                 admin_up,
                 set_address: None,
                 del_address,
+            });
+        }
+    }
+
+    // Front-panel port addresses (admin state stays with the syncd port
+    // diff; only the address moves through here).
+    for (name, wanted) in &candidate.ports {
+        let current = running.ports.get(name);
+        let (set_address, del_address) = address_delta(
+            wanted.address.as_ref(),
+            current.and_then(|c| c.address.as_ref()),
+        );
+        if set_address.is_some() || del_address.is_some() {
+            changes.ports.push(NetdevChange {
+                name: name.clone(),
+                admin_up: None,
+                set_address,
+                del_address,
+            });
+        }
+    }
+    for (name, had) in &running.ports {
+        if candidate.ports.contains_key(name) {
+            continue;
+        }
+        if let Some(old) = &had.address {
+            changes.ports.push(NetdevChange {
+                name: name.clone(),
+                admin_up: None,
+                set_address: None,
+                del_address: Some(old.clone()),
             });
         }
     }
@@ -529,7 +578,8 @@ interfaces {
             intents.ports["Ethernet0"],
             InterfaceIntent {
                 admin_up: Some(false),
-                description: Some("uplink".into())
+                description: Some("uplink".into()),
+                address: None,
             }
         );
         assert_eq!(intents.ports["Ethernet1"].admin_up, Some(true));
@@ -545,7 +595,8 @@ interfaces {
             intents.ports["Ethernet1"],
             InterfaceIntent {
                 admin_up: Some(false),
-                description: Some("uplink".into())
+                description: Some("uplink".into()),
+                address: None,
             }
         );
         assert_eq!(
@@ -575,18 +626,23 @@ interfaces {
     }
 
     #[test]
-    fn rejects_bad_or_misplaced_addresses() {
+    fn validates_addresses_on_any_interface() {
         let tree = parse("interfaces { Management1 { address banana } }").unwrap();
         assert!(matches!(
             extract(&tree),
             Err(IntentError::BadAddress { .. })
         ));
-        // Front-panel ports have no L3 support yet.
-        let tree = parse("interfaces { Ethernet1 { address 10.0.0.1/24 } }").unwrap();
+        let tree = parse("interfaces { Ethernet1 { address banana/24 } }").unwrap();
         assert!(matches!(
             extract(&tree),
-            Err(IntentError::AddressUnsupported { .. })
+            Err(IntentError::BadAddress { .. })
         ));
+        // Front-panel ports take addresses (L3 mode).
+        let intents = intents_of("interfaces { Ethernet1 { address 10.0.0.1/24 } }");
+        assert_eq!(
+            intents.ports["Ethernet1"].address.as_deref(),
+            Some("10.0.0.1/24")
+        );
     }
 
     #[test]
@@ -681,7 +737,7 @@ interfaces {
         let changes = diff_os(&running, &candidate);
         assert_eq!(
             changes.management,
-            vec![MgmtChange {
+            vec![NetdevChange {
                 name: "Management1".into(),
                 admin_up: None,
                 set_address: Some("10.42.10.9/24".into()),
@@ -708,7 +764,7 @@ interfaces {
         let back = diff_os(&candidate, &running);
         assert_eq!(
             back.management,
-            vec![MgmtChange {
+            vec![NetdevChange {
                 name: "Management1".into(),
                 admin_up: None,
                 set_address: None,
@@ -732,11 +788,40 @@ interfaces {
         let changes = diff_os(&running, &candidate);
         assert_eq!(
             changes.management,
-            vec![MgmtChange {
+            vec![NetdevChange {
                 name: "Management1".into(),
                 admin_up: None,
                 set_address: Some("10.42.10.9/24".into()),
                 del_address: Some("10.0.0.5/24".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_os_tracks_port_addresses() {
+        let running = intents_of("interfaces { Ethernet49 { admin-state enabled } }");
+        let candidate =
+            intents_of("interfaces { Ethernet49 { admin-state enabled\naddress 10.42.10.9/24 } }");
+        let changes = diff_os(&running, &candidate);
+        assert!(changes.management.is_empty());
+        assert_eq!(
+            changes.ports,
+            vec![NetdevChange {
+                name: "Ethernet49".into(),
+                admin_up: None,
+                set_address: Some("10.42.10.9/24".into()),
+                del_address: None,
+            }]
+        );
+        // Port block removed entirely -> address torn down.
+        let gone = diff_os(&candidate, &intents_of(""));
+        assert_eq!(
+            gone.ports,
+            vec![NetdevChange {
+                name: "Ethernet49".into(),
+                admin_up: None,
+                set_address: None,
+                del_address: Some("10.42.10.9/24".into()),
             }]
         );
     }

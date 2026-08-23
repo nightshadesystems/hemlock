@@ -18,6 +18,14 @@ service Syncd {
   // Set per-interface counter baselines (`clear counters`). Counters
   // reported by GetInterfaces are relative to the last clear.
   rpc ClearCounters(ClearCountersRequest) returns (ClearCountersResponse);
+  // Put a front-panel port in L3 mode with an interface address: router
+  // interface on the default VR plus IP2ME (punt) and connected-subnet
+  // routes. Replaces any previous address. The kernel-side address on
+  // the port's hostif netdev is mgmtd's job (the OS applier).
+  rpc SetInterfaceAddress(SetInterfaceAddressRequest) returns (SetInterfaceAddressResponse);
+  // Remove the port's address and router interface, restoring default
+  // L2 bridging.
+  rpc ClearInterfaceAddress(ClearInterfaceAddressRequest) returns (ClearInterfaceAddressResponse);
 }
 
 message GetSwitchInfoRequest {}
@@ -180,3 +188,16 @@ message ClearCountersRequest {
 message ClearCountersResponse {
   uint32 cleared = 1;
 }
+
+message SetInterfaceAddressRequest {
+  string name = 1;     // port name, e.g. "Ethernet49"
+  string address = 2;  // CIDR, e.g. "10.42.10.9/24"
+}
+
+message SetInterfaceAddressResponse {}
+
+message ClearInterfaceAddressRequest {
+  string name = 1;
+}
+
+message ClearInterfaceAddressResponse {}

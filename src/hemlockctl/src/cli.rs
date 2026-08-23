@@ -407,7 +407,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("Configuration commands (edit the candidate; `commit` applies):");
             println!("  set interfaces <port> description <text>");
             println!("  set interfaces <port> admin-state <enabled|disabled>");
-            println!("  set interfaces <port> address <ip/prefix>     (Management: L3 mode)");
+            println!("  set interfaces <port> address <ip/prefix>     puts the port in L3 mode");
             println!("  set system ssh                                enable the SSH server");
             println!("  set system ssh authentication local           password logins (PAM)");
             println!("  set routing static <prefix> <next-hop>        static route");

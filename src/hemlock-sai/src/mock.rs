@@ -7,16 +7,21 @@
 //! corresponding oper-status notifications — links come up when enabled,
 //! exactly what the layers above need for end-to-end testing.
 
+use std::collections::HashMap;
+
 use hemlock_platform::PortDef;
 use tokio::sync::mpsc;
 
 use crate::{
-    PortCounters, PortId, QueueCounters, SaiBackend, SaiError, SaiEvent, SaiPort, SwitchInfo,
+    IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiError,
+    SaiEvent, SaiPort, SwitchInfo,
 };
 
 /// Synthetic OIDs: obviously fake, stable, and readable in logs.
 const MOCK_SWITCH_OID: u64 = 0x2100_0000_0000_0000;
 const MOCK_PORT_OID_BASE: u64 = 0x2100_0000_0000_1000;
+const MOCK_HOSTIF_OID_BASE: u64 = 0x2100_0000_0000_2000;
+const MOCK_RIF_OID_BASE: u64 = 0x2100_0000_0000_3000;
 
 pub struct MockSai {
     port_table: Vec<PortDef>,
@@ -24,6 +29,14 @@ pub struct MockSai {
     created: bool,
     events_tx: mpsc::UnboundedSender<SaiEvent>,
     events_rx: Option<mpsc::UnboundedReceiver<SaiEvent>>,
+    /// L3 model, mirroring what the real ASIC tracks: punt install,
+    /// per-port hostif netdev names, per-port RIFs (a routed port has
+    /// left the default 802.1Q bridge), and the default-VR route table.
+    punt_installed: bool,
+    hostifs: HashMap<PortId, (Oid, String)>,
+    rifs: HashMap<PortId, Oid>,
+    routes: HashMap<IpPrefix, RouteTarget>,
+    next_oid: u64,
 }
 
 impl MockSai {
@@ -37,6 +50,11 @@ impl MockSai {
             created: false,
             events_tx,
             events_rx: Some(events_rx),
+            punt_installed: false,
+            hostifs: HashMap::new(),
+            rifs: HashMap::new(),
+            routes: HashMap::new(),
+            next_oid: 0,
         }
     }
 
@@ -45,6 +63,27 @@ impl MockSai {
             .iter_mut()
             .find(|p| p.id == id)
             .ok_or(SaiError::UnknownPort(id))
+    }
+
+    fn require_switch(&self) -> Result<(), SaiError> {
+        if self.created {
+            Ok(())
+        } else {
+            Err(SaiError::NoSwitch)
+        }
+    }
+
+    fn require_port(&self, id: PortId) -> Result<(), SaiError> {
+        if self.ports.iter().any(|p| p.id == id) {
+            Ok(())
+        } else {
+            Err(SaiError::UnknownPort(id))
+        }
+    }
+
+    fn alloc(&mut self, base: u64) -> Oid {
+        self.next_oid += 1;
+        Oid(base + self.next_oid)
     }
 }
 
@@ -118,6 +157,74 @@ impl SaiBackend for MockSai {
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>> {
         self.events_rx.take()
     }
+
+    fn setup_host_punt(&mut self) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.punt_installed {
+            return Err(SaiError::Other("host punt already installed".into()));
+        }
+        self.punt_installed = true;
+        Ok(())
+    }
+
+    fn create_hostif(&mut self, port: PortId, name: &str) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        if self.hostifs.contains_key(&port) {
+            return Err(SaiError::Other(format!("port {port} already has a hostif")));
+        }
+        let oid = self.alloc(MOCK_HOSTIF_OID_BASE);
+        self.hostifs.insert(port, (oid, name.to_string()));
+        Ok(oid)
+    }
+
+    fn create_router_interface(&mut self, port: PortId) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        if self.rifs.contains_key(&port) {
+            return Err(SaiError::Other(format!("port {port} already has a RIF")));
+        }
+        let oid = self.alloc(MOCK_RIF_OID_BASE);
+        self.rifs.insert(port, oid);
+        Ok(oid)
+    }
+
+    fn remove_router_interface(&mut self, port: PortId, rif: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        match self.rifs.get(&port) {
+            Some(have) if *have == rif => {
+                self.rifs.remove(&port);
+                Ok(())
+            }
+            _ => Err(SaiError::Other(format!("port {port} has no RIF {rif}"))),
+        }
+    }
+
+    fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if let RouteTarget::Rif(rif) = target {
+            if !self.rifs.values().any(|r| *r == rif) {
+                return Err(SaiError::Other(format!("no such RIF {rif}")));
+            }
+        }
+        // Like the real ASIC: creating an existing destination fails
+        // (callers replace via remove + create).
+        if self.routes.insert(dest, target).is_some() {
+            return Err(SaiError::Other(format!(
+                "route {}/{} exists",
+                dest.0, dest.1
+            )));
+        }
+        Ok(())
+    }
+
+    fn remove_route(&mut self, dest: IpPrefix) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.routes.remove(&dest).is_none() {
+            return Err(SaiError::Other(format!("no route {}/{}", dest.0, dest.1)));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +290,49 @@ mod tests {
             sai.set_port_admin_state(PortId(0xdead), true),
             Err(SaiError::UnknownPort(_))
         ));
+    }
+
+    #[test]
+    fn l3_lifecycle_rif_and_routes() {
+        let mut sai = MockSai::new(port_table(2));
+        assert!(matches!(sai.setup_host_punt(), Err(SaiError::NoSwitch)));
+        sai.create_switch().unwrap();
+        sai.setup_host_punt().unwrap();
+        assert!(sai.setup_host_punt().is_err(), "punt installs once");
+
+        let port = sai.ports().unwrap()[0].id;
+        let hostif = sai.create_hostif(port, "Ethernet0").unwrap();
+        assert!(hostif.0 >= MOCK_HOSTIF_OID_BASE);
+        assert!(sai.create_hostif(port, "Ethernet0").is_err());
+
+        let rif = sai.create_router_interface(port).unwrap();
+        assert!(
+            sai.create_router_interface(port).is_err(),
+            "one RIF per port"
+        );
+
+        let addr: std::net::IpAddr = "10.42.10.9".parse().unwrap();
+        let subnet: std::net::IpAddr = "10.42.10.0".parse().unwrap();
+        sai.create_route((addr, 32), RouteTarget::Cpu).unwrap();
+        sai.create_route((subnet, 24), RouteTarget::Rif(rif))
+            .unwrap();
+        assert!(
+            sai.create_route((addr, 32), RouteTarget::Cpu).is_err(),
+            "duplicate destination fails like the real ASIC"
+        );
+        assert!(
+            sai.create_route((subnet, 25), RouteTarget::Rif(Oid(0xbad)))
+                .is_err(),
+            "routes must target a live RIF"
+        );
+
+        sai.remove_route((addr, 32)).unwrap();
+        sai.remove_route((subnet, 24)).unwrap();
+        assert!(sai.remove_route((subnet, 24)).is_err());
+
+        sai.remove_router_interface(port, rif).unwrap();
+        assert!(sai.remove_router_interface(port, rif).is_err());
+        // Back to L2: a fresh RIF can be created again.
+        sai.create_router_interface(port).unwrap();
     }
 }

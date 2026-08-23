@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 use hemlock_platform::Platform;
 use hemlock_sai::{
-    PortCounters, PortId, QueueCounters, SaiBackend, SaiError, SaiEvent, SwitchInfo,
+    IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiError,
+    SaiEvent, SwitchInfo,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -37,6 +38,24 @@ pub enum SaiCmd {
     PortStats {
         ports: Vec<(String, PortId)>,
         reply: oneshot::Sender<Vec<PortStatsSample>>,
+    },
+    CreateRouterInterface {
+        port: PortId,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveRouterInterface {
+        port: PortId,
+        rif: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateRoute {
+        dest: IpPrefix,
+        target: RouteTarget,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemoveRoute {
+        dest: IpPrefix,
+        reply: oneshot::Sender<Result<(), SaiError>>,
     },
 }
 
@@ -83,6 +102,50 @@ impl SaiHandle {
             .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
         rx.await
             .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))
+    }
+
+    pub async fn create_router_interface(&self, port: PortId) -> Result<Oid, SaiError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SaiCmd::CreateRouterInterface { port, reply })
+            .await
+            .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
+        rx.await
+            .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))?
+    }
+
+    pub async fn remove_router_interface(&self, port: PortId, rif: Oid) -> Result<(), SaiError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SaiCmd::RemoveRouterInterface { port, rif, reply })
+            .await
+            .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
+        rx.await
+            .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))?
+    }
+
+    pub async fn create_route(&self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SaiCmd::CreateRoute {
+                dest,
+                target,
+                reply,
+            })
+            .await
+            .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
+        rx.await
+            .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))?
+    }
+
+    pub async fn remove_route(&self, dest: IpPrefix) -> Result<(), SaiError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SaiCmd::RemoveRoute { dest, reply })
+            .await
+            .map_err(|_| SaiError::Other("SAI actor is gone".into()))?;
+        rx.await
+            .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))?
     }
 }
 
@@ -143,6 +206,22 @@ impl SaiActor {
                                 });
                             }
                             let _ = reply.send(samples);
+                        }
+                        SaiCmd::CreateRouterInterface { port, reply } => {
+                            let _ = reply.send(backend.create_router_interface(port));
+                        }
+                        SaiCmd::RemoveRouterInterface { port, rif, reply } => {
+                            let _ = reply.send(backend.remove_router_interface(port, rif));
+                        }
+                        SaiCmd::CreateRoute {
+                            dest,
+                            target,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.create_route(dest, target));
+                        }
+                        SaiCmd::RemoveRoute { dest, reply } => {
+                            let _ = reply.send(backend.remove_route(dest));
                         }
                     }
                 }
@@ -208,6 +287,7 @@ fn init_switch(
                 admin_up: sai_port.admin_up,
                 oper_up: sai_port.oper_up,
                 description: String::new(),
+                l3: None,
             },
         );
     }
@@ -225,12 +305,26 @@ fn init_switch(
         .iter()
         .map(|(name, p)| (name.clone(), p.sai_id))
         .collect();
-    for (name, id) in ids {
+    for (name, id) in &ids {
         backend
-            .set_port_admin_state(id, true)
+            .set_port_admin_state(*id, true)
             .with_context(|| format!("admin-up {name}"))?;
-        if let Some(p) = ports.get_mut(&name) {
+        if let Some(p) = ports.get_mut(name) {
             p.admin_up = true;
+        }
+    }
+
+    // Host services: CPU punt traps plus one kernel netdev per port
+    // (named after it), so ARP and traffic to the switch's own
+    // addresses reach the Linux stack and replies transmit raw out the
+    // port. Best-effort — a backend without hostif support (or a
+    // missing knet module) degrades to L2-only, never a failed boot.
+    if let Err(err) = backend.setup_host_punt() {
+        warn!(%err, "cannot install CPU punt path; front-panel host services unavailable");
+    }
+    for (name, id) in &ids {
+        if let Err(err) = backend.create_hostif(*id, name) {
+            warn!(%err, port = %name, "cannot create host interface netdev");
         }
     }
 

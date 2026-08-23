@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 use crate::actor::SaiHandle;
 use crate::ifstats::{utilization_pct, RawCounters, SharedEngine, Snapshot};
 use crate::netdev::NetdevSample;
-use crate::state::PortState;
+use crate::state::{L3State, PortState};
 
 /// L2 MTU reported for front-panel ports. Matches the KNET default the
 /// platform loads; per-interface MTU intents arrive in a later phase.
@@ -195,6 +195,7 @@ impl SyncdService {
             media: port.def.media.clone().unwrap_or_default(),
             phy_model: port.def.phy_model.clone().unwrap_or_default(),
             supported_modes: port.def.supported_modes.clone(),
+            ip_addresses: port.l3.iter().map(|l3| l3.address.clone()).collect(),
             ..pb::InterfaceState::default()
         };
         if let Some(snap) = self.engine.snapshot(&port.def.name, now) {
@@ -235,6 +236,28 @@ impl SyncdService {
             self.stats_fields(&mut state, &snap, dev.speed_mbps, false, false);
         }
         state
+    }
+
+    /// An interface address's route destinations: the IP2ME host route,
+    /// and the connected subnet unless it coincides with it (a /32 or
+    /// /128 address has no separate subnet route).
+    fn routes_for(
+        addr: std::net::IpAddr,
+        len: u8,
+    ) -> (hemlock_sai::IpPrefix, Option<hemlock_sai::IpPrefix>) {
+        let host_len: u8 = if addr.is_ipv4() { 32 } else { 128 };
+        let host = (addr, host_len);
+        let subnet = (hemlock_common::net::network(addr, len), len);
+        (host, (subnet != host).then_some(subnet))
+    }
+
+    /// Both route destinations of a stored CIDR address (for teardown).
+    fn route_dests(address: &str) -> Vec<hemlock_sai::IpPrefix> {
+        let Ok((addr, len)) = hemlock_common::net::parse_cidr(address) else {
+            return Vec::new();
+        };
+        let (host, subnet) = Self::routes_for(addr, len);
+        std::iter::once(host).chain(subnet).collect()
     }
 }
 
@@ -393,6 +416,117 @@ impl pb::syncd_server::Syncd for SyncdService {
         let cleared = self.engine.clear(&names, Instant::now());
         Ok(Response::new(pb::ClearCountersResponse { cleared }))
     }
+
+    async fn set_interface_address(
+        &self,
+        request: Request<pb::SetInterfaceAddressRequest>,
+    ) -> Result<Response<pb::SetInterfaceAddressResponse>, Status> {
+        let req = request.into_inner();
+        let (addr, len) =
+            hemlock_common::net::parse_cidr(&req.address).map_err(Status::invalid_argument)?;
+
+        let (sai_id, existing) = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let port = table
+                .get(&req.name)
+                .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+            (port.sai_id, port.l3.clone())
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|l3| l3.address == req.address)
+        {
+            return Ok(Response::new(pb::SetInterfaceAddressResponse {}));
+        }
+
+        // Drive the ASIC outside the lock. An address change keeps the
+        // RIF and swaps the routes; route creation uses remove-then-add
+        // so a retried half-applied change converges.
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        if let Some(old) = &existing {
+            for dest in Self::route_dests(&old.address) {
+                let _ = self.handle.remove_route(dest).await;
+            }
+        }
+        let rif = match &existing {
+            Some(l3) => l3.rif,
+            None => self
+                .handle
+                .create_router_interface(sai_id)
+                .await
+                .map_err(sai)?,
+        };
+        let (host, subnet) = Self::routes_for(addr, len);
+        let _ = self.handle.remove_route(host).await;
+        self.handle
+            .create_route(host, hemlock_sai::RouteTarget::Cpu)
+            .await
+            .map_err(sai)?;
+        if let Some(subnet) = subnet {
+            let _ = self.handle.remove_route(subnet).await;
+            self.handle
+                .create_route(subnet, hemlock_sai::RouteTarget::Rif(rif))
+                .await
+                .map_err(sai)?;
+        }
+
+        let mut table = self
+            .handle
+            .ports
+            .write()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        let port = table
+            .get_mut(&req.name)
+            .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+        port.l3 = Some(L3State {
+            rif,
+            address: req.address,
+        });
+        Ok(Response::new(pb::SetInterfaceAddressResponse {}))
+    }
+
+    async fn clear_interface_address(
+        &self,
+        request: Request<pb::ClearInterfaceAddressRequest>,
+    ) -> Result<Response<pb::ClearInterfaceAddressResponse>, Status> {
+        let req = request.into_inner();
+        let (sai_id, existing) = {
+            let table = self
+                .handle
+                .ports
+                .read()
+                .map_err(|_| Status::internal("port table poisoned"))?;
+            let port = table
+                .get(&req.name)
+                .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
+            (port.sai_id, port.l3.clone())
+        };
+        let Some(l3) = existing else {
+            return Ok(Response::new(pb::ClearInterfaceAddressResponse {}));
+        };
+
+        for dest in Self::route_dests(&l3.address) {
+            let _ = self.handle.remove_route(dest).await;
+        }
+        self.handle
+            .remove_router_interface(sai_id, l3.rif)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+
+        let mut table = self
+            .handle
+            .ports
+            .write()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        if let Some(port) = table.get_mut(&req.name) {
+            port.l3 = None;
+        }
+        Ok(Response::new(pb::ClearInterfaceAddressResponse {}))
+    }
 }
 
 #[cfg(test)]
@@ -529,5 +663,98 @@ lanes = [1, 2]
             .unwrap()
             .into_inner();
         assert!(response.interfaces[0].seconds_since_clear.is_some());
+    }
+
+    /// Address lifecycle over the mock data-plane: set, replace, clear.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interface_address_lifecycle_over_mock_sai() {
+        let platform = test_platform();
+        let backend = Box::new(hemlock_sai::mock::MockSai::new(platform.ports.clone()));
+        let handle = Arc::new(SaiActor::spawn(backend, &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        // Unknown port and bad CIDR are rejected.
+        let err = service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet9".into(),
+                address: "10.0.0.1/24".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let err = service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+                address: "banana".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Set: RIF + routes recorded, address visible via GetInterfaces.
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+                address: "10.42.10.9/24".into(),
+            }))
+            .await
+            .unwrap();
+        let rif = {
+            let table = handle.ports.read().unwrap();
+            let l3 = table["Ethernet1"].l3.clone().unwrap();
+            assert_eq!(l3.address, "10.42.10.9/24");
+            l3.rif
+        };
+        let response = service
+            .get_interfaces(Request::new(pb::GetInterfacesRequest {
+                names: vec!["Ethernet1".into()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.interfaces[0].ip_addresses, ["10.42.10.9/24"]);
+
+        // Replace keeps the RIF, swaps routes; same address is a no-op.
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+                address: "192.168.1.1/24".into(),
+            }))
+            .await
+            .unwrap();
+        {
+            let table = handle.ports.read().unwrap();
+            let l3 = table["Ethernet1"].l3.clone().unwrap();
+            assert_eq!(l3.address, "192.168.1.1/24");
+            assert_eq!(l3.rif, rif, "address change keeps the RIF");
+        }
+
+        // Clear: back to L2.
+        service
+            .clear_interface_address(Request::new(pb::ClearInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(handle.ports.read().unwrap()["Ethernet1"].l3.is_none());
+        // Clearing again is a no-op, and the port can be routed afresh.
+        service
+            .clear_interface_address(Request::new(pb::ClearInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap();
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+                address: "10.0.0.1/31".into(),
+            }))
+            .await
+            .unwrap();
     }
 }

@@ -115,6 +115,34 @@ impl Engine {
         }
 
         let os_changes = intents::diff_os(&running_intents, &wanted_intents);
+
+        // ASIC side of front-panel addresses (router interface + routes)
+        // goes through syncd; the kernel side follows in the OS applier.
+        if !os_changes.ports.is_empty() {
+            let mut client = self.syncd_client().await?;
+            for change in &os_changes.ports {
+                match (&change.set_address, &change.del_address) {
+                    (Some(address), _) => {
+                        client
+                            .set_interface_address(pb::SetInterfaceAddressRequest {
+                                name: change.name.clone(),
+                                address: address.clone(),
+                            })
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                    (None, Some(_)) => {
+                        client
+                            .clear_interface_address(pb::ClearInterfaceAddressRequest {
+                                name: change.name.clone(),
+                            })
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
         self.os.apply(&os_changes);
 
         self.store.commit(
@@ -154,14 +182,23 @@ impl Engine {
                 }),
                 description: intent.description.clone(),
             };
-            if request.admin_state.is_none() && request.description.is_none() {
-                continue;
+            if request.admin_state.is_some() || request.description.is_some() {
+                client
+                    .set_port_attrs(request)
+                    .await
+                    .with_context(|| format!("replaying config for {name}"))?;
+                applied += 1;
             }
-            client
-                .set_port_attrs(request)
-                .await
-                .with_context(|| format!("replaying config for {name}"))?;
-            applied += 1;
+            if let Some(address) = &intent.address {
+                client
+                    .set_interface_address(pb::SetInterfaceAddressRequest {
+                        name: name.clone(),
+                        address: address.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("replaying address for {name}"))?;
+                applied += 1;
+            }
         }
         Ok(applied)
     }

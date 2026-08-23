@@ -6,9 +6,11 @@
 //! provides a pure-Rust in-memory implementation so the whole stack builds
 //! and tests without hardware or vendor blobs.
 //!
-//! Phase 1 surface: switch create, port enumeration, port admin state, and
-//! port oper-status notifications. L2/L3 object families arrive with
-//! hemlock-orch in later phases.
+//! Surface: switch create, port enumeration, port admin state, port
+//! oper-status notifications, and the host-services L3 family — NETDEV
+//! host interfaces, CPU punt traps, port router interfaces, and routes
+//! (IP2ME + connected subnets). Transit routing orchestration (FRR,
+//! neighbors, next-hop groups) arrives with hemlock-orch in later phases.
 
 #[cfg(feature = "mock-sai")]
 pub mod mock;
@@ -48,6 +50,29 @@ impl std::fmt::Display for PortId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:#x}", self.0)
     }
+}
+
+/// A SAI object id for a non-port object (hostif, router interface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Oid(pub u64);
+
+impl std::fmt::Display for Oid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#x}", self.0)
+    }
+}
+
+/// An IP destination prefix (`address`, `prefix length`).
+pub type IpPrefix = (std::net::IpAddr, u8);
+
+/// Where a route sends its packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTarget {
+    /// Punt to the CPU port (IP2ME: one of the switch's own addresses;
+    /// the IP2ME hostif trap delivers it to the kernel).
+    Cpu,
+    /// A connected subnet via a router interface.
+    Rif(Oid),
 }
 
 /// What a backend needs to bring the switch up. Resolved by syncd from the
@@ -240,4 +265,31 @@ pub trait SaiBackend: Send {
 
     /// Take the notification receiver. Yields `Some` on first call only.
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>>;
+
+    // --- Host-services L3 -----------------------------------------------
+
+    /// Install the CPU punt path: ARP request/response copies and an
+    /// IP2ME trap into the default trap group, delivered to the ingress
+    /// port's netdev via a wildcard hostif table entry. Called once
+    /// after `create_switch`.
+    fn setup_host_punt(&mut self) -> Result<(), SaiError>;
+
+    /// Create a NETDEV host interface for a port; the kernel sees a
+    /// netdev called `name` (SAI caps it at 15 chars + NUL) that
+    /// receives punted packets and transmits raw out the port.
+    fn create_hostif(&mut self, port: PortId, name: &str) -> Result<Oid, SaiError>;
+
+    /// Route a port: pull it out of the default 802.1Q bridge and
+    /// create a router interface on the default virtual router.
+    fn create_router_interface(&mut self, port: PortId) -> Result<Oid, SaiError>;
+
+    /// Undo [`Self::create_router_interface`]: remove the RIF and
+    /// restore default L2 bridging (bridge port + untagged default-VLAN
+    /// membership + PVID).
+    fn remove_router_interface(&mut self, port: PortId, rif: Oid) -> Result<(), SaiError>;
+
+    /// Program a route on the default virtual router.
+    fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError>;
+
+    fn remove_route(&mut self, dest: IpPrefix) -> Result<(), SaiError>;
 }

@@ -15,8 +15,8 @@ use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
 use crate::{
-    ffi, PortCounters, PortId, QueueCounters, SaiBackend, SaiError, SaiEvent, SaiPort, SwitchInfo,
-    SwitchInit,
+    ffi, IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiError,
+    SaiEvent, SaiPort, SwitchInfo, SwitchInit,
 };
 
 /// SAI profile key/value store handed to the vendor library. Static because
@@ -108,6 +108,19 @@ fn check(call: &'static str, status: ffi::sai_status_t) -> Result<(), SaiError> 
     }
 }
 
+/// Switch-scope objects the L3 family needs, resolved once right after
+/// `create_switch` (they exist for the switch's whole lifetime).
+#[derive(Debug, Clone, Copy)]
+struct SwitchDefaults {
+    virtual_router: ffi::sai_object_id_t,
+    vlan: ffi::sai_object_id_t,
+    /// The default VLAN's 802.1Q number (for restoring a port's PVID).
+    vlan_number: u16,
+    bridge_1q: ffi::sai_object_id_t,
+    cpu_port: ffi::sai_object_id_t,
+    trap_group: ffi::sai_object_id_t,
+}
+
 pub struct VendorSai {
     /// Keeps the vendor library mapped for the lifetime of the backend.
     library: libloading::Library,
@@ -117,7 +130,13 @@ pub struct VendorSai {
     switch_api: *mut ffi::sai_switch_api_t,
     port_api: *mut ffi::sai_port_api_t,
     queue_api: *mut ffi::sai_queue_api_t,
+    hostif_api: *mut ffi::sai_hostif_api_t,
+    rif_api: *mut ffi::sai_router_interface_api_t,
+    route_api: *mut ffi::sai_route_api_t,
+    bridge_api: *mut ffi::sai_bridge_api_t,
+    vlan_api: *mut ffi::sai_vlan_api_t,
     switch_oid: Option<ffi::sai_object_id_t>,
+    defaults: Option<SwitchDefaults>,
     events_rx: Option<mpsc::UnboundedReceiver<SaiEvent>>,
     src_mac: Option<[u8; 6]>,
     diag_shell: bool,
@@ -173,7 +192,7 @@ impl VendorSai {
         });
 
         // SAFETY: symbol lookup + the documented SAI bootstrap sequence.
-        let (switch_api, port_api, queue_api) = unsafe {
+        let apis = unsafe {
             let api_initialize: libloading::Symbol<
                 unsafe extern "C" fn(
                     u64,
@@ -205,19 +224,57 @@ impl VendorSai {
                 "sai_api_query(QUEUE)",
                 api_query(ffi::_sai_api_t::SAI_API_QUEUE, &mut queue_api),
             )?;
+            let mut hostif_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(HOSTIF)",
+                api_query(ffi::_sai_api_t::SAI_API_HOSTIF, &mut hostif_api),
+            )?;
+            let mut rif_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(ROUTER_INTERFACE)",
+                api_query(ffi::_sai_api_t::SAI_API_ROUTER_INTERFACE, &mut rif_api),
+            )?;
+            let mut route_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(ROUTE)",
+                api_query(ffi::_sai_api_t::SAI_API_ROUTE, &mut route_api),
+            )?;
+            let mut bridge_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(BRIDGE)",
+                api_query(ffi::_sai_api_t::SAI_API_BRIDGE, &mut bridge_api),
+            )?;
+            let mut vlan_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(VLAN)",
+                api_query(ffi::_sai_api_t::SAI_API_VLAN, &mut vlan_api),
+            )?;
             (
                 switch_api as *mut ffi::sai_switch_api_t,
                 port_api as *mut ffi::sai_port_api_t,
                 queue_api as *mut ffi::sai_queue_api_t,
+                hostif_api as *mut ffi::sai_hostif_api_t,
+                rif_api as *mut ffi::sai_router_interface_api_t,
+                route_api as *mut ffi::sai_route_api_t,
+                bridge_api as *mut ffi::sai_bridge_api_t,
+                vlan_api as *mut ffi::sai_vlan_api_t,
             )
         };
+        let (switch_api, port_api, queue_api, hostif_api, rif_api, route_api, bridge_api, vlan_api) =
+            apis;
         Ok(Self {
             library,
             _services: services,
             switch_api,
             port_api,
             queue_api,
+            hostif_api,
+            rif_api,
+            route_api,
+            bridge_api,
+            vlan_api,
             switch_oid: None,
+            defaults: None,
             events_rx: Some(rx),
             src_mac: init.src_mac,
             diag_shell: init.diag_shell,
@@ -279,6 +336,225 @@ impl VendorSai {
         attr.id = id;
         attr
     }
+
+    /// Switch-scope objects needed by the L3 family, or a clear error
+    /// when their resolution failed at create_switch.
+    fn defaults(&self) -> Result<SwitchDefaults, SaiError> {
+        self.switch_oid()?;
+        self.defaults.ok_or(SaiError::Other(
+            "switch L3 defaults unavailable (resolution failed at create_switch)".into(),
+        ))
+    }
+
+    /// One switch attribute holding a single OID.
+    fn switch_attr_oid(
+        &self,
+        call: &'static str,
+        id: u32,
+        switch: ffi::sai_object_id_t,
+    ) -> Result<ffi::sai_object_id_t, SaiError> {
+        // SAFETY: valid switch api table; attr outlives the call.
+        let get = unsafe {
+            (*self.switch_api)
+                .get_switch_attribute
+                .ok_or(SaiError::Other(
+                    "switch api lacks get_switch_attribute".into(),
+                ))?
+        };
+        let mut attr = Self::zeroed_attr(id);
+        // SAFETY: single-attr get; union read matches an oid-valued attr.
+        unsafe {
+            check(call, get(switch, 1, &mut attr))?;
+            Ok(attr.value.oid)
+        }
+    }
+
+    /// Resolve the default virtual router / VLAN / 1Q bridge / CPU port /
+    /// trap group after create_switch.
+    fn resolve_defaults(&self, switch: ffi::sai_object_id_t) -> Result<SwitchDefaults, SaiError> {
+        use ffi::_sai_switch_attr_t as sw;
+        let virtual_router = self.switch_attr_oid(
+            "get(DEFAULT_VIRTUAL_ROUTER_ID)",
+            sw::SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID,
+            switch,
+        )?;
+        let vlan = self.switch_attr_oid(
+            "get(DEFAULT_VLAN_ID)",
+            sw::SAI_SWITCH_ATTR_DEFAULT_VLAN_ID,
+            switch,
+        )?;
+        let bridge_1q = self.switch_attr_oid(
+            "get(DEFAULT_1Q_BRIDGE_ID)",
+            sw::SAI_SWITCH_ATTR_DEFAULT_1Q_BRIDGE_ID,
+            switch,
+        )?;
+        let cpu_port =
+            self.switch_attr_oid("get(CPU_PORT)", sw::SAI_SWITCH_ATTR_CPU_PORT, switch)?;
+        let trap_group = self.switch_attr_oid(
+            "get(DEFAULT_TRAP_GROUP)",
+            sw::SAI_SWITCH_ATTR_DEFAULT_TRAP_GROUP,
+            switch,
+        )?;
+
+        // The default VLAN's 802.1Q number, for restoring a port's PVID.
+        let vlan_number = {
+            // SAFETY: valid vlan api table; attr outlives the call.
+            let get = unsafe {
+                (*self.vlan_api)
+                    .get_vlan_attribute
+                    .ok_or(SaiError::Other("vlan api lacks get_vlan_attribute".into()))?
+            };
+            let mut attr = Self::zeroed_attr(ffi::_sai_vlan_attr_t::SAI_VLAN_ATTR_VLAN_ID);
+            // SAFETY: single-attr get; union read matches a u16 attr.
+            unsafe {
+                check("get_vlan_attribute(VLAN_ID)", get(vlan, 1, &mut attr))?;
+                attr.value.u16_
+            }
+        };
+
+        Ok(SwitchDefaults {
+            virtual_router,
+            vlan,
+            vlan_number,
+            bridge_1q,
+            cpu_port,
+            trap_group,
+        })
+    }
+
+    /// The 1Q bridge port fronting `port`, if it is currently bridged.
+    fn find_bridge_port(&self, port: PortId) -> Result<Option<ffi::sai_object_id_t>, SaiError> {
+        let defaults = self.defaults()?;
+        // SAFETY per block below: valid api tables, buffers outlive calls.
+        let get_bridge = unsafe {
+            (*self.bridge_api)
+                .get_bridge_attribute
+                .ok_or(SaiError::Other(
+                    "bridge api lacks get_bridge_attribute".into(),
+                ))?
+        };
+        let get_bridge_port = unsafe {
+            (*self.bridge_api)
+                .get_bridge_port_attribute
+                .ok_or(SaiError::Other(
+                    "bridge api lacks get_bridge_port_attribute".into(),
+                ))?
+        };
+
+        let mut members: Vec<ffi::sai_object_id_t> = vec![0; 256];
+        {
+            let mut attr = Self::zeroed_attr(ffi::_sai_bridge_attr_t::SAI_BRIDGE_ATTR_PORT_LIST);
+            attr.value.objlist.count = members.len() as u32;
+            attr.value.objlist.list = members.as_mut_ptr();
+            // SAFETY: list buffer alive across the call.
+            unsafe {
+                check(
+                    "get_bridge_attribute(PORT_LIST)",
+                    get_bridge(defaults.bridge_1q, 1, &mut attr),
+                )?;
+                members.truncate(attr.value.objlist.count as usize);
+            }
+        }
+        for bridge_port in members {
+            let mut attr =
+                Self::zeroed_attr(ffi::_sai_bridge_port_attr_t::SAI_BRIDGE_PORT_ATTR_PORT_ID);
+            // SAFETY: single-attr get. Non-PORT bridge ports may reject
+            // the read; those simply don't match.
+            let matched = unsafe {
+                get_bridge_port(bridge_port, 1, &mut attr) == 0 && attr.value.oid == port.0
+            };
+            if matched {
+                return Ok(Some(bridge_port));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The default-VLAN member fronting `bridge_port`, if any.
+    fn find_default_vlan_member(
+        &self,
+        bridge_port: ffi::sai_object_id_t,
+    ) -> Result<Option<ffi::sai_object_id_t>, SaiError> {
+        let defaults = self.defaults()?;
+        // SAFETY per block below: valid api tables, buffers outlive calls.
+        let get_vlan = unsafe {
+            (*self.vlan_api)
+                .get_vlan_attribute
+                .ok_or(SaiError::Other("vlan api lacks get_vlan_attribute".into()))?
+        };
+        let get_member = unsafe {
+            (*self.vlan_api)
+                .get_vlan_member_attribute
+                .ok_or(SaiError::Other(
+                    "vlan api lacks get_vlan_member_attribute".into(),
+                ))?
+        };
+
+        let mut members: Vec<ffi::sai_object_id_t> = vec![0; 256];
+        {
+            let mut attr = Self::zeroed_attr(ffi::_sai_vlan_attr_t::SAI_VLAN_ATTR_MEMBER_LIST);
+            attr.value.objlist.count = members.len() as u32;
+            attr.value.objlist.list = members.as_mut_ptr();
+            // SAFETY: list buffer alive across the call.
+            unsafe {
+                check(
+                    "get_vlan_attribute(MEMBER_LIST)",
+                    get_vlan(defaults.vlan, 1, &mut attr),
+                )?;
+                members.truncate(attr.value.objlist.count as usize);
+            }
+        }
+        for member in members {
+            let mut attr = Self::zeroed_attr(
+                ffi::_sai_vlan_member_attr_t::SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID,
+            );
+            // SAFETY: single-attr get.
+            let matched =
+                unsafe { get_member(member, 1, &mut attr) == 0 && attr.value.oid == bridge_port };
+            if matched {
+                return Ok(Some(member));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Encode a destination prefix; SAI wants address and mask in network
+    /// byte order (the in-memory bytes are the address bytes in order).
+    fn ip_prefix(dest: IpPrefix) -> ffi::sai_ip_prefix_t {
+        // SAFETY: sai_ip_prefix_t is POD; all-zero is a valid start.
+        let mut prefix: ffi::sai_ip_prefix_t = unsafe { std::mem::zeroed() };
+        match dest.0 {
+            std::net::IpAddr::V4(v4) => {
+                prefix.addr_family = ffi::_sai_ip_addr_family_t::SAI_IP_ADDR_FAMILY_IPV4;
+                prefix.addr.ip4 = u32::from_ne_bytes(v4.octets());
+                let mask = if dest.1 == 0 {
+                    0u32
+                } else {
+                    u32::MAX << (32 - u32::from(dest.1))
+                };
+                prefix.mask.ip4 = u32::from_ne_bytes(mask.to_be_bytes());
+            }
+            std::net::IpAddr::V6(v6) => {
+                prefix.addr_family = ffi::_sai_ip_addr_family_t::SAI_IP_ADDR_FAMILY_IPV6;
+                prefix.addr.ip6 = v6.octets();
+                let mask = if dest.1 == 0 {
+                    0u128
+                } else {
+                    u128::MAX << (128 - u32::from(dest.1))
+                };
+                prefix.mask.ip6 = mask.to_be_bytes();
+            }
+        }
+        prefix
+    }
+
+    fn route_entry(&self, dest: IpPrefix) -> Result<ffi::sai_route_entry_t, SaiError> {
+        Ok(ffi::sai_route_entry_t {
+            switch_id: self.switch_oid()?,
+            vr_id: self.defaults()?.virtual_router,
+            destination: Self::ip_prefix(dest),
+        })
+    }
 }
 
 fn path_to_cstring(path: &Path) -> Result<CString, SaiError> {
@@ -337,6 +613,14 @@ impl SaiBackend for VendorSai {
         }
         self.switch_oid = Some(oid);
         tracing::info!(oid = format_args!("{oid:#x}"), "SAI switch created");
+
+        // L3 needs the default VR/VLAN/bridge/CPU-port/trap-group; a
+        // vendor that can't report them keeps L2 working and fails L3
+        // calls with a clear error instead of failing bring-up.
+        match self.resolve_defaults(oid) {
+            Ok(defaults) => self.defaults = Some(defaults),
+            Err(err) => tracing::warn!(%err, "switch L3 defaults unresolved; L3 unavailable"),
+        }
 
         if self.diag_shell {
             self.spawn_diag_shell(oid)?;
@@ -656,6 +940,307 @@ impl SaiBackend for VendorSai {
 
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>> {
         self.events_rx.take()
+    }
+
+    fn setup_host_punt(&mut self) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        let defaults = self.defaults()?;
+
+        // SAFETY per block below: valid hostif api table from
+        // sai_api_query; attr arrays outlive the calls.
+        let create_trap = unsafe {
+            (*self.hostif_api)
+                .create_hostif_trap
+                .ok_or(SaiError::Other(
+                    "hostif api lacks create_hostif_trap".into(),
+                ))?
+        };
+        use ffi::_sai_hostif_trap_attr_t as trap_attr;
+        use ffi::_sai_hostif_trap_type_t as trap_type;
+        use ffi::_sai_packet_action_t as action;
+        // ARP is copied (L2 flooding keeps working on switched ports);
+        // traffic to the switch's own addresses is trapped outright.
+        let traps: [(&'static str, u32, u32); 3] = [
+            (
+                "create_hostif_trap(ARP_REQUEST)",
+                trap_type::SAI_HOSTIF_TRAP_TYPE_ARP_REQUEST,
+                action::SAI_PACKET_ACTION_COPY,
+            ),
+            (
+                "create_hostif_trap(ARP_RESPONSE)",
+                trap_type::SAI_HOSTIF_TRAP_TYPE_ARP_RESPONSE,
+                action::SAI_PACKET_ACTION_COPY,
+            ),
+            (
+                "create_hostif_trap(IP2ME)",
+                trap_type::SAI_HOSTIF_TRAP_TYPE_IP2ME,
+                action::SAI_PACKET_ACTION_TRAP,
+            ),
+        ];
+        for (call, trap, packet_action) in traps {
+            let mut type_attr = Self::zeroed_attr(trap_attr::SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE);
+            type_attr.value.s32 = trap as i32;
+            let mut action_attr = Self::zeroed_attr(trap_attr::SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION);
+            action_attr.value.s32 = packet_action as i32;
+            let mut group_attr = Self::zeroed_attr(trap_attr::SAI_HOSTIF_TRAP_ATTR_TRAP_GROUP);
+            group_attr.value.oid = defaults.trap_group;
+            let attrs = [type_attr, action_attr, group_attr];
+            let mut oid: ffi::sai_object_id_t = 0;
+            // SAFETY: attr array outlives the call.
+            unsafe {
+                check(
+                    call,
+                    create_trap(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+                )?;
+            }
+        }
+
+        // Wildcard table entry: every trapped packet is delivered on the
+        // netdev of its ingress physical port.
+        let create_entry = unsafe {
+            (*self.hostif_api)
+                .create_hostif_table_entry
+                .ok_or(SaiError::Other(
+                    "hostif api lacks create_hostif_table_entry".into(),
+                ))?
+        };
+        use ffi::_sai_hostif_table_entry_attr_t as entry_attr;
+        let mut type_attr = Self::zeroed_attr(entry_attr::SAI_HOSTIF_TABLE_ENTRY_ATTR_TYPE);
+        type_attr.value.s32 =
+            ffi::_sai_hostif_table_entry_type_t::SAI_HOSTIF_TABLE_ENTRY_TYPE_WILDCARD as i32;
+        let mut channel_attr =
+            Self::zeroed_attr(entry_attr::SAI_HOSTIF_TABLE_ENTRY_ATTR_CHANNEL_TYPE);
+        channel_attr.value.s32 =
+            ffi::_sai_hostif_table_entry_channel_type_t::SAI_HOSTIF_TABLE_ENTRY_CHANNEL_TYPE_NETDEV_PHYSICAL_PORT as i32;
+        let attrs = [type_attr, channel_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_hostif_table_entry(WILDCARD)",
+                create_entry(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        tracing::info!("CPU punt path installed (ARP copy, IP2ME trap, netdev delivery)");
+        Ok(())
+    }
+
+    fn create_hostif(&mut self, port: PortId, name: &str) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid hostif api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.hostif_api)
+                .create_hostif
+                .ok_or(SaiError::Other("hostif api lacks create_hostif".into()))?
+        };
+        use ffi::_sai_hostif_attr_t as attr;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_HOSTIF_ATTR_TYPE);
+        type_attr.value.s32 = ffi::_sai_hostif_type_t::SAI_HOSTIF_TYPE_NETDEV as i32;
+        let mut obj_attr = Self::zeroed_attr(attr::SAI_HOSTIF_ATTR_OBJ_ID);
+        obj_attr.value.oid = port.0;
+        let mut name_attr = Self::zeroed_attr(attr::SAI_HOSTIF_ATTR_NAME);
+        // SAI_HOSTIF_NAME_SIZE is 16 including the NUL; zeroed_attr left
+        // the tail NUL-filled.
+        // SAFETY: chardata is the union member NAME reads; the attr was
+        // zero-initialized so every byte is initialized.
+        unsafe {
+            for (dst, src) in name_attr
+                .value
+                .chardata
+                .iter_mut()
+                .zip(name.bytes().take(15))
+            {
+                *dst = src as c_char;
+            }
+        }
+        let mut vlan_attr = Self::zeroed_attr(attr::SAI_HOSTIF_ATTR_VLAN_TAG);
+        vlan_attr.value.s32 = ffi::_sai_hostif_vlan_tag_t::SAI_HOSTIF_VLAN_TAG_STRIP as i32;
+
+        let attrs = [type_attr, obj_attr, name_attr, vlan_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_hostif(NETDEV)",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn create_router_interface(&mut self, port: PortId) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let defaults = self.defaults()?;
+
+        // A port RIF needs the port out of the 802.1Q bridge first:
+        // default-VLAN membership, then the bridge port itself.
+        if let Some(bridge_port) = self.find_bridge_port(port)? {
+            if let Some(member) = self.find_default_vlan_member(bridge_port)? {
+                // SAFETY: valid vlan api table.
+                unsafe {
+                    let remove = (*self.vlan_api)
+                        .remove_vlan_member
+                        .ok_or(SaiError::Other("vlan api lacks remove_vlan_member".into()))?;
+                    check("remove_vlan_member(default)", remove(member))?;
+                }
+            }
+            // SAFETY: valid bridge api table.
+            unsafe {
+                let remove = (*self.bridge_api)
+                    .remove_bridge_port
+                    .ok_or(SaiError::Other(
+                        "bridge api lacks remove_bridge_port".into(),
+                    ))?;
+                check("remove_bridge_port", remove(bridge_port))?;
+            }
+        }
+
+        // SAFETY: valid rif api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.rif_api)
+                .create_router_interface
+                .ok_or(SaiError::Other(
+                    "router interface api lacks create_router_interface".into(),
+                ))?
+        };
+        use ffi::_sai_router_interface_attr_t as attr;
+        let mut vr_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID);
+        vr_attr.value.oid = defaults.virtual_router;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_TYPE);
+        type_attr.value.s32 =
+            ffi::_sai_router_interface_type_t::SAI_ROUTER_INTERFACE_TYPE_PORT as i32;
+        let mut port_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_PORT_ID);
+        port_attr.value.oid = port.0;
+        let mut mtu_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_MTU);
+        mtu_attr.value.u32_ = 9214;
+
+        let mut attrs = vec![vr_attr, type_attr, port_attr, mtu_attr];
+        if let Some(mac) = self.src_mac {
+            let mut mac_attr = Self::zeroed_attr(attr::SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS);
+            mac_attr.value.mac = mac;
+            attrs.push(mac_attr);
+        }
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_router_interface(PORT)",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_router_interface(&mut self, port: PortId, rif: Oid) -> Result<(), SaiError> {
+        let switch = self.switch_oid()?;
+        let defaults = self.defaults()?;
+
+        // SAFETY: valid rif api table.
+        unsafe {
+            let remove = (*self.rif_api)
+                .remove_router_interface
+                .ok_or(SaiError::Other(
+                    "router interface api lacks remove_router_interface".into(),
+                ))?;
+            check("remove_router_interface", remove(rif.0))?;
+        }
+
+        // Restore default L2 bridging: bridge port, untagged default-VLAN
+        // membership, PVID.
+        let bridge_port = {
+            // SAFETY: valid bridge api table; attr array outlives the call.
+            let create = unsafe {
+                (*self.bridge_api)
+                    .create_bridge_port
+                    .ok_or(SaiError::Other(
+                        "bridge api lacks create_bridge_port".into(),
+                    ))?
+            };
+            use ffi::_sai_bridge_port_attr_t as attr;
+            let mut type_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_TYPE);
+            type_attr.value.s32 = ffi::_sai_bridge_port_type_t::SAI_BRIDGE_PORT_TYPE_PORT as i32;
+            let mut port_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_PORT_ID);
+            port_attr.value.oid = port.0;
+            let mut admin_attr = Self::zeroed_attr(attr::SAI_BRIDGE_PORT_ATTR_ADMIN_STATE);
+            admin_attr.value.booldata = true;
+            let attrs = [type_attr, port_attr, admin_attr];
+            let mut oid: ffi::sai_object_id_t = 0;
+            // SAFETY: attr array outlives the call.
+            unsafe {
+                check(
+                    "create_bridge_port(PORT)",
+                    create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+                )?;
+            }
+            oid
+        };
+        {
+            // SAFETY: valid vlan api table; attr array outlives the call.
+            let create = unsafe {
+                (*self.vlan_api)
+                    .create_vlan_member
+                    .ok_or(SaiError::Other("vlan api lacks create_vlan_member".into()))?
+            };
+            use ffi::_sai_vlan_member_attr_t as attr;
+            let mut vlan_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_VLAN_ID);
+            vlan_attr.value.oid = defaults.vlan;
+            let mut bp_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID);
+            bp_attr.value.oid = bridge_port;
+            let mut mode_attr = Self::zeroed_attr(attr::SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE);
+            mode_attr.value.s32 =
+                ffi::_sai_vlan_tagging_mode_t::SAI_VLAN_TAGGING_MODE_UNTAGGED as i32;
+            let attrs = [vlan_attr, bp_attr, mode_attr];
+            let mut oid: ffi::sai_object_id_t = 0;
+            // SAFETY: attr array outlives the call.
+            unsafe {
+                check(
+                    "create_vlan_member(default)",
+                    create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+                )?;
+            }
+        }
+        {
+            let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_PORT_VLAN_ID);
+            attr.value.u16_ = defaults.vlan_number;
+            // SAFETY: valid port api table; attr outlives the call.
+            unsafe {
+                let set = (*self.port_api)
+                    .set_port_attribute
+                    .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+                check("set_port_attribute(PORT_VLAN_ID)", set(port.0, &attr))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError> {
+        let defaults = self.defaults()?;
+        let entry = self.route_entry(dest)?;
+        // SAFETY: valid route api table; entry + attr outlive the call.
+        let create = unsafe {
+            (*self.route_api)
+                .create_route_entry
+                .ok_or(SaiError::Other("route api lacks create_route_entry".into()))?
+        };
+        let mut nh_attr =
+            Self::zeroed_attr(ffi::_sai_route_entry_attr_t::SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID);
+        nh_attr.value.oid = match target {
+            RouteTarget::Cpu => defaults.cpu_port,
+            RouteTarget::Rif(rif) => rif.0,
+        };
+        // SAFETY: entry and attr outlive the call.
+        unsafe { check("create_route_entry", create(&entry, 1, &nh_attr)) }
+    }
+
+    fn remove_route(&mut self, dest: IpPrefix) -> Result<(), SaiError> {
+        let entry = self.route_entry(dest)?;
+        // SAFETY: valid route api table; entry outlives the call.
+        unsafe {
+            let remove = (*self.route_api)
+                .remove_route_entry
+                .ok_or(SaiError::Other("route api lacks remove_route_entry".into()))?;
+            check("remove_route_entry", remove(&entry))
+        }
     }
 }
 

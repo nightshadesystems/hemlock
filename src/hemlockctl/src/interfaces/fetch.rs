@@ -100,7 +100,9 @@ fn convert(state: &pb::InterfaceState, platform_model: &str) -> Option<Interface
         broadcast: "255.255.255.255".into(),
     });
     i.mtu = state.mtu;
-    i.l3 = matches!(id.kind, Kind::Management | Kind::Loopback | Kind::Vlan);
+    // Ethernet ports are L2 by default; an address puts them in L3 mode.
+    i.l3 = matches!(id.kind, Kind::Management | Kind::Loopback | Kind::Vlan)
+        || (id.kind == Kind::Ethernet && !state.ip_addresses.is_empty());
     i.bandwidth_kbit = (state.speed_mbps > 0).then_some(state.speed_mbps * 1000);
 
     let physical = matches!(id.kind, Kind::Ethernet | Kind::Management);
