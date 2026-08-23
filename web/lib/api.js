@@ -38,6 +38,53 @@ export async function api(path, options = {}) {
   return type.includes('application/json') ? res.json() : res.text();
 }
 
+// Raw-body file upload with progress callbacks (fetch can't report
+// upload progress, so this one path uses XMLHttpRequest). Resolves with
+// the parsed JSON response; rejects with ApiError like api().
+export function uploadFile(path, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', path);
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+    };
+    xhr.onerror = () => reject(new ApiError(0, 'upload failed (network error)'));
+    xhr.onload = () => {
+      let body = null;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        /* non-JSON body */
+      }
+      if (xhr.status === 401) {
+        window.location.assign('/login/');
+        reject(new ApiError(401, 'not signed in'));
+      } else if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body);
+      } else {
+        const message =
+          (body && body.error) ||
+          (body && Array.isArray(body.errors) && body.errors.join('; ')) ||
+          xhr.statusText;
+        reject(new ApiError(xhr.status, message));
+      }
+    };
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.send(file);
+  });
+}
+
+// Trigger a browser download of text content.
+export function downloadText(filename, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export const formatSpeed = (mbps) =>
   !mbps ? '—' : mbps >= 1000 ? `${mbps / 1000} Gb/s` : `${mbps} Mb/s`;
 

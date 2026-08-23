@@ -3,9 +3,10 @@
 //! per request — webd holds no cache to go stale.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::{header, request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -24,6 +25,8 @@ pub struct AppState {
     pub sessions: Sessions,
     pub dev_auth: Option<(String, String)>,
     pub secure_cookie: bool,
+    /// webd state directory (TLS material, staged upgrade images).
+    pub state_dir: PathBuf,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -44,6 +47,18 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
         .route("/api/config", get(config))
+        .route("/api/config/restore", post(config_restore))
+        .route("/api/maintenance", get(maintenance))
+        .route("/api/reboot", post(reboot))
+        .route("/api/reboot/cancel", post(reboot_cancel))
+        // Firmware images stream straight to disk; lift axum's 2 MB
+        // default body cap for this one route.
+        .route(
+            "/api/upgrade/upload",
+            post(upgrade_upload).layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)),
+        )
+        .route("/api/upgrade/apply", post(upgrade_apply))
+        .route("/api/upgrade/discard", post(upgrade_discard))
         .with_state(state)
 }
 
@@ -354,6 +369,7 @@ async fn vlans(
 /// commit's applied-changes list.
 async fn commit_edit(
     state: &AppState,
+    comment: &str,
     apply: impl FnOnce(&mut ConfigTree) -> Result<(), String>,
 ) -> Result<Response, ApiError> {
     let invalid = |errors: Vec<String>| {
@@ -385,7 +401,7 @@ async fn commit_edit(
     }
     let commit = client
         .commit(pb::CommitRequest {
-            comment: "web console".to_string(),
+            comment: comment.to_string(),
             confirm_timeout_secs: 0,
         })
         .await
@@ -404,7 +420,7 @@ async fn interfaces_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::edit::InterfaceEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, |tree| {
+    commit_edit(&state, "web console", |tree| {
         crate::edit::apply_interface_edit(tree, &edit)
     })
     .await
@@ -415,7 +431,10 @@ async fn vlans_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::edit::VlanEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, |tree| crate::edit::apply_vlan_edit(tree, &edit)).await
+    commit_edit(&state, "web console", |tree| {
+        crate::edit::apply_vlan_edit(tree, &edit)
+    })
+    .await
 }
 
 async fn users(_op: Operator, State(state): State<SharedState>) -> Response {
@@ -505,6 +524,132 @@ fn uptime_secs() -> Option<u64> {
 async fn config(_op: Operator, State(state): State<SharedState>) -> Result<Response, ApiError> {
     let text = running_config(&state.mgmtd).await?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
+}
+
+// ----------------------------------------------------------- maintenance
+
+fn errors(errors: Vec<String>) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({ "errors": errors })),
+    )
+        .into_response()
+}
+
+async fn maintenance(_op: Operator, State(state): State<SharedState>) -> Response {
+    Json(json!({
+        "hostname": crate::hostname(),
+        "version": hemlock_common::VERSION,
+        "scheduled_reboot": crate::maint::scheduled_shutdown(),
+        "staged_image": crate::maint::staged_info(&state.state_dir),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct RestoreRequest {
+    text: String,
+}
+
+/// Replace the whole configuration with an uploaded backup: parse it,
+/// run it through mgmtd's validator, commit.
+async fn config_restore(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<RestoreRequest>,
+) -> Result<Response, ApiError> {
+    let restored = match hemlock_config::parse(&request.text) {
+        Ok(tree) => tree,
+        Err(e) => return Ok(errors(vec![format!("configuration does not parse: {e}")])),
+    };
+    commit_edit(&state, "web console restore", |tree| {
+        *tree = restored;
+        tree.normalize_interfaces();
+        Ok(())
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct RebootRequest {
+    /// 0 = reboot now; otherwise minutes from now.
+    #[serde(default)]
+    in_minutes: u64,
+}
+
+async fn reboot(
+    _op: Operator,
+    State(_state): State<SharedState>,
+    Json(request): Json<RebootRequest>,
+) -> Response {
+    if !cfg!(unix) {
+        return errors(vec!["reboot is only available on the switch".to_string()]);
+    }
+    if request.in_minutes == 0 {
+        crate::maint::reboot_now();
+        return Json(json!({ "rebooting": true })).into_response();
+    }
+    if request.in_minutes > 7 * 24 * 60 {
+        return errors(vec!["reboot delay must be at most a week".to_string()]);
+    }
+    match crate::maint::schedule_reboot(request.in_minutes).await {
+        Ok(at_unix) => Json(json!({ "scheduled": true, "at_unix": at_unix })).into_response(),
+        Err(message) => errors(vec![message]),
+    }
+}
+
+async fn reboot_cancel(_op: Operator, State(_state): State<SharedState>) -> Response {
+    match crate::maint::cancel_reboot().await {
+        Ok(()) => Json(json!({ "cancelled": true })).into_response(),
+        Err(message) => errors(vec![message]),
+    }
+}
+
+/// Raw-body image upload, streamed to the staging area on disk.
+async fn upgrade_upload(
+    _op: Operator,
+    State(state): State<SharedState>,
+    body: axum::body::Body,
+) -> Response {
+    match crate::maint::stage_upload(&state.state_dir, body.into_data_stream()).await {
+        Ok(staged) => Json(json!({ "staged_image": staged })).into_response(),
+        Err(message) => errors(vec![message]),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpgradeApplyRequest {
+    /// Reboot into the new image once it is written (the default).
+    #[serde(default = "default_true")]
+    reboot: bool,
+    /// Install even if the image targets a different platform.
+    #[serde(default)]
+    force: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn upgrade_apply(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<UpgradeApplyRequest>,
+) -> Response {
+    match crate::maint::apply_staged(&state.state_dir, request.force).await {
+        Ok(header) => {
+            if request.reboot {
+                crate::maint::reboot_now();
+            }
+            Json(json!({ "version": header.version, "rebooting": request.reboot })).into_response()
+        }
+        Err(message) => errors(vec![message]),
+    }
+}
+
+async fn upgrade_discard(_op: Operator, State(state): State<SharedState>) -> Response {
+    crate::maint::discard_staged(&state.state_dir).await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]

@@ -283,6 +283,15 @@ persist dir by the stable `/hemlock/...` paths regardless of where the
 flash lands. Wiping `/hemlock/persist` is a factory
 reset; the squashfs is never modified in place.
 
+In-band upgrades (web console, System → Maintenance) reuse the same
+image format: webd stages an uploaded `.bin` under its state dir,
+verifies the `hemlock_image_platform` header against the installed
+`/hemlock/platform/onie-machine`, unpacks it with the self-extractor's
+`HEMLOCK_EXTRACT_ONLY` hook, and replaces `rootfs.squashfs`, the boot
+assets and the platform overlay on `/host` (each file via copy-to-.new +
+fsync + rename), then reboots. There is no A/B slot — recovery from a
+bad image is a reinstall from ONIE.
+
 ## Phase-1 boundaries and seams
 
 Explicitly out of scope in phase 1: FRR integration, L3/routing

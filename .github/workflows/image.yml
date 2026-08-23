@@ -8,6 +8,10 @@ name: Image build
 #   dummy — structural layout test only (no root, no vendor artifacts).
 #
 # The dummy mode also runs in the main CI on every push (ci.yml).
+#
+# Non-release builds stamp the VERSION with the UTC build time
+# (hemlock-0.1.0-YYYYMMDDHHMM-<platform>.bin); the "release" checkbox
+# ships the plain VERSION.
 on:
   workflow_dispatch:
     inputs:
@@ -25,6 +29,10 @@ on:
         type: choice
         options: [full, dummy]
         default: full
+      release:
+        description: "Release build (clean version, no timestamp)"
+        type: boolean
+        default: false
 
 jobs:
   image:
@@ -46,6 +54,18 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
 
+      # Release builds ship the plain VERSION; everything else gets a
+      # YYYYMMDDHHMM stamp so ad-hoc images are distinguishable.
+      - name: Compute image version
+        id: ver
+        run: |
+          base="$(tr -d '[:space:]' < VERSION)"
+          if [ "${{ inputs.release }}" = "true" ]; then
+            echo "version=$base" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$base-$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Fetch vendor artifacts
         if: inputs.mode == 'full'
         run: sh vendor/fetch-vendor.sh "${{ inputs.platform }}"
@@ -62,11 +82,11 @@ jobs:
         run: |
           sudo --preserve-env=HOME env "PATH=$PATH" \
             CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
-            bash build/mkimage.sh "${{ inputs.platform }}"
+            bash build/mkimage.sh "${{ inputs.platform }}" --version "${{ steps.ver.outputs.version }}"
 
       - name: Build image (dummy)
         if: inputs.mode == 'dummy'
-        run: bash build/mkimage.sh "${{ inputs.platform }}" --dummy-rootfs
+        run: bash build/mkimage.sh "${{ inputs.platform }}" --dummy-rootfs --version "${{ steps.ver.outputs.version }}"
 
       - name: Verify image structure
         run: bash build/verify-image.sh build/out/hemlock-*-"${{ inputs.platform }}".bin
@@ -81,6 +101,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: hemlock-image-${{ inputs.platform }}-${{ inputs.mode }}
+          name: hemlock-${{ steps.ver.outputs.version }}-${{ inputs.platform }}-${{ inputs.mode }}
           path: build/out/*.bin
           if-no-files-found: error

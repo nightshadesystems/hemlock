@@ -15,6 +15,7 @@
 mod api;
 mod auth;
 mod edit;
+mod maint;
 mod tls;
 mod users;
 
@@ -201,6 +202,7 @@ async fn main() -> Result<()> {
         // exists — with http enabled, a Secure cookie would break http
         // logins outright.
         secure_cookie: listeners.https && !listeners.http,
+        state_dir: args.state_dir.clone(),
     });
 
     let static_files = ServeDir::new(&args.assets)

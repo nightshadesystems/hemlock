@@ -33,6 +33,11 @@ rcgen = "0.14"
 # Session tokens
 getrandom = "0.3"
 
+# Streaming firmware-image uploads to disk (both already in the axum
+# tree; no default features so futures-macro stays out)
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
 # Password verification against /etc/shadow (Debian trixie defaults to
 # yescrypt; sha-crypt covers legacy $6$/$5$ hashes). Both pure Rust.
 sha-crypt = { version = "0.6", features = ["getrandom"] }
