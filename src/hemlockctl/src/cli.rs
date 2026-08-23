@@ -559,14 +559,15 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set system ssh authentication local           password logins (PAM)");
             println!("  set system http                               web console over HTTP");
             println!("  set system https                              web console over HTTPS (self-signed cert)");
-            println!("  set routing static <prefix> <next-hop>        static route");
+            println!("  set routing static <prefix> <next-hop|drop> [distance <1-255>]");
+            println!("                                                repeat a prefix for ECMP");
             println!(
                 "  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport|"
             );
             println!("                            channel-group|lacp|spanning-tree|storm-control|min-links ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
-            println!("  delete routing [static [<prefix>]]");
+            println!("  delete routing [static [<prefix> [<next-hop>]]]");
             println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
             println!("  delete switching [mac-table|mirror ...]");
             println!("  show                      show the candidate configuration");
@@ -1518,8 +1519,9 @@ async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> R
     .map_err(fmt_err)
 }
 
-/// `set routing static <prefix> <next-hop>` and its deletes. Prefixes
-/// are canonicalized (host bits cleared) before they enter the config.
+/// `set routing static <prefix> <next-hop|drop> [distance <1-255>]` and
+/// its deletes. Repeating a prefix with more next hops is ECMP; a
+/// non-canonical prefix (host bits set) is an error, never a rewrite.
 async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     if delete && words.is_empty() {
         return edit_config(endpoints, |tree| {
@@ -1530,9 +1532,9 @@ async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> 
     }
     let usage = move || {
         if delete {
-            "% Usage: delete routing [static [<prefix>]]".to_string()
+            "% Usage: delete routing [static [<prefix> [<next-hop>]]]".to_string()
         } else {
-            "% Usage: set routing static <prefix> <next-hop>".to_string()
+            "% Usage: set routing static <prefix> <next-hop|drop> [distance <1-255>]".to_string()
         }
     };
     let Some(first) = words.first() else {
@@ -1542,17 +1544,16 @@ async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> 
     let rest = &words[1..];
 
     if delete {
-        match rest.first() {
-            None => edit_config(endpoints, |tree| {
+        match rest {
+            [] => edit_config(endpoints, |tree| {
                 let routing = tree.block_mut("routing");
                 ConfigTree::remove_block(routing, "static", &[]);
                 remove_block_if_empty(tree, "routing");
             })
             .await
             .map_err(fmt_err),
-            Some(prefix) => {
-                let prefix =
-                    hemlock_common::net::canonical_prefix(prefix).map_err(|e| format!("% {e}"))?;
+            [prefix] => {
+                let prefix = canonical_route_prefix(prefix)?;
                 edit_config(endpoints, |tree| {
                     let routing = tree.block_mut("routing");
                     if let Some(routes) = block_children_mut(routing, "static") {
@@ -1566,22 +1567,103 @@ async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> 
                 .await
                 .map_err(fmt_err)
             }
+            [prefix, next_hop] => {
+                let prefix = canonical_route_prefix(prefix)?;
+                let next_hop = next_hop.to_string();
+                edit_config(endpoints, |tree| {
+                    let routing = tree.block_mut("routing");
+                    if let Some(routes) = block_children_mut(routing, "static") {
+                        routes.retain(|item| {
+                            !matches!(item, hemlock_config::Item::Leaf { name, values }
+                                if *name == prefix
+                                    && values.first().map(String::as_str) == Some(&next_hop))
+                        });
+                        if routes.is_empty() {
+                            ConfigTree::remove_block(routing, "static", &[]);
+                        }
+                    }
+                    remove_block_if_empty(tree, "routing");
+                })
+                .await
+                .map_err(fmt_err)
+            }
+            _ => Err(usage()),
         }
     } else {
-        let (Some(prefix), Some(next_hop)) = (rest.first(), rest.get(1)) else {
+        let (Some(prefix), Some(target)) = (rest.first(), rest.get(1)) else {
             return Err(usage());
         };
-        let prefix =
-            hemlock_common::net::validate_route(prefix, next_hop).map_err(|e| format!("% {e}"))?;
-        let next_hop = next_hop.to_string();
+        let prefix = canonical_route_prefix(prefix)?;
+        // A next hop always carries a separator; anything else resolves
+        // against the keyword so `dr` works and typos error cleanly.
+        let values = if target.contains('.') || target.contains(':') {
+            hemlock_common::net::validate_next_hop(&prefix, target)
+                .map_err(|e| format!("% {e}"))?;
+            match &rest[2..] {
+                [] => vec![target.to_string()],
+                [keyword, value] => {
+                    resolve(keyword, &["distance"])?;
+                    let distance: u8 = value
+                        .parse()
+                        .ok()
+                        .filter(|d| *d >= 1)
+                        .ok_or_else(|| format!("% bad distance {value:?} (1..255)"))?;
+                    vec![target.to_string(), "distance".into(), distance.to_string()]
+                }
+                _ => return Err(usage()),
+            }
+        } else {
+            resolve(target, &["drop"])?;
+            if rest.len() > 2 {
+                return Err(usage());
+            }
+            vec!["drop".to_string()]
+        };
         edit_config(endpoints, |tree| {
             let routing = tree.block_mut("routing");
             let routes = ConfigTree::ensure_block(routing, "static", &[]);
-            ConfigTree::set_leaf(routes, &prefix, vec![next_hop]);
+            set_route_leaf(routes, &prefix, values);
         })
         .await
         .map_err(fmt_err)
     }
+}
+
+/// The canonical form of a route prefix argument, erroring (not
+/// rewriting) when host bits are set.
+fn canonical_route_prefix(prefix: &str) -> Result<String, String> {
+    hemlock_common::net::require_canonical_prefix(prefix).map_err(|e| format!("% {prefix}: {e}"))
+}
+
+/// Insert or update one static-route line. Route leaves repeat per
+/// prefix (ECMP), so the line's identity is (prefix, first value) and a
+/// new line lands next to the prefix's existing ones.
+fn set_route_leaf(routes: &mut Vec<hemlock_config::Item>, prefix: &str, values: Vec<String>) {
+    let target = values.first().cloned();
+    for item in routes.iter_mut() {
+        if let hemlock_config::Item::Leaf {
+            name,
+            values: existing,
+        } = item
+        {
+            if name == prefix && existing.first() == target.as_ref() {
+                *existing = values;
+                return;
+            }
+        }
+    }
+    let insert_at = routes
+        .iter()
+        .rposition(|item| item.name() == prefix)
+        .map(|i| i + 1)
+        .unwrap_or(routes.len());
+    routes.insert(
+        insert_at,
+        hemlock_config::Item::Leaf {
+            name: prefix.to_string(),
+            values,
+        },
+    );
 }
 
 /// `set|delete protocols <spanning-tree|igmp-snooping|mld-snooping|lacp> ...`.

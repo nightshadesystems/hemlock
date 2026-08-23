@@ -10,7 +10,7 @@
 //! Each family stays a pure function from config tree to typed intent,
 //! diffed against the running tree and pushed to the owning applier.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hemlock_config::{ConfigTree, Item};
 
@@ -24,8 +24,9 @@ pub struct Intents {
     pub ssh: SshIntent,
     /// Web console listeners (`system { http }` / `system { https }`).
     pub web: WebIntent,
-    /// Static routes: canonical prefix -> next hop.
-    pub routes: BTreeMap<String, String>,
+    /// Static routes, keyed by canonical prefix. Repeated config lines
+    /// per prefix merge into one ECMP next-hop set.
+    pub routes: BTreeMap<String, StaticRoute>,
     /// VLANs (`vlans { vlan <id> { ... } }`), keyed by 802.1Q id.
     pub vlans: BTreeMap<u16, VlanIntent>,
     /// SVIs (`interfaces { Vlan<id> { address ... } }`), keyed by
@@ -49,6 +50,28 @@ pub struct Intents {
     pub mirror: BTreeMap<u8, MirrorIntent>,
     /// Non-fatal commit notes (empty port-channels, MTU hints).
     pub warnings: Vec<String>,
+}
+
+/// One static route: the whole per-prefix state — an ECMP next-hop set
+/// or a null route, plus the administrative distance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticRoute {
+    /// Next hops; more than one = ECMP. Empty exactly when `drop`.
+    pub next_hops: BTreeSet<String>,
+    /// Null route (`<prefix> drop`): a kernel blackhole route.
+    pub drop: bool,
+    /// Administrative distance (rendered as the kernel metric).
+    pub distance: u8,
+}
+
+impl Default for StaticRoute {
+    fn default() -> Self {
+        Self {
+            next_hops: BTreeSet::new(),
+            drop: false,
+            distance: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1105,8 +1128,12 @@ fn web(tree: &ConfigTree) -> WebIntent {
     }
 }
 
-fn routes(tree: &ConfigTree) -> Result<BTreeMap<String, String>, IntentError> {
-    let mut routes = BTreeMap::new();
+fn routes(tree: &ConfigTree) -> Result<BTreeMap<String, StaticRoute>, IntentError> {
+    let mut routes: BTreeMap<String, StaticRoute> = BTreeMap::new();
+    // Explicit `distance` values seen per prefix — distance is
+    // per-prefix, so explicit values on different lines must agree
+    // (lines without one inherit rather than conflict).
+    let mut explicit_distance: BTreeMap<String, u8> = BTreeMap::new();
     let Some((_, routing)) = tree.block("routing") else {
         return Ok(routes);
     };
@@ -1138,30 +1165,55 @@ fn routes(tree: &ConfigTree) -> Result<BTreeMap<String, String>, IntentError> {
                     route.name()
                 )));
             };
-            let [next_hop] = values.as_slice() else {
-                return Err(IntentError::BadRoute {
-                    prefix: prefix.clone(),
-                    reason: "expected exactly one next-hop".into(),
-                });
+            let bad = |reason: String| IntentError::BadRoute {
+                prefix: prefix.clone(),
+                reason,
             };
-            let canonical =
-                hemlock_common::net::validate_route(prefix, next_hop).map_err(|reason| {
-                    IntentError::BadRoute {
-                        prefix: prefix.clone(),
-                        reason,
+            let canonical = hemlock_common::net::require_canonical_prefix(prefix).map_err(&bad)?;
+            let entry = routes.entry(canonical.clone()).or_default();
+            match values.as_slice() {
+                [keyword] if keyword == "drop" => {
+                    if !entry.next_hops.is_empty() {
+                        return Err(bad("cannot mix drop with next hops".into()));
                     }
-                })?;
-            if canonical != *prefix {
-                return Err(IntentError::BadRoute {
-                    prefix: prefix.clone(),
-                    reason: format!("host bits set (use {canonical})"),
-                });
-            }
-            if routes.insert(canonical, next_hop.clone()).is_some() {
-                return Err(IntentError::BadRoute {
-                    prefix: prefix.clone(),
-                    reason: "duplicate route".into(),
-                });
+                    entry.drop = true;
+                }
+                [next_hop, rest @ ..] => {
+                    hemlock_common::net::validate_next_hop(&canonical, next_hop).map_err(&bad)?;
+                    if entry.drop {
+                        return Err(bad("cannot mix drop with next hops".into()));
+                    }
+                    match rest {
+                        [] => {}
+                        [keyword, value] if keyword == "distance" => {
+                            let distance =
+                                parse_int::<u8>(value, 1..=255, "distance").map_err(&bad)?;
+                            if let Some(prior) =
+                                explicit_distance.insert(canonical.clone(), distance)
+                            {
+                                if prior != distance {
+                                    return Err(bad(format!(
+                                        "conflicting distances ({prior} and {distance}); \
+                                         distance is per-prefix"
+                                    )));
+                                }
+                            }
+                            entry.distance = distance;
+                        }
+                        _ => {
+                            return Err(bad(
+                                "expected `<next-hop> [distance <1-255>]` or `drop`".into()
+                            ))
+                        }
+                    }
+                    // A repeated identical next hop merges (ECMP is a set).
+                    entry.next_hops.insert(next_hop.clone());
+                }
+                [] => {
+                    return Err(bad(
+                        "expected `<next-hop> [distance <1-255>]` or `drop`".into()
+                    ))
+                }
             }
         }
     }
@@ -1661,18 +1713,39 @@ impl NetdevChange {
     }
 }
 
-/// One static-route change for the OS applier.
+/// One static-route change for the OS applier. Both sides travel
+/// because the configured distance is the kernel metric, and the metric
+/// is part of a kernel route's identity — a distance change must delete
+/// the old route, not just replace at the new metric.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteChange {
     pub prefix: String,
-    /// None = remove the route.
-    pub next_hop: Option<String>,
+    /// The previously running route, if any.
+    pub old: Option<StaticRoute>,
+    /// The full wanted route (whole next-hop set); None = remove.
+    pub new: Option<StaticRoute>,
 }
 
 impl RouteChange {
     pub fn describe(&self) -> String {
-        match &self.next_hop {
-            Some(next_hop) => format!("route {} via {next_hop}", self.prefix),
+        match &self.new {
+            Some(route) if route.drop => format!("route {} drop", self.prefix),
+            Some(route) => {
+                let hops = route
+                    .next_hops
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if route.distance == 1 {
+                    format!("route {} via {hops}", self.prefix)
+                } else {
+                    format!(
+                        "route {} via {hops} (distance {})",
+                        self.prefix, route.distance
+                    )
+                }
+            }
             None => format!("route {} removed", self.prefix),
         }
     }
@@ -1859,19 +1932,22 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
         }
     }
 
-    for (prefix, next_hop) in &candidate.routes {
-        if running.routes.get(prefix) != Some(next_hop) {
+    for (prefix, wanted) in &candidate.routes {
+        let current = running.routes.get(prefix);
+        if current != Some(wanted) {
             changes.routes.push(RouteChange {
                 prefix: prefix.clone(),
-                next_hop: Some(next_hop.clone()),
+                old: current.cloned(),
+                new: Some(wanted.clone()),
             });
         }
     }
-    for prefix in running.routes.keys() {
+    for (prefix, had) in &running.routes {
         if !candidate.routes.contains_key(prefix) {
             changes.routes.push(RouteChange {
                 prefix: prefix.clone(),
-                next_hop: None,
+                old: Some(had.clone()),
+                new: None,
             });
         }
     }
@@ -2595,23 +2671,82 @@ interfaces {
         assert_eq!(back.describe(), vec!["web ui disabled".to_string()]);
     }
 
+    /// Shorthand for the expected side of route assertions.
+    fn static_route(next_hops: &[&str], drop: bool, distance: u8) -> StaticRoute {
+        StaticRoute {
+            next_hops: next_hops.iter().map(|h| h.to_string()).collect(),
+            drop,
+            distance,
+        }
+    }
+
     #[test]
     fn extracts_static_routes() {
         let intents = intents_of(
-            "routing {\n    static {\n        0.0.0.0/0 10.42.10.1\n        10.99.0.0/16 10.42.10.2\n    }\n}\n",
+            "routing {\n    static {\n        0.0.0.0/0 10.42.10.1\n        10.99.0.0/16 10.9.9.0\n        10.99.0.0/16 10.42.10.7\n        192.0.2.0/24 drop\n        172.16.0.0/12 10.42.10.1 distance 250\n        2001:db8:99::/48 2001:db8:9::1\n    }\n}\n",
         );
-        assert_eq!(intents.routes.len(), 2);
-        assert_eq!(intents.routes["0.0.0.0/0"], "10.42.10.1");
-        assert_eq!(intents.routes["10.99.0.0/16"], "10.42.10.2");
+        assert_eq!(intents.routes.len(), 5);
+        assert_eq!(
+            intents.routes["0.0.0.0/0"],
+            static_route(&["10.42.10.1"], false, 1)
+        );
+        // Repeated prefix lines merge into one ECMP set.
+        assert_eq!(
+            intents.routes["10.99.0.0/16"],
+            static_route(&["10.42.10.7", "10.9.9.0"], false, 1)
+        );
+        assert_eq!(intents.routes["192.0.2.0/24"], static_route(&[], true, 1));
+        assert_eq!(
+            intents.routes["172.16.0.0/12"],
+            static_route(&["10.42.10.1"], false, 250)
+        );
+        assert_eq!(
+            intents.routes["2001:db8:99::/48"],
+            static_route(&["2001:db8:9::1"], false, 1)
+        );
+
+        // A repeated identical next hop is idempotent, and a line
+        // without an explicit distance inherits the prefix's.
+        let intents = intents_of(
+            "routing { static { 10.0.0.0/8 10.1.1.1 distance 5\n10.0.0.0/8 10.1.1.1\n10.0.0.0/8 10.1.1.2 } }",
+        );
+        assert_eq!(
+            intents.routes["10.0.0.0/8"],
+            static_route(&["10.1.1.1", "10.1.1.2"], false, 5)
+        );
     }
 
     #[test]
     fn rejects_bad_routes() {
-        // Host bits set in the prefix.
+        // Host bits set in the prefix name the canonical form.
         let tree = parse("routing { static { 10.42.10.9/24 10.42.10.1 } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        let err = extract(&tree).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "route 10.42.10.9/24: host bits set; did you mean 10.42.10.0/24?"
+        );
         // Next hop family mismatch.
         let tree = parse("routing { static { 0.0.0.0/0 2001:db8::1 } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        // A next hop must be a plain address, not a prefix.
+        let tree = parse("routing { static { 0.0.0.0/0 10.42.10.1/24 } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        // drop and next hops are mutually exclusive, in either order.
+        let tree = parse("routing { static { 10.0.0.0/8 10.1.1.1\n10.0.0.0/8 drop } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        let tree = parse("routing { static { 10.0.0.0/8 drop\n10.0.0.0/8 10.1.1.1 } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        // Distance is per-prefix: explicit values must agree.
+        let tree = parse(
+            "routing { static { 10.0.0.0/8 10.1.1.1 distance 5\n10.0.0.0/8 10.1.1.2 distance 9 } }",
+        )
+        .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        // Distance range.
+        let tree = parse("routing { static { 10.0.0.0/8 10.1.1.1 distance 0 } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
+        // Trailing junk after the next hop.
+        let tree = parse("routing { static { 10.0.0.0/8 10.1.1.1 metric 5 } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
         // Unknown routing sub-block.
         let tree = parse("routing { ospf { } }").unwrap();
@@ -2677,7 +2812,8 @@ interfaces {
             changes.routes,
             vec![RouteChange {
                 prefix: "0.0.0.0/0".into(),
-                next_hop: Some("10.42.10.1".into()),
+                old: None,
+                new: Some(static_route(&["10.42.10.1"], false, 1)),
             }]
         );
         assert_eq!(
@@ -2704,10 +2840,60 @@ interfaces {
             back.routes,
             vec![RouteChange {
                 prefix: "0.0.0.0/0".into(),
-                next_hop: None,
+                old: Some(static_route(&["10.42.10.1"], false, 1)),
+                new: None,
             }]
         );
         assert_eq!(back.ssh, Some(SshIntent::default()));
+    }
+
+    #[test]
+    fn diff_os_routes_track_ecmp_and_distance() {
+        let running = intents_of("routing { static { 10.99.0.0/16 10.9.9.0 } }");
+        let candidate = intents_of(
+            "routing { static { 10.99.0.0/16 10.9.9.0\n10.99.0.0/16 10.42.10.7\n192.0.2.0/24 drop } }",
+        );
+        let changes = diff_os(&running, &candidate);
+        assert_eq!(
+            changes.routes,
+            vec![
+                RouteChange {
+                    prefix: "10.99.0.0/16".into(),
+                    old: Some(static_route(&["10.9.9.0"], false, 1)),
+                    new: Some(static_route(&["10.42.10.7", "10.9.9.0"], false, 1)),
+                },
+                RouteChange {
+                    prefix: "192.0.2.0/24".into(),
+                    old: None,
+                    new: Some(static_route(&[], true, 1)),
+                },
+            ]
+        );
+        assert_eq!(
+            changes.describe(),
+            vec![
+                "route 10.99.0.0/16 via 10.42.10.7, 10.9.9.0".to_string(),
+                "route 192.0.2.0/24 drop".to_string(),
+            ]
+        );
+
+        // A distance change carries both sides so the applier can
+        // delete the old-metric kernel route.
+        let slower = intents_of("routing { static { 10.99.0.0/16 10.9.9.0 distance 250 } }");
+        let changes = diff_os(&running, &slower);
+        assert_eq!(
+            changes.routes,
+            vec![RouteChange {
+                prefix: "10.99.0.0/16".into(),
+                old: Some(static_route(&["10.9.9.0"], false, 1)),
+                new: Some(static_route(&["10.9.9.0"], false, 250)),
+            }]
+        );
+        assert_eq!(
+            changes.describe(),
+            vec!["route 10.99.0.0/16 via 10.9.9.0 (distance 250)".to_string()]
+        );
+        assert!(diff_os(&candidate, &candidate).is_empty());
     }
 
     #[test]

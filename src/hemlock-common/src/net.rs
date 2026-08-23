@@ -6,7 +6,8 @@
 use std::net::IpAddr;
 
 /// Parse `address/prefix-length`. Host bits may be set — an interface
-/// address wants them; route prefixes go through [`validate_route`].
+/// address wants them; route prefixes go through
+/// [`require_canonical_prefix`].
 pub fn parse_cidr(text: &str) -> Result<(IpAddr, u8), String> {
     let Some((addr, len)) = text.split_once('/') else {
         return Err(format!("{text:?} is not <address>/<prefix-length>"));
@@ -31,10 +32,25 @@ pub fn canonical_prefix(prefix: &str) -> Result<String, String> {
     Ok(format!("{}/{len}", network(addr, len)))
 }
 
-/// Validate a static route and return its canonical prefix. The next
-/// hop must parse and match the prefix's address family.
-pub fn validate_route(prefix: &str, next_hop: &str) -> Result<String, String> {
-    let (addr, len) = parse_cidr(prefix)?;
+/// A route prefix that must already be canonical: host bits set is an
+/// error naming the canonical form, never a silent rewrite.
+pub fn require_canonical_prefix(prefix: &str) -> Result<String, String> {
+    let canonical = canonical_prefix(prefix)?;
+    if canonical != prefix {
+        return Err(format!("host bits set; did you mean {canonical}?"));
+    }
+    Ok(canonical)
+}
+
+/// Validate a static-route next hop: a plain address (never a prefix)
+/// in the same address family as the route's prefix.
+pub fn validate_next_hop(prefix: &str, next_hop: &str) -> Result<(), String> {
+    let (addr, _) = parse_cidr(prefix)?;
+    if next_hop.contains('/') {
+        return Err(format!(
+            "next hop {next_hop:?} must be a plain address, not a prefix"
+        ));
+    }
     let next_hop: IpAddr = next_hop
         .parse()
         .map_err(|_| format!("bad next-hop address {next_hop:?}"))?;
@@ -43,7 +59,7 @@ pub fn validate_route(prefix: &str, next_hop: &str) -> Result<String, String> {
             "next hop {next_hop} does not match the address family of {prefix}"
         ));
     }
-    Ok(format!("{}/{len}", network(addr, len)))
+    Ok(())
 }
 
 /// A MAC address, canonicalized to colon-separated lowercase. Accepts
@@ -139,14 +155,28 @@ mod tests {
     }
 
     #[test]
-    fn validates_routes() {
+    fn requires_canonical_prefixes() {
+        assert_eq!(require_canonical_prefix("0.0.0.0/0").unwrap(), "0.0.0.0/0");
         assert_eq!(
-            validate_route("0.0.0.0/0", "10.42.10.1").unwrap(),
-            "0.0.0.0/0"
+            require_canonical_prefix("2001:db8:99::/48").unwrap(),
+            "2001:db8:99::/48"
         );
-        // Family mismatch and bad next hops are rejected.
-        assert!(validate_route("0.0.0.0/0", "2001:db8::1").is_err());
-        assert!(validate_route("::/0", "10.0.0.1").is_err());
-        assert!(validate_route("0.0.0.0/0", "gateway").is_err());
+        // Host bits set name the canonical form instead of rewriting.
+        assert_eq!(
+            require_canonical_prefix("10.99.1.0/16").unwrap_err(),
+            "host bits set; did you mean 10.99.0.0/16?"
+        );
+        assert!(require_canonical_prefix("banana/8").is_err());
+    }
+
+    #[test]
+    fn validates_next_hops() {
+        assert!(validate_next_hop("0.0.0.0/0", "10.42.10.1").is_ok());
+        assert!(validate_next_hop("2001:db8:99::/48", "2001:db8:9::1").is_ok());
+        // Family mismatch, prefixes, and bad addresses are rejected.
+        assert!(validate_next_hop("0.0.0.0/0", "2001:db8::1").is_err());
+        assert!(validate_next_hop("::/0", "10.0.0.1").is_err());
+        assert!(validate_next_hop("0.0.0.0/0", "10.0.0.1/24").is_err());
+        assert!(validate_next_hop("0.0.0.0/0", "gateway").is_err());
     }
 }

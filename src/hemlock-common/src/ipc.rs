@@ -212,7 +212,11 @@ impl IpcEndpoint {
                 None => endpoint,
             }
         };
-        let bounded = |future| tokio::time::timeout(CONNECT_TIMEOUT, future);
+        // A generic fn, not a closure: the two arms pass distinct opaque
+        // future types, which a closure's inferred argument can't unify.
+        fn bounded<F: std::future::Future>(future: F) -> tokio::time::Timeout<F> {
+            tokio::time::timeout(CONNECT_TIMEOUT, future)
+        }
         match self {
             IpcEndpoint::Tcp(addr) => {
                 let uri = format!("http://{addr}");

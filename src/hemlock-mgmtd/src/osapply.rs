@@ -149,10 +149,11 @@ impl OsApplier {
                 );
             }
         }
-        for (prefix, next_hop) in &intents.routes {
+        for (prefix, route) in &intents.routes {
             apply_route(&RouteChange {
                 prefix: prefix.clone(),
-                next_hop: Some(next_hop.clone()),
+                old: None,
+                new: Some(route.clone()),
             });
         }
         // Declarative: an absent `system { ssh }` block means disabled.
@@ -203,10 +204,55 @@ fn apply_netdev(change: &NetdevChange, dev: &str) {
     }
 }
 
+/// One kernel route per prefix: `ip [-6] route replace <prefix>
+/// [metric <distance>]` with one `nexthop via <nh>` per ECMP entry, or
+/// `blackhole` for drop routes.
 fn apply_route(change: &RouteChange) {
-    match &change.next_hop {
-        Some(next_hop) => run("ip", &["route", "replace", &change.prefix, "via", next_hop]),
-        None => run("ip", &["route", "del", &change.prefix]),
+    let v6 = change.prefix.contains(':');
+    let ip = |args: Vec<String>| {
+        let mut full: Vec<&str> = if v6 {
+            vec!["-6", "route"]
+        } else {
+            vec!["route"]
+        };
+        full.extend(args.iter().map(String::as_str));
+        run("ip", &full);
+    };
+    let metric = |args: &mut Vec<String>, distance: u8| {
+        if distance != 1 {
+            args.extend(["metric".into(), distance.to_string()]);
+        }
+    };
+    // The metric is part of a kernel route's identity: a replace at a
+    // new metric leaves the old route installed, and a blackhole is a
+    // different route type, so either change deletes the old route
+    // first.
+    if let Some(old) = &change.old {
+        let stale = match &change.new {
+            None => true,
+            Some(new) => new.distance != old.distance || new.drop != old.drop,
+        };
+        if stale {
+            let mut args = vec!["del".to_string()];
+            if old.drop {
+                args.push("blackhole".into());
+            }
+            args.push(change.prefix.clone());
+            metric(&mut args, old.distance);
+            ip(args);
+        }
+    }
+    if let Some(new) = &change.new {
+        let mut args = vec!["replace".to_string()];
+        if new.drop {
+            args.push("blackhole".into());
+        }
+        args.push(change.prefix.clone());
+        metric(&mut args, new.distance);
+        for next_hop in &new.next_hops {
+            args.extend(["nexthop".into(), "via".into(), next_hop.clone()]);
+        }
+        ip(args);
     }
 }
 

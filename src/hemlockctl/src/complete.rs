@@ -227,6 +227,11 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set" | "delete", "system", "ssh"]) => &["authentication"],
         (CliMode::Config, ["set", "system", "ssh", "authentication"]) => &["local"],
         (CliMode::Config, ["set" | "delete", "routing"]) => &["static"],
+        (CliMode::Config, ["set" | "delete", "routing", "static"]) => &[ANY],
+        (CliMode::Config, ["set", "routing", "static", ANY]) => &["drop", ANY],
+        (CliMode::Config, ["set", "routing", "static", ANY, ANY]) => &["distance"],
+        (CliMode::Config, ["set", "routing", "static", ANY, ANY, "distance"]) => &[NUM],
+        (CliMode::Config, ["delete", "routing", "static", ANY]) => &[ANY],
         (CliMode::Config, ["set" | "delete", "protocols"]) => {
             &["spanning-tree", "igmp-snooping", "mld-snooping", "lacp"]
         }
