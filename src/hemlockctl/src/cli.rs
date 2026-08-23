@@ -334,6 +334,8 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!(
                 "  show mirror                            mirror sessions (monitor session ok)"
             );
+            println!("  show ip route [summary|<prefix>]       IPv4 route table");
+            println!("  show ipv6 route [summary|<prefix>]     IPv6 route table");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear mac-table [vlan <id>] [interface <port>]   flush dynamic MACs");
             println!("  configure | conf                       enter configuration mode");
@@ -400,8 +402,10 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "spanning-tree",
         "igmp",
         "mld",
+        "ip",
+        "ipv6",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -451,6 +455,15 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             }
             family @ ("igmp" | "mld") => {
                 crate::switching::cmd::show_snooping(&endpoints.orch, family, &words[1..]).await
+            }
+            family @ ("ip" | "ipv6") => {
+                crate::routing::cmd::show_route(
+                    &endpoints.mgmtd,
+                    &endpoints.syncd,
+                    family == "ipv6",
+                    &words[1..],
+                )
+                .await
             }
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.

@@ -124,7 +124,11 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "spanning-tree",
             "igmp",
             "mld",
+            "ip",
+            "ipv6",
         ],
+        (CliMode::Operational, ["show", "ip" | "ipv6"]) => &["route"],
+        (CliMode::Operational, ["show", "ip" | "ipv6", "route"]) => &["summary", ANY],
         (CliMode::Operational, ["show", "igmp" | "mld"]) => &["snooping"],
         (CliMode::Operational, ["show", "igmp" | "mld", "snooping"]) => &["groups", "querier"],
         (CliMode::Operational, ["show", "interfaces", rest @ ..]) => interfaces_words(rest),
@@ -676,9 +680,36 @@ mod tests {
     fn routing_path_completes() {
         let c = candidates(CliMode::Config, &["set", "routing"], "", &ports());
         assert_eq!(c, vec!["static".to_string()]);
-        // The prefix/next-hop slots are free text.
+        // The prefix slot is free text; the next-hop slot offers `drop`.
         let c = candidates(CliMode::Config, &["set", "routing", "static"], "", &ports());
         assert!(c.is_empty());
+        let c = candidates(
+            CliMode::Config,
+            &["set", "routing", "static", "10.0.0.0/8"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["drop".to_string()]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "routing", "static", "10.0.0.0/8", "10.1.1.1"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["distance".to_string()]);
+    }
+
+    #[test]
+    fn show_route_completes() {
+        let c = candidates(CliMode::Operational, &["show", "ip"], "", &ports());
+        assert_eq!(c, vec!["route".to_string()]);
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "ipv6", "route"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["summary".to_string()]);
     }
 
     #[test]

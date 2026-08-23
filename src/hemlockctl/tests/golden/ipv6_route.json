@@ -1,0 +1,26 @@
+{
+  "ipv6_route": {
+    "routes": [
+      {
+        "distance": 0,
+        "interface": "Ethernet48",
+        "metric": 0,
+        "next_hops": [],
+        "prefix": "2001:db8:9::/64",
+        "protocol": "connected"
+      },
+      {
+        "distance": 1,
+        "metric": 0,
+        "next_hops": [
+          {
+            "interface": "Ethernet48",
+            "via": "2001:db8:9::1"
+          }
+        ],
+        "prefix": "2001:db8:99::/48",
+        "protocol": "static"
+      }
+    ]
+  }
+}

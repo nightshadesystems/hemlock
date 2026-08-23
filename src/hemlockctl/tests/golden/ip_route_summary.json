@@ -1,0 +1,24 @@
+{
+  "ip_route_summary": {
+    "next_hop_groups": 2,
+    "sources": [
+      {
+        "routes": 3,
+        "source": "connected"
+      },
+      {
+        "routes": 4,
+        "source": "static"
+      },
+      {
+        "routes": 1,
+        "source": "ospf"
+      },
+      {
+        "routes": 1,
+        "source": "bgp"
+      }
+    ],
+    "total": 9
+  }
+}

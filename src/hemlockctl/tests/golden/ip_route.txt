@@ -1,0 +1,23 @@
+Codes: C - connected, S - static, K - kernel, O - OSPF, B - BGP
+
+Gateway of last resort:
+ S      0.0.0.0/0 [1/0]
+         via 10.42.10.1, Vlan99
+
+ C      10.0.100.0/24
+         directly connected, Vlan100
+ C      10.9.9.0/31
+         directly connected, Ethernet48
+ C      10.42.10.0/24
+         directly connected, Vlan99
+ O      10.50.0.0/24 [110/20]
+         via 10.42.10.7, Vlan99
+ S      10.99.0.0/16 [1/0]
+         via 10.9.9.0, Ethernet48
+         via 10.42.10.7, Vlan99
+ S      172.16.0.0/12 [250/0]
+         via 10.42.10.1, Vlan99
+ B      172.20.0.0/16 [200/0]
+         via 10.42.10.1, Vlan99
+ S      192.0.2.0/24 [1/0]
+         directly connected, Null0

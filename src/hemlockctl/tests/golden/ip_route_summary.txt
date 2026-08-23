@@ -1,0 +1,8 @@
+Route Source    Number Of Routes
+connected       3
+static          4
+ospf            1
+bgp             1
+
+Total number of routes: 9
+Number of next-hop groups in hardware: 2

@@ -1,0 +1,8 @@
+Codes: C - connected, S - static, K - kernel, O - OSPF, B - BGP
+
+Gateway of last resort is not set
+
+ C      2001:db8:9::/64
+         directly connected, Ethernet48
+ S      2001:db8:99::/48 [1/0]
+         via 2001:db8:9::1, Ethernet48

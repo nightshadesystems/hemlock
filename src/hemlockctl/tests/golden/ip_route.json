@@ -1,0 +1,102 @@
+{
+  "ip_route": {
+    "routes": [
+      {
+        "distance": 1,
+        "metric": 0,
+        "next_hops": [
+          {
+            "interface": "Vlan99",
+            "via": "10.42.10.1"
+          }
+        ],
+        "prefix": "0.0.0.0/0",
+        "protocol": "static"
+      },
+      {
+        "distance": 0,
+        "interface": "Vlan100",
+        "metric": 0,
+        "next_hops": [],
+        "prefix": "10.0.100.0/24",
+        "protocol": "connected"
+      },
+      {
+        "distance": 0,
+        "interface": "Ethernet48",
+        "metric": 0,
+        "next_hops": [],
+        "prefix": "10.9.9.0/31",
+        "protocol": "connected"
+      },
+      {
+        "distance": 0,
+        "interface": "Vlan99",
+        "metric": 0,
+        "next_hops": [],
+        "prefix": "10.42.10.0/24",
+        "protocol": "connected"
+      },
+      {
+        "distance": 110,
+        "metric": 20,
+        "next_hops": [
+          {
+            "interface": "Vlan99",
+            "via": "10.42.10.7"
+          }
+        ],
+        "prefix": "10.50.0.0/24",
+        "protocol": "ospf"
+      },
+      {
+        "distance": 1,
+        "metric": 0,
+        "next_hops": [
+          {
+            "interface": "Ethernet48",
+            "via": "10.9.9.0"
+          },
+          {
+            "interface": "Vlan99",
+            "via": "10.42.10.7"
+          }
+        ],
+        "prefix": "10.99.0.0/16",
+        "protocol": "static"
+      },
+      {
+        "distance": 250,
+        "metric": 0,
+        "next_hops": [
+          {
+            "interface": "Vlan99",
+            "via": "10.42.10.1"
+          }
+        ],
+        "prefix": "172.16.0.0/12",
+        "protocol": "static"
+      },
+      {
+        "distance": 200,
+        "metric": 0,
+        "next_hops": [
+          {
+            "interface": "Vlan99",
+            "via": "10.42.10.1"
+          }
+        ],
+        "prefix": "172.20.0.0/16",
+        "protocol": "bgp"
+      },
+      {
+        "distance": 1,
+        "interface": "Null0",
+        "metric": 0,
+        "next_hops": [],
+        "prefix": "192.0.2.0/24",
+        "protocol": "static"
+      }
+    ]
+  }
+}
