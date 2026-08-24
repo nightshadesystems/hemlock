@@ -126,8 +126,16 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "mld",
             "ip",
             "ipv6",
+            "arp",
+            "routing",
+            "vrrp",
         ],
-        (CliMode::Operational, ["show", "ip" | "ipv6"]) => &["route"],
+        (CliMode::Operational, ["show", "routing"]) => &["ospf", "bgp"],
+        (CliMode::Operational, ["show", "routing", "ospf"]) => &["neighbor", "interface"],
+        (CliMode::Operational, ["show", "routing", "bgp"]) => &["summary", "neighbors"],
+        (CliMode::Operational, ["show", "vrrp"]) => &["brief"],
+        (CliMode::Operational, ["show", "ip"]) => &["route"],
+        (CliMode::Operational, ["show", "ipv6"]) => &["route", "neighbors"],
         (CliMode::Operational, ["show", "ip" | "ipv6", "route"]) => &["summary", ANY],
         (CliMode::Operational, ["show", "igmp" | "mld"]) => &["snooping"],
         (CliMode::Operational, ["show", "igmp" | "mld", "snooping"]) => &["groups", "querier"],
@@ -152,7 +160,10 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, ["show", "mac", "address-table", "vlan"]) => &[NUM],
         (CliMode::Operational, ["show", "mac", "address-table", "interface"]) => &[PORT],
         (CliMode::Operational, ["show", "monitor"]) => &["session"],
-        (CliMode::Operational, ["clear"]) => &["counters", "mac-table"],
+        (CliMode::Operational, ["clear"]) => &["counters", "mac-table", "arp", "routing"],
+        (CliMode::Operational, ["clear", "arp"]) => &[ANY],
+        (CliMode::Operational, ["clear", "routing"]) => &["bgp"],
+        (CliMode::Operational, ["clear", "routing", "bgp"]) => &[ANY],
         (CliMode::Operational, ["clear", "counters"]) => &[PORT],
         (CliMode::Operational, ["clear", "mac-table"]) => &["vlan", "interface"],
         (CliMode::Operational, ["clear", "mac-table", "vlan"]) => &[NUM],
@@ -182,6 +193,14 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "spanning-tree",
             "storm-control",
             "min-links",
+            "vrrp",
+        ],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "vrrp"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "vrrp", NUM]) => &[
+            "address",
+            "priority",
+            "advertisement-interval",
+            "no-preempt",
         ],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "switchport"]) => {
             &["mode", "access", "trunk"]
@@ -230,7 +249,52 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set" | "delete", "system"]) => &["ssh", "http", "https"],
         (CliMode::Config, ["set" | "delete", "system", "ssh"]) => &["authentication"],
         (CliMode::Config, ["set", "system", "ssh", "authentication"]) => &["local"],
-        (CliMode::Config, ["set" | "delete", "routing"]) => &["static"],
+        (CliMode::Config, ["set" | "delete", "routing"]) => {
+            &["static", "arp", "router-id", "ospf", "bgp"]
+        }
+        (CliMode::Config, ["set" | "delete", "routing", "ospf"]) => &[
+            "area",
+            "router-id",
+            "passive-interface",
+            "redistribute",
+            "maximum-paths",
+            "interface",
+        ],
+        (CliMode::Config, ["set" | "delete", "routing", "ospf", "area"]) => &[ANY],
+        (CliMode::Config, ["set" | "delete", "routing", "ospf", "area", ANY]) => &["network"],
+        (CliMode::Config, ["set" | "delete", "routing", "ospf", "passive-interface"]) => &[PORT],
+        (CliMode::Config, ["set" | "delete", "routing", "ospf", "redistribute"]) => {
+            &["connected", "static", "bgp"]
+        }
+        (CliMode::Config, ["set", "routing", "ospf", "maximum-paths"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "routing", "ospf", "interface"]) => &[PORT],
+        (CliMode::Config, ["set" | "delete", "routing", "ospf", "interface", PORT]) => {
+            &["cost", "hello-interval", "dead-interval", "priority"]
+        }
+        (CliMode::Config, ["set" | "delete", "routing", "bgp"]) => &[
+            "as",
+            "router-id",
+            "neighbor",
+            "network",
+            "redistribute",
+            "maximum-paths",
+        ],
+        (CliMode::Config, ["set" | "delete", "routing", "bgp", "neighbor"]) => &[ANY],
+        (CliMode::Config, ["set" | "delete", "routing", "bgp", "neighbor", ANY]) => &[
+            "remote-as",
+            "description",
+            "shutdown",
+            "ebgp-multihop",
+            "next-hop-self",
+        ],
+        (CliMode::Config, ["set" | "delete", "routing", "bgp", "redistribute"]) => {
+            &["connected", "static", "ospf"]
+        }
+        (CliMode::Config, ["set", "routing", "bgp", "as" | "maximum-paths"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "routing", "arp"]) => &[ANY],
+        (CliMode::Config, ["set", "routing", "arp", ANY]) => &["interface"],
+        (CliMode::Config, ["set", "routing", "arp", ANY, "interface"]) => &[PORT],
+        (CliMode::Config, ["set", "routing", "arp", ANY, "interface", PORT]) => &["mac"],
         (CliMode::Config, ["set" | "delete", "routing", "static"]) => &[ANY],
         (CliMode::Config, ["set", "routing", "static", ANY]) => &["drop", ANY],
         (CliMode::Config, ["set", "routing", "static", ANY, ANY]) => &["distance"],
@@ -602,6 +666,7 @@ mod tests {
                 "spanning-tree".to_string(),
                 "storm-control".to_string(),
                 "min-links".to_string(),
+                "vrrp".to_string(),
             ]
         );
         let c = candidates(
@@ -679,7 +744,7 @@ mod tests {
     #[test]
     fn routing_path_completes() {
         let c = candidates(CliMode::Config, &["set", "routing"], "", &ports());
-        assert_eq!(c, vec!["static".to_string()]);
+        assert_eq!(c, ["static", "arp", "router-id", "ospf", "bgp"]);
         // The prefix slot is free text; the next-hop slot offers `drop`.
         let c = candidates(CliMode::Config, &["set", "routing", "static"], "", &ports());
         assert!(c.is_empty());

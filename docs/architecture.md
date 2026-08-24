@@ -72,7 +72,7 @@ daemons, the configuration model, and the image/installer pipeline.
 | `hemlock-syncd` | bin | The only ASIC owner: switch create, port bring-up, port state gRPC |
 | `hemlock-pmon` | bin | Manifest-driven environment monitoring + fan control |
 | `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring |
-| `hemlock-orch` | bin | L2 protocol engines: LACP, spanning tree, IGMP/MLD snooping; packet I/O; future netlink/FRR → SAI orchestration |
+| `hemlock-orch` | bin | Protocol engines: LACP, spanning tree, IGMP/MLD snooping; packet I/O; the kernel-RIB → syncd FIB pipeline; FRR state queries |
 | `hemlock-webd` | bin | Web console: serves the exported Next.js UI (`web/`) + JSON API over HTTP/HTTPS; config-driven via `set system http`/`https` |
 | `hemlock-config` | lib | Curly-brace config language: lexer, parser, tree |
 | `hemlockctl` | bin | Operator CLI |
@@ -223,6 +223,50 @@ unknown-multicast flood restriction. Keeping orch the *only* writer of
 LAG membership avoids a dual-writer race with mgmtd, which only creates
 and removes the LAG object itself.
 
+**The RIB pipeline (routing suite).** Routing state flows **kernel
+netlink → orch → syncd**: mgmtd installs static routes and static
+ARP/ND entries into the kernel (the OS applier), FRR's zebra installs
+protocol routes the same way, and orch's RIB manager (`rib.rs`) mirrors
+the kernel FIB and neighbor table into the ASIC over syncd's FIB RPCs
+(`EnsureNeighbor`/`EnsureRoute`/`RemoveRoute`/...). One pipeline, no
+side doors: mgmtd never programs routes into syncd directly, and orch
+never renders FRR config. Details:
+
+- The kernel feed runs `ip monitor route neigh` and re-dumps
+  `ip -j route show` / `ip -j -s neigh show` on change (iproute2 is
+  netlink under the hood and already the workspace's kernel access
+  path). Full-dump snapshots make the engine pure state — tests inject
+  synthetic snapshots — and double as the resync protocol: the pusher
+  reconciles per-op against a local mirror and re-anchors on syncd's
+  `DumpFib` every 30 s, so a restart on either side converges (add
+  missing, delete stale).
+- Only routes out ASIC L3 interfaces (front-panel hostifs, SVI bridges)
+  are programmed; Management-only routes stay kernel-only.
+  Connected/local routes ride syncd's RIF path and are skipped. ECMP
+  kernel routes become next-hop sets; syncd deduplicates next hops and
+  next-hop groups by member set (refcounted).
+- **Resolve-via-punt**: a route whose next hops have no
+  REACHABLE/PERMANENT neighbor is programmed to punt to the CPU, so the
+  kernel resolves ARP/ND; the neighbor event reprograms it onto the
+  resolved hops.
+- `show ip route` / `show arp` render from orch's `GetRib` /
+  `GetNeighbors` snapshots — statics, connected, and FRR routes appear
+  uniformly, with FIB (hardware) state — never from vtysh.
+
+**FRR (OSPFv2, BGP IPv4 unicast, VRRP).** FRR is the protocol stack
+(pinned Debian package in the image). mgmtd's FRR applier
+(`frrapply.rs`) renders `/etc/frr/frr.conf` + `daemons` from the
+intents — deterministically, golden-tested — and reloads via
+`frr-reload.py` (fallback `systemctl reload frr`; a daemons-file change
+restarts instead). The OS applier creates the per-group VRRP macvlans
+(virtual MAC `00:00:5e:00:01:<group>`) before the reload, and mgmtd
+pushes the virtual MACs into the ASIC's My-MAC table through syncd
+(capability-gated: a SAI without My-MAC fails the commit with the
+platform error). Protocol *detail* state (OSPF neighbors, BGP
+summaries, VRRP status) is queried live from `vtysh -c '... json'` by
+orch's `frrshow` module — orch owns vtysh access; hemlockctl and webd
+ask orch, and a dead FRR degrades to `% ospf is not running`.
+
 **Packet I/O decision**: engines exchange PDUs over Linux `AF_PACKET`
 sockets (`transport.rs`, via the `nix` crate — bound with `getifaddrs`
 link addresses so no `unsafe` sockaddr construction is needed, keeping
@@ -367,13 +411,17 @@ ONIE.
 
 ## Boundaries and seams
 
-Still out of scope: FRR integration, dynamic routing, EVPN, licensing,
-telemetry streaming. The seams they will land on already exist:
+Still out of scope: EVPN, OSPFv3, the BGP IPv6 address family, VRFs,
+multicast routing (PIM), policy routing, licensing, telemetry
+streaming. The seams they will land on already exist:
 
-- `hemlock-orch` already hosts protocol engines with packet I/O; routing
-  state will flow netlink/FRR → orch → syncd gRPC on the same pattern.
-- New SAI object families extend `SaiBackend` + the mock in lockstep, and
-  gate on the startup capability probe when support varies by platform.
+- New routing families extend the `routing { ... }` intent extractors,
+  the FRR render, and — where the ASIC is involved — the RIB pipeline's
+  translation rules.
+- New SAI object families extend `SaiBackend` + the mock in lockstep,
+  and gate on the startup capability probe when support varies by
+  platform (the routing suite added neighbors, next hops, ECMP groups,
+  and My-MAC exactly this way).
 - New config families add an intent extractor + apply step in mgmtd.
-- Telemetry can subscribe to syncd's event broadcasts (port and FDB) and
-  pmon's state.
+- Telemetry can subscribe to syncd's event broadcasts (port and FDB)
+  and pmon's state.

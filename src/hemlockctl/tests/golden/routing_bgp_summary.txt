@@ -1,0 +1,4 @@
+BGP summary information
+Router identifier 10.42.0.1, local AS number 65000
+Neighbor        V  AS      MsgRcvd  MsgSent  InQ  OutQ  Up/Down   State  PfxRcd
+10.42.10.1      4  65001      1234     1230    0     0  2d04h     Estab      42

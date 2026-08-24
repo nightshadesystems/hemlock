@@ -1,0 +1,22 @@
+{
+  "vrrp": {
+    "groups": [
+      {
+        "addresses": [
+          "10.0.100.1"
+        ],
+        "advertisement_interval_ms": 1000,
+        "effective_priority": 200,
+        "group": 10,
+        "interface": "Vlan100",
+        "master_down_interval_ms": 3210,
+        "preempt": true,
+        "priority": 200,
+        "seconds_since_transition": 252,
+        "skew_time_ms": 210,
+        "state": "Master",
+        "virtual_mac": "00:00:5e:00:01:0a"
+      }
+    ]
+  }
+}

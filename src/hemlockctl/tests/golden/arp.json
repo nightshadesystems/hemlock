@@ -1,0 +1,33 @@
+{
+  "arp": {
+    "entries": [
+      {
+        "age_secs": 33,
+        "interface": "Ethernet48",
+        "ip": "10.9.9.0",
+        "is_static": false,
+        "mac": "a0:36:9f:44:be:09"
+      },
+      {
+        "age_secs": 142,
+        "interface": "Vlan99",
+        "ip": "10.42.10.1",
+        "is_static": false,
+        "mac": "d4:af:f7:12:9c:00"
+      },
+      {
+        "age_secs": 12,
+        "interface": "Vlan99",
+        "ip": "10.42.10.7",
+        "is_static": false,
+        "mac": "00:1c:73:0c:aa:07"
+      },
+      {
+        "interface": "Vlan99",
+        "ip": "10.42.10.200",
+        "is_static": true,
+        "mac": "00:50:56:be:ef:99"
+      }
+    ]
+  }
+}

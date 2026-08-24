@@ -27,6 +27,21 @@ pub struct Intents {
     /// Static routes, keyed by canonical prefix. Repeated config lines
     /// per prefix merge into one ECMP next-hop set.
     pub routes: BTreeMap<String, StaticRoute>,
+    /// Static ARP/ND entries (`routing { arp { ... } }`), keyed by
+    /// canonical address text.
+    pub arp_statics: BTreeMap<String, ArpStatic>,
+    /// Global router identity (`routing { router-id ... }`). Absent =
+    /// derived at render time (highest SVI address, then Management),
+    /// never persisted.
+    pub router_id: Option<String>,
+    /// OSPFv2 (`routing { ospf { ... } }`), rendered into FRR.
+    pub ospf: Option<OspfIntent>,
+    /// BGP IPv4 unicast (`routing { bgp { ... } }`), rendered into FRR.
+    pub bgp: Option<BgpIntent>,
+    /// VRRP groups (`interfaces { <name> { vrrp <group> { ... } } }`),
+    /// keyed by (interface, group): FRR's vrrpd + the OS macvlan + the
+    /// syncd My-MAC entry.
+    pub vrrp: BTreeMap<(String, u8), VrrpIntent>,
     /// VLANs (`vlans { vlan <id> { ... } }`), keyed by 802.1Q id.
     pub vlans: BTreeMap<u16, VlanIntent>,
     /// SVIs (`interfaces { Vlan<id> { address ... } }`), keyed by
@@ -50,6 +65,100 @@ pub struct Intents {
     pub mirror: BTreeMap<u8, MirrorIntent>,
     /// Non-fatal commit notes (empty port-channels, MTU hints).
     pub warnings: Vec<String>,
+}
+
+/// One static ARP/ND entry: the address answers on `interface` at
+/// `mac` (kernel: `ip neigh replace ... nud permanent`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArpStatic {
+    pub interface: String,
+    /// Colon-separated lowercase unicast MAC.
+    pub mac: String,
+}
+
+/// OSPFv2 process config (`routing { ospf { ... } }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OspfIntent {
+    /// Overrides the global router-id.
+    pub router_id: Option<String>,
+    /// Canonical dotted area id -> canonical network prefixes.
+    pub areas: BTreeMap<String, BTreeSet<String>>,
+    pub passive_interfaces: BTreeSet<String>,
+    /// "connected" | "static" | "bgp".
+    pub redistribute: BTreeSet<String>,
+    /// 1..=8, capped at the probed ECMP width at commit.
+    pub maximum_paths: u8,
+    /// Per-interface knobs, stored under the protocol.
+    pub interfaces: BTreeMap<String, OspfInterfaceIntent>,
+}
+
+impl Default for OspfIntent {
+    fn default() -> Self {
+        Self {
+            router_id: None,
+            areas: BTreeMap::new(),
+            passive_interfaces: BTreeSet::new(),
+            redistribute: BTreeSet::new(),
+            maximum_paths: 4,
+            interfaces: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OspfInterfaceIntent {
+    pub cost: Option<u16>,
+    pub hello_interval: Option<u16>,
+    pub dead_interval: Option<u16>,
+    pub priority: Option<u8>,
+}
+
+/// BGP process config (`routing { bgp { ... } }`), IPv4 unicast only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BgpIntent {
+    /// asplain, required.
+    pub as_number: u32,
+    pub router_id: Option<String>,
+    /// Keyed by neighbor address text.
+    pub neighbors: BTreeMap<String, BgpNeighborIntent>,
+    pub networks: BTreeSet<String>,
+    /// "connected" | "static" | "ospf".
+    pub redistribute: BTreeSet<String>,
+    pub maximum_paths: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BgpNeighborIntent {
+    /// Required by commit.
+    pub remote_as: Option<u32>,
+    pub description: Option<String>,
+    pub shutdown: bool,
+    pub ebgp_multihop: Option<u8>,
+    pub next_hop_self: bool,
+}
+
+/// One VRRP group (IPv4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VrrpIntent {
+    /// Virtual addresses; at least one required by commit.
+    pub addresses: BTreeSet<String>,
+    /// 1..=254, default 100.
+    pub priority: u8,
+    /// Advertisement interval in seconds (1..=40), default 1.
+    pub advertisement_interval: u8,
+    /// Preempt is on by default; `no-preempt` turns it off.
+    pub preempt: bool,
+}
+
+impl Default for VrrpIntent {
+    fn default() -> Self {
+        Self {
+            addresses: BTreeSet::new(),
+            priority: 100,
+            advertisement_interval: 1,
+            preempt: true,
+        }
+    }
 }
 
 /// One static route: the whole per-prefix state — an ECMP next-hop set
@@ -373,6 +482,22 @@ pub enum IntentError {
     #[error("route {prefix}: {reason}")]
     BadRoute { prefix: String, reason: String },
 
+    #[error("arp {ip}: {reason}")]
+    BadArp { ip: String, reason: String },
+
+    #[error("routing ospf: {0}")]
+    BadOspf(String),
+
+    #[error("routing bgp: {0}")]
+    BadBgp(String),
+
+    #[error("vrrp {interface} group {group}: {reason}")]
+    BadVrrp {
+        interface: String,
+        group: String,
+        reason: String,
+    },
+
     #[error("interface {name}: {reason}")]
     BadLag { name: String, reason: String },
 
@@ -421,10 +546,10 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
     let mut intents = Intents {
         ssh: ssh(tree)?,
         web: web(tree),
-        routes: routes(tree)?,
         vlans: vlans(tree)?,
         ..Intents::default()
     };
+    routing(tree, &mut intents)?;
     protocols(tree, &mut intents)?;
     switching(tree, &mut intents)?;
     let Some((_, items)) = tree.block("interfaces") else {
@@ -482,6 +607,17 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
             }
             None => None,
         };
+
+        for (group, vrrp) in vrrp_groups(children, &ifname)? {
+            if matches!(kind, Kind::Management | Kind::Lag) {
+                return Err(IntentError::BadVrrp {
+                    interface: ifname.clone(),
+                    group: group.to_string(),
+                    reason: "vrrp runs on L3 ports and SVIs only".into(),
+                });
+            }
+            intents.vrrp.insert((ifname.clone(), group), vrrp);
+        }
 
         match kind {
             Kind::Port => {
@@ -607,10 +743,144 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
     Ok(intents)
 }
 
+/// `vrrp <group> { address ...; priority; advertisement-interval;
+/// no-preempt }` blocks of one interface.
+fn vrrp_groups(children: &[Item], ifname: &str) -> Result<Vec<(u8, VrrpIntent)>, IntentError> {
+    let mut groups = Vec::new();
+    for (keys, body) in ConfigTree::blocks_named(children, "vrrp") {
+        let bad_group = |group: &str, reason: String| IntentError::BadVrrp {
+            interface: ifname.to_string(),
+            group: group.to_string(),
+            reason,
+        };
+        let [group_text] = keys else {
+            return Err(bad_group("?", "expected `vrrp <1-255>`".into()));
+        };
+        let group =
+            parse_int::<u8>(group_text, 1..=255, "group").map_err(|e| bad_group(group_text, e))?;
+        let bad = |reason: String| bad_group(group_text, reason);
+        let mut vrrp = VrrpIntent::default();
+        for item in body {
+            let Item::Leaf { name, values } = item else {
+                return Err(bad(format!("unrecognized block {:?}", item.name())));
+            };
+            match (name.as_str(), values.as_slice()) {
+                ("address", [address]) => {
+                    let vip: std::net::Ipv4Addr = address
+                        .parse()
+                        .map_err(|_| bad(format!("bad address {address:?} (IPv4)")))?;
+                    vrrp.addresses.insert(vip.to_string());
+                }
+                ("priority", [priority]) => {
+                    vrrp.priority = parse_int::<u8>(priority, 1..=254, "priority").map_err(&bad)?;
+                }
+                ("advertisement-interval", [interval]) => {
+                    vrrp.advertisement_interval =
+                        parse_int::<u8>(interval, 1..=40, "advertisement-interval")
+                            .map_err(&bad)?;
+                }
+                ("no-preempt", []) => vrrp.preempt = false,
+                _ => {
+                    return Err(bad(format!("unrecognized statement {name:?}")));
+                }
+            }
+        }
+        groups.push((group, vrrp));
+    }
+    Ok(groups)
+}
+
 /// Cross-family semantic checks that need the whole tree extracted:
 /// channel-group consistency, mirror destination rules, and the
 /// non-fatal commit notes.
+/// An interface's configured address: `None` = no such interface,
+/// `Some(None)` = exists but carries no address.
+fn interface_address<'a>(intents: &'a Intents, name: &str) -> Option<Option<&'a String>> {
+    intents
+        .ports
+        .get(name)
+        .map(|p| p.address.as_ref())
+        .or_else(|| intents.svis.get(name).map(|s| s.address.as_ref()))
+        .or_else(|| intents.management.get(name).map(|m| m.address.as_ref()))
+}
+
 fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
+    // ARP statics: the named interface must be L3 (carry an address in
+    // this same config).
+    for (ip, arp) in &intents.arp_statics {
+        match interface_address(intents, &arp.interface) {
+            Some(Some(_)) => {}
+            Some(None) => {
+                return Err(IntentError::BadArp {
+                    ip: ip.clone(),
+                    reason: format!("{} has no address (not L3)", arp.interface),
+                });
+            }
+            None => {
+                return Err(IntentError::BadArp {
+                    ip: ip.clone(),
+                    reason: format!("no such L3 interface {:?}", arp.interface),
+                });
+            }
+        }
+    }
+
+    // OSPF interface knobs and passive-interfaces name L3 interfaces.
+    if let Some(ospf) = &intents.ospf {
+        for name in ospf.interfaces.keys().chain(ospf.passive_interfaces.iter()) {
+            match interface_address(intents, name) {
+                Some(Some(_)) => {}
+                Some(None) => {
+                    return Err(IntentError::BadOspf(format!(
+                        "interface {name} has no address (not L3)"
+                    )));
+                }
+                None => {
+                    return Err(IntentError::BadOspf(format!(
+                        "no such L3 interface {name:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // VRRP: the parent must carry an address, group addresses are
+    // required, and each VIP must fall inside one of the parent's
+    // subnets — an off-subnet VIP on an access switch is a typo, so an
+    // error, not a warning.
+    for ((interface, group), vrrp) in &intents.vrrp {
+        let bad = |reason: String| IntentError::BadVrrp {
+            interface: interface.clone(),
+            group: group.to_string(),
+            reason,
+        };
+        let address = match interface_address(intents, interface) {
+            Some(Some(address)) => address,
+            _ => {
+                return Err(bad("the interface must carry an address".into()));
+            }
+        };
+        let Ok((addr, len)) = hemlock_common::net::parse_cidr(address) else {
+            return Err(bad(format!("bad interface address {address:?}")));
+        };
+        if vrrp.addresses.is_empty() {
+            return Err(bad("at least one address (VIP) is required".into()));
+        }
+        for vip in &vrrp.addresses {
+            let Ok(vip_addr) = vip.parse::<std::net::IpAddr>() else {
+                return Err(bad(format!("bad address {vip:?}")));
+            };
+            if !vip_addr.is_ipv4()
+                || hemlock_common::net::network(vip_addr, len)
+                    != hemlock_common::net::network(addr, len)
+            {
+                return Err(bad(format!(
+                    "address {vip} is outside {interface}'s subnet {address}"
+                )));
+            }
+        }
+    }
+
     // Channel groups: members may not carry their own switchport
     // config, groups are capped at 8 members, and every member of a
     // group runs the same mode.
@@ -1128,32 +1398,316 @@ fn web(tree: &ConfigTree) -> WebIntent {
     }
 }
 
-fn routes(tree: &ConfigTree) -> Result<BTreeMap<String, StaticRoute>, IntentError> {
+/// `routing { static | arp }` (the FRR families join per suite).
+/// Explicitly deferred families are rejected by name so the operator
+/// sees "not supported" instead of a generic parse error.
+fn routing(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
+    let Some((_, routing)) = tree.block("routing") else {
+        return Ok(());
+    };
+    for item in routing {
+        let (name, keys, children) = match item {
+            Item::Block {
+                name,
+                keys,
+                children,
+            } => (name, keys, children.as_slice()),
+            Item::Leaf { name, values } if name == "router-id" => {
+                let [router_id] = values.as_slice() else {
+                    return Err(IntentError::BadRouting(
+                        "router-id takes one IPv4 address".into(),
+                    ));
+                };
+                let router_id: std::net::Ipv4Addr = router_id
+                    .parse()
+                    .map_err(|_| IntentError::BadRouting(format!("bad router-id {router_id:?}")))?;
+                intents.router_id = Some(router_id.to_string());
+                continue;
+            }
+            _ => {
+                return Err(IntentError::BadRouting(format!(
+                    "unrecognized statement {:?}",
+                    item.name()
+                )));
+            }
+        };
+        if !keys.is_empty() {
+            return Err(IntentError::BadRouting(format!(
+                "unrecognized block {name:?}"
+            )));
+        }
+        match name.as_str() {
+            "static" => intents.routes = static_routes(children)?,
+            "arp" => intents.arp_statics = arp_statics(children)?,
+            "ospf" => intents.ospf = Some(ospf_intent(children)?),
+            "bgp" => intents.bgp = Some(bgp_intent(children)?),
+            "vrf" | "ospfv3" | "pim" | "policy" | "route-map" | "prefix-list" => {
+                return Err(IntentError::BadRouting(format!("{name} is not supported")));
+            }
+            _ => {
+                return Err(IntentError::BadRouting(format!(
+                    "unrecognized block {name:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The canonical dotted form of an OSPF area id (dotted or integer).
+fn canonical_area(text: &str) -> Result<String, String> {
+    if let Ok(area) = text.parse::<std::net::Ipv4Addr>() {
+        return Ok(area.to_string());
+    }
+    text.parse::<u32>()
+        .map(|n| std::net::Ipv4Addr::from(n).to_string())
+        .map_err(|_| format!("bad area {text:?} (dotted or 0..4294967295)"))
+}
+
+/// `ospf { router-id | area <id> { network ... } | passive-interface |
+/// redistribute | maximum-paths | interface <name> { ... } }`.
+fn ospf_intent(children: &[Item]) -> Result<OspfIntent, IntentError> {
+    let bad = |reason: String| IntentError::BadOspf(reason);
+    let mut ospf = OspfIntent::default();
+    for item in children {
+        match item {
+            Item::Leaf { name, values } => match (name.as_str(), values.as_slice()) {
+                ("router-id", [id]) => {
+                    let id: std::net::Ipv4Addr = id
+                        .parse()
+                        .map_err(|_| bad(format!("bad router-id {id:?}")))?;
+                    ospf.router_id = Some(id.to_string());
+                }
+                ("passive-interface", [interface]) => {
+                    ospf.passive_interfaces.insert(interface.clone());
+                }
+                ("redistribute", [source]) => {
+                    if !matches!(source.as_str(), "connected" | "static" | "bgp") {
+                        return Err(bad(format!(
+                            "redistribute {source:?} (connected|static|bgp)"
+                        )));
+                    }
+                    ospf.redistribute.insert(source.clone());
+                }
+                ("maximum-paths", [paths]) => {
+                    ospf.maximum_paths =
+                        parse_int::<u8>(paths, 1..=8, "maximum-paths").map_err(&bad)?;
+                }
+                _ => {
+                    return Err(bad(format!("unrecognized statement {name:?}")));
+                }
+            },
+            Item::Block {
+                name,
+                keys,
+                children,
+            } => match (name.as_str(), keys.as_slice()) {
+                ("area", [area]) => {
+                    let area = canonical_area(area).map_err(&bad)?;
+                    let networks = ospf.areas.entry(area.clone()).or_default();
+                    for network in children {
+                        let Item::Leaf { name, values } = network else {
+                            return Err(bad(format!(
+                                "area {area}: unrecognized block {:?}",
+                                network.name()
+                            )));
+                        };
+                        let ([prefix], "network") = (values.as_slice(), name.as_str()) else {
+                            return Err(bad(format!("area {area}: expected `network <prefix>`")));
+                        };
+                        let prefix = hemlock_common::net::require_canonical_prefix(prefix)
+                            .map_err(|e| bad(format!("area {area}: {e}")))?;
+                        if prefix.contains(':') {
+                            return Err(bad(format!(
+                                "area {area}: {prefix} is IPv6 (OSPFv3 is not supported)"
+                            )));
+                        }
+                        networks.insert(prefix);
+                    }
+                }
+                ("interface", [interface]) => {
+                    let mut knobs = OspfInterfaceIntent::default();
+                    for knob in children {
+                        let Item::Leaf { name, values } = knob else {
+                            return Err(bad(format!(
+                                "interface {interface}: unrecognized block {:?}",
+                                knob.name()
+                            )));
+                        };
+                        let [value] = values.as_slice() else {
+                            return Err(bad(format!(
+                                "interface {interface}: {name} takes one value"
+                            )));
+                        };
+                        let knob_err = |e: String| bad(format!("interface {interface}: {e}"));
+                        match name.as_str() {
+                            "cost" => {
+                                knobs.cost = Some(
+                                    parse_int::<u16>(value, 1..=65535, "cost").map_err(knob_err)?,
+                                );
+                            }
+                            "hello-interval" => {
+                                knobs.hello_interval = Some(
+                                    parse_int::<u16>(value, 1..=65535, "hello-interval")
+                                        .map_err(knob_err)?,
+                                );
+                            }
+                            "dead-interval" => {
+                                knobs.dead_interval = Some(
+                                    parse_int::<u16>(value, 1..=65535, "dead-interval")
+                                        .map_err(knob_err)?,
+                                );
+                            }
+                            "priority" => {
+                                knobs.priority = Some(
+                                    parse_int::<u8>(value, 0..=255, "priority")
+                                        .map_err(knob_err)?,
+                                );
+                            }
+                            other => {
+                                return Err(bad(format!(
+                                    "interface {interface}: unrecognized statement {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    ospf.interfaces.insert(interface.clone(), knobs);
+                }
+                _ => {
+                    return Err(bad(format!("unrecognized block {name:?}")));
+                }
+            },
+        }
+    }
+    Ok(ospf)
+}
+
+/// `bgp { as | router-id | neighbor <ip> { ... } | network |
+/// redistribute | maximum-paths }`.
+fn bgp_intent(children: &[Item]) -> Result<BgpIntent, IntentError> {
+    let bad = |reason: String| IntentError::BadBgp(reason);
+    let mut bgp = BgpIntent {
+        as_number: 0,
+        router_id: None,
+        neighbors: BTreeMap::new(),
+        networks: BTreeSet::new(),
+        redistribute: BTreeSet::new(),
+        maximum_paths: 4,
+    };
+    for item in children {
+        match item {
+            Item::Leaf { name, values } => match (name.as_str(), values.as_slice()) {
+                ("as", [as_number]) => {
+                    bgp.as_number =
+                        parse_int::<u32>(as_number, 1..=4294967295, "as").map_err(&bad)?;
+                }
+                ("router-id", [id]) => {
+                    let id: std::net::Ipv4Addr = id
+                        .parse()
+                        .map_err(|_| bad(format!("bad router-id {id:?}")))?;
+                    bgp.router_id = Some(id.to_string());
+                }
+                ("network", [prefix]) => {
+                    let prefix =
+                        hemlock_common::net::require_canonical_prefix(prefix).map_err(&bad)?;
+                    if prefix.contains(':') {
+                        return Err(bad(format!(
+                            "{prefix} is IPv6 (the IPv6 address family is not supported)"
+                        )));
+                    }
+                    bgp.networks.insert(prefix);
+                }
+                ("redistribute", [source]) => {
+                    if !matches!(source.as_str(), "connected" | "static" | "ospf") {
+                        return Err(bad(format!(
+                            "redistribute {source:?} (connected|static|ospf)"
+                        )));
+                    }
+                    bgp.redistribute.insert(source.clone());
+                }
+                ("maximum-paths", [paths]) => {
+                    bgp.maximum_paths =
+                        parse_int::<u8>(paths, 1..=8, "maximum-paths").map_err(&bad)?;
+                }
+                _ => {
+                    return Err(bad(format!("unrecognized statement {name:?}")));
+                }
+            },
+            Item::Block {
+                name,
+                keys,
+                children,
+            } => match (name.as_str(), keys.as_slice()) {
+                ("neighbor", [address]) => {
+                    let ip: std::net::IpAddr = address
+                        .parse()
+                        .map_err(|_| bad(format!("bad neighbor address {address:?}")))?;
+                    if ip.is_ipv6() {
+                        return Err(bad(format!(
+                            "neighbor {ip} is IPv6 (the IPv6 address family is not supported)"
+                        )));
+                    }
+                    let mut neighbor = BgpNeighborIntent::default();
+                    for knob in children {
+                        let Item::Leaf { name, values } = knob else {
+                            return Err(bad(format!(
+                                "neighbor {ip}: unrecognized block {:?}",
+                                knob.name()
+                            )));
+                        };
+                        let knob_err = |e: String| bad(format!("neighbor {ip}: {e}"));
+                        match (name.as_str(), values.as_slice()) {
+                            ("remote-as", [remote]) => {
+                                neighbor.remote_as = Some(
+                                    parse_int::<u32>(remote, 1..=4294967295, "remote-as")
+                                        .map_err(knob_err)?,
+                                );
+                            }
+                            ("description", [text]) => {
+                                neighbor.description = Some(text.clone());
+                            }
+                            ("shutdown", []) => neighbor.shutdown = true,
+                            ("ebgp-multihop", [ttl]) => {
+                                neighbor.ebgp_multihop = Some(
+                                    parse_int::<u8>(ttl, 1..=255, "ebgp-multihop")
+                                        .map_err(knob_err)?,
+                                );
+                            }
+                            ("next-hop-self", []) => neighbor.next_hop_self = true,
+                            _ => {
+                                return Err(bad(format!(
+                                    "neighbor {ip}: unrecognized statement {name:?}"
+                                )));
+                            }
+                        }
+                    }
+                    bgp.neighbors.insert(ip.to_string(), neighbor);
+                }
+                _ => {
+                    return Err(bad(format!("unrecognized block {name:?}")));
+                }
+            },
+        }
+    }
+    // `as` is required as soon as any other bgp leaf exists.
+    if bgp.as_number == 0 {
+        return Err(bad("as is required".into()));
+    }
+    for (ip, neighbor) in &bgp.neighbors {
+        if neighbor.remote_as.is_none() {
+            return Err(bad(format!("neighbor {ip}: remote-as is required")));
+        }
+    }
+    Ok(bgp)
+}
+
+fn static_routes(children: &[Item]) -> Result<BTreeMap<String, StaticRoute>, IntentError> {
     let mut routes: BTreeMap<String, StaticRoute> = BTreeMap::new();
     // Explicit `distance` values seen per prefix — distance is
     // per-prefix, so explicit values on different lines must agree
     // (lines without one inherit rather than conflict).
     let mut explicit_distance: BTreeMap<String, u8> = BTreeMap::new();
-    let Some((_, routing)) = tree.block("routing") else {
-        return Ok(routes);
-    };
-    for item in routing {
-        let Item::Block {
-            name,
-            keys,
-            children,
-        } = item
-        else {
-            return Err(IntentError::BadRouting(format!(
-                "unrecognized statement {:?}",
-                item.name()
-            )));
-        };
-        if name != "static" || !keys.is_empty() {
-            return Err(IntentError::BadRouting(format!(
-                "unrecognized block {name:?}"
-            )));
-        }
+    {
         for route in children {
             let Item::Leaf {
                 name: prefix,
@@ -1218,6 +1772,40 @@ fn routes(tree: &ConfigTree) -> Result<BTreeMap<String, StaticRoute>, IntentErro
         }
     }
     Ok(routes)
+}
+
+/// `arp { <ip> interface <name> mac <mac> }` — one leaf per address.
+fn arp_statics(children: &[Item]) -> Result<BTreeMap<String, ArpStatic>, IntentError> {
+    let mut statics = BTreeMap::new();
+    for item in children {
+        let Item::Leaf { name: ip, values } = item else {
+            return Err(IntentError::BadRouting(format!(
+                "arp: unrecognized block {:?}",
+                item.name()
+            )));
+        };
+        let bad = |reason: String| IntentError::BadArp {
+            ip: ip.clone(),
+            reason,
+        };
+        let address: std::net::IpAddr =
+            ip.parse().map_err(|_| bad(format!("bad address {ip:?}")))?;
+        let [keyword_interface, interface, keyword_mac, mac] = values.as_slice() else {
+            return Err(bad("expected `interface <name> mac <mac>`".into()));
+        };
+        if keyword_interface != "interface" || keyword_mac != "mac" {
+            return Err(bad("expected `interface <name> mac <mac>`".into()));
+        }
+        let mac = hemlock_common::net::parse_unicast_mac(mac).map_err(&bad)?;
+        statics.insert(
+            address.to_string(),
+            ArpStatic {
+                interface: interface.clone(),
+                mac,
+            },
+        );
+    }
+    Ok(statics)
 }
 
 /// `protocols { spanning-tree | igmp-snooping | mld-snooping | lacp }`.
@@ -1751,6 +2339,74 @@ impl RouteChange {
     }
 }
 
+/// One static ARP/ND entry change for the OS applier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArpChange {
+    pub ip: String,
+    /// The previously running entry (removed first when the interface
+    /// changed).
+    pub old: Option<ArpStatic>,
+    /// The wanted entry; None = remove.
+    pub new: Option<ArpStatic>,
+}
+
+impl ArpChange {
+    pub fn describe(&self) -> String {
+        match &self.new {
+            Some(entry) => format!("arp {} is {} on {}", self.ip, entry.mac, entry.interface),
+            None => format!("arp {} removed", self.ip),
+        }
+    }
+}
+
+/// One VRRP macvlan change for the OS applier. FRR's vrrpd requires a
+/// macvlan per group carrying the virtual MAC, created on the group's
+/// parent netdev *before* the FRR reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VrrpMacvlanChange {
+    pub interface: String,
+    pub group: u8,
+    /// false = delete the macvlan.
+    pub create: bool,
+}
+
+impl VrrpMacvlanChange {
+    pub fn describe(&self) -> String {
+        format!(
+            "vrrp {} group {} macvlan {} {}",
+            self.interface,
+            self.group,
+            vrrp_macvlan_name(&self.interface, self.group),
+            if self.create { "created" } else { "removed" }
+        )
+    }
+}
+
+/// The macvlan netdev name for one (interface, group) — compact so the
+/// worst case ("vrrp4-v4094-255") still fits IFNAMSIZ.
+pub fn vrrp_macvlan_name(interface: &str, group: u8) -> String {
+    let compact = if let Some(id) = interface.strip_prefix("Vlan") {
+        format!("v{id}")
+    } else if let Some(n) = interface.strip_prefix("Ethernet") {
+        format!("e{n}")
+    } else if let Some(n) = interface.strip_prefix("Port-Channel") {
+        format!("p{n}")
+    } else {
+        interface
+            .chars()
+            .filter(char::is_ascii)
+            .take(4)
+            .collect::<String>()
+            .to_lowercase()
+    };
+    format!("vrrp4-{compact}-{group}")
+}
+
+/// The IPv4 virtual router MAC of a VRRP group (RFC 5798).
+pub fn vrrp_virtual_mac(group: u8) -> String {
+    format!("00:00:5e:00:01:{group:02x}")
+}
+
 /// The OS-side delta of one commit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OsChanges {
@@ -1764,6 +2420,10 @@ pub struct OsChanges {
     /// the bridge netdev the same way.
     pub svis: Vec<NetdevChange>,
     pub routes: Vec<RouteChange>,
+    pub arp: Vec<ArpChange>,
+    /// VRRP macvlan creates/deletes (group config changes ride the FRR
+    /// render, not this).
+    pub vrrp_macvlans: Vec<VrrpMacvlanChange>,
     /// The full wanted SSH state, present exactly when it changed.
     pub ssh: Option<SshIntent>,
     /// The full wanted web console state, present exactly when it changed.
@@ -1776,6 +2436,8 @@ impl OsChanges {
             && self.ports.is_empty()
             && self.svis.is_empty()
             && self.routes.is_empty()
+            && self.arp.is_empty()
+            && self.vrrp_macvlans.is_empty()
             && self.ssh.is_none()
             && self.web.is_none()
     }
@@ -1805,6 +2467,8 @@ impl OsChanges {
             .chain(&self.management)
             .map(NetdevChange::describe)
             .chain(self.routes.iter().map(RouteChange::describe))
+            .chain(self.arp.iter().map(ArpChange::describe))
+            .chain(self.vrrp_macvlans.iter().map(VrrpMacvlanChange::describe))
             .chain(ssh)
             .chain(web)
             .collect()
@@ -1948,6 +2612,45 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
                 prefix: prefix.clone(),
                 old: Some(had.clone()),
                 new: None,
+            });
+        }
+    }
+
+    for (ip, wanted) in &candidate.arp_statics {
+        let current = running.arp_statics.get(ip);
+        if current != Some(wanted) {
+            changes.arp.push(ArpChange {
+                ip: ip.clone(),
+                old: current.cloned(),
+                new: Some(wanted.clone()),
+            });
+        }
+    }
+    for (ip, had) in &running.arp_statics {
+        if !candidate.arp_statics.contains_key(ip) {
+            changes.arp.push(ArpChange {
+                ip: ip.clone(),
+                old: Some(had.clone()),
+                new: None,
+            });
+        }
+    }
+
+    for (interface, group) in candidate.vrrp.keys() {
+        if !running.vrrp.contains_key(&(interface.clone(), *group)) {
+            changes.vrrp_macvlans.push(VrrpMacvlanChange {
+                interface: interface.clone(),
+                group: *group,
+                create: true,
+            });
+        }
+    }
+    for (interface, group) in running.vrrp.keys() {
+        if !candidate.vrrp.contains_key(&(interface.clone(), *group)) {
+            changes.vrrp_macvlans.push(VrrpMacvlanChange {
+                interface: interface.clone(),
+                group: *group,
+                create: false,
             });
         }
     }
@@ -2749,7 +3452,7 @@ interfaces {
         let tree = parse("routing { static { 10.0.0.0/8 10.1.1.1 metric 5 } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadRoute { .. })));
         // Unknown routing sub-block.
-        let tree = parse("routing { ospf { } }").unwrap();
+        let tree = parse("routing { rip { } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadRouting(_))));
     }
 
@@ -2845,6 +3548,185 @@ interfaces {
             }]
         );
         assert_eq!(back.ssh, Some(SshIntent::default()));
+    }
+
+    #[test]
+    fn extracts_and_validates_arp_statics() {
+        let intents = intents_of(
+            "vlans { vlan 99 { } } interfaces { Vlan99 { address 10.42.10.9/24 } }\nrouting { arp { 10.42.10.200 interface Vlan99 mac 00-50-56-BE-EF-99 } }",
+        );
+        assert_eq!(
+            intents.arp_statics["10.42.10.200"],
+            ArpStatic {
+                interface: "Vlan99".into(),
+                mac: "00:50:56:be:ef:99".into(),
+            }
+        );
+
+        // The interface must exist and be L3 in the same config.
+        let tree = parse("routing { arp { 10.42.10.200 interface Vlan99 mac 00:50:56:be:ef:99 } }")
+            .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadArp { .. })));
+        let tree = parse(
+            "interfaces { Ethernet1 { } }\nrouting { arp { 10.0.0.1 interface Ethernet1 mac 00:50:56:be:ef:99 } }",
+        )
+        .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadArp { .. })));
+        // Multicast MACs and bad addresses are rejected.
+        let tree = parse(
+            "vlans { vlan 99 { } } interfaces { Vlan99 { address 10.42.10.9/24 } }\nrouting { arp { 10.0.0.1 interface Vlan99 mac 01:00:5e:00:00:01 } }",
+        )
+        .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadArp { .. })));
+        let tree = parse(
+            "vlans { vlan 99 { } } interfaces { Vlan99 { address 10.42.10.9/24 } }\nrouting { arp { banana interface Vlan99 mac 00:50:56:be:ef:99 } }",
+        )
+        .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadArp { .. })));
+        // Deferred families reject by name.
+        let tree = parse("routing { vrf { } }").unwrap();
+        let err = extract(&tree).unwrap_err();
+        assert_eq!(err.to_string(), "routing: vrf is not supported");
+    }
+
+    #[test]
+    fn extracts_and_validates_frr_families() {
+        let intents = intents_of(
+            "vlans { vlan 99 { } vlan 100 { } }\ninterfaces { Vlan99 { address 10.42.10.9/24 } Vlan100 { address 10.0.100.2/24\nvrrp 10 { address 10.0.100.1\npriority 200 } } }\nrouting { router-id 10.42.0.1\nospf { area 0 { network 10.42.10.0/24 }\npassive-interface Vlan100\nredistribute static }\nbgp { as 65000\nneighbor 10.42.10.1 { remote-as 65001\ndescription \"upstream\" }\nnetwork 10.42.0.0/16 } }",
+        );
+        assert_eq!(intents.router_id.as_deref(), Some("10.42.0.1"));
+        let ospf = intents.ospf.unwrap();
+        // Integer area ids canonicalize to dotted form.
+        assert!(ospf.areas.contains_key("0.0.0.0"));
+        assert_eq!(ospf.maximum_paths, 4);
+        let bgp = intents.bgp.unwrap();
+        assert_eq!(bgp.as_number, 65000);
+        assert_eq!(
+            bgp.neighbors["10.42.10.1"].description.as_deref(),
+            Some("upstream")
+        );
+        let vrrp = &intents.vrrp[&("Vlan100".to_string(), 10)];
+        assert_eq!(vrrp.priority, 200);
+        assert!(vrrp.preempt);
+        assert_eq!(vrrp.addresses.len(), 1);
+
+        // BGP: `as` is required as soon as the block exists.
+        let tree = parse("routing { bgp { network 10.0.0.0/8 } }").unwrap();
+        let err = extract(&tree).unwrap_err();
+        assert_eq!(err.to_string(), "routing bgp: as is required");
+        // A neighbor needs remote-as by commit.
+        let tree = parse("routing { bgp { as 65000\nneighbor 10.0.0.1 { } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadBgp(_))));
+        // The IPv6 address family is deferred.
+        let tree = parse("routing { bgp { as 65000\nnetwork 2001:db8::/32 } }").unwrap();
+        let err = extract(&tree).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+        // OSPF interface knobs must name an L3 interface.
+        let tree = parse("routing { ospf { interface Vlan99 { cost 10 } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadOspf(_))));
+        // OSPF networks must be canonical.
+        let tree = parse("routing { ospf { area 0 { network 10.42.10.9/24 } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadOspf(_))));
+
+        // VRRP: the VIP must sit inside the parent's subnet, the parent
+        // must carry an address, and Management is rejected.
+        let tree = parse(
+            "vlans { vlan 100 { } }\ninterfaces { Vlan100 { address 10.0.100.2/24\nvrrp 10 { address 192.168.9.1 } } }",
+        )
+        .unwrap();
+        let err = extract(&tree).unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+        let tree = parse(
+            "vlans { vlan 100 { } }\ninterfaces { Vlan100 { vrrp 10 { address 10.0.100.1 } } }",
+        )
+        .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadVrrp { .. })));
+        let tree = parse(
+            "vlans { vlan 100 { } }\ninterfaces { Vlan100 { address 10.0.100.2/24\nvrrp 10 { } } }",
+        )
+        .unwrap();
+        let err = extract(&tree).unwrap_err();
+        assert!(err.to_string().contains("at least one address"), "{err}");
+        let tree = parse(
+            "interfaces { Management1 { address 192.168.0.2/24\nvrrp 10 { address 192.168.0.1 } } }",
+        )
+        .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadVrrp { .. })));
+
+        // The macvlan and virtual MAC derivations.
+        assert_eq!(vrrp_macvlan_name("Vlan100", 10), "vrrp4-v100-10");
+        assert_eq!(vrrp_macvlan_name("Ethernet48", 255), "vrrp4-e48-255");
+        assert_eq!(vrrp_virtual_mac(10), "00:00:5e:00:01:0a");
+    }
+
+    #[test]
+    fn routing_seed_round_trips_and_extracts() {
+        // The spec's Part 1.1 seed: parse -> serialize -> parse is the
+        // identity, and every family extracts.
+        let text = "vlans {\n    vlan 99 {\n    }\n    vlan 100 {\n    }\n}\ninterfaces {\n    Vlan99 {\n        address 10.42.10.9/24\n    }\n    Vlan100 {\n        address 10.0.100.2/24\n        vrrp 10 {\n            address 10.0.100.1\n            priority 200\n            advertisement-interval 1\n        }\n    }\n    Ethernet48 {\n        address 10.9.9.1/31\n    }\n}\nrouting {\n    router-id 10.42.0.1\n    static {\n        0.0.0.0/0 10.42.10.1\n        10.99.0.0/16 10.9.9.0\n        10.99.0.0/16 10.42.10.7\n        192.0.2.0/24 drop\n        172.16.0.0/12 10.42.10.1 distance 250\n        2001:db8:99::/48 2001:db8:9::1\n    }\n    arp {\n        10.42.10.200 interface Vlan99 mac 00:50:56:be:ef:99\n    }\n    ospf {\n        area 0.0.0.0 {\n            network 10.42.10.0/24\n        }\n        passive-interface Vlan100\n        redistribute static\n        maximum-paths 4\n    }\n    bgp {\n        as 65000\n        neighbor 10.42.10.1 {\n            remote-as 65001\n            description upstream\n        }\n        network 10.42.0.0/16\n        redistribute connected\n        maximum-paths 4\n    }\n}\n";
+        let tree = parse(text).unwrap();
+        assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+        let intents = extract(&tree).unwrap();
+        assert_eq!(intents.routes.len(), 5);
+        assert_eq!(intents.arp_statics.len(), 1);
+        assert!(intents.ospf.is_some());
+        assert!(intents.bgp.is_some());
+        assert_eq!(intents.vrrp.len(), 1);
+        assert_eq!(intents.router_id.as_deref(), Some("10.42.0.1"));
+    }
+
+    #[test]
+    fn diff_os_tracks_vrrp_macvlans() {
+        let base = "vlans { vlan 100 { } }\ninterfaces { Vlan100 { address 10.0.100.2/24";
+        let running = intents_of(&format!("{base} }} }}"));
+        let candidate = intents_of(&format!("{base}\nvrrp 10 {{ address 10.0.100.1 }} }} }}"));
+        let changes = diff_os(&running, &candidate);
+        assert_eq!(
+            changes.vrrp_macvlans,
+            vec![VrrpMacvlanChange {
+                interface: "Vlan100".into(),
+                group: 10,
+                create: true,
+            }]
+        );
+        assert_eq!(
+            changes.describe(),
+            vec!["vrrp Vlan100 group 10 macvlan vrrp4-v100-10 created".to_string()]
+        );
+        let back = diff_os(&candidate, &running);
+        assert!(!back.vrrp_macvlans[0].create);
+        assert!(diff_os(&candidate, &candidate).is_empty());
+    }
+
+    #[test]
+    fn diff_os_tracks_arp_statics() {
+        let running = intents_of(
+            "vlans { vlan 99 { } }
+interfaces { Vlan99 { address 10.42.10.9/24 } }",
+        );
+        let candidate = intents_of(
+            "vlans { vlan 99 { } } interfaces { Vlan99 { address 10.42.10.9/24 } }\nrouting { arp { 10.42.10.200 interface Vlan99 mac 00:50:56:be:ef:99 } }",
+        );
+        let changes = diff_os(&running, &candidate);
+        assert_eq!(
+            changes.arp,
+            vec![ArpChange {
+                ip: "10.42.10.200".into(),
+                old: None,
+                new: Some(ArpStatic {
+                    interface: "Vlan99".into(),
+                    mac: "00:50:56:be:ef:99".into(),
+                }),
+            }]
+        );
+        assert_eq!(
+            changes.describe(),
+            vec!["arp 10.42.10.200 is 00:50:56:be:ef:99 on Vlan99".to_string()]
+        );
+        let back = diff_os(&candidate, &running);
+        assert_eq!(back.arp.len(), 1);
+        assert!(back.arp[0].new.is_none());
+        assert!(diff_os(&candidate, &candidate).is_empty());
     }
 
     #[test]

@@ -948,6 +948,7 @@ dependencies = [
  "clap",
  "hemlock-common",
  "nix",
+ "serde_json",
  "tokio",
  "tonic",
  "tracing",

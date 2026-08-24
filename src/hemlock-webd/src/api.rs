@@ -62,6 +62,15 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/mirror/edit", post(mirror_edit))
         .route("/api/routes", get(routes))
         .route("/api/routes/static/edit", post(static_routes_edit))
+        .route("/api/arp", get(arp))
+        .route("/api/arp/edit", post(arp_edit))
+        .route("/api/arp/flush", post(arp_flush))
+        .route("/api/ospf", get(ospf))
+        .route("/api/ospf/edit", post(ospf_edit))
+        .route("/api/bgp", get(bgp))
+        .route("/api/bgp/edit", post(bgp_edit))
+        .route("/api/vrrp", get(vrrp))
+        .route("/api/vrrp/edit", post(vrrp_edit))
         .route("/api/system", get(system))
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
@@ -866,10 +875,77 @@ async fn mirror_edit(
     .await
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct FamilyQuery {
+    /// "v4" (default) or "v6".
+    #[serde(default)]
+    family: String,
+}
+
+impl FamilyQuery {
+    fn ipv6(&self) -> bool {
+        self.family == "v6"
+    }
+}
+
+/// `GET /api/routes[?family=v4|v6]` — the static-route config rows plus
+/// the live RIB view (orch) and FIB summary (syncd), both degrading to
+/// empty when their daemon is unreachable.
 async fn routes(
     _op: Operator,
     State(state): State<SharedState>,
+    axum::extract::Query(query): axum::extract::Query<FamilyQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let rib: Vec<serde_json::Value> = match orch_client(&state).await {
+        Ok(mut orch) => orch
+            .get_rib(pb::GetRibRequest {
+                ipv6: query.ipv6(),
+                page_size: 0,
+                page_token: String::new(),
+            })
+            .await
+            .map(|response| {
+                response
+                    .into_inner()
+                    .routes
+                    .into_iter()
+                    .map(|route| {
+                        json!({
+                            "prefix": route.prefix,
+                            "protocol": route.protocol,
+                            "distance": route.distance,
+                            "metric": route.metric,
+                            "uptime_secs": route.uptime_secs,
+                            "next_hops": route.next_hops.iter().map(|hop| json!({
+                                "via": hop.via,
+                                "interface": hop.interface,
+                                "resolved": hop.resolved,
+                            })).collect::<Vec<_>>(),
+                            "fib": route.fib,
+                            "interface": route.interface,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let summary = match syncd_client(&state).await {
+        Ok(mut syncd) => syncd
+            .get_fib_summary(pb::GetFibSummaryRequest {})
+            .await
+            .map(|response| {
+                let summary = response.into_inner();
+                json!({
+                    "routes_v4": summary.routes_v4,
+                    "routes_v6": summary.routes_v6,
+                    "neighbors": summary.neighbors,
+                    "next_hop_groups": summary.next_hop_groups,
+                })
+            })
+            .ok(),
+        Err(_) => None,
+    };
     let text = running_config(&state.mgmtd).await?;
     let tree =
         hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
@@ -921,7 +997,334 @@ async fn routes(
             })
         })
         .collect();
-    Ok(Json(json!({ "static_routes": static_routes })))
+    Ok(Json(json!({
+        "static_routes": static_routes,
+        "rib": rib,
+        "summary": summary,
+    })))
+}
+
+/// `GET /api/arp[?family=v4|v6]` — the kernel neighbor table from orch.
+async fn arp(
+    _op: Operator,
+    State(state): State<SharedState>,
+    axum::extract::Query(query): axum::extract::Query<FamilyQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let neighbors: Vec<serde_json::Value> = orch
+        .get_neighbors(pb::GetNeighborsRequest { ipv6: query.ipv6() })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner()
+        .neighbors
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "ip": entry.ip,
+                "mac": entry.mac,
+                "interface": entry.interface,
+                "is_static": entry.permanent,
+                "age_secs": entry.age_secs,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "neighbors": neighbors })))
+}
+
+async fn arp_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::routing_edit::ArpEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::routing_edit::apply_arp_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ArpFlushRequest {
+    /// Scope the flush to one address; empty = every dynamic entry.
+    #[serde(default)]
+    ip: String,
+}
+
+async fn arp_flush(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<ArpFlushRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let flushed = orch
+        .clear_neighbors(pb::ClearNeighborsRequest { ip: request.ip })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner()
+        .flushed;
+    Ok(Json(json!({ "flushed": flushed })))
+}
+
+// ------------------------------------------------ FRR protocol families
+
+fn leaf_json(items: &[hemlock_config::Item], name: &str) -> Option<String> {
+    ConfigTree::leaf_value(items, name).map(str::to_string)
+}
+
+fn repeated_leaves(items: &[hemlock_config::Item], name: &str) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name: n, values } if n == name => values.first().cloned(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `GET /api/ospf` — the configured process (running config) plus the
+/// live state from orch/FRR (null when not running).
+async fn ospf(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let config = tree.block("routing").and_then(|(_, routing)| {
+        ConfigTree::blocks_named(routing, "ospf")
+            .next()
+            .map(|(_, ospf)| {
+                let areas: Vec<serde_json::Value> = ospf
+                    .iter()
+                    .filter_map(|item| match item {
+                        hemlock_config::Item::Block {
+                            name,
+                            keys,
+                            children,
+                        } if name == "area" => Some(json!({
+                            "id": keys.first().cloned().unwrap_or_default(),
+                            "networks": repeated_leaves(children, "network"),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                let interfaces: Vec<serde_json::Value> = ospf
+                    .iter()
+                    .filter_map(|item| match item {
+                        hemlock_config::Item::Block {
+                            name,
+                            keys,
+                            children,
+                        } if name == "interface" => Some(json!({
+                            "interface": keys.first().cloned().unwrap_or_default(),
+                            "cost": leaf_json(children, "cost"),
+                            "hello_interval": leaf_json(children, "hello-interval"),
+                            "dead_interval": leaf_json(children, "dead-interval"),
+                            "priority": leaf_json(children, "priority"),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                json!({
+                    "router_id": leaf_json(ospf, "router-id"),
+                    "maximum_paths": leaf_json(ospf, "maximum-paths"),
+                    "areas": areas,
+                    "passive_interfaces": repeated_leaves(ospf, "passive-interface"),
+                    "redistribute": repeated_leaves(ospf, "redistribute"),
+                    "interfaces": interfaces,
+                })
+            })
+    });
+    let live = match orch_client(&state).await {
+        Ok(mut orch) => orch
+            .get_ospf_state(pb::GetOspfStateRequest {})
+            .await
+            .map(|response| {
+                let s = response.into_inner();
+                json!({
+                    "router_id": s.router_id,
+                    "spf_runs": s.spf_runs,
+                    "areas": s.areas.iter().map(|a| json!({
+                        "id": a.id, "interfaces": a.interfaces,
+                    })).collect::<Vec<_>>(),
+                    "neighbors": s.neighbors.iter().map(|n| json!({
+                        "router_id": n.router_id,
+                        "priority": n.priority,
+                        "state": n.state,
+                        "dead_time_msecs": n.dead_time_msecs,
+                        "address": n.address,
+                        "interface": n.interface,
+                    })).collect::<Vec<_>>(),
+                    "interfaces": s.interfaces.iter().map(|i| json!({
+                        "name": i.name,
+                        "up": i.up,
+                        "address": i.address,
+                        "area": i.area,
+                        "cost": i.cost,
+                        "hello_interval": i.hello_interval,
+                        "dead_interval": i.dead_interval,
+                        "neighbors": i.neighbors,
+                        "adjacent": i.adjacent,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .ok(),
+        Err(_) => None,
+    };
+    Ok(Json(json!({ "config": config, "state": live })))
+}
+
+async fn ospf_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::routing_edit::OspfEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::routing_edit::apply_ospf_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/bgp` — the configured process plus the live summary.
+async fn bgp(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let config = tree.block("routing").and_then(|(_, routing)| {
+        ConfigTree::blocks_named(routing, "bgp")
+            .next()
+            .map(|(_, bgp)| {
+                let neighbors: Vec<serde_json::Value> = bgp
+                    .iter()
+                    .filter_map(|item| match item {
+                        hemlock_config::Item::Block {
+                            name,
+                            keys,
+                            children,
+                        } if name == "neighbor" => Some(json!({
+                            "ip": keys.first().cloned().unwrap_or_default(),
+                            "remote_as": leaf_json(children, "remote-as"),
+                            "description": leaf_json(children, "description"),
+                            "shutdown": ConfigTree::has_leaf(children, "shutdown"),
+                            "ebgp_multihop": leaf_json(children, "ebgp-multihop"),
+                            "next_hop_self": ConfigTree::has_leaf(children, "next-hop-self"),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                json!({
+                    "as_number": leaf_json(bgp, "as"),
+                    "router_id": leaf_json(bgp, "router-id"),
+                    "maximum_paths": leaf_json(bgp, "maximum-paths"),
+                    "networks": repeated_leaves(bgp, "network"),
+                    "redistribute": repeated_leaves(bgp, "redistribute"),
+                    "neighbors": neighbors,
+                })
+            })
+    });
+    let live = match orch_client(&state).await {
+        Ok(mut orch) => orch
+            .get_bgp_state(pb::GetBgpStateRequest {
+                neighbor: String::new(),
+            })
+            .await
+            .map(|response| {
+                let s = response.into_inner();
+                json!({
+                    "router_id": s.router_id,
+                    "as_number": s.as_number,
+                    "peers": s.peers.iter().map(|p| json!({
+                        "ip": p.ip,
+                        "remote_as": p.remote_as,
+                        "state": p.state,
+                        "up_down": p.up_down,
+                        "msg_rcvd": p.msg_rcvd,
+                        "msg_sent": p.msg_sent,
+                        "pfx_rcvd": p.pfx_rcvd,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .ok(),
+        Err(_) => None,
+    };
+    Ok(Json(json!({ "config": config, "state": live })))
+}
+
+async fn bgp_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::routing_edit::BgpEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::routing_edit::apply_bgp_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/vrrp` — configured groups merged with live vrrpd state by
+/// (interface, group).
+async fn vrrp(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let live = match orch_client(&state).await {
+        Ok(mut orch) => orch
+            .get_vrrp_state(pb::GetVrrpStateRequest {})
+            .await
+            .map(|response| response.into_inner().groups)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let mut groups = Vec::new();
+    if let Some((_, interfaces)) = tree.block("interfaces") {
+        for item in interfaces {
+            let hemlock_config::Item::Block {
+                name: interface,
+                keys,
+                children,
+            } = item
+            else {
+                continue;
+            };
+            if !keys.is_empty() {
+                continue;
+            }
+            for (group_keys, body) in ConfigTree::blocks_named(children, "vrrp") {
+                let group = group_keys.first().cloned().unwrap_or_default();
+                let state = live
+                    .iter()
+                    .find(|g| g.interface == *interface && g.group.to_string() == group);
+                groups.push(json!({
+                    "interface": interface,
+                    "group": group,
+                    "addresses": repeated_leaves(body, "address"),
+                    "priority": leaf_json(body, "priority"),
+                    "advertisement_interval": leaf_json(body, "advertisement-interval"),
+                    "preempt": !ConfigTree::has_leaf(body, "no-preempt"),
+                    "state": state.map(|s| s.state.clone()),
+                    "effective_priority": state.map(|s| s.effective_priority),
+                    "virtual_mac": state.map(|s| s.virtual_mac.clone()),
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({ "groups": groups })))
+}
+
+async fn vrrp_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::routing_edit::VrrpEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::routing_edit::apply_vrrp_edit(tree, &edit)
+    })
+    .await
 }
 
 async fn static_routes_edit(

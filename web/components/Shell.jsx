@@ -8,7 +8,7 @@ import { VerticalNav } from '@/components/ds/VerticalNav';
 const TABS = [
   { label: 'Dashboard', href: '/dashboard/' },
   { label: 'Switching', href: '/switching/interfaces/', root: '/switching' },
-  { label: 'Routing', href: '/routing/static/', root: '/routing' },
+  { label: 'Routing', href: '/routing/routes/', root: '/routing' },
   { label: 'System', href: '/system/general/', root: '/system' },
 ];
 
@@ -29,7 +29,14 @@ const SIDE_NAV = {
   },
   '/routing': {
     label: 'Routing',
-    items: [{ id: '/routing/static/', label: 'Static routes', icon: 'map' }],
+    items: [
+      { id: '/routing/routes/', label: 'Routes', icon: 'map' },
+      { id: '/routing/static/', label: 'Static Routes', icon: 'view-list' },
+      { id: '/routing/ospf/', label: 'OSPF', icon: 'network-globe' },
+      { id: '/routing/bgp/', label: 'BGP', icon: 'cloud-network' },
+      { id: '/routing/vrrp/', label: 'VRRP', icon: 'link' },
+      { id: '/routing/arp/', label: 'ARP / ND', icon: 'network-settings' },
+    ],
   },
   '/system': {
     label: 'System',

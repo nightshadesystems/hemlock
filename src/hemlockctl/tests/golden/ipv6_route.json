@@ -3,6 +3,7 @@
     "routes": [
       {
         "distance": 0,
+        "fib": "connected",
         "interface": "Ethernet48",
         "metric": 0,
         "next_hops": [],
@@ -11,6 +12,7 @@
       },
       {
         "distance": 1,
+        "fib": "programmed",
         "metric": 0,
         "next_hops": [
           {

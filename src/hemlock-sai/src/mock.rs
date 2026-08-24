@@ -32,6 +32,10 @@ const MOCK_LAG_MEMBER_OID_BASE: u64 = 0x2100_0000_0000_8000;
 const MOCK_STP_OID_BASE: u64 = 0x2100_0000_0000_9000;
 const MOCK_L2MC_OID_BASE: u64 = 0x2100_0000_0000_a000;
 const MOCK_L2MC_MEMBER_OID_BASE: u64 = 0x2100_0000_0000_b000;
+const MOCK_NEXT_HOP_OID_BASE: u64 = 0x2100_0000_0000_c000;
+const MOCK_NHG_OID_BASE: u64 = 0x2100_0000_0000_d000;
+const MOCK_NHG_MEMBER_OID_BASE: u64 = 0x2100_0000_0000_e000;
+const MOCK_MY_MAC_OID_BASE: u64 = 0x2100_0000_0000_f000;
 
 /// The default 802.1Q VLAN's synthetic OID (the base itself; `alloc`
 /// starts above it), so FDB events on VLAN 1 can be mapped back.
@@ -85,6 +89,13 @@ pub struct MockSai {
     l2mc_members: HashMap<Oid, (Oid, PortId)>,
     l2mc_entries: HashMap<(Option<Oid>, IpAddr), Oid>,
     vlan_unknown_mcast: HashMap<Option<Oid>, Oid>,
+    /// FIB model: neighbor entries per RIF, next hops, ECMP groups
+    /// (member oid -> (group, next hop)), and My-MAC entries.
+    neighbors: HashMap<(Oid, IpAddr), [u8; 6]>,
+    next_hops: HashMap<Oid, (Oid, IpAddr)>,
+    nh_groups: std::collections::HashSet<Oid>,
+    nh_group_members: HashMap<Oid, (Oid, Oid)>,
+    my_macs: HashMap<Oid, (Option<u16>, [u8; 6])>,
     next_oid: u64,
 }
 
@@ -124,6 +135,11 @@ impl MockSai {
             l2mc_members: HashMap::new(),
             l2mc_entries: HashMap::new(),
             vlan_unknown_mcast: HashMap::new(),
+            neighbors: HashMap::new(),
+            next_hops: HashMap::new(),
+            nh_groups: std::collections::HashSet::new(),
+            nh_group_members: HashMap::new(),
+            my_macs: HashMap::new(),
             next_oid: 0,
         }
     }
@@ -184,6 +200,20 @@ impl MockSai {
     fn alloc(&mut self, base: u64) -> Oid {
         self.next_oid += 1;
         Oid(base + self.next_oid)
+    }
+
+    /// Any router interface — a routed port's or an SVI's.
+    fn rif_exists(&self, rif: Oid) -> bool {
+        self.rifs.values().any(|r| *r == rif) || self.vlan_rifs.contains_key(&rif)
+    }
+
+    /// The pinned SAI's posture on v6: reject when the probed
+    /// capability says unsupported, like the vendor library would.
+    fn require_ipv6(&self, ip: IpAddr) -> Result<(), SaiError> {
+        if ip.is_ipv6() && !self.capabilities.ipv6 {
+            return Err(SaiError::Other("IPv6 is not supported".into()));
+        }
+        Ok(())
     }
 }
 
@@ -338,10 +368,18 @@ impl SaiBackend for MockSai {
 
     fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError> {
         self.require_switch()?;
-        if let RouteTarget::Rif(rif) = target {
-            if !self.rifs.values().any(|r| *r == rif) && !self.vlan_rifs.contains_key(&rif) {
+        self.require_ipv6(dest.0)?;
+        match target {
+            RouteTarget::Rif(rif) if !self.rif_exists(rif) => {
                 return Err(SaiError::Other(format!("no such RIF {rif}")));
             }
+            RouteTarget::NextHop(next_hop) if !self.next_hops.contains_key(&next_hop) => {
+                return Err(SaiError::Other(format!("no such next hop {next_hop}")));
+            }
+            RouteTarget::Group(group) if !self.nh_groups.contains(&group) => {
+                return Err(SaiError::Other(format!("no such next-hop group {group}")));
+            }
+            _ => {}
         }
         // Like the real ASIC: creating an existing destination fails
         // (callers replace via remove + create).
@@ -350,6 +388,140 @@ impl SaiBackend for MockSai {
                 "route {}/{} exists",
                 dest.0, dest.1
             )));
+        }
+        Ok(())
+    }
+
+    fn create_neighbor(&mut self, rif: Oid, ip: IpAddr, mac: [u8; 6]) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_ipv6(ip)?;
+        if !self.rif_exists(rif) {
+            return Err(SaiError::Other(format!("no such RIF {rif}")));
+        }
+        self.neighbors.insert((rif, ip), mac);
+        Ok(())
+    }
+
+    fn remove_neighbor(&mut self, rif: Oid, ip: IpAddr) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.neighbors.remove(&(rif, ip)).is_none() {
+            return Err(SaiError::Other(format!("no neighbor {ip} on {rif}")));
+        }
+        Ok(())
+    }
+
+    fn create_next_hop(&mut self, rif: Oid, ip: IpAddr) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        self.require_ipv6(ip)?;
+        if !self.rif_exists(rif) {
+            return Err(SaiError::Other(format!("no such RIF {rif}")));
+        }
+        let oid = self.alloc(MOCK_NEXT_HOP_OID_BASE);
+        self.next_hops.insert(oid, (rif, ip));
+        Ok(oid)
+    }
+
+    fn remove_next_hop(&mut self, next_hop: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self
+            .routes
+            .values()
+            .any(|t| *t == RouteTarget::NextHop(next_hop))
+        {
+            return Err(SaiError::Other(format!(
+                "next hop {next_hop} still routed to"
+            )));
+        }
+        if self.nh_group_members.values().any(|(_, n)| *n == next_hop) {
+            return Err(SaiError::Other(format!(
+                "next hop {next_hop} still a group member"
+            )));
+        }
+        if self.next_hops.remove(&next_hop).is_none() {
+            return Err(SaiError::Other(format!("no such next hop {next_hop}")));
+        }
+        Ok(())
+    }
+
+    fn create_next_hop_group(&mut self) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if self.capabilities.ecmp_width == 0 {
+            return Err(SaiError::Other("next-hop groups are not supported".into()));
+        }
+        let oid = self.alloc(MOCK_NHG_OID_BASE);
+        self.nh_groups.insert(oid);
+        Ok(oid)
+    }
+
+    fn remove_next_hop_group(&mut self, group: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.nh_group_members.values().any(|(g, _)| *g == group) {
+            return Err(SaiError::Other(format!("group {group} still has members")));
+        }
+        if self
+            .routes
+            .values()
+            .any(|t| *t == RouteTarget::Group(group))
+        {
+            return Err(SaiError::Other(format!("group {group} still routed to")));
+        }
+        if !self.nh_groups.remove(&group) {
+            return Err(SaiError::Other(format!("no such next-hop group {group}")));
+        }
+        Ok(())
+    }
+
+    fn add_next_hop_group_member(&mut self, group: Oid, next_hop: Oid) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if !self.nh_groups.contains(&group) {
+            return Err(SaiError::Other(format!("no such next-hop group {group}")));
+        }
+        if !self.next_hops.contains_key(&next_hop) {
+            return Err(SaiError::Other(format!("no such next hop {next_hop}")));
+        }
+        let width = self
+            .nh_group_members
+            .values()
+            .filter(|(g, _)| *g == group)
+            .count() as u32;
+        if width >= self.capabilities.ecmp_width {
+            return Err(SaiError::Other(format!(
+                "group {group} is at the ECMP width limit ({})",
+                self.capabilities.ecmp_width
+            )));
+        }
+        let member = self.alloc(MOCK_NHG_MEMBER_OID_BASE);
+        self.nh_group_members.insert(member, (group, next_hop));
+        Ok(member)
+    }
+
+    fn remove_next_hop_group_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.nh_group_members.remove(&member).is_none() {
+            return Err(SaiError::Other(format!("no such group member {member}")));
+        }
+        Ok(())
+    }
+
+    fn create_my_mac(&mut self, vlan_id: Option<u16>, mac: [u8; 6]) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if !self.capabilities.my_mac {
+            return Err(SaiError::Other("My-MAC entries are not supported".into()));
+        }
+        if let Some(vlan) = vlan_id {
+            if vlan != DEFAULT_VLAN && !self.vlans.contains_key(&vlan) {
+                return Err(SaiError::Other(format!("no such VLAN {vlan}")));
+            }
+        }
+        let oid = self.alloc(MOCK_MY_MAC_OID_BASE);
+        self.my_macs.insert(oid, (vlan_id, mac));
+        Ok(oid)
+    }
+
+    fn remove_my_mac(&mut self, my_mac: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.my_macs.remove(&my_mac).is_none() {
+            return Err(SaiError::Other(format!("no such My-MAC entry {my_mac}")));
         }
         Ok(())
     }
@@ -901,6 +1073,83 @@ mod tests {
             sai.set_port_admin_state(PortId(0xdead), true),
             Err(SaiError::UnknownPort(_))
         ));
+    }
+
+    #[test]
+    fn fib_lifecycle_neighbors_next_hops_groups_my_mac() {
+        let mut sai = MockSai::new(port_table(2));
+        sai.create_switch().unwrap();
+        let port = sai.ports().unwrap()[0].id;
+        let rif = sai.create_router_interface(port).unwrap();
+
+        // Neighbors replace per (rif, ip) and reject a dead RIF.
+        let gw: IpAddr = "10.9.9.0".parse().unwrap();
+        let mac = [0xa0, 0x36, 0x9f, 0x44, 0xbe, 0x09];
+        sai.create_neighbor(rif, gw, mac).unwrap();
+        sai.create_neighbor(rif, gw, mac).unwrap();
+        assert!(sai.create_neighbor(Oid(0xbad), gw, mac).is_err());
+
+        // Next hop + single-hop route.
+        let nh = sai.create_next_hop(rif, gw).unwrap();
+        let dest: IpAddr = "10.99.0.0".parse().unwrap();
+        sai.create_route((dest, 16), RouteTarget::NextHop(nh))
+            .unwrap();
+        assert!(
+            sai.remove_next_hop(nh).is_err(),
+            "a routed-to next hop cannot be removed"
+        );
+
+        // ECMP: group of two, then teardown in dependency order.
+        let gw2: IpAddr = "10.42.10.7".parse().unwrap();
+        let nh2 = sai.create_next_hop(rif, gw2).unwrap();
+        let group = sai.create_next_hop_group().unwrap();
+        let m1 = sai.add_next_hop_group_member(group, nh).unwrap();
+        let m2 = sai.add_next_hop_group_member(group, nh2).unwrap();
+        sai.remove_route((dest, 16)).unwrap();
+        sai.create_route((dest, 16), RouteTarget::Group(group))
+            .unwrap();
+        assert!(sai.remove_next_hop_group(group).is_err(), "members remain");
+        sai.remove_route((dest, 16)).unwrap();
+        sai.remove_next_hop_group_member(m1).unwrap();
+        sai.remove_next_hop_group_member(m2).unwrap();
+        sai.remove_next_hop_group(group).unwrap();
+        sai.remove_next_hop(nh).unwrap();
+        sai.remove_next_hop(nh2).unwrap();
+        sai.remove_neighbor(rif, gw).unwrap();
+        assert!(sai.remove_neighbor(rif, gw).is_err());
+
+        // Drop routes need no target object.
+        sai.create_route((dest, 16), RouteTarget::Drop).unwrap();
+        sai.remove_route((dest, 16)).unwrap();
+
+        // My-MAC entries (VRRP virtual MAC), VLAN-scoped.
+        let vrrp_mac = [0x00, 0x00, 0x5e, 0x00, 0x01, 0x0a];
+        let my_mac = sai.create_my_mac(Some(1), vrrp_mac).unwrap();
+        sai.remove_my_mac(my_mac).unwrap();
+        assert!(sai.remove_my_mac(my_mac).is_err());
+        assert!(
+            sai.create_my_mac(Some(100), vrrp_mac).is_err(),
+            "no VLAN 100"
+        );
+
+        // Capability posture is enforced like the vendor library's.
+        let mut caps = SaiCapabilities::all();
+        caps.ipv6 = false;
+        caps.my_mac = false;
+        caps.ecmp_width = 1;
+        sai.set_capabilities(caps);
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(sai.create_next_hop(rif, v6).is_err());
+        assert!(sai.create_route((v6, 128), RouteTarget::Cpu).is_err());
+        assert!(sai.create_my_mac(None, vrrp_mac).is_err());
+        let nh = sai.create_next_hop(rif, gw).unwrap();
+        let nh2 = sai.create_next_hop(rif, gw2).unwrap();
+        let group = sai.create_next_hop_group().unwrap();
+        sai.add_next_hop_group_member(group, nh).unwrap();
+        assert!(
+            sai.add_next_hop_group_member(group, nh2).is_err(),
+            "the ECMP width limit holds"
+        );
     }
 
     #[test]

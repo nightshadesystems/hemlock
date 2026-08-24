@@ -19,6 +19,7 @@ pub struct Engine {
     syncd: IpcEndpoint,
     orch: IpcEndpoint,
     os: OsApplier,
+    frr: crate::frrapply::FrrApplier,
     commit_seq: u64,
     /// Pending commit-confirm: the pre-commit running text to restore if no
     /// confirmation arrives, plus a cancel handle for the timer task.
@@ -38,6 +39,7 @@ impl Engine {
             syncd,
             orch,
             os,
+            frr: crate::frrapply::FrrApplier::new(),
             commit_seq: 0,
             pending_confirm: None,
         }
@@ -84,6 +86,30 @@ impl Engine {
             for name in wanted.management.keys() {
                 if name != mgmt {
                     anyhow::bail!("unknown interface {name:?}");
+                }
+            }
+        }
+        // `maximum-paths` is capped at the probed ECMP width.
+        let max_paths = wanted
+            .ospf
+            .as_ref()
+            .map(|o| ("ospf", o.maximum_paths))
+            .into_iter()
+            .chain(wanted.bgp.as_ref().map(|b| ("bgp", b.maximum_paths)))
+            .max_by_key(|(_, paths)| *paths);
+        if let Some((family, paths)) = max_paths {
+            if let Ok(mut client) = self.syncd_client().await {
+                if let Ok(info) = client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
+                    let width = info
+                        .into_inner()
+                        .capabilities
+                        .map(|c| c.ecmp_width)
+                        .unwrap_or(0);
+                    if u32::from(paths) > width {
+                        anyhow::bail!(
+                            "routing {family}: maximum-paths {paths} exceeds this platform's ECMP width of {width}"
+                        );
+                    }
                 }
             }
         }
@@ -335,6 +361,33 @@ impl Engine {
                 .context("pushing mld-snooping config to orch")?;
         }
 
+        // VRRP virtual MACs into the ASIC's My-MAC table. Runs with the
+        // fallible syncd steps: a platform whose SAI refused the My-MAC
+        // capability fails the commit here with the platform error.
+        let my_macs_wanted = vrrp_my_macs(&wanted_intents);
+        let my_macs_running = vrrp_my_macs(&running_intents);
+        if my_macs_wanted != my_macs_running {
+            let mut client = self.syncd_client().await?;
+            for (vlan, mac) in my_macs_wanted.difference(&my_macs_running) {
+                client
+                    .ensure_my_mac(pb::EnsureMyMacRequest {
+                        vlan: *vlan,
+                        mac: mac.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("installing VRRP virtual MAC {mac}"))?;
+            }
+            for (vlan, mac) in my_macs_running.difference(&my_macs_wanted) {
+                client
+                    .remove_my_mac(pb::RemoveMyMacRequest {
+                        vlan: *vlan,
+                        mac: mac.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("removing VRRP virtual MAC {mac}"))?;
+            }
+        }
+
         // The kernel-side apply runs LAST, after every fallible step:
         // it is best-effort (never fails the commit), so were it to run
         // earlier a later syncd/orch failure would leave the kernel
@@ -343,6 +396,15 @@ impl Engine {
         // the box unreachable until a replay. Fallible first, then the
         // infallible OS pass, then persist.
         self.os.apply(&os_changes);
+
+        // FRR rides behind the OS pass (VRRP macvlans must exist before
+        // the reload); render-diff gated so unrelated commits leave FRR
+        // alone. Best-effort like the OS applier.
+        let frr_changed = crate::frrapply::render_frr(&running_intents)
+            != crate::frrapply::render_frr(&wanted_intents);
+        if frr_changed {
+            self.frr.apply(&wanted_intents);
+        }
 
         self.store.commit(
             new_text,
@@ -373,6 +435,9 @@ impl Engine {
         described.extend(mac_changes.describe());
         described.extend(storm_changes.iter().map(intents::StormChange::describe));
         described.extend(mirror_changes.iter().map(intents::MirrorChange::describe));
+        if frr_changed {
+            described.push("frr configuration updated (ospf/bgp/vrrp)".into());
+        }
         described.extend(wanted_intents.warnings.iter().cloned());
         Ok(described)
     }
@@ -697,6 +762,22 @@ impl Engine {
     }
 }
 
+/// The (VLAN scope, virtual MAC) set the VRRP groups want in the
+/// ASIC's My-MAC table (VLAN 0 = unscoped, for routed-port parents).
+fn vrrp_my_macs(intents: &Intents) -> std::collections::BTreeSet<(u32, String)> {
+    intents
+        .vrrp
+        .keys()
+        .map(|(interface, group)| {
+            let vlan = interface
+                .strip_prefix("Vlan")
+                .and_then(|id| id.parse::<u32>().ok())
+                .unwrap_or(0);
+            (vlan, intents::vrrp_virtual_mac(*group))
+        })
+        .collect()
+}
+
 /// The full wanted switchport program as a syncd request.
 fn switchport_request(name: &str, sp: &intents::SwitchportIntent) -> pb::SetPortSwitchportRequest {
     pb::SetPortSwitchportRequest {
@@ -854,15 +935,27 @@ impl Engine {
             .await
             .context("replaying switching families")?;
         }
+
+        // VRRP virtual MACs back into the ASIC's My-MAC table.
+        for (vlan, mac) in vrrp_my_macs(&running) {
+            client
+                .ensure_my_mac(pb::EnsureMyMacRequest { vlan, mac })
+                .await
+                .context("replaying VRRP virtual MACs")?;
+            applied += 1;
+        }
         Ok(applied)
     }
 
     /// Replay the OS-side families (management address, static routes,
     /// sshd state) from the running config. Independent of syncd, so it
     /// runs once at startup rather than inside the syncd retry loop.
+    /// FRR replays through the same idempotent apply — after the OS
+    /// pass, so the VRRP macvlans exist before the reload.
     pub fn replay_os(&self) -> Result<()> {
         let running = Self::parse_intents(&self.store.running()?)?;
         self.os.replay(&running);
+        self.frr.apply(&running);
         Ok(())
     }
 }

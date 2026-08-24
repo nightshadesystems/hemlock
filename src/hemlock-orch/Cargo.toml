@@ -1,6 +1,6 @@
 [package]
 name = "hemlock-orch"
-description = "Orchestration daemon: netlink/FRR state -> SAI objects (phase 1: seam stub)"
+description = "Orchestration daemon: protocol engines + the kernel RIB -> SAI pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,6 +15,8 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }
+# iproute2 JSON parsing (the RIB kernel feed) and vtysh JSON (FRR shows).
+serde_json = { workspace = true }
 
 # LACPDU transport over the member ports' hostif netdevs.
 [target.'cfg(target_os = "linux")'.dependencies]

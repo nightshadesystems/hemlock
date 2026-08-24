@@ -3,6 +3,7 @@
     "routes": [
       {
         "distance": 1,
+        "fib": "programmed",
         "metric": 0,
         "next_hops": [
           {
@@ -15,6 +16,7 @@
       },
       {
         "distance": 0,
+        "fib": "connected",
         "interface": "Vlan100",
         "metric": 0,
         "next_hops": [],
@@ -23,6 +25,7 @@
       },
       {
         "distance": 0,
+        "fib": "connected",
         "interface": "Ethernet48",
         "metric": 0,
         "next_hops": [],
@@ -31,6 +34,7 @@
       },
       {
         "distance": 0,
+        "fib": "connected",
         "interface": "Vlan99",
         "metric": 0,
         "next_hops": [],
@@ -39,6 +43,7 @@
       },
       {
         "distance": 110,
+        "fib": "programmed",
         "metric": 20,
         "next_hops": [
           {
@@ -51,6 +56,7 @@
       },
       {
         "distance": 1,
+        "fib": "programmed",
         "metric": 0,
         "next_hops": [
           {
@@ -67,6 +73,7 @@
       },
       {
         "distance": 250,
+        "fib": "programmed",
         "metric": 0,
         "next_hops": [
           {
@@ -79,6 +86,7 @@
       },
       {
         "distance": 200,
+        "fib": "programmed",
         "metric": 0,
         "next_hops": [
           {
@@ -91,6 +99,7 @@
       },
       {
         "distance": 1,
+        "fib": "drop",
         "interface": "Null0",
         "metric": 0,
         "next_hops": [],

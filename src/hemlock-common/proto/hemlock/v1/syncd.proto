@@ -100,6 +100,26 @@ service Syncd {
   // (the mrouter set) while snooping is active, back to flood-all when
   // not.
   rpc SetVlanUnknownMcast(SetVlanUnknownMcastRequest) returns (SetVlanUnknownMcastResponse);
+
+  // --- FIB: neighbors, transit routes, VRRP My-MAC ----------------------
+  // Pushed by orch, which mirrors the kernel RIB and neighbor table
+  // (connected routes ride the SetInterfaceAddress RIF path instead).
+  rpc EnsureNeighbor(EnsureNeighborRequest) returns (EnsureNeighborResponse);
+  rpc RemoveNeighbor(RemoveNeighborRequest) returns (RemoveNeighborResponse);
+  // Declarative per-prefix program: punt (next hop resolving), drop, or
+  // a next-hop set. syncd owns next-hop and ECMP-group lifecycle,
+  // deduplicated by member set and refcounted across routes.
+  rpc EnsureRoute(EnsureRouteRequest) returns (EnsureRouteResponse);
+  rpc RemoveRoute(RemoveRouteRequest) returns (RemoveRouteResponse);
+  // VRRP virtual router MACs (VLAN-scoped My-MAC entries).
+  rpc EnsureMyMac(EnsureMyMacRequest) returns (EnsureMyMacResponse);
+  rpc RemoveMyMac(RemoveMyMacRequest) returns (RemoveMyMacResponse);
+  // Route/neighbor/group counts for `show ip route summary` and the
+  // dashboard.
+  rpc GetFibSummary(GetFibSummaryRequest) returns (GetFibSummaryResponse);
+  // What the transit FIB currently holds, for orch's reconciler: after
+  // an orch restart it deletes entries the kernel no longer wants.
+  rpc DumpFib(DumpFibRequest) returns (DumpFibResponse);
 }
 
 message GetSwitchInfoRequest {}
@@ -125,6 +145,91 @@ message SwitchCapabilities {
   bool mirror = 7;
   uint32 mirror_sessions_max = 8;
   bool port_tpid = 9;
+  // Widest ECMP next-hop group (0 = no next-hop groups).
+  uint32 ecmp_width = 10;
+  bool ipv6 = 11;
+  // My-MAC entries (VRRP virtual MACs).
+  bool my_mac = 12;
+}
+
+message EnsureNeighborRequest {
+  // An L3 interface name ("Ethernet48", "Vlan99").
+  string interface = 1;
+  string ip = 2;
+  // Colon form; canonicalized by syncd.
+  string mac = 3;
+}
+
+message EnsureNeighborResponse {}
+
+message RemoveNeighborRequest {
+  string interface = 1;
+  string ip = 2;
+}
+
+message RemoveNeighborResponse {}
+
+message RouteNextHop {
+  // The egress L3 interface the next hop resolves onto.
+  string interface = 1;
+  string ip = 2;
+}
+
+message EnsureRouteRequest {
+  // Canonical CIDR prefix.
+  string prefix = 1;
+  // Punt to the CPU while the next hop resolves (resolve-via-punt).
+  bool cpu = 2;
+  // Null route: dropped in hardware.
+  bool drop = 3;
+  // Resolved next hops; one = a plain next hop, several = an ECMP
+  // next-hop group. Exactly one of cpu/drop/next_hops applies.
+  repeated RouteNextHop next_hops = 4;
+}
+
+message EnsureRouteResponse {}
+
+message RemoveRouteRequest {
+  string prefix = 1;
+}
+
+message RemoveRouteResponse {}
+
+message EnsureMyMacRequest {
+  // 802.1Q scope; 0 = unscoped.
+  uint32 vlan = 1;
+  string mac = 2;
+}
+
+message EnsureMyMacResponse {}
+
+message RemoveMyMacRequest {
+  uint32 vlan = 1;
+  string mac = 2;
+}
+
+message RemoveMyMacResponse {}
+
+message DumpFibRequest {}
+
+message DumpFibResponse {
+  // Canonical prefixes of installed transit routes.
+  repeated string routes = 1;
+  // Installed neighbor entries.
+  repeated RemoveNeighborRequest neighbors = 2;
+  // Installed My-MAC entries.
+  repeated RemoveMyMacRequest my_macs = 3;
+}
+
+message GetFibSummaryRequest {}
+
+message GetFibSummaryResponse {
+  // Transit routes programmed via EnsureRoute, per family (connected
+  // and IP2ME routes from the interface-address path not included).
+  uint32 routes_v4 = 1;
+  uint32 routes_v6 = 2;
+  uint32 neighbors = 3;
+  uint32 next_hop_groups = 4;
 }
 
 message ListPortsRequest {}

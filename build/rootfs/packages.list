@@ -15,8 +15,13 @@ ca-certificates
 curl
 less
 vim-tiny
-# networking basics (FRR arrives in a later phase)
+# networking basics
 iproute2
+# The protocol stack (OSPFv2, BGP, VRRP): mgmtd renders /etc/frr/frr.conf
+# + daemons from the config and reloads. Debian 13 ships FRR 10.x; the
+# routing suite pins the distro package rather than an upstream build.
+frr
+frr-pythontools
 ethtool
 iputils-ping
 # setcap for ping's cap_net_raw (see the operator-account section)

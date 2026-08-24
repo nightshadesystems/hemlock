@@ -1,0 +1,41 @@
+{
+  "ospf": {
+    "areas": [
+      {
+        "id": "0.0.0.0",
+        "interfaces": 1
+      }
+    ],
+    "interfaces": [
+      {
+        "address": "10.42.10.9/24",
+        "adjacent": 1,
+        "area": "0.0.0.0",
+        "cost": 10,
+        "dead_interval": 40,
+        "dr_address": "10.42.10.7",
+        "dr_id": "10.42.0.7",
+        "hello_interval": 10,
+        "name": "Vlan99",
+        "neighbors": 1,
+        "network_type": "BROADCAST",
+        "priority": 1,
+        "router_id": "10.42.0.1",
+        "state": "Backup",
+        "up": true
+      }
+    ],
+    "neighbors": [
+      {
+        "address": "10.42.10.7",
+        "dead_time_msecs": 33000,
+        "interface": "Vlan99",
+        "priority": 1,
+        "router_id": "10.42.0.7",
+        "state": "Full"
+      }
+    ],
+    "router_id": "10.42.0.1",
+    "spf_runs": 7
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "ipv6_neighbors": {
+    "entries": [
+      {
+        "age_secs": 33,
+        "interface": "Ethernet48",
+        "ip": "2001:db8:9::1",
+        "is_static": false,
+        "mac": "a0:36:9f:44:be:09"
+      }
+    ]
+  }
+}

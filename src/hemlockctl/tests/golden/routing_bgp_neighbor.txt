@@ -1,0 +1,6 @@
+BGP neighbor is 10.42.10.1, remote AS 65001
+ Description: upstream
+ BGP state = Established, up for 2d04h
+ Message statistics: 1234 received, 1230 sent
+ Prefixes: 42 received, 42 accepted, 12 advertised
+ Configured options: next-hop-self, ebgp-multihop 2

@@ -1,0 +1,5 @@
+Address         Age (sec)  Hardware Addr      Interface
+10.9.9.0               33  a0:36:9f:44:be:09  Ethernet48
+10.42.10.1            142  d4:af:f7:12:9c:00  Vlan99
+10.42.10.7             12  00:1c:73:0c:aa:07  Vlan99
+10.42.10.200            -  00:50:56:be:ef:99  Vlan99

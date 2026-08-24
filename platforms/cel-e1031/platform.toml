@@ -32,6 +32,10 @@ config_bcm = "helix4-e1031-48x1G+4x10G.config.bcm"
 extra_files = ["sai_postinit_cmd.soc"]
 
 # Extra SAI profile entries, mirroring SONiC's sai.profile for this hwsku.
+# SAI_NUM_ECMP_MEMBERS pins the Helix4 ECMP group width at 64 (SONiC's
+# value for this hwsku); the routing suite's capability probe reads the
+# effective width back from the SAI at boot and caps `maximum-paths`
+# and next-hop-group sizes against it.
 [sai.profile]
 SAI_NUM_ECMP_MEMBERS = "64"
 

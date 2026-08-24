@@ -1,0 +1,7 @@
+Vlan100, group 10
+  State is Master
+  Virtual address(es): 10.0.100.1
+  Virtual MAC address is 00:00:5e:00:01:0a
+  Priority 200 (effective 200), preempt enabled
+  Advertisement interval 1.0 s, skew time 0.2 s, master down interval 3.2 s
+  Last state change 00:04:12 ago

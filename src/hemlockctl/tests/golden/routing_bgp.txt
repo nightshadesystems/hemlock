@@ -1,0 +1,5 @@
+BGP routing table information
+Status: * - valid, > - active
+    Network             Next Hop        Metric  LocPref  Path
+ *> 10.42.0.0/16        -                    -      100  i
+ *> 172.20.0.0/16       10.42.10.1           0      100  65001 i

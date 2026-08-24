@@ -1,0 +1,40 @@
+{
+  "bgp": {
+    "as_number": 65000,
+    "peers": [
+      {
+        "in_q": 0,
+        "ip": "10.42.10.1",
+        "msg_rcvd": 1234,
+        "msg_sent": 1230,
+        "out_q": 0,
+        "pfx_rcvd": 42,
+        "remote_as": 65001,
+        "state": "Established",
+        "up_down": "2d04h",
+        "version": 4
+      }
+    ],
+    "router_id": "10.42.0.1",
+    "routes": [
+      {
+        "best": true,
+        "loc_pref": "100",
+        "metric": "-",
+        "network": "10.42.0.0/16",
+        "next_hop": "-",
+        "path": "i",
+        "valid": true
+      },
+      {
+        "best": true,
+        "loc_pref": "100",
+        "metric": "0",
+        "network": "172.20.0.0/16",
+        "next_hop": "10.42.10.1",
+        "path": "65001 i",
+        "valid": true
+      }
+    ]
+  }
+}

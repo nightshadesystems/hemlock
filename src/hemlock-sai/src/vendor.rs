@@ -198,6 +198,10 @@ pub struct VendorSai {
     stp_api: *mut ffi::sai_stp_api_t,
     l2mc_api: *mut ffi::sai_l2mc_api_t,
     l2mc_group_api: *mut ffi::sai_l2mc_group_api_t,
+    neighbor_api: *mut ffi::sai_neighbor_api_t,
+    next_hop_api: *mut ffi::sai_next_hop_api_t,
+    next_hop_group_api: *mut ffi::sai_next_hop_group_api_t,
+    my_mac_api: *mut ffi::sai_my_mac_api_t,
     /// `sai_query_attribute_capability`, when the library exports it
     /// (optional in the SAI spec; absent = assume supported and let the
     /// call fail with a real status).
@@ -365,6 +369,31 @@ impl VendorSai {
                 "sai_api_query(L2MC_GROUP)",
                 api_query(ffi::_sai_api_t::SAI_API_L2MC_GROUP, &mut l2mc_group_api),
             )?;
+            let mut neighbor_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(NEIGHBOR)",
+                api_query(ffi::_sai_api_t::SAI_API_NEIGHBOR, &mut neighbor_api),
+            )?;
+            let mut next_hop_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(NEXT_HOP)",
+                api_query(ffi::_sai_api_t::SAI_API_NEXT_HOP, &mut next_hop_api),
+            )?;
+            let mut next_hop_group_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(NEXT_HOP_GROUP)",
+                api_query(
+                    ffi::_sai_api_t::SAI_API_NEXT_HOP_GROUP,
+                    &mut next_hop_group_api,
+                ),
+            )?;
+            // MY_MAC is late-spec (v1.9); a vendor library may not serve
+            // the table at all — probe softly, a null table = capability
+            // off rather than a failed boot.
+            let mut my_mac_api: *mut c_void = std::ptr::null_mut();
+            if api_query(ffi::_sai_api_t::SAI_API_MY_MAC, &mut my_mac_api) != 0 {
+                my_mac_api = std::ptr::null_mut();
+            }
             (
                 switch_api as *mut ffi::sai_switch_api_t,
                 port_api as *mut ffi::sai_port_api_t,
@@ -381,6 +410,10 @@ impl VendorSai {
                 stp_api as *mut ffi::sai_stp_api_t,
                 l2mc_api as *mut ffi::sai_l2mc_api_t,
                 l2mc_group_api as *mut ffi::sai_l2mc_group_api_t,
+                neighbor_api as *mut ffi::sai_neighbor_api_t,
+                next_hop_api as *mut ffi::sai_next_hop_api_t,
+                next_hop_group_api as *mut ffi::sai_next_hop_group_api_t,
+                my_mac_api as *mut ffi::sai_my_mac_api_t,
             )
         };
         let (
@@ -399,6 +432,10 @@ impl VendorSai {
             stp_api,
             l2mc_api,
             l2mc_group_api,
+            neighbor_api,
+            next_hop_api,
+            next_hop_group_api,
+            my_mac_api,
         ) = apis;
         // SAFETY: symbol lookup only; the fn pointer is copied out and
         // the library stays mapped for our whole lifetime.
@@ -431,6 +468,10 @@ impl VendorSai {
             stp_api,
             l2mc_api,
             l2mc_group_api,
+            neighbor_api,
+            next_hop_api,
+            next_hop_group_api,
+            my_mac_api,
             query_capability,
             storm_policers: HashMap::new(),
             stp_ports: HashMap::new(),
@@ -725,6 +766,35 @@ impl VendorSai {
             switch_id: self.switch_oid()?,
             vr_id: self.defaults()?.virtual_router,
             destination: Self::ip_prefix(dest),
+        })
+    }
+
+    /// Encode a host address (neighbor / next-hop targets).
+    fn ip_address(ip: std::net::IpAddr) -> ffi::sai_ip_address_t {
+        // SAFETY: sai_ip_address_t is POD; all-zero is a valid start.
+        let mut address: ffi::sai_ip_address_t = unsafe { std::mem::zeroed() };
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                address.addr_family = ffi::_sai_ip_addr_family_t::SAI_IP_ADDR_FAMILY_IPV4;
+                address.addr.ip4 = u32::from_ne_bytes(v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                address.addr_family = ffi::_sai_ip_addr_family_t::SAI_IP_ADDR_FAMILY_IPV6;
+                address.addr.ip6 = v6.octets();
+            }
+        }
+        address
+    }
+
+    fn neighbor_entry(
+        &self,
+        rif: Oid,
+        ip: std::net::IpAddr,
+    ) -> Result<ffi::sai_neighbor_entry_t, SaiError> {
+        Ok(ffi::sai_neighbor_entry_t {
+            switch_id: self.switch_oid()?,
+            rif_id: rif.0,
+            ip_address: Self::ip_address(ip),
         })
     }
 
@@ -1631,14 +1701,31 @@ impl SaiBackend for VendorSai {
                 .create_route_entry
                 .ok_or(SaiError::Other("route api lacks create_route_entry".into()))?
         };
-        let mut nh_attr =
-            Self::zeroed_attr(ffi::_sai_route_entry_attr_t::SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID);
-        nh_attr.value.oid = match target {
-            RouteTarget::Cpu => defaults.cpu_port,
-            RouteTarget::Rif(rif) => rif.0,
+        // A drop route carries a packet action instead of a next hop.
+        let attr = match target {
+            RouteTarget::Drop => {
+                let mut action = Self::zeroed_attr(
+                    ffi::_sai_route_entry_attr_t::SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION,
+                );
+                action.value.s32 = ffi::_sai_packet_action_t::SAI_PACKET_ACTION_DROP as i32;
+                action
+            }
+            _ => {
+                let mut nh_attr = Self::zeroed_attr(
+                    ffi::_sai_route_entry_attr_t::SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID,
+                );
+                nh_attr.value.oid = match target {
+                    RouteTarget::Cpu => defaults.cpu_port,
+                    RouteTarget::Rif(rif) => rif.0,
+                    RouteTarget::NextHop(next_hop) => next_hop.0,
+                    RouteTarget::Group(group) => group.0,
+                    RouteTarget::Drop => unreachable!("handled above"),
+                };
+                nh_attr
+            }
         };
         // SAFETY: entry and attr outlive the call.
-        unsafe { check("create_route_entry", create(&entry, 1, &nh_attr)) }
+        unsafe { check("create_route_entry", create(&entry, 1, &attr)) }
     }
 
     fn remove_route(&mut self, dest: IpPrefix) -> Result<(), SaiError> {
@@ -1649,6 +1736,223 @@ impl SaiBackend for VendorSai {
                 .remove_route_entry
                 .ok_or(SaiError::Other("route api lacks remove_route_entry".into()))?;
             check("remove_route_entry", remove(&entry))
+        }
+    }
+
+    fn create_neighbor(
+        &mut self,
+        rif: Oid,
+        ip: std::net::IpAddr,
+        mac: [u8; 6],
+    ) -> Result<(), SaiError> {
+        let entry = self.neighbor_entry(rif, ip)?;
+        // SAFETY: valid neighbor api table; entry + attr outlive the call.
+        let create = unsafe {
+            (*self.neighbor_api)
+                .create_neighbor_entry
+                .ok_or(SaiError::Other(
+                    "neighbor api lacks create_neighbor_entry".into(),
+                ))?
+        };
+        let mut mac_attr = Self::zeroed_attr(
+            ffi::_sai_neighbor_entry_attr_t::SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS,
+        );
+        mac_attr.value.mac = mac;
+        // SAFETY: entry and attr outlive the call. A pre-existing entry
+        // for the same (rif, ip) is replaced by remove + create: SAI's
+        // create fails with ITEM_ALREADY_EXISTS, so try the set path on
+        // that status.
+        unsafe {
+            let status = create(&entry, 1, &mac_attr);
+            if status != 0 {
+                if let Some(set) = (*self.neighbor_api).set_neighbor_entry_attribute {
+                    return check(
+                        "set_neighbor_entry_attribute(DST_MAC)",
+                        set(&entry, &mac_attr),
+                    );
+                }
+            }
+            check("create_neighbor_entry", status)
+        }
+    }
+
+    fn remove_neighbor(&mut self, rif: Oid, ip: std::net::IpAddr) -> Result<(), SaiError> {
+        let entry = self.neighbor_entry(rif, ip)?;
+        // SAFETY: valid neighbor api table; entry outlives the call.
+        unsafe {
+            let remove = (*self.neighbor_api)
+                .remove_neighbor_entry
+                .ok_or(SaiError::Other(
+                    "neighbor api lacks remove_neighbor_entry".into(),
+                ))?;
+            check("remove_neighbor_entry", remove(&entry))
+        }
+    }
+
+    fn create_next_hop(&mut self, rif: Oid, ip: std::net::IpAddr) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid next-hop api table; attrs outlive the call.
+        let create = unsafe {
+            (*self.next_hop_api)
+                .create_next_hop
+                .ok_or(SaiError::Other("next-hop api lacks create_next_hop".into()))?
+        };
+        use ffi::_sai_next_hop_attr_t as attr;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_NEXT_HOP_ATTR_TYPE);
+        type_attr.value.s32 = ffi::_sai_next_hop_type_t::SAI_NEXT_HOP_TYPE_IP as i32;
+        let mut ip_attr = Self::zeroed_attr(attr::SAI_NEXT_HOP_ATTR_IP);
+        ip_attr.value.ipaddr = Self::ip_address(ip);
+        let mut rif_attr = Self::zeroed_attr(attr::SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID);
+        rif_attr.value.oid = rif.0;
+        let attrs = [type_attr, ip_attr, rif_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_next_hop",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_next_hop(&mut self, next_hop: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid next-hop api table.
+        unsafe {
+            let remove = (*self.next_hop_api)
+                .remove_next_hop
+                .ok_or(SaiError::Other("next-hop api lacks remove_next_hop".into()))?;
+            check("remove_next_hop", remove(next_hop.0))
+        }
+    }
+
+    fn create_next_hop_group(&mut self) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid next-hop-group api table; attr outlives the call.
+        let create = unsafe {
+            (*self.next_hop_group_api)
+                .create_next_hop_group
+                .ok_or(SaiError::Other(
+                    "next-hop-group api lacks create_next_hop_group".into(),
+                ))?
+        };
+        let mut type_attr =
+            Self::zeroed_attr(ffi::_sai_next_hop_group_attr_t::SAI_NEXT_HOP_GROUP_ATTR_TYPE);
+        type_attr.value.s32 = ffi::_sai_next_hop_group_type_t::SAI_NEXT_HOP_GROUP_TYPE_ECMP as i32;
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr outlives the call.
+        unsafe {
+            check(
+                "create_next_hop_group",
+                create(&mut oid, switch, 1, &type_attr),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_next_hop_group(&mut self, group: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid next-hop-group api table.
+        unsafe {
+            let remove =
+                (*self.next_hop_group_api)
+                    .remove_next_hop_group
+                    .ok_or(SaiError::Other(
+                        "next-hop-group api lacks remove_next_hop_group".into(),
+                    ))?;
+            check("remove_next_hop_group", remove(group.0))
+        }
+    }
+
+    fn add_next_hop_group_member(&mut self, group: Oid, next_hop: Oid) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid next-hop-group api table; attrs outlive the call.
+        let create = unsafe {
+            (*self.next_hop_group_api)
+                .create_next_hop_group_member
+                .ok_or(SaiError::Other(
+                    "next-hop-group api lacks create_next_hop_group_member".into(),
+                ))?
+        };
+        use ffi::_sai_next_hop_group_member_attr_t as attr;
+        let mut group_attr =
+            Self::zeroed_attr(attr::SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID);
+        group_attr.value.oid = group.0;
+        let mut nh_attr = Self::zeroed_attr(attr::SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID);
+        nh_attr.value.oid = next_hop.0;
+        let attrs = [group_attr, nh_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_next_hop_group_member",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_next_hop_group_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid next-hop-group api table.
+        unsafe {
+            let remove = (*self.next_hop_group_api)
+                .remove_next_hop_group_member
+                .ok_or(SaiError::Other(
+                    "next-hop-group api lacks remove_next_hop_group_member".into(),
+                ))?;
+            check("remove_next_hop_group_member", remove(member.0))
+        }
+    }
+
+    fn create_my_mac(&mut self, vlan_id: Option<u16>, mac: [u8; 6]) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        if self.my_mac_api.is_null() {
+            return Err(SaiError::Other(
+                "this SAI does not serve the MY_MAC api".into(),
+            ));
+        }
+        // SAFETY: non-null my-mac api table; attrs outlive the call.
+        let create = unsafe {
+            (*self.my_mac_api)
+                .create_my_mac
+                .ok_or(SaiError::Other("my-mac api lacks create_my_mac".into()))?
+        };
+        use ffi::_sai_my_mac_attr_t as attr;
+        let mut attrs = Vec::with_capacity(2);
+        let mut mac_attr = Self::zeroed_attr(attr::SAI_MY_MAC_ATTR_MAC_ADDRESS);
+        mac_attr.value.mac = mac;
+        attrs.push(mac_attr);
+        if let Some(vlan) = vlan_id {
+            let mut vlan_attr = Self::zeroed_attr(attr::SAI_MY_MAC_ATTR_VLAN_ID);
+            vlan_attr.value.u16_ = vlan;
+            attrs.push(vlan_attr);
+        }
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_my_mac",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_my_mac(&mut self, my_mac: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        if self.my_mac_api.is_null() {
+            return Err(SaiError::Other(
+                "this SAI does not serve the MY_MAC api".into(),
+            ));
+        }
+        // SAFETY: non-null my-mac api table.
+        unsafe {
+            let remove = (*self.my_mac_api)
+                .remove_my_mac
+                .ok_or(SaiError::Other("my-mac api lacks remove_my_mac".into()))?;
+            check("remove_my_mac", remove(my_mac.0))
         }
     }
 
@@ -1764,6 +2068,54 @@ impl SaiBackend for VendorSai {
             max
         };
 
+        // ECMP: next-hop groups exist iff the api serves creates; the
+        // width comes from SAI_SWITCH_ATTR_ECMP_MEMBERS when the switch
+        // answers, else the manifest-profiled Helix4 default (64).
+        let nhg_fns = unsafe { (*self.next_hop_group_api).create_next_hop_group.is_some() };
+        let ecmp_width = if !nhg_fns {
+            0
+        } else {
+            let mut width = 64u32;
+            // SAFETY: valid switch api table; attr outlives the call;
+            // union read matches the u32 attr.
+            unsafe {
+                if let Some(get) = (*self.switch_api).get_switch_attribute {
+                    let mut attr =
+                        Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_ECMP_MEMBERS);
+                    if get(self.switch_oid()?, 1, &mut attr) == 0 && attr.value.u32_ > 0 {
+                        width = attr.value.u32_;
+                    }
+                }
+            }
+            width
+        };
+        // IPv6: assumed present unless the switch reports a zero-entry
+        // v6 route table (attribute optional; a failed get proves
+        // nothing, so it does not clear the bit).
+        let mut ipv6 = true;
+        // SAFETY: valid switch api table; attr outlives the call.
+        unsafe {
+            if let Some(get) = (*self.switch_api).get_switch_attribute {
+                let mut attr = Self::zeroed_attr(
+                    ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_AVAILABLE_IPV6_ROUTE_ENTRY,
+                );
+                if get(self.switch_oid()?, 1, &mut attr) == 0 && attr.value.u32_ == 0 {
+                    ipv6 = false;
+                }
+            }
+        }
+        // MY_MAC: the api table may be absent outright (pre-v1.9 blobs)
+        // and, even served, the Broadcom blob may refuse the object —
+        // the attribute-capability query is the closest static probe.
+        // SAFETY: null check before the fn-pointer presence read.
+        let my_mac = !self.my_mac_api.is_null()
+            && unsafe { (*self.my_mac_api).create_my_mac.is_some() }
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_MY_MAC,
+                ffi::_sai_my_mac_attr_t::SAI_MY_MAC_ATTR_MAC_ADDRESS,
+                false,
+            );
+
         Ok(SaiCapabilities {
             lag: self.attr_supported(
                 object::SAI_OBJECT_TYPE_LAG,
@@ -1799,6 +2151,9 @@ impl SaiBackend for VendorSai {
                 ffi::_sai_port_attr_t::SAI_PORT_ATTR_TPID,
                 true,
             ),
+            ecmp_width,
+            ipv6,
+            my_mac,
         })
     }
 

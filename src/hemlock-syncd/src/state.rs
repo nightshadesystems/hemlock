@@ -197,6 +197,48 @@ pub type SharedL2mc = Arc<RwLock<BTreeMap<(u16, String), L2mcGroupState>>>;
 /// mrouter set.
 pub type SharedUnknownMcast = Arc<RwLock<BTreeMap<u16, L2mcGroupState>>>;
 
+/// The transit FIB as programmed by orch: per-prefix targets plus the
+/// deduplicated, refcounted next-hop and ECMP-group objects backing
+/// them. Connected/IP2ME routes ride the interface-address path and are
+/// not tracked here.
+#[derive(Debug, Default)]
+pub struct FibTable {
+    /// Installed transit routes keyed by canonical prefix text.
+    pub routes: BTreeMap<String, FibRoute>,
+    /// Deduplicated next hops keyed by (rif, next-hop ip text):
+    /// (next-hop oid, reference count).
+    pub next_hops: HashMap<(Oid, String), (Oid, u32)>,
+    /// Deduplicated ECMP groups keyed by their sorted member next-hop
+    /// oid set.
+    pub groups: HashMap<Vec<Oid>, FibGroup>,
+    /// Neighbor entries keyed by (interface, ip text) -> (rif, mac).
+    pub neighbors: BTreeMap<(String, String), (Oid, String)>,
+    /// My-MAC entries keyed by (vlan, colon mac) -> oid (vlan 0 =
+    /// unscoped).
+    pub my_macs: BTreeMap<(u16, String), Oid>,
+}
+
+/// One installed transit route: what it targets and which shared
+/// objects it holds references on.
+#[derive(Debug, Clone)]
+pub struct FibRoute {
+    /// The (rif, ip) next-hop keys this route holds references on
+    /// (empty for punt and drop routes).
+    pub hop_keys: Vec<(Oid, String)>,
+    /// The sorted member-oid group key, when ECMP.
+    pub group_key: Option<Vec<Oid>>,
+}
+
+/// One ECMP group: its oid, member objects, and how many routes use it.
+#[derive(Debug, Clone)]
+pub struct FibGroup {
+    pub oid: Oid,
+    pub members: Vec<Oid>,
+    pub refs: u32,
+}
+
+pub type SharedFib = Arc<RwLock<FibTable>>;
+
 /// Resolve a SAI port id back to a port name (for event handling).
 pub fn name_for(ports: &HashMap<String, PortState>, id: PortId) -> Option<String> {
     ports

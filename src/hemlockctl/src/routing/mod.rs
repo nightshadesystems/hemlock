@@ -16,3 +16,5 @@ mod render;
 mod fixtures;
 #[cfg(test)]
 mod golden_tests;
+#[cfg(test)]
+mod prop_tests;

@@ -395,6 +395,9 @@ impl SyncdService {
     /// Tear down an SVI's ASIC objects (routes + VLAN RIF) and its
     /// kernel bridge. The caller updates the VLAN table.
     async fn teardown_svi(&self, vlan: u16, l3: &L3State) -> Result<(), Status> {
+        // Transit routes/neighbors riding this RIF go first, or the RIF
+        // removal would find the ASIC objects still in use.
+        self.fib_teardown_rif(l3.rif).await;
         for dest in Self::route_dests(&l3.address) {
             let _ = self.handle.remove_route(dest).await;
         }
@@ -557,6 +560,251 @@ impl SyncdService {
             None => Err(Status::failed_precondition(format!(
                 "VLAN {vlan} is not defined (set vlans vlan {vlan})"
             ))),
+        }
+    }
+
+    /// The RIF fronting an L3 interface name (routed port or SVI).
+    fn rif_of(&self, interface: &str) -> Result<hemlock_sai::Oid, Status> {
+        let no_l3 = || {
+            Status::failed_precondition(format!(
+                "{interface} has no router interface (no address configured)"
+            ))
+        };
+        if let Some(vlan) = svi_vlan_id(interface) {
+            let vlans = self
+                .handle
+                .vlans
+                .read()
+                .map_err(|_| Status::internal("vlan table poisoned"))?;
+            let state = vlans
+                .get(&vlan)
+                .ok_or_else(|| Status::not_found(format!("no such VLAN {vlan}")))?;
+            return state.l3.as_ref().map(|l3| l3.rif).ok_or_else(no_l3);
+        }
+        let ports = self
+            .handle
+            .ports
+            .read()
+            .map_err(|_| Status::internal("port table poisoned"))?;
+        let port = ports
+            .get(interface)
+            .ok_or_else(|| Status::not_found(format!("no such interface {interface:?}")))?;
+        port.l3.as_ref().map(|l3| l3.rif).ok_or_else(no_l3)
+    }
+
+    /// Take one reference on the deduplicated next hop for (rif, ip),
+    /// creating it on first use.
+    async fn fib_acquire_hop(
+        &self,
+        rif: hemlock_sai::Oid,
+        ip: std::net::IpAddr,
+    ) -> Result<hemlock_sai::Oid, Status> {
+        let key = (rif, ip.to_string());
+        let existing = {
+            let mut fib = self
+                .handle
+                .fib
+                .write()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.next_hops.get_mut(&key).map(|(oid, refs)| {
+                *refs += 1;
+                *oid
+            })
+        };
+        if let Some(oid) = existing {
+            return Ok(oid);
+        }
+        let oid = self
+            .handle
+            .create_next_hop(rif, ip)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        let mut fib = self
+            .handle
+            .fib
+            .write()
+            .map_err(|_| Status::internal("fib table poisoned"))?;
+        fib.next_hops.insert(key, (oid, 1));
+        Ok(oid)
+    }
+
+    /// Drop one reference on a next hop, removing the ASIC object with
+    /// the last one.
+    async fn fib_release_hop(&self, key: &(hemlock_sai::Oid, String)) {
+        let gone = {
+            let Ok(mut fib) = self.handle.fib.write() else {
+                return;
+            };
+            let last = match fib.next_hops.get_mut(key) {
+                Some((_, refs)) if *refs <= 1 => true,
+                Some((_, refs)) => {
+                    *refs -= 1;
+                    false
+                }
+                None => false,
+            };
+            if last {
+                fib.next_hops.remove(key).map(|(oid, _)| oid)
+            } else {
+                None
+            }
+        };
+        if let Some(oid) = gone {
+            if let Err(err) = self.handle.remove_next_hop(oid).await {
+                tracing::warn!(%err, "removing next hop");
+            }
+        }
+    }
+
+    /// Take one reference on the deduplicated ECMP group for a sorted
+    /// member set, creating group + members on first use.
+    async fn fib_acquire_group(
+        &self,
+        member_oids: &[hemlock_sai::Oid],
+    ) -> Result<hemlock_sai::Oid, Status> {
+        let key = member_oids.to_vec();
+        let existing = {
+            let mut fib = self
+                .handle
+                .fib
+                .write()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.groups.get_mut(&key).map(|group| {
+                group.refs += 1;
+                group.oid
+            })
+        };
+        if let Some(oid) = existing {
+            return Ok(oid);
+        }
+        let sai = |e: hemlock_sai::SaiError| Status::internal(format!("SAI: {e}"));
+        let group = self.handle.create_next_hop_group().await.map_err(sai)?;
+        let mut members = Vec::with_capacity(member_oids.len());
+        for next_hop in member_oids {
+            match self
+                .handle
+                .add_next_hop_group_member(group, *next_hop)
+                .await
+            {
+                Ok(member) => members.push(member),
+                Err(err) => {
+                    // Unwind the half-built group.
+                    for member in members {
+                        let _ = self.handle.remove_next_hop_group_member(member).await;
+                    }
+                    let _ = self.handle.remove_next_hop_group(group).await;
+                    return Err(sai(err));
+                }
+            }
+        }
+        let mut fib = self
+            .handle
+            .fib
+            .write()
+            .map_err(|_| Status::internal("fib table poisoned"))?;
+        fib.groups.insert(
+            key,
+            crate::state::FibGroup {
+                oid: group,
+                members,
+                refs: 1,
+            },
+        );
+        Ok(group)
+    }
+
+    /// Drop one reference on an ECMP group, tearing it down with the
+    /// last one.
+    async fn fib_release_group(&self, key: &[hemlock_sai::Oid]) {
+        let gone = {
+            let Ok(mut fib) = self.handle.fib.write() else {
+                return;
+            };
+            let last = match fib.groups.get_mut(key) {
+                Some(group) if group.refs <= 1 => true,
+                Some(group) => {
+                    group.refs -= 1;
+                    false
+                }
+                None => false,
+            };
+            if last {
+                fib.groups.remove(key)
+            } else {
+                None
+            }
+        };
+        if let Some(group) = gone {
+            for member in group.members {
+                if let Err(err) = self.handle.remove_next_hop_group_member(member).await {
+                    tracing::warn!(%err, "removing next-hop group member");
+                }
+            }
+            if let Err(err) = self.handle.remove_next_hop_group(group.oid).await {
+                tracing::warn!(%err, "removing next-hop group");
+            }
+        }
+    }
+
+    /// Release everything a route record holds (group first: members
+    /// reference the next hops).
+    async fn fib_release_route(&self, route: &crate::state::FibRoute) {
+        if let Some(group_key) = &route.group_key {
+            self.fib_release_group(group_key).await;
+        }
+        for key in &route.hop_keys {
+            self.fib_release_hop(key).await;
+        }
+    }
+
+    /// Tear down every FIB object riding a RIF that is about to be
+    /// removed (interface address cleared). orch re-ensures whatever
+    /// still applies on its next reconcile.
+    async fn fib_teardown_rif(&self, rif: hemlock_sai::Oid) {
+        let (routes, neighbors) = {
+            let Ok(fib) = self.handle.fib.read() else {
+                return;
+            };
+            let routes: Vec<String> = fib
+                .routes
+                .iter()
+                .filter(|(_, route)| route.hop_keys.iter().any(|(r, _)| *r == rif))
+                .map(|(prefix, _)| prefix.clone())
+                .collect();
+            let neighbors: Vec<(String, String)> = fib
+                .neighbors
+                .iter()
+                .filter(|(_, (r, _))| *r == rif)
+                .map(|(key, _)| key.clone())
+                .collect();
+            (routes, neighbors)
+        };
+        for prefix in routes {
+            let record = self
+                .handle
+                .fib
+                .write()
+                .ok()
+                .and_then(|mut fib| fib.routes.remove(&prefix));
+            if let Some(record) = record {
+                if let Ok(dest) = hemlock_common::net::parse_cidr(&prefix) {
+                    let _ = self.handle.remove_route(dest).await;
+                }
+                self.fib_release_route(&record).await;
+            }
+        }
+        for key in neighbors {
+            let record = self
+                .handle
+                .fib
+                .write()
+                .ok()
+                .and_then(|mut fib| fib.neighbors.remove(&key));
+            if let Some((rif, _)) = record {
+                if let Ok(ip) = key.1.parse() {
+                    let _ = self.handle.remove_neighbor(rif, ip).await;
+                }
+            }
         }
     }
 
@@ -927,6 +1175,9 @@ impl pb::syncd_server::Syncd for SyncdService {
                 mirror: caps.mirror,
                 mirror_sessions_max: caps.mirror_sessions_max,
                 port_tpid: caps.port_tpid,
+                ecmp_width: caps.ecmp_width,
+                ipv6: caps.ipv6,
+                my_mac: caps.my_mac,
             }),
         }))
     }
@@ -1294,6 +1545,9 @@ impl pb::syncd_server::Syncd for SyncdService {
             return Ok(Response::new(pb::ClearInterfaceAddressResponse {}));
         };
 
+        // Transit routes/neighbors riding this RIF go first, or the RIF
+        // removal would find the ASIC objects still in use.
+        self.fib_teardown_rif(l3.rif).await;
         for dest in Self::route_dests(&l3.address) {
             let _ = self.handle.remove_route(dest).await;
         }
@@ -2996,6 +3250,343 @@ impl pb::syncd_server::Syncd for SyncdService {
         }
         Ok(Response::new(pb::SetVlanUnknownMcastResponse {}))
     }
+
+    async fn ensure_neighbor(
+        &self,
+        request: Request<pb::EnsureNeighborRequest>,
+    ) -> Result<Response<pb::EnsureNeighborResponse>, Status> {
+        let req = request.into_inner();
+        let ip: std::net::IpAddr = req
+            .ip
+            .parse()
+            .map_err(|_| Status::invalid_argument(format!("bad IP address {:?}", req.ip)))?;
+        if ip.is_ipv6() {
+            self.require_capability(self.handle.capabilities.ipv6, "IPv6")?;
+        }
+        let (mac_bytes, mac) = Self::mac_bytes(&req.mac)?;
+        let rif = self.rif_of(&req.interface)?;
+        // The interface may have been re-addressed since the entry was
+        // first pushed; a stale entry on the old RIF goes first.
+        let stale = {
+            let fib = self
+                .handle
+                .fib
+                .read()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.neighbors
+                .get(&(req.interface.clone(), req.ip.clone()))
+                .filter(|(old_rif, _)| *old_rif != rif)
+                .map(|(old_rif, _)| *old_rif)
+        };
+        if let Some(old_rif) = stale {
+            let _ = self.handle.remove_neighbor(old_rif, ip).await;
+        }
+        self.handle
+            .create_neighbor(rif, ip, mac_bytes)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        let mut fib = self
+            .handle
+            .fib
+            .write()
+            .map_err(|_| Status::internal("fib table poisoned"))?;
+        fib.neighbors.insert((req.interface, req.ip), (rif, mac));
+        Ok(Response::new(pb::EnsureNeighborResponse {}))
+    }
+
+    async fn remove_neighbor(
+        &self,
+        request: Request<pb::RemoveNeighborRequest>,
+    ) -> Result<Response<pb::RemoveNeighborResponse>, Status> {
+        let req = request.into_inner();
+        // Idempotent: the reconciler may retry removals.
+        let record = {
+            let mut fib = self
+                .handle
+                .fib
+                .write()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.neighbors.remove(&(req.interface, req.ip.clone()))
+        };
+        if let Some((rif, _)) = record {
+            if let Ok(ip) = req.ip.parse() {
+                if let Err(err) = self.handle.remove_neighbor(rif, ip).await {
+                    tracing::warn!(%err, "removing neighbor");
+                }
+            }
+        }
+        Ok(Response::new(pb::RemoveNeighborResponse {}))
+    }
+
+    async fn ensure_route(
+        &self,
+        request: Request<pb::EnsureRouteRequest>,
+    ) -> Result<Response<pb::EnsureRouteResponse>, Status> {
+        let req = request.into_inner();
+        let prefix = hemlock_common::net::require_canonical_prefix(&req.prefix)
+            .map_err(Status::invalid_argument)?;
+        let dest = hemlock_common::net::parse_cidr(&prefix).map_err(Status::invalid_argument)?;
+        if dest.0.is_ipv6() {
+            self.require_capability(self.handle.capabilities.ipv6, "IPv6 routing")?;
+        }
+        let targets = [req.cpu, req.drop, !req.next_hops.is_empty()];
+        if targets.iter().filter(|t| **t).count() != 1 {
+            return Err(Status::invalid_argument(
+                "exactly one of cpu, drop, or next_hops must be given",
+            ));
+        }
+        let width = self.handle.capabilities.ecmp_width;
+        if req.next_hops.len() > 1 {
+            self.require_capability(width > 0, "ECMP next-hop groups")?;
+            if req.next_hops.len() as u32 > width {
+                return Err(Status::failed_precondition(format!(
+                    "{} next hops exceed this platform's ECMP width of {width}",
+                    req.next_hops.len()
+                )));
+            }
+        }
+
+        // Resolve and take references on the hops (deduplicated).
+        let mut hop_keys: Vec<(hemlock_sai::Oid, String)> = Vec::new();
+        let mut hop_oids = Vec::new();
+        for hop in &req.next_hops {
+            let ip: std::net::IpAddr = hop.ip.parse().map_err(|_| {
+                Status::invalid_argument(format!("bad next-hop address {:?}", hop.ip))
+            })?;
+            let rif = match self.rif_of(&hop.interface) {
+                Ok(rif) => rif,
+                Err(status) => {
+                    for key in &hop_keys {
+                        self.fib_release_hop(key).await;
+                    }
+                    return Err(status);
+                }
+            };
+            let key = (rif, ip.to_string());
+            if hop_keys.contains(&key) {
+                continue;
+            }
+            match self.fib_acquire_hop(rif, ip).await {
+                Ok(oid) => {
+                    hop_keys.push(key);
+                    hop_oids.push(oid);
+                }
+                Err(status) => {
+                    for key in &hop_keys {
+                        self.fib_release_hop(key).await;
+                    }
+                    return Err(status);
+                }
+            }
+        }
+
+        // The route target; several hops become a deduplicated group.
+        let mut group_key = None;
+        let target = if req.cpu {
+            hemlock_sai::RouteTarget::Cpu
+        } else if req.drop {
+            hemlock_sai::RouteTarget::Drop
+        } else if hop_oids.len() == 1 {
+            hemlock_sai::RouteTarget::NextHop(hop_oids[0])
+        } else {
+            let mut members = hop_oids.clone();
+            members.sort_by_key(|oid| oid.0);
+            match self.fib_acquire_group(&members).await {
+                Ok(group) => {
+                    group_key = Some(members);
+                    hemlock_sai::RouteTarget::Group(group)
+                }
+                Err(status) => {
+                    for key in &hop_keys {
+                        self.fib_release_hop(key).await;
+                    }
+                    return Err(status);
+                }
+            }
+        };
+
+        // Replace: new target objects exist before the old program goes,
+        // so shared hops/groups never bounce through zero references.
+        let old = {
+            let mut fib = self
+                .handle
+                .fib
+                .write()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.routes.remove(&prefix)
+        };
+        if old.is_some() {
+            let _ = self.handle.remove_route(dest).await;
+        }
+        if let Err(err) = self.handle.create_route(dest, target).await {
+            if let Some(group_key) = &group_key {
+                self.fib_release_group(group_key).await;
+            }
+            for key in &hop_keys {
+                self.fib_release_hop(key).await;
+            }
+            if let Some(old) = old {
+                self.fib_release_route(&old).await;
+            }
+            return Err(Status::internal(format!("SAI: {err}")));
+        }
+        {
+            let mut fib = self
+                .handle
+                .fib
+                .write()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.routes.insert(
+                prefix,
+                crate::state::FibRoute {
+                    hop_keys,
+                    group_key,
+                },
+            );
+        }
+        if let Some(old) = old {
+            self.fib_release_route(&old).await;
+        }
+        Ok(Response::new(pb::EnsureRouteResponse {}))
+    }
+
+    async fn remove_route(
+        &self,
+        request: Request<pb::RemoveRouteRequest>,
+    ) -> Result<Response<pb::RemoveRouteResponse>, Status> {
+        let req = request.into_inner();
+        let prefix = hemlock_common::net::require_canonical_prefix(&req.prefix)
+            .map_err(Status::invalid_argument)?;
+        // Idempotent: the reconciler may retry removals.
+        let record = {
+            let mut fib = self
+                .handle
+                .fib
+                .write()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.routes.remove(&prefix)
+        };
+        if let Some(record) = record {
+            if let Ok(dest) = hemlock_common::net::parse_cidr(&prefix) {
+                if let Err(err) = self.handle.remove_route(dest).await {
+                    tracing::warn!(%err, prefix = %prefix, "removing route");
+                }
+            }
+            self.fib_release_route(&record).await;
+        }
+        Ok(Response::new(pb::RemoveRouteResponse {}))
+    }
+
+    async fn ensure_my_mac(
+        &self,
+        request: Request<pb::EnsureMyMacRequest>,
+    ) -> Result<Response<pb::EnsureMyMacResponse>, Status> {
+        self.require_capability(self.handle.capabilities.my_mac, "vrrp (My-MAC entries)")?;
+        let req = request.into_inner();
+        let (mac_bytes, mac) = Self::mac_bytes(&req.mac)?;
+        let vlan = match req.vlan {
+            0 => None,
+            raw => {
+                let vlan = vlan_id(raw).map_err(Status::invalid_argument)?;
+                // Validates the VLAN exists (the ref itself is unused).
+                let _ = self.fdb_vlan_ref(vlan)?;
+                Some(vlan)
+            }
+        };
+        let key = (req.vlan as u16, mac.clone());
+        {
+            let fib = self
+                .handle
+                .fib
+                .read()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            if fib.my_macs.contains_key(&key) {
+                return Ok(Response::new(pb::EnsureMyMacResponse {}));
+            }
+        }
+        let oid = self
+            .handle
+            .create_my_mac(vlan, mac_bytes)
+            .await
+            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        let mut fib = self
+            .handle
+            .fib
+            .write()
+            .map_err(|_| Status::internal("fib table poisoned"))?;
+        fib.my_macs.insert(key, oid);
+        Ok(Response::new(pb::EnsureMyMacResponse {}))
+    }
+
+    async fn remove_my_mac(
+        &self,
+        request: Request<pb::RemoveMyMacRequest>,
+    ) -> Result<Response<pb::RemoveMyMacResponse>, Status> {
+        let req = request.into_inner();
+        let mac = hemlock_common::net::parse_mac(&req.mac).map_err(Status::invalid_argument)?;
+        let record = {
+            let mut fib = self
+                .handle
+                .fib
+                .write()
+                .map_err(|_| Status::internal("fib table poisoned"))?;
+            fib.my_macs.remove(&(req.vlan as u16, mac))
+        };
+        if let Some(oid) = record {
+            if let Err(err) = self.handle.remove_my_mac(oid).await {
+                tracing::warn!(%err, "removing My-MAC entry");
+            }
+        }
+        Ok(Response::new(pb::RemoveMyMacResponse {}))
+    }
+
+    async fn dump_fib(
+        &self,
+        _request: Request<pb::DumpFibRequest>,
+    ) -> Result<Response<pb::DumpFibResponse>, Status> {
+        let fib = self
+            .handle
+            .fib
+            .read()
+            .map_err(|_| Status::internal("fib table poisoned"))?;
+        Ok(Response::new(pb::DumpFibResponse {
+            routes: fib.routes.keys().cloned().collect(),
+            neighbors: fib
+                .neighbors
+                .keys()
+                .map(|(interface, ip)| pb::RemoveNeighborRequest {
+                    interface: interface.clone(),
+                    ip: ip.clone(),
+                })
+                .collect(),
+            my_macs: fib
+                .my_macs
+                .keys()
+                .map(|(vlan, mac)| pb::RemoveMyMacRequest {
+                    vlan: u32::from(*vlan),
+                    mac: mac.clone(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_fib_summary(
+        &self,
+        _request: Request<pb::GetFibSummaryRequest>,
+    ) -> Result<Response<pb::GetFibSummaryResponse>, Status> {
+        let fib = self
+            .handle
+            .fib
+            .read()
+            .map_err(|_| Status::internal("fib table poisoned"))?;
+        let v6 = fib.routes.keys().filter(|p| p.contains(':')).count() as u32;
+        Ok(Response::new(pb::GetFibSummaryResponse {
+            routes_v4: fib.routes.len() as u32 - v6,
+            routes_v6: v6,
+            neighbors: fib.neighbors.len() as u32,
+            next_hop_groups: fib.groups.len() as u32,
+        }))
+    }
 }
 
 /// A user-supplied 802.1Q VLAN id (1..=4094).
@@ -3153,6 +3744,294 @@ lanes = [1, 2]
             .unwrap()
             .into_inner();
         assert!(response.interfaces[0].seconds_since_clear.is_some());
+    }
+
+    /// The transit-FIB pipeline over the mock: neighbors, resolve-via-
+    /// punt flip, ECMP group build/dedup/teardown, My-MAC, summary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fib_lifecycle_over_mock_sai() {
+        let platform = test_platform();
+        let backend = Box::new(hemlock_sai::mock::MockSai::new(platform.ports.clone()));
+        let handle = Arc::new(SaiActor::spawn(backend, &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        // A neighbor or route against an un-addressed interface fails.
+        let err = service
+            .ensure_neighbor(Request::new(pb::EnsureNeighborRequest {
+                interface: "Ethernet1".into(),
+                ip: "10.42.10.7".into(),
+                mac: "00:1c:73:0c:aa:07".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+                address: "10.42.10.9/24".into(),
+            }))
+            .await
+            .unwrap();
+        service
+            .ensure_neighbor(Request::new(pb::EnsureNeighborRequest {
+                interface: "Ethernet1".into(),
+                ip: "10.42.10.7".into(),
+                mac: "00:1c:73:0c:aa:07".into(),
+            }))
+            .await
+            .unwrap();
+        service
+            .ensure_neighbor(Request::new(pb::EnsureNeighborRequest {
+                interface: "Ethernet1".into(),
+                ip: "10.42.10.8".into(),
+                mac: "00:1c:73:0c:aa:08".into(),
+            }))
+            .await
+            .unwrap();
+
+        // Resolve-via-punt: the route lands as CPU, then flips to a
+        // next hop once orch reports the neighbor resolved.
+        let ensure = |cpu: bool, hops: Vec<&str>| pb::EnsureRouteRequest {
+            prefix: "10.99.0.0/16".into(),
+            cpu,
+            drop: false,
+            next_hops: hops
+                .iter()
+                .map(|ip| pb::RouteNextHop {
+                    interface: "Ethernet1".into(),
+                    ip: ip.to_string(),
+                })
+                .collect(),
+        };
+        service
+            .ensure_route(Request::new(ensure(true, vec![])))
+            .await
+            .unwrap();
+        {
+            let fib = handle.fib.read().unwrap();
+            assert!(fib.routes["10.99.0.0/16"].hop_keys.is_empty());
+            assert!(fib.next_hops.is_empty());
+        }
+        service
+            .ensure_route(Request::new(ensure(false, vec!["10.42.10.7"])))
+            .await
+            .unwrap();
+        {
+            let fib = handle.fib.read().unwrap();
+            assert_eq!(fib.routes["10.99.0.0/16"].hop_keys.len(), 1);
+            assert_eq!(fib.next_hops.len(), 1);
+            assert!(fib.groups.is_empty());
+        }
+
+        // ECMP: two hops build a group; a second prefix with the same
+        // hop set shares it (deduplicated by member set).
+        service
+            .ensure_route(Request::new(ensure(
+                false,
+                vec!["10.42.10.7", "10.42.10.8"],
+            )))
+            .await
+            .unwrap();
+        service
+            .ensure_route(Request::new(pb::EnsureRouteRequest {
+                prefix: "10.98.0.0/16".into(),
+                cpu: false,
+                drop: false,
+                next_hops: vec![
+                    pb::RouteNextHop {
+                        interface: "Ethernet1".into(),
+                        ip: "10.42.10.7".into(),
+                    },
+                    pb::RouteNextHop {
+                        interface: "Ethernet1".into(),
+                        ip: "10.42.10.8".into(),
+                    },
+                ],
+            }))
+            .await
+            .unwrap();
+        let summary = service
+            .get_fib_summary(Request::new(pb::GetFibSummaryRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(summary.routes_v4, 2);
+        assert_eq!(summary.neighbors, 2);
+        assert_eq!(summary.next_hop_groups, 1, "shared by member set");
+
+        // Drop and v6 routes program without any next-hop objects.
+        service
+            .ensure_route(Request::new(pb::EnsureRouteRequest {
+                prefix: "192.0.2.0/24".into(),
+                cpu: false,
+                drop: true,
+                next_hops: vec![],
+            }))
+            .await
+            .unwrap();
+        service
+            .ensure_route(Request::new(pb::EnsureRouteRequest {
+                prefix: "2001:db8:99::/48".into(),
+                cpu: true,
+                drop: false,
+                next_hops: vec![],
+            }))
+            .await
+            .unwrap();
+        let summary = service
+            .get_fib_summary(Request::new(pb::GetFibSummaryRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((summary.routes_v4, summary.routes_v6), (3, 1));
+
+        // Teardown releases the shared group with its last reference;
+        // removal is idempotent (the reconciler retries).
+        for prefix in [
+            "10.99.0.0/16",
+            "10.98.0.0/16",
+            "192.0.2.0/24",
+            "2001:db8:99::/48",
+        ] {
+            service
+                .remove_route(Request::new(pb::RemoveRouteRequest {
+                    prefix: prefix.into(),
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .remove_route(Request::new(pb::RemoveRouteRequest {
+                prefix: "10.99.0.0/16".into(),
+            }))
+            .await
+            .unwrap();
+        {
+            let fib = handle.fib.read().unwrap();
+            assert!(fib.routes.is_empty());
+            assert!(fib.next_hops.is_empty());
+            assert!(fib.groups.is_empty());
+        }
+        service
+            .remove_neighbor(Request::new(pb::RemoveNeighborRequest {
+                interface: "Ethernet1".into(),
+                ip: "10.42.10.7".into(),
+            }))
+            .await
+            .unwrap();
+        service
+            .remove_neighbor(Request::new(pb::RemoveNeighborRequest {
+                interface: "Ethernet1".into(),
+                ip: "10.42.10.8".into(),
+            }))
+            .await
+            .unwrap();
+
+        // My-MAC entries: idempotent ensure, idempotent remove.
+        let my_mac = pb::EnsureMyMacRequest {
+            vlan: 0,
+            mac: "00:00:5e:00:01:0a".into(),
+        };
+        service
+            .ensure_my_mac(Request::new(my_mac.clone()))
+            .await
+            .unwrap();
+        service.ensure_my_mac(Request::new(my_mac)).await.unwrap();
+        assert_eq!(handle.fib.read().unwrap().my_macs.len(), 1);
+        for _ in 0..2 {
+            service
+                .remove_my_mac(Request::new(pb::RemoveMyMacRequest {
+                    vlan: 0,
+                    mac: "00:00:5e:00:01:0a".into(),
+                }))
+                .await
+                .unwrap();
+        }
+        assert!(handle.fib.read().unwrap().my_macs.is_empty());
+    }
+
+    /// FIB capability gates: absent My-MAC, IPv6, and ECMP width fail
+    /// with the platform error, never silently no-op.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fib_capabilities_gate_cleanly() {
+        let platform = test_platform();
+        let mut mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let mut caps = hemlock_sai::SaiCapabilities::all();
+        caps.my_mac = false;
+        caps.ipv6 = false;
+        caps.ecmp_width = 1;
+        mock.set_capabilities(caps);
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+        service
+            .set_interface_address(Request::new(pb::SetInterfaceAddressRequest {
+                name: "Ethernet1".into(),
+                address: "10.42.10.9/24".into(),
+            }))
+            .await
+            .unwrap();
+
+        let err = service
+            .ensure_my_mac(Request::new(pb::EnsureMyMacRequest {
+                vlan: 0,
+                mac: "00:00:5e:00:01:0a".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err
+            .message()
+            .contains("not supported by this platform's SAI"));
+
+        let err = service
+            .ensure_route(Request::new(pb::EnsureRouteRequest {
+                prefix: "2001:db8:99::/48".into(),
+                cpu: true,
+                drop: false,
+                next_hops: vec![],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("IPv6 routing"));
+
+        let err = service
+            .ensure_route(Request::new(pb::EnsureRouteRequest {
+                prefix: "10.99.0.0/16".into(),
+                cpu: false,
+                drop: false,
+                next_hops: vec![
+                    pb::RouteNextHop {
+                        interface: "Ethernet1".into(),
+                        ip: "10.42.10.7".into(),
+                    },
+                    pb::RouteNextHop {
+                        interface: "Ethernet1".into(),
+                        ip: "10.42.10.8".into(),
+                    },
+                ],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("ECMP width of 1"),
+            "{}",
+            err.message()
+        );
+        // The failed ensure released the hop references it took.
+        assert!(handle.fib.read().unwrap().next_hops.is_empty());
     }
 
     /// Address lifecycle over the mock data-plane: set, replace, clear.

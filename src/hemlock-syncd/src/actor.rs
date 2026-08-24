@@ -216,6 +216,51 @@ pub enum SaiCmd {
         l2mc: Option<Oid>,
         reply: oneshot::Sender<Result<(), SaiError>>,
     },
+    CreateNeighbor {
+        rif: Oid,
+        ip: std::net::IpAddr,
+        mac: [u8; 6],
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemoveNeighbor {
+        rif: Oid,
+        ip: std::net::IpAddr,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateNextHop {
+        rif: Oid,
+        ip: std::net::IpAddr,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveNextHop {
+        next_hop: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateNextHopGroup {
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveNextHopGroup {
+        group: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    AddNextHopGroupMember {
+        group: Oid,
+        next_hop: Oid,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveNextHopGroupMember {
+        member: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateMyMac {
+        vlan_id: Option<u16>,
+        mac: [u8; 6],
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveMyMac {
+        my_mac: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
 }
 
 /// A port's oper status changed (already applied to shared state).
@@ -259,6 +304,9 @@ pub struct SaiHandle {
     pub l2mc: crate::state::SharedL2mc,
     /// Per-VLAN unknown-multicast restriction groups.
     pub unknown_mcast: crate::state::SharedUnknownMcast,
+    /// The transit FIB (routes, deduplicated next hops/groups,
+    /// neighbors, My-MAC entries) as programmed by orch.
+    pub fib: crate::state::SharedFib,
     cmd_tx: mpsc::Sender<SaiCmd>,
     pub events: broadcast::Sender<OperEvent>,
     pub fdb_events: broadcast::Sender<FdbNotify>,
@@ -589,6 +637,78 @@ impl SaiHandle {
         rx.await
             .map_err(|_| SaiError::Other("SAI actor dropped the reply".into()))?
     }
+
+    pub async fn create_neighbor(
+        &self,
+        rif: Oid,
+        ip: std::net::IpAddr,
+        mac: [u8; 6],
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::CreateNeighbor {
+            rif,
+            ip,
+            mac,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_neighbor(&self, rif: Oid, ip: std::net::IpAddr) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveNeighbor { rif, ip, reply })
+            .await
+    }
+
+    pub async fn create_next_hop(&self, rif: Oid, ip: std::net::IpAddr) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateNextHop { rif, ip, reply })
+            .await
+    }
+
+    pub async fn remove_next_hop(&self, next_hop: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveNextHop { next_hop, reply })
+            .await
+    }
+
+    pub async fn create_next_hop_group(&self) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateNextHopGroup { reply })
+            .await
+    }
+
+    pub async fn remove_next_hop_group(&self, group: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveNextHopGroup { group, reply })
+            .await
+    }
+
+    pub async fn add_next_hop_group_member(
+        &self,
+        group: Oid,
+        next_hop: Oid,
+    ) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::AddNextHopGroupMember {
+            group,
+            next_hop,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_next_hop_group_member(&self, member: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveNextHopGroupMember { member, reply })
+            .await
+    }
+
+    pub async fn create_my_mac(&self, vlan_id: Option<u16>, mac: [u8; 6]) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateMyMac {
+            vlan_id,
+            mac,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_my_mac(&self, my_mac: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveMyMac { my_mac, reply })
+            .await
+    }
 }
 
 pub struct SaiActor;
@@ -664,6 +784,49 @@ impl SaiActor {
                         }
                         SaiCmd::RemoveRoute { dest, reply } => {
                             let _ = reply.send(backend.remove_route(dest));
+                        }
+                        SaiCmd::CreateNeighbor {
+                            rif,
+                            ip,
+                            mac,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.create_neighbor(rif, ip, mac));
+                        }
+                        SaiCmd::RemoveNeighbor { rif, ip, reply } => {
+                            let _ = reply.send(backend.remove_neighbor(rif, ip));
+                        }
+                        SaiCmd::CreateNextHop { rif, ip, reply } => {
+                            let _ = reply.send(backend.create_next_hop(rif, ip));
+                        }
+                        SaiCmd::RemoveNextHop { next_hop, reply } => {
+                            let _ = reply.send(backend.remove_next_hop(next_hop));
+                        }
+                        SaiCmd::CreateNextHopGroup { reply } => {
+                            let _ = reply.send(backend.create_next_hop_group());
+                        }
+                        SaiCmd::RemoveNextHopGroup { group, reply } => {
+                            let _ = reply.send(backend.remove_next_hop_group(group));
+                        }
+                        SaiCmd::AddNextHopGroupMember {
+                            group,
+                            next_hop,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.add_next_hop_group_member(group, next_hop));
+                        }
+                        SaiCmd::RemoveNextHopGroupMember { member, reply } => {
+                            let _ = reply.send(backend.remove_next_hop_group_member(member));
+                        }
+                        SaiCmd::CreateMyMac {
+                            vlan_id,
+                            mac,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.create_my_mac(vlan_id, mac));
+                        }
+                        SaiCmd::RemoveMyMac { my_mac, reply } => {
+                            let _ = reply.send(backend.remove_my_mac(my_mac));
                         }
                         SaiCmd::CreateVlan { id, reply } => {
                             let _ = reply.send(backend.create_vlan(id));
@@ -847,6 +1010,7 @@ impl SaiActor {
             stps: crate::state::SharedStps::default(),
             l2mc: crate::state::SharedL2mc::default(),
             unknown_mcast: crate::state::SharedUnknownMcast::default(),
+            fib: crate::state::SharedFib::default(),
             cmd_tx,
             events,
             fdb_events,

@@ -8,7 +8,9 @@
 //! raw sockets on those netdevs directly rather than proxying packets
 //! over gRPC.
 
+mod frrshow;
 mod lacp;
+mod rib;
 mod snoop;
 mod stp;
 #[cfg(target_os = "linux")]
@@ -40,6 +42,7 @@ struct OrchService {
     stp: stp::Engine,
     igmp: snoop::Engine,
     mld: snoop::Engine,
+    rib: rib::Engine,
 }
 
 impl OrchService {
@@ -352,6 +355,120 @@ impl Orch for OrchService {
         }))
     }
 
+    async fn get_rib(
+        &self,
+        request: Request<pb::GetRibRequest>,
+    ) -> Result<Response<pb::GetRibResponse>, Status> {
+        let req = request.into_inner();
+        let mut views = self.rib.snapshot(req.ipv6);
+        if !req.page_token.is_empty() {
+            if let Some(position) = views.iter().position(|v| v.prefix == req.page_token) {
+                views.drain(..=position);
+            }
+        }
+        let mut next_page_token = String::new();
+        if req.page_size > 0 && views.len() > req.page_size as usize {
+            views.truncate(req.page_size as usize);
+            next_page_token = views.last().map(|v| v.prefix.clone()).unwrap_or_default();
+        }
+        Ok(Response::new(pb::GetRibResponse {
+            routes: views
+                .into_iter()
+                .map(|view| pb::RibRoute {
+                    prefix: view.prefix,
+                    protocol: view.protocol,
+                    distance: view.distance,
+                    metric: view.metric,
+                    uptime_secs: view.uptime_secs,
+                    next_hops: view
+                        .hops
+                        .into_iter()
+                        .map(|hop| pb::RibNextHop {
+                            via: hop.via,
+                            interface: hop.interface,
+                            resolved: hop.resolved,
+                        })
+                        .collect(),
+                    fib: view.fib.to_string(),
+                    interface: view.interface.unwrap_or_default(),
+                })
+                .collect(),
+            next_page_token,
+        }))
+    }
+
+    async fn get_neighbors(
+        &self,
+        request: Request<pb::GetNeighborsRequest>,
+    ) -> Result<Response<pb::GetNeighborsResponse>, Status> {
+        let req = request.into_inner();
+        Ok(Response::new(pb::GetNeighborsResponse {
+            neighbors: self
+                .rib
+                .neighbors(req.ipv6)
+                .into_iter()
+                .map(|view| pb::NeighborEntry {
+                    ip: view.ip,
+                    mac: view.mac,
+                    interface: view.interface,
+                    permanent: view.permanent,
+                    age_secs: view.age_secs,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn clear_neighbors(
+        &self,
+        request: Request<pb::ClearNeighborsRequest>,
+    ) -> Result<Response<pb::ClearNeighborsResponse>, Status> {
+        let req = request.into_inner();
+        let ip = (!req.ip.is_empty()).then_some(req.ip.as_str());
+        let flushed = rib::flush_neighbors(ip).await;
+        Ok(Response::new(pb::ClearNeighborsResponse { flushed }))
+    }
+
+    async fn get_ospf_state(
+        &self,
+        _request: Request<pb::GetOspfStateRequest>,
+    ) -> Result<Response<pb::GetOspfStateResponse>, Status> {
+        frrshow::ospf_state()
+            .await
+            .map(Response::new)
+            .map_err(Status::failed_precondition)
+    }
+
+    async fn get_bgp_state(
+        &self,
+        request: Request<pb::GetBgpStateRequest>,
+    ) -> Result<Response<pb::GetBgpStateResponse>, Status> {
+        let req = request.into_inner();
+        frrshow::bgp_state(&req.neighbor)
+            .await
+            .map(Response::new)
+            .map_err(Status::failed_precondition)
+    }
+
+    async fn get_vrrp_state(
+        &self,
+        _request: Request<pb::GetVrrpStateRequest>,
+    ) -> Result<Response<pb::GetVrrpStateResponse>, Status> {
+        frrshow::vrrp_state()
+            .await
+            .map(Response::new)
+            .map_err(Status::failed_precondition)
+    }
+
+    async fn clear_bgp(
+        &self,
+        request: Request<pb::ClearBgpRequest>,
+    ) -> Result<Response<pb::ClearBgpResponse>, Status> {
+        let req = request.into_inner();
+        Ok(Response::new(pb::ClearBgpResponse {
+            cleared: frrshow::clear_bgp(&req.neighbor).await,
+        }))
+    }
+
     async fn get_lacp_state(
         &self,
         _request: Request<pb::GetLacpStateRequest>,
@@ -466,14 +583,24 @@ async fn main() -> Result<()> {
             drop((packet_in, packet_out));
         }
     }
+    // The RIB pipeline: kernel netlink (iproute2 dumps) -> engine ->
+    // syncd FIB RPCs. The pusher reconciles on every engine change and
+    // re-anchors against syncd's own dump periodically (restart resync).
+    let (rib_engine, rib_generation) = rib::Engine::spawn();
+    tokio::spawn(push_fib(syncd.clone(), rib_engine.clone(), rib_generation));
+    #[cfg(target_os = "linux")]
+    tokio::spawn(rib::run_feed(rib_engine.clone()));
+
     // syncd port events -> the engines' link states.
     tokio::spawn(watch_links(syncd.clone(), links, stp_links));
     // The VLAN membership view (query transmission + VLAN
-    // classification of snooped frames on tag-stripped netdevs).
+    // classification of snooped frames on tag-stripped netdevs), plus
+    // the RIB engine's ASIC L3 interface set.
     tokio::spawn(watch_vlans(
         syncd.clone(),
         igmp_engine.clone(),
         mld_engine.clone(),
+        rib_engine.clone(),
     ));
     // Protocol frames <-> the ports' hostif netdevs (Linux only; on dev
     // hosts the engines still run, partnerless).
@@ -498,6 +625,7 @@ async fn main() -> Result<()> {
         stp: stp_engine,
         igmp: igmp_engine,
         mld: mld_engine,
+        rib: rib_engine,
     };
     let router = tonic::transport::Server::builder().add_service(OrchServer::new(service));
     listen
@@ -717,7 +845,12 @@ async fn push_unknown_mcast(
 /// Keep the snooping engines' VLAN membership view fresh from syncd
 /// (query transmission wants the port lists; the transport classifies
 /// tag-stripped frames by the ingress port's untagged VLAN).
-async fn watch_vlans(syncd: IpcEndpoint, igmp: snoop::Engine, mld: snoop::Engine) {
+async fn watch_vlans(
+    syncd: IpcEndpoint,
+    igmp: snoop::Engine,
+    mld: snoop::Engine,
+    rib: rib::Engine,
+) {
     loop {
         if let Ok(channel) = syncd.connect().await {
             let mut client = pb::syncd_client::SyncdClient::new(channel);
@@ -726,6 +859,18 @@ async fn watch_vlans(syncd: IpcEndpoint, igmp: snoop::Engine, mld: snoop::Engine
                 .await
             {
                 let response = response.into_inner();
+                // The RIB engine's ASIC L3 interface set: routed ports
+                // and SVIs, i.e. anything with an interface address.
+                let l3: std::collections::BTreeSet<String> = response
+                    .interfaces
+                    .iter()
+                    .filter(|i| {
+                        matches!(i.kind.as_str(), "ethernet" | "port-channel" | "vlan")
+                            && !i.ip_addresses.is_empty()
+                    })
+                    .map(|i| i.name.clone())
+                    .collect();
+                rib.set_l3_interfaces(l3);
                 let mut vlan_ports: std::collections::BTreeMap<u16, Vec<String>> =
                     std::collections::BTreeMap::new();
                 let mut pvids: std::collections::BTreeMap<String, u16> =
@@ -766,6 +911,145 @@ async fn watch_vlans(syncd: IpcEndpoint, igmp: snoop::Engine, mld: snoop::Engine
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
+}
+
+/// A mirror value that never matches a real program, so a re-anchored
+/// entry is always re-ensured (the RPCs are idempotent).
+fn unknown_route() -> rib::WantedRoute {
+    rib::WantedRoute {
+        cpu: true,
+        drop: true,
+        hops: Vec::new(),
+    }
+}
+
+/// Reconcile syncd's FIB onto the RIB engine's wanted program: push the
+/// diff on every engine change; periodically re-anchor the local mirror
+/// on syncd's own dump so a restart on either side converges (add
+/// missing, delete stale) — the resync half of the pipeline.
+async fn push_fib(
+    syncd: IpcEndpoint,
+    engine: rib::Engine,
+    mut generation: tokio::sync::watch::Receiver<u64>,
+) {
+    let mut mirror = rib::Program::default();
+    let mut verify = tokio::time::interval(Duration::from_secs(30));
+    verify.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = generation.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = verify.tick() => {
+                if !engine.have_kernel() {
+                    continue;
+                }
+                match dump_fib(&syncd).await {
+                    Ok(anchored) => mirror = anchored,
+                    Err(e) => {
+                        warn!(error = %e, "syncd fib dump failed; reconcile deferred");
+                        continue;
+                    }
+                }
+            }
+        }
+        if !engine.have_kernel() {
+            continue;
+        }
+        let wanted = engine.wanted();
+        for op in rib::diff_program(&mirror, &wanted) {
+            match apply_fib_op(&syncd, &op).await {
+                // The mirror tracks per-op success so one persistently
+                // failing entry never wedges the rest.
+                Ok(()) => match op {
+                    rib::FibOp::EnsureNeighbor { interface, ip, mac } => {
+                        mirror.neighbors.insert((interface, ip), mac);
+                    }
+                    rib::FibOp::EnsureRoute { prefix, route } => {
+                        mirror.routes.insert(prefix, route);
+                    }
+                    rib::FibOp::RemoveRoute { prefix } => {
+                        mirror.routes.remove(&prefix);
+                    }
+                    rib::FibOp::RemoveNeighbor { interface, ip } => {
+                        mirror.neighbors.remove(&(interface, ip));
+                    }
+                },
+                Err(e) => warn!(error = %e, op = ?op, "fib push failed; will retry"),
+            }
+        }
+    }
+}
+
+/// syncd's installed FIB, as a mirror whose entries always re-ensure
+/// (targets are not dumped; the sentinel values never match).
+async fn dump_fib(syncd: &IpcEndpoint) -> Result<rib::Program> {
+    let channel = syncd.connect().await?;
+    let dump = pb::syncd_client::SyncdClient::new(channel)
+        .dump_fib(pb::DumpFibRequest {})
+        .await?
+        .into_inner();
+    let mut program = rib::Program::default();
+    for prefix in dump.routes {
+        program.routes.insert(prefix, unknown_route());
+    }
+    for neighbor in dump.neighbors {
+        program
+            .neighbors
+            .insert((neighbor.interface, neighbor.ip), String::new());
+    }
+    Ok(program)
+}
+
+async fn apply_fib_op(syncd: &IpcEndpoint, op: &rib::FibOp) -> Result<()> {
+    let channel = syncd.connect().await?;
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    match op {
+        rib::FibOp::EnsureNeighbor { interface, ip, mac } => {
+            client
+                .ensure_neighbor(pb::EnsureNeighborRequest {
+                    interface: interface.clone(),
+                    ip: ip.clone(),
+                    mac: mac.clone(),
+                })
+                .await?;
+        }
+        rib::FibOp::EnsureRoute { prefix, route } => {
+            client
+                .ensure_route(pb::EnsureRouteRequest {
+                    prefix: prefix.clone(),
+                    cpu: route.cpu,
+                    drop: route.drop,
+                    next_hops: route
+                        .hops
+                        .iter()
+                        .map(|(interface, ip)| pb::RouteNextHop {
+                            interface: interface.clone(),
+                            ip: ip.clone(),
+                        })
+                        .collect(),
+                })
+                .await?;
+        }
+        rib::FibOp::RemoveRoute { prefix } => {
+            client
+                .remove_route(pb::RemoveRouteRequest {
+                    prefix: prefix.clone(),
+                })
+                .await?;
+        }
+        rib::FibOp::RemoveNeighbor { interface, ip } => {
+            client
+                .remove_neighbor(pb::RemoveNeighborRequest {
+                    interface: interface.clone(),
+                    ip: ip.clone(),
+                })
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Track member link states from syncd: seed from ListPorts, then follow

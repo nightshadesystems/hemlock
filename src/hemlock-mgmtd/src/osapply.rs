@@ -17,7 +17,10 @@
 
 use tracing::warn;
 
-use crate::intents::{Intents, NetdevChange, OsChanges, RouteChange, SshIntent, WebIntent};
+use crate::intents::{
+    ArpChange, Intents, NetdevChange, OsChanges, RouteChange, SshIntent, VrrpMacvlanChange,
+    WebIntent,
+};
 
 /// mgmtd's sshd drop-in (`10-hemlock-motd.conf` is the image's).
 const SSHD_DROPIN: &str = "/etc/ssh/sshd_config.d/20-hemlock.conf";
@@ -85,6 +88,12 @@ impl OsApplier {
         }
         for route in &changes.routes {
             apply_route(route);
+        }
+        for arp in &changes.arp {
+            self.apply_arp(arp);
+        }
+        for macvlan in &changes.vrrp_macvlans {
+            self.apply_vrrp_macvlan(macvlan);
         }
         if let Some(ssh) = &changes.ssh {
             apply_ssh(ssh);
@@ -156,6 +165,20 @@ impl OsApplier {
                 new: Some(route.clone()),
             });
         }
+        for (ip, entry) in &intents.arp_statics {
+            self.apply_arp(&ArpChange {
+                ip: ip.clone(),
+                old: None,
+                new: Some(entry.clone()),
+            });
+        }
+        for (interface, group) in intents.vrrp.keys() {
+            self.apply_vrrp_macvlan(&VrrpMacvlanChange {
+                interface: interface.clone(),
+                group: *group,
+                create: true,
+            });
+        }
         // Declarative: an absent `system { ssh }` block means disabled.
         apply_ssh(&intents.ssh);
         // Same for the web console (`system { http }` / `{ https }`).
@@ -168,6 +191,84 @@ impl OsApplier {
             return;
         };
         apply_netdev(change, dev);
+    }
+
+    /// The kernel netdev an interface name maps to: the manifest's
+    /// os_device for the management port, the identically named
+    /// hostif/bridge netdev otherwise.
+    fn netdev_of<'a>(&'a self, interface: &'a str) -> &'a str {
+        self.os_device(interface).unwrap_or(interface)
+    }
+
+    /// One VRRP macvlan: `ip link add vrrp4-<if>-<group> link
+    /// <parent> addr 00:00:5e:00:01:<group> type macvlan mode bridge`.
+    /// FRR's vrrpd finds it by parent + virtual MAC; created before the
+    /// FRR reload (this applier runs first), removed on delete.
+    fn apply_vrrp_macvlan(&self, change: &VrrpMacvlanChange) {
+        let name = crate::intents::vrrp_macvlan_name(&change.interface, change.group);
+        if change.create {
+            run(
+                "ip",
+                &[
+                    "link",
+                    "add",
+                    &name,
+                    "link",
+                    self.netdev_of(&change.interface),
+                    "addr",
+                    &crate::intents::vrrp_virtual_mac(change.group),
+                    "type",
+                    "macvlan",
+                    "mode",
+                    "bridge",
+                ],
+            );
+            run("ip", &["link", "set", "dev", &name, "up"]);
+        } else {
+            run("ip", &["link", "del", &name]);
+        }
+    }
+
+    /// One static ARP/ND entry: `ip [-6] neigh replace <ip> lladdr
+    /// <mac> dev <netdev> nud permanent`. An interface change deletes
+    /// the entry on the old netdev first.
+    fn apply_arp(&self, change: &ArpChange) {
+        let v6 = change.ip.contains(':');
+        let ip = |args: Vec<&str>| {
+            let mut full = if v6 {
+                vec!["-6", "neigh"]
+            } else {
+                vec!["neigh"]
+            };
+            full.extend(args);
+            run("ip", &full);
+        };
+        if let Some(old) = &change.old {
+            let stale = match &change.new {
+                None => true,
+                Some(new) => new.interface != old.interface,
+            };
+            if stale {
+                ip(vec![
+                    "del",
+                    &change.ip,
+                    "dev",
+                    self.netdev_of(&old.interface),
+                ]);
+            }
+        }
+        if let Some(new) = &change.new {
+            ip(vec![
+                "replace",
+                &change.ip,
+                "lladdr",
+                &new.mac,
+                "dev",
+                self.netdev_of(&new.interface),
+                "nud",
+                "permanent",
+            ]);
+        }
     }
 }
 

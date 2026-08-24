@@ -1,0 +1,6 @@
+Vlan99 is up
+  Internet Address 10.42.10.9/24, Area 0.0.0.0
+  Router ID 10.42.0.1, Network Type BROADCAST, Cost: 10
+  Designated Router (ID) 10.42.0.7, Interface Address 10.42.10.7
+  Timer intervals: Hello 10, Dead 40
+  Neighbor Count is 1, Adjacent neighbor count is 1

@@ -34,6 +34,30 @@ fn as_json<T: serde::Serialize>(label: &str, value: &T) -> String {
 }
 
 #[test]
+fn arp() {
+    assert_golden(
+        &render::neighbor_table(&fx::arp_table()),
+        include_str!("../../tests/golden/arp.txt"),
+    );
+    assert_golden(
+        &as_json("arp", &fx::arp_table()),
+        include_str!("../../tests/golden/arp.json"),
+    );
+}
+
+#[test]
+fn ipv6_neighbors() {
+    assert_golden(
+        &render::neighbor_table(&fx::ipv6_neighbor_table()),
+        include_str!("../../tests/golden/ipv6_neighbors.txt"),
+    );
+    assert_golden(
+        &as_json("ipv6_neighbors", &fx::ipv6_neighbor_table()),
+        include_str!("../../tests/golden/ipv6_neighbors.json"),
+    );
+}
+
+#[test]
 fn ip_route() {
     assert_golden(
         &render::route_table(&fx::ip_route_table()),
@@ -74,5 +98,61 @@ fn ipv6_route() {
     assert_golden(
         &as_json("ipv6_route", &fx::ipv6_route_table()),
         include_str!("../../tests/golden/ipv6_route.json"),
+    );
+}
+
+#[test]
+fn routing_ospf() {
+    assert_golden(
+        &render::ospf_overview(&fx::ospf_state()),
+        include_str!("../../tests/golden/routing_ospf.txt"),
+    );
+    assert_golden(
+        &render::ospf_neighbors(&fx::ospf_state()),
+        include_str!("../../tests/golden/routing_ospf_neighbor.txt"),
+    );
+    assert_golden(
+        &render::ospf_interfaces(&fx::ospf_state()),
+        include_str!("../../tests/golden/routing_ospf_interface.txt"),
+    );
+    assert_golden(
+        &as_json("ospf", &fx::ospf_state()),
+        include_str!("../../tests/golden/routing_ospf.json"),
+    );
+}
+
+#[test]
+fn routing_bgp() {
+    assert_golden(
+        &render::bgp_summary(&fx::bgp_state()),
+        include_str!("../../tests/golden/routing_bgp_summary.txt"),
+    );
+    assert_golden(
+        &render::bgp_table(&fx::bgp_state()),
+        include_str!("../../tests/golden/routing_bgp.txt"),
+    );
+    assert_golden(
+        &render::bgp_neighbor_detail(&fx::bgp_neighbor_state()),
+        include_str!("../../tests/golden/routing_bgp_neighbor.txt"),
+    );
+    assert_golden(
+        &as_json("bgp", &fx::bgp_state()),
+        include_str!("../../tests/golden/routing_bgp.json"),
+    );
+}
+
+#[test]
+fn vrrp() {
+    assert_golden(
+        &render::vrrp_brief(&fx::vrrp_state()),
+        include_str!("../../tests/golden/vrrp_brief.txt"),
+    );
+    assert_golden(
+        &render::vrrp_detail(&fx::vrrp_state()),
+        include_str!("../../tests/golden/vrrp.txt"),
+    );
+    assert_golden(
+        &as_json("vrrp", &fx::vrrp_state()),
+        include_str!("../../tests/golden/vrrp.json"),
     );
 }

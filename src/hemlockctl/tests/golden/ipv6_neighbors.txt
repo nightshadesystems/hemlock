@@ -1,0 +1,2 @@
+Address         Age (sec)  Hardware Addr      Interface
+2001:db8:9::1          33  a0:36:9f:44:be:09  Ethernet48

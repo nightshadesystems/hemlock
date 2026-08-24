@@ -298,7 +298,16 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             stay(Mode::Operational)
         }
         "clear" => {
-            crate::switching::cmd::clear(&endpoints.syncd, &words[1..]).await?;
+            let clear_topics: &[&str] = &["counters", "mac-table", "arp", "routing"];
+            match words.get(1).map(|w| resolve(w, clear_topics)).transpose()? {
+                Some("arp") => {
+                    crate::routing::cmd::clear_arp(&endpoints.orch, &words[2..]).await?;
+                }
+                Some("routing") => {
+                    crate::routing::cmd::clear_routing(&endpoints.orch, &words[2..]).await?;
+                }
+                _ => crate::switching::cmd::clear(&endpoints.syncd, &words[1..]).await?,
+            }
             stay(Mode::Operational)
         }
         "upgrade" => {
@@ -336,7 +345,13 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             );
             println!("  show ip route [summary|<prefix>]       IPv4 route table");
             println!("  show ipv6 route [summary|<prefix>]     IPv6 route table");
+            println!("  show arp | show ipv6 neighbors         kernel neighbor tables");
+            println!("  show routing ospf [neighbor|interface] OSPF process / adjacencies");
+            println!("  show routing bgp [summary|neighbors <ip>]  BGP table / peers");
+            println!("  show vrrp [brief]                      VRRP group state");
             println!("  clear counters [<interface>]           baseline interface counters");
+            println!("  clear arp [<ip>]                       flush dynamic ARP entries");
+            println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
             println!("  clear mac-table [vlan <id>] [interface <port>]   flush dynamic MACs");
             println!("  configure | conf                       enter configuration mode");
             println!("  upgrade <image.bin> [force] [reboot]   install an OS image (via mgmtd)");
@@ -404,8 +419,11 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "mld",
         "ip",
         "ipv6",
+        "arp",
+        "routing",
+        "vrrp",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -457,14 +475,11 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
                 crate::switching::cmd::show_snooping(&endpoints.orch, family, &words[1..]).await
             }
             family @ ("ip" | "ipv6") => {
-                crate::routing::cmd::show_route(
-                    &endpoints.mgmtd,
-                    &endpoints.syncd,
-                    family == "ipv6",
-                    &words[1..],
-                )
-                .await
+                crate::routing::cmd::show_family(endpoints, family == "ipv6", &words[1..]).await
             }
+            "arp" => crate::routing::cmd::show_neighbors(&endpoints.orch, false, &words[1..]).await,
+            "routing" => crate::routing::cmd::show_routing(&endpoints.orch, &words[1..]).await,
+            "vrrp" => crate::routing::cmd::show_vrrp(&endpoints.orch, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -574,13 +589,31 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set system https                              web console over HTTPS (self-signed cert)");
             println!("  set routing static <prefix> <next-hop|drop> [distance <1-255>]");
             println!("                                                repeat a prefix for ECMP");
+            println!("  set routing arp <ip> interface <if> mac <mac> static ARP/ND entry");
+            println!("  set routing router-id <ipv4>");
+            println!("  set routing ospf [area <id> network <prefix> | router-id | passive-interface <if>");
+            println!(
+                "                    | redistribute <connected|static|bgp> | maximum-paths <1-8>"
+            );
+            println!("                    | interface <if> <cost|hello-interval|dead-interval|priority> <n>]");
+            println!(
+                "  set routing bgp [as <asn> | router-id | neighbor <ip> <remote-as|description|"
+            );
+            println!("                   shutdown|ebgp-multihop|next-hop-self> | network <prefix>");
+            println!(
+                "                   | redistribute <connected|static|ospf> | maximum-paths <1-8>]"
+            );
+            println!("  set interfaces <if> vrrp <1-255> [address <vip> | priority <1-254>");
+            println!(
+                "                                    | advertisement-interval <1-40> | no-preempt]"
+            );
             println!(
                 "  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport|"
             );
             println!("                            channel-group|lacp|spanning-tree|storm-control|min-links ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
-            println!("  delete routing [static [<prefix> [<next-hop>]]]");
+            println!("  delete routing [static [<prefix> [<next-hop>]] | arp [<ip>]]");
             println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
             println!("  delete switching [mac-table|mirror ...]");
             println!("  show                      show the candidate configuration");
@@ -791,10 +824,12 @@ async fn config_interfaces(
             "spanning-tree",
             "storm-control",
             "min-links",
+            "vrrp",
         ],
     )?;
-    // Phase-1 SVIs carry an address and nothing else.
-    if port.starts_with("Vlan") && subcommand != "address" {
+    // SVIs carry an address (and, with the routing suite, VRRP groups)
+    // and nothing else.
+    if port.starts_with("Vlan") && !matches!(subcommand, "address" | "vrrp") {
         return Err(format!(
             "% {subcommand} is not supported on VLAN interfaces"
         ));
@@ -802,7 +837,7 @@ async fn config_interfaces(
     if port.starts_with("Management")
         && matches!(
             subcommand,
-            "channel-group" | "lacp" | "spanning-tree" | "storm-control" | "min-links"
+            "channel-group" | "lacp" | "spanning-tree" | "storm-control" | "min-links" | "vrrp"
         )
     {
         return Err(format!(
@@ -810,7 +845,7 @@ async fn config_interfaces(
         ));
     }
     let is_lag = port.starts_with("Port-Channel");
-    if is_lag && matches!(subcommand, "address" | "channel-group") {
+    if is_lag && matches!(subcommand, "address" | "channel-group" | "vrrp") {
         return Err(format!(
             "% {subcommand} is not supported on port-channel interfaces"
         ));
@@ -833,6 +868,9 @@ async fn config_interfaces(
         }
         "min-links" => {
             return config_min_links(endpoints, &port, &rest[1..], delete).await;
+        }
+        "vrrp" => {
+            return config_vrrp(endpoints, &port, &rest[1..], delete).await;
         }
         _ => {}
     }
@@ -1545,15 +1583,21 @@ async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> 
     }
     let usage = move || {
         if delete {
-            "% Usage: delete routing [static [<prefix> [<next-hop>]]]".to_string()
+            "% Usage: delete routing [static|arp|router-id|ospf|bgp ...]".to_string()
         } else {
-            "% Usage: set routing static <prefix> <next-hop|drop> [distance <1-255>]".to_string()
+            "% Usage: set routing <static|arp|router-id|ospf|bgp> ...".to_string()
         }
     };
     let Some(first) = words.first() else {
         return Err(usage());
     };
-    resolve(first, &["static"])?;
+    match resolve(first, &["static", "arp", "router-id", "ospf", "bgp"])? {
+        "arp" => return config_arp(endpoints, &words[1..], delete).await,
+        "router-id" => return config_router_id(endpoints, &words[1..], delete).await,
+        "ospf" => return config_ospf(endpoints, &words[1..], delete).await,
+        "bgp" => return config_bgp(endpoints, &words[1..], delete).await,
+        _ => {}
+    }
     let rest = &words[1..];
 
     if delete {
@@ -1640,6 +1684,684 @@ async fn config_routing(endpoints: &Endpoints, words: &[&str], delete: bool) -> 
         .await
         .map_err(fmt_err)
     }
+}
+
+/// `set routing router-id <ipv4>` / `delete routing router-id`.
+async fn config_router_id(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if delete {
+        if !words.is_empty() {
+            return Err("% Usage: delete routing router-id".into());
+        }
+        return edit_config(endpoints, |tree| {
+            let routing = tree.block_mut("routing");
+            ConfigTree::remove_leaf(routing, "router-id");
+            remove_block_if_empty(tree, "routing");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let [id] = words else {
+        return Err("% Usage: set routing router-id <ipv4>".into());
+    };
+    let id: std::net::Ipv4Addr = id
+        .parse()
+        .map_err(|_| format!("% bad router-id {id:?} (IPv4)"))?;
+    edit_config(endpoints, move |tree| {
+        let routing = tree.block_mut("routing");
+        ConfigTree::set_leaf(routing, "router-id", vec![id.to_string()]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// The canonical dotted form of an OSPF area id (dotted or integer).
+fn canonical_area(text: &str) -> Result<String, String> {
+    if let Ok(area) = text.parse::<std::net::Ipv4Addr>() {
+        return Ok(area.to_string());
+    }
+    text.parse::<u32>()
+        .map(|n| std::net::Ipv4Addr::from(n).to_string())
+        .map_err(|_| format!("% bad area {text:?} (dotted or 0..4294967295)"))
+}
+
+/// A bounded integer CLI argument with the customary `%` error.
+fn int_arg<T>(value: &str, range: std::ops::RangeInclusive<T>, what: &str) -> Result<T, String>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+{
+    value
+        .parse::<T>()
+        .ok()
+        .filter(|n| range.contains(n))
+        .ok_or_else(|| {
+            format!(
+                "% bad {what} {value:?} ({}..{})",
+                range.start(),
+                range.end()
+            )
+        })
+}
+
+/// An interface argument for the routing families: `Vlan<id>`, a
+/// port-channel form, or a (prefix-resolved) port name.
+async fn l3_interface_arg(endpoints: &Endpoints, input: &str) -> Result<String, String> {
+    if let Some(svi) = vlan_interface(input) {
+        return Ok(svi);
+    }
+    if let Some(lag) = port_channel_interface(input) {
+        return Ok(lag);
+    }
+    let known = list_port_names(endpoints).await.map_err(fmt_err)?;
+    canonical_port(input, &known)
+}
+
+/// `set|delete routing ospf ...` (Part 1.2's OSPFv2 family).
+async fn config_ospf(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    const SET_USAGE: &str = "% Usage: set routing ospf <area <id> network <prefix> | router-id <ipv4> | passive-interface <if> | redistribute <connected|static|bgp> | maximum-paths <1-8> | interface <if> <cost|hello-interval|dead-interval|priority> <n>>";
+    const DELETE_USAGE: &str = "% Usage: delete routing ospf [area <id> [network <prefix>] | router-id | passive-interface <if> | redistribute <src> | maximum-paths | interface <if> [<knob>]]";
+    let usage = move || {
+        if delete {
+            DELETE_USAGE.to_string()
+        } else {
+            SET_USAGE.to_string()
+        }
+    };
+    // The scoped edit: run `edit` on the ospf block's children, then
+    // prune emptied blocks.
+    let ospf_edit = |edit: BlockEdit| async move {
+        edit_config(endpoints, |tree| {
+            let routing = tree.block_mut("routing");
+            let ospf = ConfigTree::ensure_block(routing, "ospf", &[]);
+            edit(ospf);
+            if ospf.is_empty() {
+                ConfigTree::remove_block(routing, "ospf", &[]);
+            }
+            remove_block_if_empty(tree, "routing");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            let routing = tree.block_mut("routing");
+            ConfigTree::remove_block(routing, "ospf", &[]);
+            remove_block_if_empty(tree, "routing");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(usage());
+    };
+    let keyword = resolve(
+        first,
+        &[
+            "area",
+            "router-id",
+            "passive-interface",
+            "redistribute",
+            "maximum-paths",
+            "interface",
+        ],
+    )?;
+    let rest = &words[1..];
+    match (keyword, delete) {
+        ("area", false) => {
+            let [area, keyword_network, prefix] = rest else {
+                return Err(usage());
+            };
+            resolve(keyword_network, &["network"])?;
+            let area = canonical_area(area)?;
+            let prefix = canonical_route_prefix(prefix)?;
+            if prefix.contains(':') {
+                return Err("% OSPFv3 is not supported".into());
+            }
+            ospf_edit(Box::new(move |ospf| {
+                let networks = ConfigTree::ensure_block(ospf, "area", &[&area]);
+                remove_leaf_matching(networks, "network", &[&prefix]);
+                push_leaf(networks, "network", vec![prefix]);
+            }))
+            .await
+        }
+        ("area", true) => match rest {
+            [area] => {
+                let area = canonical_area(area)?;
+                ospf_edit(Box::new(move |ospf| {
+                    ConfigTree::remove_block(ospf, "area", &[&area]);
+                }))
+                .await
+            }
+            [area, keyword_network, prefix] => {
+                resolve(keyword_network, &["network"])?;
+                let area = canonical_area(area)?;
+                let prefix = canonical_route_prefix(prefix)?;
+                ospf_edit(Box::new(move |ospf| {
+                    if let Some(networks) = keyed_block_children_mut(ospf, "area", &area) {
+                        remove_leaf_matching(networks, "network", &[&prefix]);
+                        if networks.is_empty() {
+                            ConfigTree::remove_block(ospf, "area", &[&area]);
+                        }
+                    }
+                }))
+                .await
+            }
+            _ => Err(usage()),
+        },
+        ("router-id", false) => {
+            let [id] = rest else { return Err(usage()) };
+            let id: std::net::Ipv4Addr = id
+                .parse()
+                .map_err(|_| format!("% bad router-id {id:?} (IPv4)"))?;
+            ospf_edit(Box::new(move |ospf| {
+                ConfigTree::set_leaf(ospf, "router-id", vec![id.to_string()]);
+            }))
+            .await
+        }
+        ("router-id" | "maximum-paths", true) => {
+            if !rest.is_empty() {
+                return Err(usage());
+            }
+            let leaf = keyword.to_string();
+            ospf_edit(Box::new(move |ospf| {
+                ConfigTree::remove_leaf(ospf, &leaf);
+            }))
+            .await
+        }
+        ("passive-interface", set_delete) => {
+            let [interface] = rest else {
+                return Err(usage());
+            };
+            let interface = l3_interface_arg(endpoints, interface).await?;
+            ospf_edit(Box::new(move |ospf| {
+                remove_leaf_matching(ospf, "passive-interface", &[&interface]);
+                if !set_delete {
+                    push_leaf(ospf, "passive-interface", vec![interface]);
+                }
+            }))
+            .await
+        }
+        ("redistribute", set_delete) => {
+            let [source] = rest else { return Err(usage()) };
+            let source = resolve(source, &["connected", "static", "bgp"])?.to_string();
+            ospf_edit(Box::new(move |ospf| {
+                remove_leaf_matching(ospf, "redistribute", &[&source]);
+                if !set_delete {
+                    push_leaf(ospf, "redistribute", vec![source]);
+                }
+            }))
+            .await
+        }
+        ("maximum-paths", false) => {
+            let [paths] = rest else { return Err(usage()) };
+            let paths = int_arg::<u8>(paths, 1..=8, "maximum-paths")?;
+            ospf_edit(Box::new(move |ospf| {
+                ConfigTree::set_leaf(ospf, "maximum-paths", vec![paths.to_string()]);
+            }))
+            .await
+        }
+        ("interface", false) => {
+            let [interface, knob, value] = rest else {
+                return Err(usage());
+            };
+            let interface = l3_interface_arg(endpoints, interface).await?;
+            let knob = resolve(
+                knob,
+                &["cost", "hello-interval", "dead-interval", "priority"],
+            )?
+            .to_string();
+            let value = match knob.as_str() {
+                "priority" => int_arg::<u16>(value, 0..=255, &knob)?,
+                _ => int_arg::<u16>(value, 1..=65535, &knob)?,
+            };
+            ospf_edit(Box::new(move |ospf| {
+                let block = ConfigTree::ensure_block(ospf, "interface", &[&interface]);
+                ConfigTree::set_leaf(block, &knob, vec![value.to_string()]);
+            }))
+            .await
+        }
+        ("interface", true) => match rest {
+            [interface] => {
+                let interface = l3_interface_arg(endpoints, interface).await?;
+                ospf_edit(Box::new(move |ospf| {
+                    ConfigTree::remove_block(ospf, "interface", &[&interface]);
+                }))
+                .await
+            }
+            [interface, knob] => {
+                let interface = l3_interface_arg(endpoints, interface).await?;
+                let knob = resolve(
+                    knob,
+                    &["cost", "hello-interval", "dead-interval", "priority"],
+                )?
+                .to_string();
+                ospf_edit(Box::new(move |ospf| {
+                    if let Some(block) = keyed_block_children_mut(ospf, "interface", &interface) {
+                        ConfigTree::remove_leaf(block, &knob);
+                        if block.is_empty() {
+                            ConfigTree::remove_block(ospf, "interface", &[&interface]);
+                        }
+                    }
+                }))
+                .await
+            }
+            _ => Err(usage()),
+        },
+        _ => Err(usage()),
+    }
+}
+
+/// `set|delete routing bgp ...` (Part 1.2's BGP IPv4-unicast family).
+async fn config_bgp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    const SET_USAGE: &str = "% Usage: set routing bgp <as <1-4294967295> | router-id <ipv4> | neighbor <ip> <remote-as <asn>|description <text>|shutdown|ebgp-multihop <1-255>|next-hop-self> | network <prefix> | redistribute <connected|static|ospf> | maximum-paths <1-8>>";
+    const DELETE_USAGE: &str = "% Usage: delete routing bgp [as | router-id | neighbor <ip> [<knob>] | network <prefix> | redistribute <src> | maximum-paths]";
+    let usage = move || {
+        if delete {
+            DELETE_USAGE.to_string()
+        } else {
+            SET_USAGE.to_string()
+        }
+    };
+    let bgp_edit = |edit: BlockEdit| async move {
+        edit_config(endpoints, |tree| {
+            let routing = tree.block_mut("routing");
+            let bgp = ConfigTree::ensure_block(routing, "bgp", &[]);
+            edit(bgp);
+            if bgp.is_empty() {
+                ConfigTree::remove_block(routing, "bgp", &[]);
+            }
+            remove_block_if_empty(tree, "routing");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            let routing = tree.block_mut("routing");
+            ConfigTree::remove_block(routing, "bgp", &[]);
+            remove_block_if_empty(tree, "routing");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(usage());
+    };
+    let keyword = resolve(
+        first,
+        &[
+            "as",
+            "router-id",
+            "neighbor",
+            "network",
+            "redistribute",
+            "maximum-paths",
+        ],
+    )?;
+    let rest = &words[1..];
+    match (keyword, delete) {
+        ("as", false) => {
+            let [as_number] = rest else {
+                return Err(usage());
+            };
+            let as_number = int_arg::<u32>(as_number, 1..=4294967295, "as")?;
+            bgp_edit(Box::new(move |bgp| {
+                ConfigTree::set_leaf(bgp, "as", vec![as_number.to_string()]);
+            }))
+            .await
+        }
+        ("as" | "router-id" | "maximum-paths", true) => {
+            if !rest.is_empty() {
+                return Err(usage());
+            }
+            let leaf = keyword.to_string();
+            bgp_edit(Box::new(move |bgp| {
+                ConfigTree::remove_leaf(bgp, &leaf);
+            }))
+            .await
+        }
+        ("router-id", false) => {
+            let [id] = rest else { return Err(usage()) };
+            let id: std::net::Ipv4Addr = id
+                .parse()
+                .map_err(|_| format!("% bad router-id {id:?} (IPv4)"))?;
+            bgp_edit(Box::new(move |bgp| {
+                ConfigTree::set_leaf(bgp, "router-id", vec![id.to_string()]);
+            }))
+            .await
+        }
+        ("neighbor", false) => {
+            let (Some(ip), Some(knob)) = (rest.first(), rest.get(1)) else {
+                return Err(usage());
+            };
+            let ip: std::net::IpAddr = ip
+                .parse()
+                .map_err(|_| format!("% bad neighbor address {ip:?}"))?;
+            if ip.is_ipv6() {
+                return Err("% the BGP IPv6 address family is not supported".into());
+            }
+            let ip = ip.to_string();
+            let knob = resolve(
+                knob,
+                &[
+                    "remote-as",
+                    "description",
+                    "shutdown",
+                    "ebgp-multihop",
+                    "next-hop-self",
+                ],
+            )?;
+            let values = &rest[2..];
+            let edit: BlockEdit = match knob {
+                "remote-as" => {
+                    let [remote] = values else {
+                        return Err(usage());
+                    };
+                    let remote = int_arg::<u32>(remote, 1..=4294967295, "remote-as")?;
+                    Box::new(move |neighbor| {
+                        ConfigTree::set_leaf(neighbor, "remote-as", vec![remote.to_string()]);
+                    })
+                }
+                "description" => {
+                    let text = values.join(" ");
+                    if text.is_empty() {
+                        return Err(usage());
+                    }
+                    Box::new(move |neighbor| {
+                        ConfigTree::set_leaf(neighbor, "description", vec![text]);
+                    })
+                }
+                "ebgp-multihop" => {
+                    let [ttl] = values else { return Err(usage()) };
+                    let ttl = int_arg::<u8>(ttl, 1..=255, "ebgp-multihop")?;
+                    Box::new(move |neighbor| {
+                        ConfigTree::set_leaf(neighbor, "ebgp-multihop", vec![ttl.to_string()]);
+                    })
+                }
+                marker @ ("shutdown" | "next-hop-self") => {
+                    if !values.is_empty() {
+                        return Err(usage());
+                    }
+                    let marker = marker.to_string();
+                    Box::new(move |neighbor| {
+                        ConfigTree::set_leaf(neighbor, &marker, vec![]);
+                    })
+                }
+                _ => unreachable!(),
+            };
+            bgp_edit(Box::new(move |bgp| {
+                let neighbor = ConfigTree::ensure_block(bgp, "neighbor", &[&ip]);
+                edit(neighbor);
+            }))
+            .await
+        }
+        ("neighbor", true) => {
+            let Some(ip) = rest.first() else {
+                return Err(usage());
+            };
+            let ip: std::net::IpAddr = ip
+                .parse()
+                .map_err(|_| format!("% bad neighbor address {ip:?}"))?;
+            let ip = ip.to_string();
+            match rest.get(1) {
+                None => {
+                    bgp_edit(Box::new(move |bgp| {
+                        ConfigTree::remove_block(bgp, "neighbor", &[&ip]);
+                    }))
+                    .await
+                }
+                Some(knob) => {
+                    if rest.len() > 2 {
+                        return Err(usage());
+                    }
+                    let knob = resolve(
+                        knob,
+                        &[
+                            "remote-as",
+                            "description",
+                            "shutdown",
+                            "ebgp-multihop",
+                            "next-hop-self",
+                        ],
+                    )?
+                    .to_string();
+                    bgp_edit(Box::new(move |bgp| {
+                        if let Some(neighbor) = keyed_block_children_mut(bgp, "neighbor", &ip) {
+                            ConfigTree::remove_leaf(neighbor, &knob);
+                            if neighbor.is_empty() {
+                                ConfigTree::remove_block(bgp, "neighbor", &[&ip]);
+                            }
+                        }
+                    }))
+                    .await
+                }
+            }
+        }
+        ("network", set_delete) => {
+            let [prefix] = rest else { return Err(usage()) };
+            let prefix = canonical_route_prefix(prefix)?;
+            if prefix.contains(':') {
+                return Err("% the BGP IPv6 address family is not supported".into());
+            }
+            bgp_edit(Box::new(move |bgp| {
+                remove_leaf_matching(bgp, "network", &[&prefix]);
+                if !set_delete {
+                    push_leaf(bgp, "network", vec![prefix]);
+                }
+            }))
+            .await
+        }
+        ("redistribute", set_delete) => {
+            let [source] = rest else { return Err(usage()) };
+            let source = resolve(source, &["connected", "static", "ospf"])?.to_string();
+            bgp_edit(Box::new(move |bgp| {
+                remove_leaf_matching(bgp, "redistribute", &[&source]);
+                if !set_delete {
+                    push_leaf(bgp, "redistribute", vec![source]);
+                }
+            }))
+            .await
+        }
+        ("maximum-paths", false) => {
+            let [paths] = rest else { return Err(usage()) };
+            let paths = int_arg::<u8>(paths, 1..=8, "maximum-paths")?;
+            bgp_edit(Box::new(move |bgp| {
+                ConfigTree::set_leaf(bgp, "maximum-paths", vec![paths.to_string()]);
+            }))
+            .await
+        }
+        _ => Err(usage()),
+    }
+}
+
+/// `set|delete interfaces <name> vrrp <group> ...` (per-interface VRRP
+/// groups, IPv4).
+async fn config_vrrp(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    const SET_USAGE: &str = "% Usage: set interfaces <if> vrrp <1-255> [address <ipv4> | priority <1-254> | advertisement-interval <1-40> | no-preempt]";
+    let usage = move || {
+        if delete {
+            "% Usage: delete interfaces <if> vrrp <group> [address <ip> | priority | advertisement-interval | no-preempt]".to_string()
+        } else {
+            SET_USAGE.to_string()
+        }
+    };
+    let Some(group) = words.first() else {
+        return Err(usage());
+    };
+    let group = int_arg::<u16>(group, 1..=255, "vrrp group")?.to_string();
+    let rest = &words[1..];
+
+    if delete {
+        return match rest {
+            [] => edit_interface(endpoints, port, move |iface| {
+                ConfigTree::remove_block(iface, "vrrp", &[&group]);
+            })
+            .await
+            .map_err(fmt_err),
+            [knob, values @ ..] => {
+                let knob = resolve(
+                    knob,
+                    &[
+                        "address",
+                        "priority",
+                        "advertisement-interval",
+                        "no-preempt",
+                    ],
+                )?
+                .to_string();
+                let address = match (knob.as_str(), values) {
+                    ("address", [ip]) => Some(canonical_ip(ip)?),
+                    ("address", []) => None,
+                    (_, []) => None,
+                    _ => return Err(usage()),
+                };
+                edit_interface(endpoints, port, move |iface| {
+                    if let Some(body) = keyed_block_children_mut(iface, "vrrp", &group) {
+                        match (&knob[..], &address) {
+                            ("address", Some(ip)) => remove_leaf_matching(body, "address", &[ip]),
+                            ("address", None) => ConfigTree::remove_leaf(body, "address"),
+                            (knob, _) => ConfigTree::remove_leaf(body, knob),
+                        }
+                    }
+                })
+                .await
+                .map_err(fmt_err)
+            }
+        };
+    }
+
+    match rest {
+        [] => edit_interface(endpoints, port, move |iface| {
+            ConfigTree::ensure_block(iface, "vrrp", &[&group]);
+        })
+        .await
+        .map_err(fmt_err),
+        [knob, values @ ..] => {
+            let knob = resolve(
+                knob,
+                &[
+                    "address",
+                    "priority",
+                    "advertisement-interval",
+                    "no-preempt",
+                ],
+            )?;
+            let edit: BlockEdit = match (knob, values) {
+                ("address", [ip]) => {
+                    let ip = ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| format!("% bad address {ip:?} (IPv4)"))?
+                        .to_string();
+                    Box::new(move |body| {
+                        remove_leaf_matching(body, "address", &[&ip]);
+                        push_leaf(body, "address", vec![ip]);
+                    })
+                }
+                ("priority", [priority]) => {
+                    let priority = int_arg::<u8>(priority, 1..=254, "priority")?;
+                    Box::new(move |body| {
+                        ConfigTree::set_leaf(body, "priority", vec![priority.to_string()]);
+                    })
+                }
+                ("advertisement-interval", [interval]) => {
+                    let interval = int_arg::<u8>(interval, 1..=40, "advertisement-interval")?;
+                    Box::new(move |body| {
+                        ConfigTree::set_leaf(
+                            body,
+                            "advertisement-interval",
+                            vec![interval.to_string()],
+                        );
+                    })
+                }
+                ("no-preempt", []) => Box::new(move |body| {
+                    ConfigTree::set_leaf(body, "no-preempt", vec![]);
+                }),
+                _ => return Err(usage()),
+            };
+            edit_interface(endpoints, port, move |iface| {
+                let body = ConfigTree::ensure_block(iface, "vrrp", &[&group]);
+                edit(body);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    }
+}
+
+/// `set routing arp <ip> interface <port|Vlan<id>> mac <mac>` and its
+/// deletes. Addresses are canonicalized; MACs canonicalize to colons.
+async fn config_arp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    if delete {
+        return match words {
+            [] => edit_config(endpoints, |tree| {
+                let routing = tree.block_mut("routing");
+                ConfigTree::remove_block(routing, "arp", &[]);
+                remove_block_if_empty(tree, "routing");
+            })
+            .await
+            .map_err(fmt_err),
+            [ip] => {
+                let ip = canonical_ip(ip)?;
+                edit_config(endpoints, |tree| {
+                    let routing = tree.block_mut("routing");
+                    if let Some(entries) = block_children_mut(routing, "arp") {
+                        ConfigTree::remove_leaf(entries, &ip);
+                        if entries.is_empty() {
+                            ConfigTree::remove_block(routing, "arp", &[]);
+                        }
+                    }
+                    remove_block_if_empty(tree, "routing");
+                })
+                .await
+                .map_err(fmt_err)
+            }
+            _ => Err("% Usage: delete routing arp [<ip>]".into()),
+        };
+    }
+    const USAGE: &str = "% Usage: set routing arp <ip> interface <port|Vlan<id>> mac <mac>";
+    let [ip, keyword_interface, interface, keyword_mac, mac] = words else {
+        return Err(USAGE.into());
+    };
+    resolve(keyword_interface, &["interface"])?;
+    resolve(keyword_mac, &["mac"])?;
+    let ip = canonical_ip(ip)?;
+    let interface = if let Some(svi) = vlan_interface(interface) {
+        svi
+    } else if let Some(lag) = port_channel_interface(interface) {
+        lag
+    } else {
+        let known = list_port_names(endpoints).await.map_err(fmt_err)?;
+        canonical_port(interface, &known)?
+    };
+    let mac = hemlock_common::net::parse_unicast_mac(mac).map_err(|e| format!("% {e}"))?;
+    edit_config(endpoints, |tree| {
+        let routing = tree.block_mut("routing");
+        let entries = ConfigTree::ensure_block(routing, "arp", &[]);
+        ConfigTree::set_leaf(
+            entries,
+            &ip,
+            vec!["interface".into(), interface, "mac".into(), mac],
+        );
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// A canonical IP address argument (v4 or v6).
+fn canonical_ip(text: &str) -> Result<String, String> {
+    text.parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| format!("% bad IP address {text:?}"))
 }
 
 /// The canonical form of a route prefix argument, erroring (not

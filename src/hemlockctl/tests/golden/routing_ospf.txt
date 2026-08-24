@@ -1,0 +1,5 @@
+Routing Process "ospf" with ID 10.42.0.1
+  Number of areas in this router is 1
+  Area 0.0.0.0
+    Number of interfaces in this area: 1
+    SPF algorithm executed 7 times

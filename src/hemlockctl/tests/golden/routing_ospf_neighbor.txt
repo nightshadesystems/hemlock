@@ -1,0 +1,2 @@
+Neighbor ID     Pri  State     Dead Time  Address         Interface
+10.42.0.7         1  Full      00:00:33   10.42.10.7      Vlan99

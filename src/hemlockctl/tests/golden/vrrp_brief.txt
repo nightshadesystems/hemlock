@@ -1,0 +1,2 @@
+Interface  Group  Pri  Adv   Pre  State    Master addr      Group addr
+Vl100      10     200  1     Y    Master   local            10.0.100.1

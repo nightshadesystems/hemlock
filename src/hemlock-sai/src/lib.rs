@@ -69,10 +69,18 @@ pub type IpPrefix = (std::net::IpAddr, u8);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteTarget {
     /// Punt to the CPU port (IP2ME: one of the switch's own addresses;
-    /// the IP2ME hostif trap delivers it to the kernel).
+    /// the IP2ME hostif trap delivers it to the kernel). Also the
+    /// resolve-via-punt state of a transit route whose next hop has no
+    /// neighbor yet.
     Cpu,
     /// A connected subnet via a router interface.
     Rif(Oid),
+    /// A single resolved next hop.
+    NextHop(Oid),
+    /// An ECMP next-hop group.
+    Group(Oid),
+    /// A null route: packets to the prefix are dropped in hardware.
+    Drop,
 }
 
 /// What a backend needs to bring the switch up. Resolved by syncd from the
@@ -194,6 +202,15 @@ pub struct SaiCapabilities {
     /// Sessions the ASIC can host concurrently (0 = unsupported).
     pub mirror_sessions_max: u32,
     pub port_tpid: bool,
+    /// Widest ECMP next-hop group the ASIC accepts (0 = no next-hop
+    /// groups at all).
+    pub ecmp_width: u32,
+    /// IPv6 routes and neighbors.
+    pub ipv6: bool,
+    /// The My-MAC table (VRRP virtual router MACs). `saimymac.h` is in
+    /// the pinned v1.11.0 headers, but a vendor blob may still refuse
+    /// the object.
+    pub my_mac: bool,
 }
 
 impl SaiCapabilities {
@@ -209,6 +226,9 @@ impl SaiCapabilities {
             mirror: true,
             mirror_sessions_max: 4,
             port_tpid: true,
+            ecmp_width: 64,
+            ipv6: true,
+            my_mac: true,
         }
     }
 }
@@ -385,6 +405,45 @@ pub trait SaiBackend: Send {
     fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError>;
 
     fn remove_route(&mut self, dest: IpPrefix) -> Result<(), SaiError>;
+
+    // --- FIB: neighbors, next hops, ECMP groups, My-MAC --------------------
+
+    /// Install a neighbor entry (`ip` reachable as `mac`) on a router
+    /// interface. Replaces an existing entry for the same (rif, ip).
+    fn create_neighbor(
+        &mut self,
+        rif: Oid,
+        ip: std::net::IpAddr,
+        mac: [u8; 6],
+    ) -> Result<(), SaiError>;
+
+    fn remove_neighbor(&mut self, rif: Oid, ip: std::net::IpAddr) -> Result<(), SaiError>;
+
+    /// Create an IP next hop via `rif` toward `ip` (which should have a
+    /// neighbor entry before traffic flows).
+    fn create_next_hop(&mut self, rif: Oid, ip: std::net::IpAddr) -> Result<Oid, SaiError>;
+
+    /// Remove a next hop; it must no longer be referenced by any route
+    /// or group member.
+    fn remove_next_hop(&mut self, next_hop: Oid) -> Result<(), SaiError>;
+
+    /// Create an (empty) ECMP next-hop group.
+    fn create_next_hop_group(&mut self) -> Result<Oid, SaiError>;
+
+    /// Remove a next-hop group; its members must already be gone.
+    fn remove_next_hop_group(&mut self, group: Oid) -> Result<(), SaiError>;
+
+    /// Add a next hop to a group, returning the member object.
+    fn add_next_hop_group_member(&mut self, group: Oid, next_hop: Oid) -> Result<Oid, SaiError>;
+
+    fn remove_next_hop_group_member(&mut self, member: Oid) -> Result<(), SaiError>;
+
+    /// Install a My-MAC entry: frames to `mac` (optionally scoped to a
+    /// VLAN) enter L3 as if addressed to the router — the VRRP virtual
+    /// MAC path.
+    fn create_my_mac(&mut self, vlan_id: Option<u16>, mac: [u8; 6]) -> Result<Oid, SaiError>;
+
+    fn remove_my_mac(&mut self, my_mac: Oid) -> Result<(), SaiError>;
 
     // --- L2 VLANs ---------------------------------------------------------
 

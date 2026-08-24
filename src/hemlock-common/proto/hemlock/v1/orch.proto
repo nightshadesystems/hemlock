@@ -26,6 +26,25 @@ service Orch {
 
   // Snooping runtime state for `show igmp|mld snooping ...`.
   rpc GetSnoopingState(GetSnoopingStateRequest) returns (GetSnoopingStateResponse);
+
+  // --- The RIB (kernel -> orch -> syncd pipeline) ----------------------
+  // The RIB snapshot for `show ip route` / `show ipv6 route`: statics,
+  // connected, and FRR routes uniformly, with FIB (hardware) state.
+  rpc GetRib(GetRibRequest) returns (GetRibResponse);
+  // The kernel neighbor table for `show arp` / `show ipv6 neighbors`.
+  rpc GetNeighbors(GetNeighborsRequest) returns (GetNeighborsResponse);
+  // `clear arp [<ip>]`: flush dynamic kernel neighbor entries (statics
+  // survive); the change flows back through the RIB pipeline.
+  rpc ClearNeighbors(ClearNeighborsRequest) returns (ClearNeighborsResponse);
+
+  // --- FRR protocol detail (queried live from vtysh) -------------------
+  // orch owns vtysh access: hemlockctl and webd ask orch. A dead FRR
+  // degrades to a failed-precondition ("ospf is not running").
+  rpc GetOspfState(GetOspfStateRequest) returns (GetOspfStateResponse);
+  rpc GetBgpState(GetBgpStateRequest) returns (GetBgpStateResponse);
+  rpc GetVrrpState(GetVrrpStateRequest) returns (GetVrrpStateResponse);
+  // `clear routing bgp <neighbor|*>`.
+  rpc ClearBgp(ClearBgpRequest) returns (ClearBgpResponse);
 }
 
 message GetOrchStatusRequest {}
@@ -229,4 +248,205 @@ message GetStpStateResponse {
   optional uint64 seconds_since_tc = 16;
   string last_tc_port = 17;
   repeated StpPortStateInfo ports = 18;
+}
+
+// --- RIB ----------------------------------------------------------------
+
+message GetRibRequest {
+  bool ipv6 = 1;
+  // Paging: 0 = everything.
+  uint32 page_size = 2;
+  // The prefix to continue after (from next_page_token).
+  string page_token = 3;
+}
+
+message GetRibResponse {
+  repeated RibRoute routes = 1;
+  // Non-empty when a page_size was given and more routes remain.
+  string next_page_token = 2;
+}
+
+message RibRoute {
+  // Canonical CIDR prefix.
+  string prefix = 1;
+  // "connected" | "static" | "kernel" | "ospf" | "bgp".
+  string protocol = 2;
+  uint32 distance = 3;
+  uint32 metric = 4;
+  // Seconds since orch first saw the route.
+  uint64 uptime_secs = 5;
+  repeated RibNextHop next_hops = 6;
+  // FIB state: "programmed" | "punt" | "drop" | "connected" | "kernel".
+  string fib = 7;
+  // Directly-connected egress interface (connected routes).
+  string interface = 8;
+}
+
+message RibNextHop {
+  string via = 1;
+  string interface = 2;
+  // The next hop has a resolved neighbor entry (hardware-forwardable).
+  bool resolved = 3;
+}
+
+message GetNeighborsRequest {
+  bool ipv6 = 1;
+}
+
+message GetNeighborsResponse {
+  repeated NeighborEntry neighbors = 1;
+}
+
+message NeighborEntry {
+  string ip = 1;
+  // Colon-separated lowercase; empty while unresolved.
+  string mac = 2;
+  string interface = 3;
+  // A configured static (permanent) entry.
+  bool permanent = 4;
+  // Seconds since the entry was last confirmed; unset when unknown.
+  optional uint64 age_secs = 5;
+}
+
+message ClearNeighborsRequest {
+  // Scope the flush to one address; empty = every dynamic entry.
+  string ip = 1;
+}
+
+message ClearNeighborsResponse {
+  bool flushed = 1;
+}
+
+// --- FRR protocol detail ------------------------------------------------
+
+message GetOspfStateRequest {}
+
+message OspfArea {
+  string id = 1;
+  uint32 interfaces = 2;
+}
+
+message OspfNeighborState {
+  string router_id = 1;
+  uint32 priority = 2;
+  // "Full", "2-Way", ... (the DR suffix stripped).
+  string state = 3;
+  uint64 dead_time_msecs = 4;
+  string address = 5;
+  string interface = 6;
+}
+
+message OspfInterfaceState {
+  string name = 1;
+  bool up = 2;
+  // CIDR form.
+  string address = 3;
+  string area = 4;
+  string router_id = 5;
+  // "BROADCAST", "POINTOPOINT", ...
+  string network_type = 6;
+  uint32 cost = 7;
+  string state = 8;
+  uint32 priority = 9;
+  string dr_id = 10;
+  string dr_address = 11;
+  uint32 hello_interval = 12;
+  uint32 dead_interval = 13;
+  uint32 neighbors = 14;
+  uint32 adjacent = 15;
+}
+
+message GetOspfStateResponse {
+  string router_id = 1;
+  uint32 spf_runs = 2;
+  repeated OspfArea areas = 3;
+  repeated OspfNeighborState neighbors = 4;
+  repeated OspfInterfaceState interfaces = 5;
+}
+
+message GetBgpStateRequest {
+  // Detail for one neighbor; empty = summary + RIB.
+  string neighbor = 1;
+}
+
+message BgpPeerState {
+  string ip = 1;
+  uint32 version = 2;
+  uint32 remote_as = 3;
+  uint64 msg_rcvd = 4;
+  uint64 msg_sent = 5;
+  uint32 in_q = 6;
+  uint32 out_q = 7;
+  // FRR's formatted uptime ("2d04h", "never").
+  string up_down = 8;
+  // "Established", "Idle", ...
+  string state = 9;
+  int64 pfx_rcvd = 10;
+}
+
+message BgpRibEntry {
+  string network = 1;
+  string next_hop = 2;
+  // Textual; "-" when absent.
+  string metric = 3;
+  string loc_pref = 4;
+  // AS-path plus origin code ("65001 i").
+  string path = 5;
+  bool valid = 6;
+  bool best = 7;
+}
+
+message BgpNeighborDetail {
+  string ip = 1;
+  uint32 remote_as = 2;
+  string description = 3;
+  string state = 4;
+  string uptime = 5;
+  uint64 msg_rcvd = 6;
+  uint64 msg_sent = 7;
+  int64 prefixes_received = 8;
+  int64 prefixes_accepted = 9;
+  int64 prefixes_advertised = 10;
+  bool next_hop_self = 11;
+  uint32 ebgp_multihop = 12;
+}
+
+message GetBgpStateResponse {
+  string router_id = 1;
+  uint32 as_number = 2;
+  repeated BgpPeerState peers = 3;
+  repeated BgpRibEntry routes = 4;
+  BgpNeighborDetail detail = 5;
+}
+
+message GetVrrpStateRequest {}
+
+message VrrpGroupState {
+  string interface = 1;
+  uint32 group = 2;
+  uint32 priority = 3;
+  uint32 effective_priority = 4;
+  uint32 advertisement_interval_ms = 5;
+  bool preempt = 6;
+  // "Master" | "Backup" | "Initialize".
+  string state = 7;
+  repeated string addresses = 8;
+  string virtual_mac = 9;
+  uint32 skew_time_ms = 10;
+  uint32 master_down_interval_ms = 11;
+  // Seconds since the last state transition; unset = unknown.
+  optional uint64 seconds_since_transition = 12;
+}
+
+message GetVrrpStateResponse {
+  repeated VrrpGroupState groups = 1;
+}
+
+message ClearBgpRequest {
+  // A neighbor address, or "*" for every peer.
+  string neighbor = 1;
+}
+
+message ClearBgpResponse {
+  bool cleared = 1;
 }
