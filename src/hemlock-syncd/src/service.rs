@@ -5599,18 +5599,32 @@ lanes = [1, 2]
             "per-rule policers are not supported by this platform's SAI"
         );
 
-        let err = service
+        // No ASIC learn limit: the set still applies, falling back to
+        // the software engine rather than failing the commit.
+        service
             .set_port_security(Request::new(pb::SetPortSecurityRequest {
                 port: "Ethernet1".into(),
                 maximum: 4,
                 shutdown: true,
             }))
             .await
-            .unwrap_err();
-        assert_eq!(
-            err.message(),
-            "port-security is not supported by this platform's SAI"
-        );
+            .unwrap();
+        let state = service
+            .get_port_security_state(Request::new(pb::GetPortSecurityStateRequest {
+                port: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.ports.len(), 1);
+        assert_eq!(state.ports[0].port, "Ethernet1");
+        assert_eq!(state.ports[0].maximum, 4);
+        service
+            .clear_port_security(Request::new(pb::ClearPortSecurityRequest {
+                port: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap();
 
         let err = service
             .set_copp_class(Request::new(pb::SetCoppClassRequest {

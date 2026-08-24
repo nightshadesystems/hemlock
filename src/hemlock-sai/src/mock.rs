@@ -1357,6 +1357,14 @@ impl SaiBackend for MockSai {
     fn set_port_learn_limit(&mut self, port: PortId, limit: Option<u32>) -> Result<(), SaiError> {
         self.require_switch()?;
         self.require_port(port)?;
+        if !self.capabilities.port_learn_limit {
+            // What a blob without the attribute answers (the Helix4
+            // libsaibcm does exactly this): ATTR_NOT_IMPLEMENTED_0.
+            return Err(SaiError::Status {
+                call: "set_bridge_port_attribute(MAX_LEARNED_ADDRESSES)",
+                status: -0x0003_0000,
+            });
+        }
         match limit {
             Some(limit) => {
                 self.learn_limits.insert(port, limit);

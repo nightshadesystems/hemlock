@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Shell from '@/components/Shell';
 import { api, shortName, compareNames, formatUptime } from '@/lib/api';
-import { Alert, Badge, Card, Label } from '@/components/ds/misc';
+import { Alert, Badge, Card, CardBlock, Label } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
@@ -326,28 +326,30 @@ export default function Dot1xPage() {
             }
             style={{ marginBottom: 16 }}
           >
-            {data.radius_servers.length === 0 && (
-              <p className="dim" style={{ margin: 0 }}>
-                No RADIUS servers configured — 802.1X ports cannot authorize supplicants.
-              </p>
-            )}
-            {data.radius_servers.map((server) => (
-              <div key={server.ip}
-                style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '2px 0' }}>
-                <span className="cell-mono">
-                  {server.ip}:{server.port || 1812}
-                </span>
-                <span className="dim">
-                  {server.has_key ? 'key set' : 'no key'}
-                  {server.timeout ? ` · timeout ${server.timeout}s` : ''}
-                  {server.retransmit ? ` · retransmit ${server.retransmit}` : ''}
-                </span>
-                <Button variant="link-neutral" sm icon="pencil" aria-label={`Edit server ${server.ip}`}
-                  onClick={() => setModal({ kind: 'server', server })} />
-                <Button variant="link-neutral" sm icon="trash" aria-label={`Remove server ${server.ip}`}
-                  onClick={() => removeServer(server.ip)} />
-              </div>
-            ))}
+            <CardBlock>
+              {data.radius_servers.length === 0 && (
+                <p className="dim" style={{ margin: 0 }}>
+                  No RADIUS servers configured — 802.1X ports cannot authorize supplicants.
+                </p>
+              )}
+              {data.radius_servers.map((server) => (
+                <div key={server.ip}
+                  style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '2px 0' }}>
+                  <span className="cell-mono">
+                    {server.ip}:{server.port || 1812}
+                  </span>
+                  <span className="dim">
+                    {server.has_key ? 'key set' : 'no key'}
+                    {server.timeout ? ` · timeout ${server.timeout}s` : ''}
+                    {server.retransmit ? ` · retransmit ${server.retransmit}` : ''}
+                  </span>
+                  <Button variant="link-neutral" sm icon="pencil" aria-label={`Edit server ${server.ip}`}
+                    onClick={() => setModal({ kind: 'server', server })} />
+                  <Button variant="link-neutral" sm icon="trash" aria-label={`Remove server ${server.ip}`}
+                    onClick={() => removeServer(server.ip)} />
+                </div>
+              ))}
+            </CardBlock>
           </Card>
 
           <Datagrid

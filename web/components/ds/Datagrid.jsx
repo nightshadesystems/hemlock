@@ -32,7 +32,7 @@ export function Datagrid({columns,rows,rowKey,selectable,expandable,renderDetail
       <thead><tr className="datagrid-row">
         {selectable&&<th className="datagrid-column datagrid-select"><div className="clr-checkbox-wrapper"><input type="checkbox" checked={allSel} onChange={toggleAll} aria-label="Select all"/></div></th>}
         {expandable&&<th className="datagrid-column datagrid-expandable-caret"></th>}
-        {columns.map(c=><th key={c.key} className="datagrid-column" style={{width:c.width}}>
+        {columns.map(c=><th key={c.key} className={'datagrid-column'+(c.label?'':' datagrid-column-blank')} style={{width:c.width}}>
           {c.sortable?<button onClick={()=>toggleSort(c)}>{c.label}{sort&&sort.key===c.key&&<span className="sort-icon">{sort.dir==='asc'?'▲':'▼'}</span>}</button>:c.label}
         </th>)}
       </tr></thead>

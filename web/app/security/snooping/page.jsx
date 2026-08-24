@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Shell from '@/components/Shell';
 import { api, shortName, compareNames, parseVlanList } from '@/lib/api';
-import { Alert, Badge, Card, Label } from '@/components/ds/misc';
+import { Alert, Badge, Card, CardBlock, Label } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
@@ -89,71 +89,81 @@ function ConfigTab({ data, interfaces, onSaved, onError }) {
   return (
     <>
       <Card header="DHCP Snooping" style={{ marginBottom: 16 }}>
-        <div className="clr-form-compact">
-          <FormField label="VLANs" htmlFor="dhcp-vlans"
-            helper="Comma/range list, e.g. 10,20,30-32; empty disables">
-            <Input id="dhcp-vlans" className="mono" value={dhcpVlans}
-              onChange={(e) => setDhcpVlans(e.target.value)} style={{ maxWidth: 320 }} />
-          </FormField>
-          <Button variant="primary" sm onClick={commitDhcp} loading={busyDhcp} disabled={busyDhcp}>
-            Commit
-          </Button>
-        </div>
+        <CardBlock>
+          <div className="clr-form-compact">
+            <FormField label="VLANs" htmlFor="dhcp-vlans"
+              helper="Comma/range list, e.g. 10,20,30-32; empty disables">
+              <Input id="dhcp-vlans" className="mono" value={dhcpVlans}
+                onChange={(e) => setDhcpVlans(e.target.value)} style={{ maxWidth: 320 }} />
+            </FormField>
+            <div style={{ marginTop: 16 }}>
+              <Button variant="primary" sm onClick={commitDhcp} loading={busyDhcp} disabled={busyDhcp}>
+                Commit
+              </Button>
+            </div>
+          </div>
+        </CardBlock>
       </Card>
 
       <Card header="ARP Inspection" style={{ marginBottom: 16 }}>
-        <div className="clr-form-compact">
-          <FormField label="VLANs" htmlFor="arp-vlans"
-            helper="Comma/range list; empty disables">
-            <Input id="arp-vlans" className="mono" value={arpVlans}
-              onChange={(e) => setArpVlans(e.target.value)} style={{ maxWidth: 320 }} />
-          </FormField>
-          <FormField label="Validate" helper="Extra checks on ARP payloads; src-mac is the default">
-            <div style={{ display: 'flex', gap: 16 }}>
-              {VALIDATE_CHECKS.map((check) => (
-                <Checkbox key={check} label={check} checked={validate.includes(check)}
-                  onChange={(e) => setValidate(e.target.checked
-                    ? [...validate, check]
-                    : validate.filter((c) => c !== check))} />
-              ))}
+        <CardBlock>
+          <div className="clr-form-compact">
+            <FormField label="VLANs" htmlFor="arp-vlans"
+              helper="Comma/range list; empty disables">
+              <Input id="arp-vlans" className="mono" value={arpVlans}
+                onChange={(e) => setArpVlans(e.target.value)} style={{ maxWidth: 320 }} />
+            </FormField>
+            <FormField label="Validate" helper="Extra checks on ARP payloads; src-mac is the default">
+              <div style={{ display: 'flex', gap: 16 }}>
+                {VALIDATE_CHECKS.map((check) => (
+                  <Checkbox key={check} label={check} checked={validate.includes(check)}
+                    onChange={(e) => setValidate(e.target.checked
+                      ? [...validate, check]
+                      : validate.filter((c) => c !== check))} />
+                ))}
+              </div>
+            </FormField>
+            <div style={{ marginTop: 16 }}>
+              <Button variant="primary" sm onClick={commitArp} loading={busyArp} disabled={busyArp}>
+                Commit
+              </Button>
             </div>
-          </FormField>
-          <Button variant="primary" sm onClick={commitArp} loading={busyArp} disabled={busyArp}>
-            Commit
-          </Button>
-        </div>
+          </div>
+        </CardBlock>
       </Card>
 
       <Card header="Trusted Interfaces">
-        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
-          <FormField label="Interface">
-            <SearchSelect options={interfaces.map((name) => ({ value: name, label: name }))}
-              value={trustIface} onChange={setTrustIface} placeholder="Select interface…" />
-          </FormField>
-          <FormField label="Feature">
-            <Select options={['dhcp-snooping', 'arp-inspection']} value={trustFeature}
-              onChange={(e) => setTrustFeature(e.target.value)} />
-          </FormField>
-          <Button variant="primary" sm icon="plus" disabled={!trustIface}
-            onClick={() => setTrust(trustIface, trustFeature, true)}>
-            Trust
-          </Button>
-        </div>
-        {trustRows.length === 0 && (
-          <p className="dim" style={{ margin: 0 }}>
-            No trusted interfaces — DHCP server replies and ARP traffic on uplinks will be dropped.
-          </p>
-        )}
-        {trustRows.map((row) => (
-          <div key={`${row.iface}-${row.feature}`}
-            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '2px 0' }}>
-            <span className="cell-mono">{shortName(row.iface)}</span>
-            <Label>{row.feature}</Label>
-            <Button variant="link-neutral" sm icon="trash"
-              aria-label={`Untrust ${row.iface} for ${row.feature}`}
-              onClick={() => setTrust(row.iface, row.feature, false)} />
+        <CardBlock>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
+            <FormField label="Interface">
+              <SearchSelect options={interfaces.map((name) => ({ value: name, label: name }))}
+                value={trustIface} onChange={setTrustIface} placeholder="Select interface…" />
+            </FormField>
+            <FormField label="Feature">
+              <Select options={['dhcp-snooping', 'arp-inspection']} value={trustFeature}
+                onChange={(e) => setTrustFeature(e.target.value)} />
+            </FormField>
+            <Button variant="primary" sm icon="plus" disabled={!trustIface}
+              onClick={() => setTrust(trustIface, trustFeature, true)}>
+              Trust
+            </Button>
           </div>
-        ))}
+          {trustRows.length === 0 && (
+            <p className="dim" style={{ margin: 0 }}>
+              No trusted interfaces — DHCP server replies and ARP traffic on uplinks will be dropped.
+            </p>
+          )}
+          {trustRows.map((row) => (
+            <div key={`${row.iface}-${row.feature}`}
+              style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '2px 0' }}>
+              <span className="cell-mono">{shortName(row.iface)}</span>
+              <Label>{row.feature}</Label>
+              <Button variant="link-neutral" sm icon="trash"
+                aria-label={`Untrust ${row.iface} for ${row.feature}`}
+                onClick={() => setTrust(row.iface, row.feature, false)} />
+            </div>
+          ))}
+        </CardBlock>
       </Card>
     </>
   );

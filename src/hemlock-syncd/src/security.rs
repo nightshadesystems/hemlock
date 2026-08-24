@@ -254,7 +254,7 @@ pub async fn port_security_watch(handle: Arc<SaiHandle>) {
                             }
                         };
                         if over_limit {
-                            apply_violation(&handle, &port, &event.mac).await;
+                            apply_violation(&handle, &port, Some(event.vlan), &event.mac).await;
                         }
                     }
                     hemlock_sai::FdbEventKind::Aged | hemlock_sai::FdbEventKind::Flushed => {
@@ -272,14 +272,17 @@ pub async fn port_security_watch(handle: Arc<SaiHandle>) {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 };
-                apply_violation(&handle, &event.port, &event.mac).await;
+                // The ASIC discarded the learn, so nothing to unlearn.
+                apply_violation(&handle, &event.port, None, &event.mac).await;
             }
         }
     }
 }
 
 /// Record a violation and enforce the port's configured action.
-async fn apply_violation(handle: &SaiHandle, port: &str, mac: &str) {
+/// `vlan` is set when the violation came from a learn event, meaning
+/// the offending MAC reached the FDB and has to be unlearned again.
+async fn apply_violation(handle: &SaiHandle, port: &str, vlan: Option<u16>, mac: &str) {
     let shutdown = {
         let Ok(mut table) = handle.port_security.write() else {
             return;
@@ -314,7 +317,51 @@ async fn apply_violation(handle: &SaiHandle, port: &str, mac: &str) {
         if let Err(err) = handle.set_port_learning(sai_id, false).await {
             warn!(%port, %err, "port-security protect (learning off) failed");
         }
+        // Freeze first, then unlearn, so the offender cannot slip back
+        // in between the two calls.
+        if let Some(vlan) = vlan {
+            unlearn(handle, vlan, mac).await;
+        }
         warn!(%port, %mac, "port-security violation: learning frozen (protect)");
+    }
+}
+
+/// Drop one dynamic FDB entry — the MAC that tripped a protect action.
+/// Without an ASIC learn limit the offender is already in the table, and
+/// freezing learning alone would leave it forwarding.
+async fn unlearn(handle: &SaiHandle, vlan: u16, mac: &str) {
+    let mut bytes = [0u8; 6];
+    let mut parts = 0;
+    for (slot, part) in bytes.iter_mut().zip(mac.split(':')) {
+        match u8::from_str_radix(part, 16) {
+            Ok(byte) => *slot = byte,
+            Err(_) => return,
+        }
+        parts += 1;
+    }
+    if parts != bytes.len() {
+        return;
+    }
+    // VLAN 1 rides the default 802.1Q object, which needs no lookup.
+    let vlan_ref = if vlan == 1 {
+        None
+    } else {
+        match handle
+            .vlans
+            .read()
+            .ok()
+            .and_then(|table| table.get(&vlan).and_then(|v| v.oid))
+        {
+            Some(oid) => Some(oid),
+            None => return,
+        }
+    };
+    if let Err(err) = handle.remove_fdb_entry(vlan_ref, bytes).await {
+        warn!(%mac, vlan, %err, "port-security: unlearning the offender failed");
+        return;
+    }
+    if let Ok(mut fdb) = handle.fdb.write() {
+        fdb.dynamics.remove(&(vlan, mac.to_string()));
     }
 }
 
@@ -1448,7 +1495,6 @@ impl SyncdService {
         &self,
         req: pb::SetPortSecurityRequest,
     ) -> Result<(), Status> {
-        self.require_capability(self.handle.capabilities.port_learn_limit, "port-security")?;
         if !(1..=1024).contains(&req.maximum) {
             return Err(Status::invalid_argument(format!(
                 "bad maximum {} (1..1024)",
@@ -1456,10 +1502,25 @@ impl SyncdService {
             )));
         }
         let port_id = self.port_sai_id(&req.port)?;
-        self.handle
+        // The ASIC learn limit is an assist, not the enforcement: the
+        // engine in `port_security_watch` counts learns itself. Blobs
+        // that leave MAX_LEARNED_ADDRESSES unimplemented (the pinned
+        // Helix4 libsaibcm answers ATTR_NOT_IMPLEMENTED_0) fall back to
+        // software counting instead of failing the commit.
+        if let Err(err) = self
+            .handle
             .set_port_learn_limit(port_id, Some(req.maximum))
             .await
-            .map_err(Self::sai_err)?;
+        {
+            if !err.is_unsupported() {
+                return Err(Self::sai_err(err));
+            }
+            warn!(
+                port = %req.port,
+                %err,
+                "no ASIC learn limit; enforcing port-security in software"
+            );
+        }
         // Seed the secure set from what the port already learned.
         let seed: Vec<String> = {
             let fdb = self
@@ -1508,10 +1569,11 @@ impl SyncdService {
             return Ok(());
         }
         let port_id = self.port_sai_id(port)?;
-        self.handle
-            .set_port_learn_limit(port_id, None)
-            .await
-            .map_err(Self::sai_err)?;
+        if let Err(err) = self.handle.set_port_learn_limit(port_id, None).await {
+            if !err.is_unsupported() {
+                return Err(Self::sai_err(err));
+            }
+        }
         self.handle
             .set_port_learning(port_id, true)
             .await

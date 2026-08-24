@@ -117,9 +117,10 @@ impl Engine {
         // needing an absent stage/policer/learn-limit fails at
         // validation with the platform error, before anything applies.
         let bindings = intents::acl_bindings(&wanted);
-        let needs_security_caps = !bindings.is_empty()
-            || !intents::port_security_state(&wanted).is_empty()
-            || !wanted.copp.is_empty();
+        // Port-security is absent here on purpose: syncd enforces it in
+        // software when the ASIC has no learn limit, so it needs no
+        // capability probe.
+        let needs_security_caps = !bindings.is_empty() || !wanted.copp.is_empty();
         if needs_security_caps {
             if let Ok(mut client) = self.syncd_client().await {
                 if let Ok(info) = client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
@@ -139,9 +140,6 @@ impl Engine {
                     });
                     if bound_polices && !caps.acl_entry_policer {
                         anyhow::bail!("per-rule policers are not supported by this platform's SAI");
-                    }
-                    if !intents::port_security_state(&wanted).is_empty() && !caps.port_learn_limit {
-                        anyhow::bail!("port-security is not supported by this platform's SAI");
                     }
                     if !wanted.copp.is_empty() && !caps.copp {
                         anyhow::bail!(

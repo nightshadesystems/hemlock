@@ -19,6 +19,9 @@
 .datagrid-column,.datagrid-cell{vertical-align:middle;text-align:left;padding:0 12px;height:var(--clr-base-dg-row-height);border-bottom:1px solid var(--cds-alias-object-border-subtle)}
 .datagrid-column{background:var(--cds-alias-object-container-background-shade);color:var(--cds-alias-typography-color-450);font-size:12px;font-weight:600;border-bottom:1px solid var(--cds-alias-object-container-border-color);position:relative;white-space:nowrap}
 .datagrid-column+.datagrid-column::before{content:"";position:absolute;left:0;top:25%;height:50%;border-left:1px solid var(--cds-alias-object-border-color)}
+/* No divider around the structural columns (select, expand caret) or a
+   header-less one (row actions): they read as an empty boxed column. */
+.datagrid-column+.datagrid-column.datagrid-select::before,.datagrid-column+.datagrid-column.datagrid-expandable-caret::before,.datagrid-column+.datagrid-column.datagrid-column-blank::before,.datagrid-select+.datagrid-column::before,.datagrid-expandable-caret+.datagrid-column::before{content:none}
 .datagrid-column-flex{display:flex;align-items:center;gap:6px;height:var(--clr-base-dg-row-height)}
 .datagrid-column .sort-icon{color:var(--cds-alias-interaction-action);font-size:11px}
 .datagrid-column button{all:unset;cursor:pointer;display:flex;align-items:center;gap:6px}

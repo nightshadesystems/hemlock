@@ -42,6 +42,23 @@ pub enum SaiError {
     Other(String),
 }
 
+impl SaiError {
+    /// True when the vendor SAI refused the call because the attribute
+    /// (or its whole family) is unimplemented, rather than because the
+    /// request was wrong. Callers that have a software fallback degrade
+    /// on this; every other status stays a hard failure.
+    pub fn is_unsupported(&self) -> bool {
+        let Self::Status { status, .. } = self else {
+            return false;
+        };
+        let magnitude = -(*status as i64);
+        // saistatus.h: NOT_SUPPORTED and NOT_IMPLEMENTED in the simple
+        // family, plus the attribute-indexed ATTR_NOT_IMPLEMENTED (3),
+        // UNKNOWN_ATTRIBUTE (4) and ATTR_NOT_SUPPORTED (5) families.
+        matches!(magnitude, 0x2 | 0xF) || matches!(magnitude >> 16, 3..=5)
+    }
+}
+
 /// A SAI object id for a port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PortId(pub u64);
@@ -175,6 +192,24 @@ mod status_tests {
         assert_eq!(status_name(-0x0001_0002), "INVALID_ATTRIBUTE_2");
         assert_eq!(status_name(-0x0005_0001), "ATTR_NOT_SUPPORTED_1");
         assert!(status_name(-0x0100_0000).starts_with("unknown"));
+    }
+
+    #[test]
+    fn classifies_unsupported_statuses() {
+        use super::SaiError;
+        let status = |status| SaiError::Status {
+            call: "set_bridge_port_attribute(MAX_LEARNED_ADDRESSES)",
+            status,
+        };
+        // What the Helix4 blob returns for MAX_LEARNED_ADDRESSES.
+        assert!(status(-0x0003_0000).is_unsupported());
+        assert!(status(-0x0005_0001).is_unsupported());
+        assert!(status(-0x0004_0000).is_unsupported());
+        assert!(status(-0x2).is_unsupported());
+        assert!(status(-0xF).is_unsupported());
+        assert!(!status(-0x5).is_unsupported());
+        assert!(!status(-0x0001_0000).is_unsupported());
+        assert!(!SaiError::NoSwitch.is_unsupported());
     }
 }
 
