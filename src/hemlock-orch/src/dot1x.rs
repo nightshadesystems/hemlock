@@ -285,7 +285,10 @@ pub fn render_hostapd_conf(port: &str, config: &Config, ctrl_dir: &str) -> Strin
         out.push_str(&format!("auth_server_shared_secret={}\n", radius.key));
     }
     if let Some(first) = config.radius.first() {
-        out.push_str(&format!("radius_retry_primary_interval={}\n", u32::from(first.timeout) * (u32::from(first.retransmit) + 1)));
+        out.push_str(&format!(
+            "radius_retry_primary_interval={}\n",
+            u32::from(first.timeout) * (u32::from(first.retransmit) + 1)
+        ));
     }
     out
 }
@@ -318,11 +321,8 @@ pub async fn run_hostapd(
                 let mut conf_paths = Vec::new();
                 for port in &config.ports {
                     let path = run_dir.join(format!("{port}.conf"));
-                    let text = render_hostapd_conf(
-                        port,
-                        &config,
-                        &run_dir.join("ctrl").to_string_lossy(),
-                    );
+                    let text =
+                        render_hostapd_conf(port, &config, &run_dir.join("ctrl").to_string_lossy());
                     if let Err(err) = write_private(&path, &text) {
                         tracing::warn!(%err, %port, "cannot write hostapd config");
                         continue;
@@ -384,8 +384,7 @@ fn spawn_ctrl_reader(
                     continue;
                 };
                 let mut buffer = [0u8; 1024];
-                loop {
-                    let Ok(n) = stream.recv(&mut buffer) else { break };
+                while let Ok(n) = stream.recv(&mut buffer) {
                     let line = String::from_utf8_lossy(&buffer[..n]);
                     if let Some(event) = parse_ctrl_event(&port, &line) {
                         if events.send(event).is_err() {
@@ -404,10 +403,7 @@ fn spawn_ctrl_reader(
 
 #[cfg(unix)]
 fn attach_ctrl(socket: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixDatagram> {
-    let local = std::env::temp_dir().join(format!(
-        "hemlock-hostapd-{}",
-        std::process::id()
-    ));
+    let local = std::env::temp_dir().join(format!("hemlock-hostapd-{}", std::process::id()));
     let _ = std::fs::remove_file(&local);
     let stream = std::os::unix::net::UnixDatagram::bind(&local)?;
     stream.connect(socket)?;
@@ -486,7 +482,10 @@ mod tests {
     async fn auth_flow_drives_port_flips() {
         let (engine, mut io) = Engine::spawn();
         engine.set_config(config(&["Ethernet10"]));
-        assert_eq!(io.auth_out.recv().await.unwrap(), ("Ethernet10".into(), false));
+        assert_eq!(
+            io.auth_out.recv().await.unwrap(),
+            ("Ethernet10".into(), false)
+        );
         assert!(matches!(
             io.directives.recv().await.unwrap(),
             Directive::Reconfigure(_)
@@ -498,7 +497,10 @@ mod tests {
                 mac: "00:1c:73:0c:aa:10".into(),
             })
             .unwrap();
-        assert_eq!(io.auth_out.recv().await.unwrap(), ("Ethernet10".into(), true));
+        assert_eq!(
+            io.auth_out.recv().await.unwrap(),
+            ("Ethernet10".into(), true)
+        );
         let snapshot = engine.snapshot();
         assert!(snapshot.ports[0].authorized);
         assert_eq!(
@@ -513,7 +515,10 @@ mod tests {
                 mac: "00:1c:73:0c:aa:10".into(),
             })
             .unwrap();
-        assert_eq!(io.auth_out.recv().await.unwrap(), ("Ethernet10".into(), false));
+        assert_eq!(
+            io.auth_out.recv().await.unwrap(),
+            ("Ethernet10".into(), false)
+        );
         assert_eq!(engine.snapshot().ports[0].failures, 0);
 
         // A reauth failure counts and keeps the port unauthorized.
@@ -542,13 +547,20 @@ mod tests {
 
         // Disabling re-authorizes (enforcement entries removed).
         engine.set_config(config(&[]));
-        assert_eq!(io.auth_out.recv().await.unwrap(), ("Ethernet10".into(), true));
+        assert_eq!(
+            io.auth_out.recv().await.unwrap(),
+            ("Ethernet10".into(), true)
+        );
         assert!(engine.snapshot().ports.is_empty());
     }
 
     #[test]
     fn hostapd_conf_renders_wired_authenticator() {
-        let conf = render_hostapd_conf("Ethernet10", &config(&["Ethernet10"]), "/run/hemlock/hostapd/ctrl");
+        let conf = render_hostapd_conf(
+            "Ethernet10",
+            &config(&["Ethernet10"]),
+            "/run/hemlock/hostapd/ctrl",
+        );
         assert!(conf.contains("interface=Ethernet10\n"));
         assert!(conf.contains("driver=wired\n"));
         assert!(conf.contains("ieee8021x=1\n"));
@@ -580,6 +592,9 @@ mod tests {
                 mac: "00:1c:73:0c:aa:10".into()
             })
         );
-        assert_eq!(parse_ctrl_event("Ethernet10", "<3>CTRL-EVENT-CONNECTED"), None);
+        assert_eq!(
+            parse_ctrl_event("Ethernet10", "<3>CTRL-EVENT-CONNECTED"),
+            None
+        );
     }
 }

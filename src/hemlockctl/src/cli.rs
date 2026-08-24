@@ -337,8 +337,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
                     crate::routing::cmd::clear_routing(&endpoints.orch, &words[2..]).await?;
                 }
                 Some("acl") => {
-                    crate::security::cmd::clear_acl_counters(&endpoints.syncd, &words[2..])
-                        .await?;
+                    crate::security::cmd::clear_acl_counters(&endpoints.syncd, &words[2..]).await?;
                 }
                 Some("copp") => {
                     crate::security::cmd::clear_copp_counters(&endpoints.syncd, &words[2..])
@@ -716,7 +715,9 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("                    source-port|destination-port|dscp|log|police rate <r> burst <b>|");
             println!("                    source-mac|destination-mac|ethertype ...]");
             println!("  set security copp class <name> [rate <pps> | burst <pkts>]");
-            println!("  set security dot1x radius-server <ip> [key <secret>|port|timeout|retransmit]");
+            println!(
+                "  set security dot1x radius-server <ip> [key <secret>|port|timeout|retransmit]"
+            );
             println!("  set security dot1x reauth-interval <0|60-86400>");
             println!("  set security dhcp-snooping [vlan <id> | binding <mac> vlan <id> address <ip> interface <port>]");
             println!("  set security arp-inspection [vlan <id> | validate <src-mac|dst-mac|ip>]");
@@ -932,7 +933,11 @@ async fn config_port_security(
 }
 
 /// `set|delete security <acl|copp|dot1x|dhcp-snooping|arp-inspection> ...`.
-async fn config_security(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+async fn config_security(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
     if delete && words.is_empty() {
         return edit_config(endpoints, |tree| {
@@ -973,9 +978,9 @@ async fn config_security(endpoints: &Endpoints, words: &[&str], delete: bool) ->
 /// Remove an emptied `security { <sub> { ... } }` chain bottom-up.
 fn prune_security(tree: &mut hemlock_config::ConfigTree) {
     let security = tree.block_mut("security");
-    security.retain(|item| {
-        !matches!(item, hemlock_config::Item::Block { children, .. } if children.is_empty())
-    });
+    security.retain(
+        |item| !matches!(item, hemlock_config::Item::Block { children, .. } if children.is_empty()),
+    );
     remove_block_if_empty(tree, "security");
 }
 
@@ -1183,9 +1188,7 @@ async fn config_acl(endpoints: &Endpoints, words: &[&str], delete: bool) -> Resu
             if delete {
                 ("police".into(), vec![])
             } else {
-                let [kw_rate, rate, kw_burst, burst] =
-                    body.get(1..5).unwrap_or_default()
-                else {
+                let [kw_rate, rate, kw_burst, burst] = body.get(1..5).unwrap_or_default() else {
                     return Err(rule_usage("police rate <bps|pps> burst <bytes|pkts>"));
                 };
                 resolve(kw_rate, &["rate"])?;
@@ -1288,7 +1291,8 @@ fn prune_security_rules_only(tree: &mut hemlock_config::ConfigTree) {
 /// `set|delete security copp class <name> [rate <pps> | burst <pkts>]`.
 async fn config_copp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
-    let usage = move || format!("% Usage: {verb} security copp class <name> [rate <pps> | burst <pkts>]");
+    let usage =
+        move || format!("% Usage: {verb} security copp class <name> [rate <pps> | burst <pkts>]");
     let Some(first) = words.first() else {
         if delete {
             return edit_config(endpoints, |tree| {
@@ -1349,7 +1353,9 @@ async fn config_copp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
         .map_err(fmt_err);
     }
     let Some(value) = rest.get(1) else {
-        return Err(format!("% Usage: set security copp class {class} {knob} <n>"));
+        return Err(format!(
+            "% Usage: set security copp class {class} {knob} <n>"
+        ));
     };
     let value = if knob == "rate" {
         int_arg::<u32>(value, 1..=10_000_000, "rate")?.to_string()
@@ -1431,8 +1437,7 @@ async fn config_dot1x(endpoints: &Endpoints, words: &[&str], delete: bool) -> Re
             if rest.is_empty() {
                 return if delete {
                     edit_config(endpoints, move |tree| {
-                        let Some(security) = block_children_mut(&mut tree.items, "security")
-                        else {
+                        let Some(security) = block_children_mut(&mut tree.items, "security") else {
                             return;
                         };
                         if let Some(dot1x) = block_children_mut(security, "dot1x") {
@@ -1563,8 +1568,13 @@ async fn config_dhcp_snooping(
     };
     let Some(first) = words.first() else {
         if delete {
-            return edit_security_feature(endpoints, "dhcp-snooping", true, Box::new(|b| b.clear()))
-                .await;
+            return edit_security_feature(
+                endpoints,
+                "dhcp-snooping",
+                true,
+                Box::new(|b| b.clear()),
+            )
+            .await;
         }
         return Err(usage());
     };
@@ -1973,9 +1983,7 @@ async fn config_interfaces(
                     }
                 }
                 None if !delete => {
-                    return Err(format!(
-                        "% Usage: set interfaces {port} {feature} trust"
-                    ));
+                    return Err(format!("% Usage: set interfaces {port} {feature} trust"));
                 }
                 None => {}
             }

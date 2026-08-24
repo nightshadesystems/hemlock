@@ -1222,8 +1222,7 @@ fn valid_acl_name(name: &str) -> bool {
         Some(c) if c.is_ascii_alphabetic() => {}
         _ => return false,
     }
-    name.len() <= 32
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    name.len() <= 32 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// `acl { <ipv4|ipv6|mac> <name> { rule <n> { ... } } }`.
@@ -1407,9 +1406,7 @@ fn acl_rule(
                     pps,
                 });
             }
-            ("source-mac", [value]) | ("destination-mac", [value])
-                if family == AclFamily::Mac =>
-            {
+            ("source-mac", [value]) | ("destination-mac", [value]) if family == AclFamily::Mac => {
                 let (mac_text, mask_text) = match value.split_once('/') {
                     Some((mac, mask)) => (mac, Some(mask)),
                     None => (value.as_str(), None),
@@ -1434,7 +1431,9 @@ fn acl_rule(
                         .strip_prefix("0x")
                         .and_then(|h| u16::from_str_radix(h, 16).ok())
                         .ok_or_else(|| {
-                            bad(format!("bad ethertype {hex:?} (0x0000-0xffff|ipv4|ipv6|arp)"))
+                            bad(format!(
+                                "bad ethertype {hex:?} (0x0000-0xffff|ipv4|ipv6|arp)"
+                            ))
                         })?,
                 });
             }
@@ -1475,9 +1474,7 @@ fn copp(items: &[Item], intents: &mut Intents) -> Result<(), IntentError> {
             )));
         };
         if name != "class" {
-            return Err(IntentError::BadCopp(format!(
-                "unrecognized block {name:?}"
-            )));
+            return Err(IntentError::BadCopp(format!("unrecognized block {name:?}")));
         }
         let [class] = keys.as_slice() else {
             return Err(IntentError::BadCopp("class block needs a name key".into()));
@@ -1535,10 +1532,7 @@ fn dot1x(items: &[Item]) -> Result<Dot1xIntent, IntentError> {
                     |reason: String| IntentError::BadDot1x(format!("radius-server {ip}: {reason}"));
                 for item in children {
                     let Item::Leaf { name, values } = item else {
-                        return Err(bad_server(format!(
-                            "unrecognized block {:?}",
-                            item.name()
-                        )));
+                        return Err(bad_server(format!("unrecognized block {:?}", item.name())));
                     };
                     match (name.as_str(), values.as_slice()) {
                         ("key", [key]) => server.key = Some(key.clone()),
@@ -1575,10 +1569,7 @@ fn dot1x(items: &[Item]) -> Result<Dot1xIntent, IntentError> {
                 intent.reauth_interval = secs;
             }
             other => {
-                return Err(bad(format!(
-                    "unrecognized statement {:?}",
-                    other.name()
-                )));
+                return Err(bad(format!("unrecognized statement {:?}", other.name())));
             }
         }
     }
@@ -1645,9 +1636,7 @@ fn arp_inspection(items: &[Item], intents: &mut Intents) -> Result<(), IntentErr
                     "dst-mac" => ArpValidate::DstMac,
                     "ip" => ArpValidate::Ip,
                     other => {
-                        return Err(bad(format!(
-                            "bad validate {other:?} (src-mac|dst-mac|ip)"
-                        )));
+                        return Err(bad(format!("bad validate {other:?} (src-mac|dst-mac|ip)")));
                     }
                 };
                 intents.snoop_sec.validate.insert(check);
@@ -1891,13 +1880,7 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
         .filter(|(_, p)| p.dot1x)
         .map(|(n, _)| n)
         .collect();
-    if !dot1x_ports.is_empty()
-        && !intents
-            .dot1x
-            .radius_servers
-            .iter()
-            .any(|s| s.key.is_some())
-    {
+    if !dot1x_ports.is_empty() && !intents.dot1x.radius_servers.iter().any(|s| s.key.is_some()) {
         return Err(IntentError::BadDot1x(
             "radius-server with key is required".into(),
         ));
@@ -2023,12 +2006,22 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
         };
         for (name, port) in &intents.ports {
             check(name, "dhcp-snooping", port.dhcp_snooping_trust, &snooped);
-            check(name, "arp-inspection", port.arp_inspection_trust, &inspected);
+            check(
+                name,
+                "arp-inspection",
+                port.arp_inspection_trust,
+                &inspected,
+            );
         }
         for (group, lag) in &intents.lags {
             let name = format!("Port-Channel{group}");
             check(&name, "dhcp-snooping", lag.dhcp_snooping_trust, &snooped);
-            check(&name, "arp-inspection", lag.arp_inspection_trust, &inspected);
+            check(
+                &name,
+                "arp-inspection",
+                lag.arp_inspection_trust,
+                &inspected,
+            );
         }
     }
     intents.warnings.extend(trust_notes);
@@ -4247,8 +4240,16 @@ impl AclBindingChange {
 
     pub fn describe(&self) -> String {
         match &self.acl {
-            Some(acl) => format!("access-group {acl} applied to {} ({})", self.target, self.direction()),
-            None => format!("access-group removed from {} ({})", self.target, self.direction()),
+            Some(acl) => format!(
+                "access-group {acl} applied to {} ({})",
+                self.target,
+                self.direction()
+            ),
+            None => format!(
+                "access-group removed from {} ({})",
+                self.target,
+                self.direction()
+            ),
         }
     }
 }
@@ -6109,10 +6110,18 @@ interfaces {
         let radius = &intents.dot1x.radius_servers;
         assert_eq!(radius.len(), 1);
         assert_eq!(radius[0].key.as_deref(), Some("s3cret"));
-        assert_eq!((radius[0].port, radius[0].timeout, radius[0].retransmit), (1812, 5, 3));
+        assert_eq!(
+            (radius[0].port, radius[0].timeout, radius[0].retransmit),
+            (1812, 5, 3)
+        );
         assert_eq!(intents.dot1x.reauth_interval, 3600);
         assert_eq!(
-            intents.snoop_sec.dhcp_vlans.iter().copied().collect::<Vec<_>>(),
+            intents
+                .snoop_sec
+                .dhcp_vlans
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
             vec![10, 20]
         );
         assert!(intents.snoop_sec.arp_vlans.contains(&10));
@@ -6139,34 +6148,56 @@ interfaces {
     #[test]
     fn acl_validation() {
         // A rule needs permit or deny by commit.
-        let tree =
-            parse("security { acl { ipv4 A { rule 10 { protocol tcp } } } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        let tree = parse("security { acl { ipv4 A { rule 10 { protocol tcp } } } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAclRule { .. })
+        ));
         // L4 ports require tcp or udp.
         let tree =
             parse("security { acl { ipv4 A { rule 10 { permit\ndestination-port 443 } } } }")
                 .unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAclRule { .. })
+        ));
         // Prefixes must be canonical, in the ACL's family.
         let tree =
             parse("security { acl { ipv4 A { rule 10 { permit\nsource 10.0.0.1/8 } } } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
-        let tree = parse("security { acl { ipv4 A { rule 10 { permit\nsource 2001:db8::/32 } } } }")
-            .unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
-        // MAC fields don't ride IP families and vice versa.
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAclRule { .. })
+        ));
         let tree =
-            parse("security { acl { ipv4 A { rule 10 { permit\nsource-mac 00:00:5e:00:00:01 } } } }")
+            parse("security { acl { ipv4 A { rule 10 { permit\nsource 2001:db8::/32 } } } }")
                 .unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAclRule { .. })
+        ));
+        // MAC fields don't ride IP families and vice versa.
+        let tree = parse(
+            "security { acl { ipv4 A { rule 10 { permit\nsource-mac 00:00:5e:00:00:01 } } } }",
+        )
+        .unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAclRule { .. })
+        ));
         let tree = parse("security { acl { mac A { rule 10 { permit\ndscp 10 } } } }").unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAclRule { .. })
+        ));
         // A pps rate takes its burst in packets.
         let tree = parse(
             "security { acl { ipv4 A { rule 10 { permit\npolice rate 2000pps burst 256k } } } }",
         )
         .unwrap();
-        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAclRule { .. })
+        ));
         // Names: letter first; unique across families.
         let tree = parse("security { acl { ipv4 9BAD { } } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadAcl { .. })));
@@ -6249,7 +6280,10 @@ interfaces {
         )
         .unwrap();
         let intents = extract(&tree).unwrap();
-        assert!(intents.warnings.iter().any(|w| w.contains("trust has no effect")));
+        assert!(intents
+            .warnings
+            .iter()
+            .any(|w| w.contains("trust has no effect")));
         // CoPP classes are the fixed set.
         let tree = parse("security { copp { class banana { rate 1 } } }").unwrap();
         assert!(matches!(extract(&tree), Err(IntentError::BadCopp(_))));
@@ -6284,20 +6318,15 @@ interfaces {
 
         // Drop a binding and add another: one unbind, one bind.
         candidate.ports.get_mut("Ethernet1").unwrap().access_groups = AccessGroups::default();
-        candidate
-            .lags
-            .get_mut(&1)
-            .unwrap()
-            .access_groups
-            .egress = Some("MGMT6-IN".into());
+        candidate.lags.get_mut(&1).unwrap().access_groups.egress = Some("MGMT6-IN".into());
         let changes = diff_acl_bindings(&running, &candidate);
         assert_eq!(changes.len(), 2);
         assert!(changes
             .iter()
             .any(|c| c.target == "Ethernet1" && !c.egress && c.acl.is_none()));
-        assert!(changes
-            .iter()
-            .any(|c| c.target == "Port-Channel1" && c.egress && c.acl.as_deref() == Some("MGMT6-IN")));
+        assert!(changes.iter().any(|c| c.target == "Port-Channel1"
+            && c.egress
+            && c.acl.as_deref() == Some("MGMT6-IN")));
 
         // A dropped CoPP override restores the compiled default.
         candidate.copp.remove("bpdu");

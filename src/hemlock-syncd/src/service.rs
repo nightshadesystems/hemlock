@@ -5155,11 +5155,7 @@ lanes = [1, 2]
         assert_eq!(state.acls[0].matches.len(), 4);
         assert_eq!(state.acls[0].bindings.len(), 1);
         assert_eq!(state.acls[0].bindings[0].port, "Ethernet1");
-        let tcam_ingress = state
-            .tcam
-            .iter()
-            .find(|t| t.stage == ingress)
-            .unwrap();
+        let tcam_ingress = state.tcam.iter().find(|t| t.stage == ingress).unwrap();
         assert_eq!(tcam_ingress.used, 5);
         assert_eq!(tcam_ingress.available, 507);
 
@@ -5437,9 +5433,15 @@ lanes = [1, 2]
             mac,
             port: Some(port_id),
         };
-        injector.send(learn([0, 0x50, 0x56, 0xbe, 0xef, 1])).unwrap();
-        injector.send(learn([0, 0x50, 0x56, 0xbe, 0xef, 2])).unwrap();
-        injector.send(learn([0, 0x50, 0x56, 0xbe, 0xef, 3])).unwrap();
+        injector
+            .send(learn([0, 0x50, 0x56, 0xbe, 0xef, 1]))
+            .unwrap();
+        injector
+            .send(learn([0, 0x50, 0x56, 0xbe, 0xef, 2]))
+            .unwrap();
+        injector
+            .send(learn([0, 0x50, 0x56, 0xbe, 0xef, 3]))
+            .unwrap();
         for _ in 0..200 {
             let done = {
                 let table = handle.port_security.read().unwrap();

@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use hemlock_platform::PortDef;
-use hemlock_sai::{AclFamily, AclFields, AclPacketAction, AclStage, Oid, PolicerSpec, PolicerStats, PortId, StormClass};
+use hemlock_sai::{
+    AclFamily, AclFields, AclPacketAction, AclStage, Oid, PolicerSpec, PolicerStats, PortId,
+    StormClass,
+};
 
 /// One front-panel port: manifest definition + live ASIC state + the
 /// operator-facing attributes syncd tracks (description, L3 mode).

@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 use hemlock_platform::Platform;
 use hemlock_sai::{
-    AclAction, AclFamily, AclFields, AclStage, FdbAction, FdbEventKind, IpPrefix, Oid,
-    PolicerSpec, PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend,
-    SaiCapabilities, SaiError, SaiEvent, StormClass, StpPortState, SwitchInfo, TrapKind,
+    AclAction, AclFamily, AclFields, AclStage, FdbAction, FdbEventKind, IpPrefix, Oid, PolicerSpec,
+    PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities,
+    SaiError, SaiEvent, StormClass, StpPortState, SwitchInfo, TrapKind,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -1445,6 +1445,19 @@ fn init_switch(
         }
     }
 
+    // The enumeration above predates admin-up, so its oper state is
+    // stale by construction. Re-read it: any link that came up during
+    // admin-up notifies asynchronously, and that event races this
+    // seeding. Later transitions still arrive via PortOperStatus.
+    if let Ok(fresh) = backend.ports() {
+        let oper: HashMap<PortId, bool> = fresh.iter().map(|p| (p.id, p.oper_up)).collect();
+        for p in ports.values_mut() {
+            if let Some(up) = oper.get(&p.sai_id) {
+                p.oper_up = *up;
+            }
+        }
+    }
+
     // Host services: CPU punt traps plus one kernel netdev per port
     // (named after it), so ARP and traffic to the switch's own
     // addresses reach the Linux stack and replies transmit raw out the
@@ -1481,8 +1494,7 @@ async fn pump_events(
     while let Some(event) = sai_events.recv().await {
         match event {
             SaiEvent::LearnLimitViolation { port, mac } => {
-                let Some(name) = ports.read().ok().and_then(|table| name_for(&table, port))
-                else {
+                let Some(name) = ports.read().ok().and_then(|table| name_for(&table, port)) else {
                     warn!(%port, "learn-limit violation on unknown port");
                     continue;
                 };

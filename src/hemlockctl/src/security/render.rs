@@ -50,11 +50,7 @@ pub fn acl(state: &AclState) -> String {
         if i > 0 {
             out.blank();
         }
-        out.line(format!(
-            "{} access list {}",
-            acl.family_display(),
-            acl.name
-        ));
+        out.line(format!("{} access list {}", acl.family_display(), acl.name));
         for rule in &acl.rules {
             out.line(rule_line(rule));
         }
@@ -161,7 +157,13 @@ pub fn copp(state: &CoppState) -> String {
     );
     out.row(
         &COLS,
-        &["--------", "----------", "-----", "-------------", "--------"],
+        &[
+            "--------",
+            "----------",
+            "-----",
+            "-------------",
+            "--------",
+        ],
     );
     for class in &state.classes {
         let name = if class.overridden {
@@ -201,7 +203,14 @@ pub fn port_security(rows: &[PortSecurityEntry]) -> String {
     let mut out = Text::new();
     out.row(
         &COLS,
-        &["Port", "Max", "Learned", "Violation", "Action", "Last Violation"],
+        &[
+            "Port",
+            "Max",
+            "Learned",
+            "Violation",
+            "Action",
+            "Last Violation",
+        ],
     );
     out.row(
         &COLS,
@@ -328,7 +337,10 @@ pub fn dhcp_snooping(dhcp: &DhcpSnooping) -> String {
             vlan_list(&dhcp.vlans)
         ));
     }
-    out.line(format!("Trusted interfaces: {}", trusted_list(&dhcp.trusted)));
+    out.line(format!(
+        "Trusted interfaces: {}",
+        trusted_list(&dhcp.trusted)
+    ));
     out.finish()
 }
 
@@ -369,7 +381,11 @@ pub fn dhcp_snooping_binding(bindings: &[SnoopBinding]) -> String {
             .lease_secs
             .map(|secs| secs.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let kind = if binding.is_static { "static" } else { "dynamic" };
+        let kind = if binding.is_static {
+            "static"
+        } else {
+            "dynamic"
+        };
         out.row(
             &COLS,
             &[
@@ -420,7 +436,10 @@ pub fn arp_inspection(arp: &ArpInspection) -> String {
         ));
     }
     out.line(format!("Validate: {}", arp.validate.join(", ")));
-    out.line(format!("Trusted interfaces: {}", trusted_list(&arp.trusted)));
+    out.line(format!(
+        "Trusted interfaces: {}",
+        trusted_list(&arp.trusted)
+    ));
     out.blank();
     dai_stats_table(&mut out, &arp.statistics);
     out.finish()

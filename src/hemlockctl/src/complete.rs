@@ -249,10 +249,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set", "interfaces", PORT, "port-security", "violation"]) => {
             &["protect", "shutdown"]
         }
-        (
-            CliMode::Config,
-            ["set", "interfaces", PORT, "dhcp-snooping" | "arp-inspection"],
-        ) => &["trust"],
+        (CliMode::Config, ["set", "interfaces", PORT, "dhcp-snooping" | "arp-inspection"]) => {
+            &["trust"]
+        }
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "vrrp"]) => &[NUM],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "vrrp", NUM]) => &[
             "address",
@@ -433,21 +432,14 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set", "switching", "mirror", "session", NUM, "source", PORT]) => {
             &["rx", "tx", "both"]
         }
-        (CliMode::Config, ["set" | "delete", "security"]) => &[
-            "acl",
-            "copp",
-            "dot1x",
-            "dhcp-snooping",
-            "arp-inspection",
-        ],
-        (CliMode::Config, ["set" | "delete", "security", "acl"]) => &["ipv4", "ipv6", "mac"],
-        (CliMode::Config, ["set" | "delete", "security", "acl", "ipv4" | "ipv6" | "mac"]) => {
-            &[ACL]
+        (CliMode::Config, ["set" | "delete", "security"]) => {
+            &["acl", "copp", "dot1x", "dhcp-snooping", "arp-inspection"]
         }
-        (
-            CliMode::Config,
-            ["set" | "delete", "security", "acl", "ipv4" | "ipv6" | "mac", ACL],
-        ) => &["rule"],
+        (CliMode::Config, ["set" | "delete", "security", "acl"]) => &["ipv4", "ipv6", "mac"],
+        (CliMode::Config, ["set" | "delete", "security", "acl", "ipv4" | "ipv6" | "mac"]) => &[ACL],
+        (CliMode::Config, ["set" | "delete", "security", "acl", "ipv4" | "ipv6" | "mac", ACL]) => {
+            &["rule"]
+        }
         (
             CliMode::Config,
             ["set" | "delete", "security", "acl", "ipv4" | "ipv6" | "mac", ACL, "rule"],
@@ -491,9 +483,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "bpdu", "lacp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
             "acl-log", "default",
         ],
-        (CliMode::Config, ["set" | "delete", "security", "copp", "class", _]) => {
-            &["rate", "burst"]
-        }
+        (CliMode::Config, ["set" | "delete", "security", "copp", "class", _]) => &["rate", "burst"],
         (CliMode::Config, ["set" | "delete", "security", "dot1x"]) => {
             &["radius-server", "reauth-interval"]
         }
@@ -501,17 +491,14 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set" | "delete", "security", "dot1x", "radius-server", ANY]) => {
             &["key", "port", "timeout", "retransmit"]
         }
-        (CliMode::Config, ["set" | "delete", "security", "dhcp-snooping"]) => {
-            &["vlan", "binding"]
-        }
+        (CliMode::Config, ["set" | "delete", "security", "dhcp-snooping"]) => &["vlan", "binding"],
         (CliMode::Config, ["set" | "delete", "security", "dhcp-snooping", "vlan"]) => &[NUM],
         (CliMode::Config, ["set" | "delete", "security", "dhcp-snooping", "binding"]) => &[ANY],
         (CliMode::Config, ["set", "security", "dhcp-snooping", "binding", ANY]) => &["vlan"],
         (CliMode::Config, ["set", "security", "dhcp-snooping", "binding", ANY, "vlan"]) => &[NUM],
-        (
-            CliMode::Config,
-            ["set", "security", "dhcp-snooping", "binding", ANY, "vlan", NUM],
-        ) => &["address"],
+        (CliMode::Config, ["set", "security", "dhcp-snooping", "binding", ANY, "vlan", NUM]) => {
+            &["address"]
+        }
         (
             CliMode::Config,
             ["set", "security", "dhcp-snooping", "binding", ANY, "vlan", NUM, "address"],
@@ -770,7 +757,14 @@ mod tests {
         // ACL names complete from the candidate cache; `summary` shares
         // the level.
         let c = candidates_with_acls(CliMode::Operational, &["show", "acl"], "", &ports(), &acls);
-        assert_eq!(c, vec!["summary".to_string(), "EDGE-IN".to_string(), "MGMT6-IN".to_string()]);
+        assert_eq!(
+            c,
+            vec![
+                "summary".to_string(),
+                "EDGE-IN".to_string(),
+                "MGMT6-IN".to_string()
+            ]
+        );
         let c = candidates_with_acls(CliMode::Operational, &["show", "acl"], "E", &ports(), &acls);
         assert_eq!(c, vec!["EDGE-IN".to_string()]);
         // A binding's name slot completes too, and the direction follows

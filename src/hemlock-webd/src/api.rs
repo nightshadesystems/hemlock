@@ -1462,8 +1462,7 @@ async fn acls(
                     })
                 })
                 .collect();
-            let total: u64 =
-                acl.matches.iter().sum::<u64>() + acl.implicit_deny_matches;
+            let total: u64 = acl.matches.iter().sum::<u64>() + acl.implicit_deny_matches;
             json!({
                 "name": acl.name,
                 "family": acl_family_word(acl.family),

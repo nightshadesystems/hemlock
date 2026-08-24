@@ -138,12 +138,9 @@ impl Engine {
                             .unwrap_or(false)
                     });
                     if bound_polices && !caps.acl_entry_policer {
-                        anyhow::bail!(
-                            "per-rule policers are not supported by this platform's SAI"
-                        );
+                        anyhow::bail!("per-rule policers are not supported by this platform's SAI");
                     }
-                    if !intents::port_security_state(&wanted).is_empty() && !caps.port_learn_limit
-                    {
+                    if !intents::port_security_state(&wanted).is_empty() && !caps.port_learn_limit {
                         anyhow::bail!("port-security is not supported by this platform's SAI");
                     }
                     if !wanted.copp.is_empty() && !caps.copp {

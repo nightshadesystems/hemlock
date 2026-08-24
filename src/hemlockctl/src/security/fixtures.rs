@@ -208,16 +208,15 @@ pub fn dot1x_state() -> Dot1xState {
 /// DHCP snooping on VLANs 10/20 with two dynamic and one static
 /// binding, ARP inspection on VLAN 10.
 pub fn snoop_state() -> SnoopState {
-    let binding = |mac: &str, ip: &str, lease_secs: Option<u64>, vlan: u32, interface: &str| {
-        SnoopBinding {
+    let binding =
+        |mac: &str, ip: &str, lease_secs: Option<u64>, vlan: u32, interface: &str| SnoopBinding {
             mac: mac.into(),
             ip: ip.into(),
             is_static: lease_secs.is_none(),
             lease_secs,
             vlan,
             interface: interface.into(),
-        }
-    };
+        };
     SnoopState {
         dhcp: DhcpSnooping {
             vlans: vec![10, 20],

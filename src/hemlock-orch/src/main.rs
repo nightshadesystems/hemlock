@@ -576,17 +576,14 @@ impl Orch for OrchService {
                 "dst-mac" => snoopsec::Validate::DstMac,
                 "ip" => snoopsec::Validate::Ip,
                 other => {
-                    return Err(Status::invalid_argument(format!(
-                        "bad validate {other:?}"
-                    )));
+                    return Err(Status::invalid_argument(format!("bad validate {other:?}")));
                 }
             });
         }
         for binding in req.static_bindings {
-            let ip: std::net::Ipv4Addr = binding
-                .address
-                .parse()
-                .map_err(|_| Status::invalid_argument(format!("bad address {:?}", binding.address)))?;
+            let ip: std::net::Ipv4Addr = binding.address.parse().map_err(|_| {
+                Status::invalid_argument(format!("bad address {:?}", binding.address))
+            })?;
             config.statics.insert(
                 (binding.mac, vlan16(binding.vlan)?),
                 snoopsec::StaticBinding {
@@ -665,9 +662,7 @@ impl Orch for OrchService {
         let mac = if mac.is_empty() {
             None
         } else {
-            Some(
-                hemlock_common::net::parse_mac(&mac).map_err(Status::invalid_argument)?,
-            )
+            Some(hemlock_common::net::parse_mac(&mac).map_err(Status::invalid_argument)?)
         };
         Ok(Response::new(pb::ClearSnoopBindingResponse {
             cleared: self.snoopsec.clear_bindings(mac.as_deref()),
@@ -765,9 +760,9 @@ async fn main() -> Result<()> {
     let (igmp_engine, igmp_io) = snoop::Engine::spawn(snoop::Family::Igmp, system_mac);
     let (mld_engine, mld_io) = snoop::Engine::spawn(snoop::Family::Mld, system_mac);
     let (dot1x_engine, dot1x_io) = dot1x::Engine::spawn();
-    let (snoopsec_engine, snoopsec_io) = snoopsec::Engine::spawn(Some(
-        std::path::PathBuf::from("/var/lib/hemlock/dhcp-bindings.json"),
-    ));
+    let (snoopsec_engine, snoopsec_io) = snoopsec::Engine::spawn(Some(std::path::PathBuf::from(
+        "/var/lib/hemlock/dhcp-bindings.json",
+    )));
 
     // Gates -> syncd SetLagMembers; STP states -> SetPortStpState;
     // BPDU-guard trips -> SetPortErrdisable; snooping group/mrouter
@@ -1240,10 +1235,8 @@ async fn watch_vlans(
                 > = std::collections::BTreeMap::new();
                 for iface in &response.interfaces {
                     if iface.kind == "port-channel" {
-                        po_members.insert(
-                            iface.name.clone(),
-                            iface.members.iter().cloned().collect(),
-                        );
+                        po_members
+                            .insert(iface.name.clone(), iface.members.iter().cloned().collect());
                     }
                 }
                 let mut physical_vlan_ports: std::collections::BTreeMap<
@@ -1262,9 +1255,15 @@ async fn watch_vlans(
                     } else {
                         iface.access_vlan
                     };
-                    vlans.push(u16::try_from(if untagged == 0 { 1 } else { untagged }).unwrap_or(1));
+                    vlans
+                        .push(u16::try_from(if untagged == 0 { 1 } else { untagged }).unwrap_or(1));
                     if iface.switchport_mode == "trunk" {
-                        vlans.extend(iface.trunk_vlans.iter().filter_map(|v| u16::try_from(*v).ok()));
+                        vlans.extend(
+                            iface
+                                .trunk_vlans
+                                .iter()
+                                .filter_map(|v| u16::try_from(*v).ok()),
+                        );
                     }
                     let targets: Vec<String> = if iface.kind == "port-channel" {
                         iface.members.clone()

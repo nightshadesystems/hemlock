@@ -2172,8 +2172,8 @@ impl SaiBackend for VendorSai {
         // probe individually (Helix4's egress TCAM is optional in some
         // SAI builds).
         // SAFETY: null check before the fn-pointer presence read.
-        let acl_fns = !self.acl_api.is_null()
-            && unsafe { (*self.acl_api).create_acl_table.is_some() };
+        let acl_fns =
+            !self.acl_api.is_null() && unsafe { (*self.acl_api).create_acl_table.is_some() };
         let acl_ingress = acl_fns
             && self.attr_supported(
                 object::SAI_OBJECT_TYPE_PORT,
@@ -2199,8 +2199,7 @@ impl SaiBackend for VendorSai {
             true,
         );
         // SAFETY: valid hostif api table (fn-pointer presence read).
-        let copp = policer_fns
-            && unsafe { (*self.hostif_api).create_hostif_trap_group.is_some() };
+        let copp = policer_fns && unsafe { (*self.hostif_api).create_hostif_trap_group.is_some() };
 
         Ok(SaiCapabilities {
             lag: self.attr_supported(
@@ -3057,8 +3056,7 @@ impl SaiBackend for VendorSai {
             ffi::_sai_acl_range_type_t::SAI_ACL_RANGE_TYPE_L4_DST_PORT_RANGE as i32,
         ];
         if family != AclFamily::Mac {
-            let mut range_attr =
-                Self::zeroed_attr(attr::SAI_ACL_TABLE_ATTR_FIELD_ACL_RANGE_TYPE);
+            let mut range_attr = Self::zeroed_attr(attr::SAI_ACL_TABLE_ATTR_FIELD_ACL_RANGE_TYPE);
             range_attr.value.s32list.count = range_types.len() as u32;
             range_attr.value.s32list.list = range_types.as_mut_ptr();
             attrs.push(range_attr);
@@ -3120,7 +3118,11 @@ impl SaiBackend for VendorSai {
             a.value.aclfield.enable = true;
             match ip.0 {
                 std::net::IpAddr::V4(v4) => {
-                    let mask: u32 = if ip.1 == 0 { 0 } else { u32::MAX << (32 - ip.1) };
+                    let mask: u32 = if ip.1 == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - ip.1)
+                    };
                     a.value.aclfield.data.ip4 = u32::from_ne_bytes(v4.octets());
                     a.value.aclfield.mask.ip4 = mask.to_be();
                 }
@@ -3305,9 +3307,9 @@ impl SaiBackend for VendorSai {
         let api = self.acl_api()?;
         // SAFETY: valid acl api table; attrs outlive the calls.
         let set = unsafe {
-            (*api)
-                .set_acl_entry_attribute
-                .ok_or(SaiError::Other("acl api lacks set_acl_entry_attribute".into()))?
+            (*api).set_acl_entry_attribute.ok_or(SaiError::Other(
+                "acl api lacks set_acl_entry_attribute".into(),
+            ))?
         };
         use ffi::_sai_acl_entry_attr_t as attr;
         let mut action_attr = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION);
@@ -3403,7 +3405,10 @@ impl SaiBackend for VendorSai {
             ))?;
             let mut attr =
                 Self::zeroed_attr(ffi::_sai_acl_counter_attr_t::SAI_ACL_COUNTER_ATTR_PACKETS);
-            check("get_acl_counter_attribute(PACKETS)", get(counter.0, 1, &mut attr))?;
+            check(
+                "get_acl_counter_attribute(PACKETS)",
+                get(counter.0, 1, &mut attr),
+            )?;
             Ok(attr.value.u64_)
         }
     }
@@ -3524,7 +3529,12 @@ impl SaiBackend for VendorSai {
         unsafe {
             check(
                 "get_policer_stats(GREEN/RED_PACKETS)",
-                get_stats(policer.0, ids.len() as u32, ids.as_ptr(), values.as_mut_ptr()),
+                get_stats(
+                    policer.0,
+                    ids.len() as u32,
+                    ids.as_ptr(),
+                    values.as_mut_ptr(),
+                ),
             )?;
         }
         Ok(PolicerStats {
@@ -3595,8 +3605,9 @@ impl SaiBackend for VendorSai {
             };
             use ffi::_sai_hostif_user_defined_trap_attr_t as attr;
             let mut type_attr = Self::zeroed_attr(attr::SAI_HOSTIF_USER_DEFINED_TRAP_ATTR_TYPE);
-            type_attr.value.s32 = ffi::_sai_hostif_user_defined_trap_type_t::SAI_HOSTIF_USER_DEFINED_TRAP_TYPE_ACL
-                as i32;
+            type_attr.value.s32 =
+                ffi::_sai_hostif_user_defined_trap_type_t::SAI_HOSTIF_USER_DEFINED_TRAP_TYPE_ACL
+                    as i32;
             let mut group_attr =
                 Self::zeroed_attr(attr::SAI_HOSTIF_USER_DEFINED_TRAP_ATTR_TRAP_GROUP);
             group_attr.value.oid = if group.0 == 0 {
@@ -3620,7 +3631,9 @@ impl SaiBackend for VendorSai {
         let create = unsafe {
             (*self.hostif_api)
                 .create_hostif_trap
-                .ok_or(SaiError::Other("hostif api lacks create_hostif_trap".into()))?
+                .ok_or(SaiError::Other(
+                    "hostif api lacks create_hostif_trap".into(),
+                ))?
         };
         use ffi::_sai_hostif_trap_attr_t as attr;
         let mut type_attr = Self::zeroed_attr(attr::SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE);
@@ -3655,11 +3668,12 @@ impl SaiBackend for VendorSai {
         if self.user_traps.remove(&trap.0) {
             // SAFETY: valid hostif api table.
             return unsafe {
-                let remove = (*self.hostif_api)
-                    .remove_hostif_user_defined_trap
-                    .ok_or(SaiError::Other(
-                        "hostif api lacks remove_hostif_user_defined_trap".into(),
-                    ))?;
+                let remove =
+                    (*self.hostif_api)
+                        .remove_hostif_user_defined_trap
+                        .ok_or(SaiError::Other(
+                            "hostif api lacks remove_hostif_user_defined_trap".into(),
+                        ))?;
                 check("remove_hostif_user_defined_trap", remove(trap.0))
             };
         }
@@ -3667,7 +3681,9 @@ impl SaiBackend for VendorSai {
         unsafe {
             let remove = (*self.hostif_api)
                 .remove_hostif_trap
-                .ok_or(SaiError::Other("hostif api lacks remove_hostif_trap".into()))?;
+                .ok_or(SaiError::Other(
+                    "hostif api lacks remove_hostif_trap".into(),
+                ))?;
             check("remove_hostif_trap", remove(trap.0))
         }
     }

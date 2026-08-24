@@ -245,14 +245,10 @@ pub async fn configuration(
 /// secret with `<hidden>` before display.
 fn redact_secrets(tree: &mut hemlock_config::ConfigTree) {
     use hemlock_config::Item;
-    let Some(security) = tree
-        .items
-        .iter_mut()
-        .find_map(|item| match item {
-            Item::Block { name, children, .. } if name == "security" => Some(children),
-            _ => None,
-        })
-    else {
+    let Some(security) = tree.items.iter_mut().find_map(|item| match item {
+        Item::Block { name, children, .. } if name == "security" => Some(children),
+        _ => None,
+    }) else {
         return;
     };
     for item in security.iter_mut() {

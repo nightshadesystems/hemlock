@@ -97,9 +97,7 @@ fn leaf(name: &str, values: Vec<String>) -> Item {
 /// Remove an emptied `security { <sub> { ... } }` chain bottom-up.
 fn prune_security(tree: &mut ConfigTree) {
     let security = tree.block_mut("security");
-    security.retain(|item| {
-        !matches!(item, Item::Block { children, .. } if children.is_empty())
-    });
+    security.retain(|item| !matches!(item, Item::Block { children, .. } if children.is_empty()));
     remove_block_if_empty(tree, "security");
 }
 
@@ -192,7 +190,10 @@ fn build_rule(family: &str, rule: &RuleSet) -> Result<(String, Vec<Item>), Strin
             ("source", nonempty(&rule.source).is_some()),
             ("destination", nonempty(&rule.destination).is_some()),
             ("source-port", nonempty(&rule.source_port).is_some()),
-            ("destination-port", nonempty(&rule.destination_port).is_some()),
+            (
+                "destination-port",
+                nonempty(&rule.destination_port).is_some(),
+            ),
             ("dscp", nonempty(&rule.dscp).is_some()),
         ] {
             if present {
@@ -223,12 +224,13 @@ fn build_rule(family: &str, rule: &RuleSet) -> Result<(String, Vec<Item>), Strin
         items.push(leaf("protocol", vec![canonical]));
     }
     for (slot, value) in [("source", &rule.source), ("destination", &rule.destination)] {
-        let Some(value) = nonempty(value) else { continue };
+        let Some(value) = nonempty(value) else {
+            continue;
+        };
         if value == "any" {
             continue;
         }
-        let canonical =
-            hemlock_common::net::require_canonical_prefix(value).map_err(&context)?;
+        let canonical = hemlock_common::net::require_canonical_prefix(value).map_err(&context)?;
         if canonical.contains(':') != (family == "ipv6") {
             return Err(context(format!(
                 "{canonical} does not match the ACL family ({family})"
@@ -240,7 +242,9 @@ fn build_rule(family: &str, rule: &RuleSet) -> Result<(String, Vec<Item>), Strin
         ("source-port", &rule.source_port),
         ("destination-port", &rule.destination_port),
     ] {
-        let Some(value) = nonempty(value) else { continue };
+        let Some(value) = nonempty(value) else {
+            continue;
+        };
         hemlock_common::net::parse_port_match(value).map_err(&context)?;
         items.push(leaf(slot, vec![value.to_string()]));
     }
@@ -284,7 +288,9 @@ fn build_rule(family: &str, rule: &RuleSet) -> Result<(String, Vec<Item>), Strin
         ("source-mac", &rule.source_mac),
         ("destination-mac", &rule.destination_mac),
     ] {
-        let Some(value) = nonempty(value) else { continue };
+        let Some(value) = nonempty(value) else {
+            continue;
+        };
         let canonical = match value.split_once('/') {
             Some((mac, mask)) => format!(
                 "{}/{}",
@@ -302,7 +308,9 @@ fn build_rule(family: &str, rule: &RuleSet) -> Result<(String, Vec<Item>), Strin
                 hex.strip_prefix("0x")
                     .and_then(|h| u16::from_str_radix(h, 16).ok())
                     .ok_or_else(|| {
-                        context(format!("bad ethertype {hex:?} (0x0000-0xffff|ipv4|ipv6|arp)"))
+                        context(format!(
+                            "bad ethertype {hex:?} (0x0000-0xffff|ipv4|ipv6|arp)"
+                        ))
                     })?;
                 hex.to_string()
             }
@@ -424,7 +432,11 @@ pub fn apply_acl_binding_edit(tree: &mut ConfigTree, edit: &AclBindingEdit) -> R
         let eth = ConfigTree::ensure_block(interfaces, &set.interface, &[]);
         // One binding per direction: replace any previous one.
         remove_binding_leaf(eth, &set.direction);
-        push_leaf(eth, "access-group", vec![set.acl.clone(), set.direction.clone()]);
+        push_leaf(
+            eth,
+            "access-group",
+            vec![set.acl.clone(), set.direction.clone()],
+        );
     }
     for delete in &edit.delete {
         let interfaces = tree.block_mut("interfaces");
@@ -551,7 +563,9 @@ pub fn apply_port_security_edit(
         }
         if let Some(violation) = &set.violation {
             if !matches!(violation.as_str(), "protect" | "shutdown") {
-                return Err(format!("bad violation action {violation:?} (protect|shutdown)"));
+                return Err(format!(
+                    "bad violation action {violation:?} (protect|shutdown)"
+                ));
             }
         }
     }
@@ -1169,9 +1183,8 @@ mod tests {
         assert!(text.contains("validate src-mac"));
         assert!(text.contains("validate ip"));
         assert!(text.contains("dhcp-snooping trust"));
-        assert!(
-            text.contains("binding 00:50:56:be:ef:99 vlan 20 address 10.0.20.50 interface Ethernet7")
-        );
+        assert!(text
+            .contains("binding 00:50:56:be:ef:99 vlan 20 address 10.0.20.50 interface Ethernet7"));
         // Round-trips.
         assert_eq!(hemlock_config::parse(&text).unwrap(), t);
 

@@ -14,9 +14,9 @@ use hemlock_platform::PortDef;
 use tokio::sync::mpsc;
 
 use crate::{
-    AclAction, AclFamily, AclFields, AclStage, FdbAction, IpPrefix, Oid, PolicerSpec,
-    PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities,
-    SaiError, SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo, TrapKind,
+    AclAction, AclFamily, AclFields, AclStage, FdbAction, IpPrefix, Oid, PolicerSpec, PolicerStats,
+    PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities, SaiError,
+    SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo, TrapKind,
 };
 
 /// Synthetic OIDs: obviously fake, stable, and readable in logs.
@@ -1481,7 +1481,8 @@ mod tests {
         sai.remove_acl_entry(entry).unwrap();
         sai.remove_acl_counter(counter).unwrap();
         assert!(sai.remove_acl_table(table).is_err());
-        sai.bind_port_acl(ports[0], AclStage::Ingress, None).unwrap();
+        sai.bind_port_acl(ports[0], AclStage::Ingress, None)
+            .unwrap();
         sai.remove_acl_table(table).unwrap();
         sai.remove_acl_entry(entry6).unwrap();
         sai.remove_acl_table(table6).unwrap();

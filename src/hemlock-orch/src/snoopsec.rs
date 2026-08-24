@@ -163,10 +163,7 @@ impl Engine {
         let (packet_in_tx, mut packet_in_rx) = mpsc::unbounded_channel::<(String, u16, Vec<u8>)>();
         let (packet_out_tx, packet_out_rx) = mpsc::unbounded_channel();
         let (redirects_tx, redirects_rx) = mpsc::unbounded_channel();
-        let dynamics = store
-            .as_deref()
-            .map(load_bindings)
-            .unwrap_or_default();
+        let dynamics = store.as_deref().map(load_bindings).unwrap_or_default();
         let inner = Arc::new(Mutex::new(Inner {
             config: Config::default(),
             view: L2View::default(),
@@ -283,15 +280,16 @@ impl Engine {
     }
 
     fn handle_dhcp(&self, port: &str, vlan: u16, frame: &[u8]) {
-        let Some(dhcp) = parse_dhcp(frame) else { return };
+        let Some(dhcp) = parse_dhcp(frame) else {
+            return;
+        };
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
         if !inner.config.dhcp_vlans.contains(&vlan) {
             return;
         }
-        let trusted = Self::expand_trusted(&inner.view, &inner.config.dhcp_trusted)
-            .contains(port)
+        let trusted = Self::expand_trusted(&inner.view, &inner.config.dhcp_trusted).contains(port)
             || inner.config.dhcp_trusted.contains(port);
         inner.dhcp_stats.entry(vlan).or_default().packets += 1;
         let src_mac = mac_text(&frame[6..12]);
@@ -926,7 +924,10 @@ mod tests {
         assert_eq!(snapshot.untrusted_server_drops, 1);
         assert_eq!(snapshot.dhcp_stats[&10].dropped, 1);
         // The rogue offer never became a binding.
-        assert_eq!(snapshot.bindings[0].ip, "10.0.10.101".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            snapshot.bindings[0].ip,
+            "10.0.10.101".parse::<Ipv4Addr>().unwrap()
+        );
 
         // A spoofed chaddr drops.
         io.packet_in
@@ -995,7 +996,12 @@ mod tests {
             .send((
                 "Ethernet1".into(),
                 10,
-                arp_frame(CLIENT_MAC, CLIENT_MAC, "10.0.10.101".parse().unwrap(), false),
+                arp_frame(
+                    CLIENT_MAC,
+                    CLIENT_MAC,
+                    "10.0.10.101".parse().unwrap(),
+                    false,
+                ),
             ))
             .unwrap();
         let (target, _) = io.packet_out.recv().await.unwrap();
@@ -1022,7 +1028,12 @@ mod tests {
             .send((
                 "Ethernet1".into(),
                 10,
-                arp_frame(CLIENT_MAC, CLIENT_MAC, "10.0.10.250".parse().unwrap(), false),
+                arp_frame(
+                    CLIENT_MAC,
+                    CLIENT_MAC,
+                    "10.0.10.250".parse().unwrap(),
+                    false,
+                ),
             ))
             .unwrap();
         // A spoofed sender-MAC: bad src-mac drop (the default check).

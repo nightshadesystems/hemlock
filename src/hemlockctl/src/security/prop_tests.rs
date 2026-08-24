@@ -95,9 +95,7 @@ fn random_rule(rng: &mut Rng, mac_family: bool) -> AclRule {
         protocol: if mac_family {
             None
         } else {
-            Some(
-                ["tcp", "udp", "icmp", "89", "ip"][rng.u32(5) as usize].to_string(),
-            )
+            Some(["tcp", "udp", "icmp", "89", "ip"][rng.u32(5) as usize].to_string())
         },
         source: if rng.chance() {
             "any".into()
@@ -145,7 +143,9 @@ fn acl_rendering_holds_for_arbitrary_rule_combinations() {
         let table = AclTable {
             name: format!("ACL-{round}"),
             family,
-            rules: (0..rng.u32(8)).map(|_| random_rule(&mut rng, mac_family)).collect(),
+            rules: (0..rng.u32(8))
+                .map(|_| random_rule(&mut rng, mac_family))
+                .collect(),
             implicit_deny_matches: rng.next() % 10_000,
             bindings: (0..rng.u32(3))
                 .map(|i| AclBinding {
@@ -174,8 +174,8 @@ fn acl_rendering_holds_for_arbitrary_rule_combinations() {
         // under the block header.
         for rule in &state.acls[0].rules {
             assert!(
-                text.lines()
-                    .any(|l| l.starts_with("        ") && l.contains(&format!("[match {}]", rule.matches))),
+                text.lines().any(|l| l.starts_with("        ")
+                    && l.contains(&format!("[match {}]", rule.matches))),
                 "rule {} missing from:\n{text}",
                 rule.number
             );

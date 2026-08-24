@@ -110,7 +110,10 @@ pub const COPP_CLASSES: &[CoppClassDef] = &[
         name: "arp",
         rate: 2000,
         burst: 500,
-        traps: &[(TrapKind::ArpRequest, false), (TrapKind::ArpResponse, false)],
+        traps: &[
+            (TrapKind::ArpRequest, false),
+            (TrapKind::ArpResponse, false),
+        ],
     },
     CoppClassDef {
         // A copy, not a trap: DHCP keeps forwarding in hardware; the
@@ -289,7 +292,9 @@ async fn apply_violation(handle: &SaiHandle, port: &str, mac: &str) {
         state.shutdown
     };
     let sai_id = {
-        let Ok(ports) = handle.ports.read() else { return };
+        let Ok(ports) = handle.ports.read() else {
+            return;
+        };
         let Some(state) = ports.get(port) else { return };
         state.sai_id
     };
@@ -505,8 +510,7 @@ impl SyncdService {
                 None => None,
             };
             let internal = world.internal.get(&(port.to_string(), stage));
-            let desired =
-                desired_entries(user, internal).map_err(Status::failed_precondition)?;
+            let desired = desired_entries(user, internal).map_err(Status::failed_precondition)?;
             let current = world.tables.get(&(port.to_string(), stage)).map(|t| {
                 (
                     t.table,
@@ -878,8 +882,7 @@ fn rule_state_from_proto(rule: &pb::AclRule) -> Result<(u32, AclRuleState), Stat
     }
     if !rule.destination.is_empty() {
         fields.dst_ip = Some(
-            hemlock_common::net::parse_cidr(&rule.destination)
-                .map_err(Status::invalid_argument)?,
+            hemlock_common::net::parse_cidr(&rule.destination).map_err(Status::invalid_argument)?,
         );
     }
     let port_range = |low: Option<u32>, high: Option<u32>| -> Result<Option<(u16, u16)>, Status> {
@@ -920,9 +923,8 @@ fn rule_state_from_proto(rule: &pb::AclRule) -> Result<(u32, AclRuleState), Stat
     fields.src_mac = mac_match(&rule.source_mac, &rule.source_mac_mask)?;
     fields.dst_mac = mac_match(&rule.destination_mac, &rule.destination_mac_mask)?;
     if let Some(ethertype) = rule.ethertype {
-        fields.ethertype = Some(
-            u16::try_from(ethertype).map_err(|_| bad(format!("bad ethertype {ethertype}")))?,
-        );
+        fields.ethertype =
+            Some(u16::try_from(ethertype).map_err(|_| bad(format!("bad ethertype {ethertype}")))?);
     }
     let police = match (rule.police_rate, rule.police_burst) {
         (None, None) => None,
@@ -1051,9 +1053,7 @@ impl SyncdService {
                 .map(|((target, stage), _)| (target.clone(), *stage))
                 .collect()
         };
-        if !bound_targets.is_empty()
-            && program.rules.values().any(|r| r.police.is_some())
-        {
+        if !bound_targets.is_empty() && program.rules.values().any(|r| r.police.is_some()) {
             self.require_entry_policers()?;
         }
         {
@@ -1101,9 +1101,10 @@ impl SyncdService {
                 .acls
                 .read()
                 .map_err(|_| Status::internal("acl table poisoned"))?;
-            let program = world.acls.get(&req.acl).ok_or_else(|| {
-                Status::failed_precondition(format!("no such ACL {:?}", req.acl))
-            })?;
+            let program = world
+                .acls
+                .get(&req.acl)
+                .ok_or_else(|| Status::failed_precondition(format!("no such ACL {:?}", req.acl)))?;
             program.rules.values().any(|r| r.police.is_some())
         };
         if has_police {
@@ -1185,11 +1186,7 @@ impl SyncdService {
                 programs.push((
                     name.clone(),
                     program.family,
-                    program
-                        .rules
-                        .iter()
-                        .map(|(n, r)| (*n, r.clone()))
-                        .collect(),
+                    program.rules.iter().map(|(n, r)| (*n, r.clone())).collect(),
                 ));
                 let mut per_rule: Vec<(u32, Vec<Oid>)> =
                     program.rules.keys().map(|n| (*n, Vec::new())).collect();
@@ -1199,7 +1196,9 @@ impl SyncdService {
                         continue;
                     }
                     for (key, objs) in &table.entries {
-                        let Some(counter) = objs.counter else { continue };
+                        let Some(counter) = objs.counter else {
+                            continue;
+                        };
                         match key {
                             AclEntryKey::User(number) => {
                                 if let Some((_, list)) =
@@ -1226,12 +1225,22 @@ impl SyncdService {
             }
             let mut used = vec![(AclStage::Ingress, 0u32), (AclStage::Egress, 0u32)];
             for ((_, stage), table) in world.tables.iter().map(|(k, v)| (k.clone(), v)) {
-                let width = if table.family == AclFamily::Ipv6 { 2 } else { 1 };
+                let width = if table.family == AclFamily::Ipv6 {
+                    2
+                } else {
+                    1
+                };
                 if let Some((_, total)) = used.iter_mut().find(|(s, _)| *s == stage) {
                     *total += table.entries.len() as u32 * width;
                 }
             }
-            (programs, counters, bindings, used, world.counter_base.clone())
+            (
+                programs,
+                counters,
+                bindings,
+                used,
+                world.counter_base.clone(),
+            )
         };
 
         let read = |oid: Oid, base: &std::collections::HashMap<u64, u64>| {
@@ -1239,10 +1248,8 @@ impl SyncdService {
             async move { (oid, base) }
         };
         let mut acls = Vec::new();
-        for (((name, family, rules), counter_set), (_, acl_bindings)) in programs
-            .into_iter()
-            .zip(counters)
-            .zip(bindings)
+        for (((name, family, rules), counter_set), (_, acl_bindings)) in
+            programs.into_iter().zip(counters).zip(bindings)
         {
             let mut matches = Vec::new();
             for (_, oids) in &counter_set.per_rule {
@@ -1329,8 +1336,9 @@ impl SyncdService {
         req: pb::SetCoppClassRequest,
     ) -> Result<(), Status> {
         self.require_capability(self.handle.capabilities.copp, "control-plane policing")?;
-        let def = copp_class(&req.class)
-            .ok_or_else(|| Status::invalid_argument(format!("unknown CoPP class {:?}", req.class)))?;
+        let def = copp_class(&req.class).ok_or_else(|| {
+            Status::invalid_argument(format!("unknown CoPP class {:?}", req.class))
+        })?;
         let rate = req.rate.unwrap_or(def.rate);
         let burst = req.burst.unwrap_or(def.burst);
         if rate == 0 || burst == 0 {
@@ -1717,15 +1725,14 @@ impl SyncdService {
                     affected.insert(port.clone());
                 }
             }
-            let push =
-                |world: &mut crate::state::AclWorld,
-                 port: &str,
-                 entry: InternalAclEntry,
-                 affected: &mut std::collections::BTreeSet<String>| {
-                    let key = (port.to_string(), AclStage::Ingress);
-                    world.internal.entry(key).or_default().snoop.push(entry);
-                    affected.insert(port.to_string());
-                };
+            let push = |world: &mut crate::state::AclWorld,
+                        port: &str,
+                        entry: InternalAclEntry,
+                        affected: &mut std::collections::BTreeSet<String>| {
+                let key = (port.to_string(), AclStage::Ingress);
+                world.internal.entry(key).or_default().snoop.push(entry);
+                affected.insert(port.to_string());
+            };
             for program in &req.dhcp {
                 let vlan = program.vlan as u16;
                 let dhcp_fields = AclFields {
@@ -1791,4 +1798,3 @@ impl SyncdService {
         Ok(())
     }
 }
-
