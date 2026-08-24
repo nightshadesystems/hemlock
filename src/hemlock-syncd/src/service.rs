@@ -1688,6 +1688,12 @@ impl pb::syncd_server::Syncd for SyncdService {
         if let Some(oid) = state.oid {
             self.handle.remove_vlan(oid).await.map_err(sai)?;
         }
+        // The VLAN's hardware FDB entries went with it; drop the
+        // software mirror too.
+        if let Ok(mut fdb) = self.handle.fdb.write() {
+            fdb.statics.retain(|(v, _), _| *v != id);
+            fdb.dynamics.retain(|(v, _), _| *v != id);
+        }
         self.handle
             .vlans
             .write()
@@ -1983,11 +1989,14 @@ impl pb::syncd_server::Syncd for SyncdService {
         if !exists {
             return Ok(Response::new(pb::RemoveStaticFdbResponse {}));
         }
-        let vlan_ref = self.fdb_vlan_ref(vlan)?;
-        self.handle
-            .remove_fdb_entry(vlan_ref, mac)
-            .await
-            .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        // A since-removed VLAN took its hardware FDB entries with it;
+        // only the shadow entry is left to clean up.
+        if let Ok(vlan_ref) = self.fdb_vlan_ref(vlan) {
+            self.handle
+                .remove_fdb_entry(vlan_ref, mac)
+                .await
+                .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        }
         if let Ok(mut fdb) = self.handle.fdb.write() {
             fdb.statics.remove(&key);
         }
@@ -4251,6 +4260,65 @@ lanes = [1, 2]
             .await
             .unwrap();
         assert!(handle.vlans.read().unwrap().is_empty());
+    }
+
+    /// A VLAN removal takes its FDB mirror entries with it, and a
+    /// static whose VLAN is already gone is still removable (the
+    /// hardware entry died with the VLAN; only the shadow remains).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn static_fdb_outlives_vlan_removal() {
+        let platform = test_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        service
+            .ensure_vlan(Request::new(pb::EnsureVlanRequest {
+                id: 69,
+                name: "IOT".into(),
+                suspend: false,
+            }))
+            .await
+            .unwrap();
+        service
+            .add_static_fdb(Request::new(pb::AddStaticFdbRequest {
+                mac: "0a:bc:bc:00:6a:b2".into(),
+                vlan: 69,
+                port: "Ethernet1".into(),
+                drop: false,
+            }))
+            .await
+            .unwrap();
+        service
+            .remove_vlan(Request::new(pb::RemoveVlanRequest { id: 69 }))
+            .await
+            .unwrap();
+        assert!(
+            handle.fdb.read().unwrap().statics.is_empty(),
+            "VLAN removal purges its statics"
+        );
+
+        // A zombie shadow entry (static recorded, VLAN gone) must
+        // still be removable rather than failing the commit.
+        handle.fdb.write().unwrap().statics.insert(
+            (69, "0a:bc:bc:00:6a:b2".into()),
+            FdbStaticEntry {
+                port: Some("Ethernet1".into()),
+            },
+        );
+        service
+            .remove_static_fdb(Request::new(pb::RemoveStaticFdbRequest {
+                mac: "0a:bc:bc:00:6a:b2".into(),
+                vlan: 69,
+            }))
+            .await
+            .unwrap();
+        assert!(handle.fdb.read().unwrap().statics.is_empty());
     }
 
     /// The switching-suite families over the mock data-plane: FDB

@@ -2,6 +2,7 @@
 .page-header{display:flex;align-items:center;gap:12px;margin-bottom:16px}
 .page-header h2{margin-right:auto}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{padding:14px 16px}
 .stat-card .stat-value{font-family:var(--ns-font-mono);font-size:28px;line-height:32px;color:var(--cds-alias-typography-color-450)}
 .stat-card .stat-value .unit{font-size:14px;color:var(--cds-alias-typography-color-300);margin-left:4px}
 .stat-card .stat-label{font-size:12px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:var(--cds-alias-typography-color-300);margin-bottom:8px}

@@ -6,7 +6,7 @@ import { Alert } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
-import { FormField, Input, Select, MultiSelect } from '@/components/ds/forms';
+import { FormField, Input, Select, MultiSelect, SearchSelect } from '@/components/ds/forms';
 import { OperLabel, AdminLabel, ModeLabel } from '@/components/status';
 
 const NO_CHANGE = '';
@@ -131,6 +131,12 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
     value: v.id,
     label: v.name ? `${v.id} — ${v.name}` : String(v.id),
   }));
+  // The default VLAN always exists even when not configured.
+  const accessOptions = [
+    ...(single ? [] : [{ value: '', label: 'Unchanged' }]),
+    ...(vlanOptions.some((o) => o.value === 1) ? [] : [{ value: 1, label: '1' }]),
+    ...vlanOptions,
+  ];
 
   return (
     <Modal
@@ -179,10 +185,10 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
                 options={modeOptions} />
             </FormField>
             {mode === 'access' && (
-              <FormField label="Access VLAN" htmlFor="if-access-vlan">
-                <Input id="if-access-vlan" className="mono" value={accessVlan}
-                  placeholder={single ? undefined : 'unchanged'}
-                  onChange={(e) => setAccessVlan(e.target.value)} style={{ maxWidth: 120 }} />
+              <FormField label="Access VLAN">
+                <SearchSelect options={accessOptions} value={accessVlan}
+                  onChange={(v) => setAccessVlan(String(v))}
+                  placeholder={single ? 'Select VLAN…' : 'Unchanged'} />
               </FormField>
             )}
             {mode === 'dot1q-tunnel' && (

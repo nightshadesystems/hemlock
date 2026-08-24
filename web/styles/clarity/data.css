@@ -10,6 +10,11 @@
 .table-noborder th{background:transparent}
 /* ---------------- datagrid ---------------- */
 .datagrid{display:flex;flex-direction:column;background:var(--cds-alias-object-container-background);border:1px solid var(--cds-alias-object-container-border-color);border-radius:var(--clr-base-border-radius-m);overflow:hidden;font-size:13px}
+/* Nested in a card, the grid loses its own frame and hugs the card's
+   corners instead of drawing a second rounded box inside it. */
+.card>.datagrid{border:none;border-radius:0}
+.card>.datagrid:first-child{border-top-left-radius:calc(var(--clr-base-border-radius-m) - 1px);border-top-right-radius:calc(var(--clr-base-border-radius-m) - 1px)}
+.card>.datagrid:last-child{border-bottom-left-radius:calc(var(--clr-base-border-radius-m) - 1px);border-bottom-right-radius:calc(var(--clr-base-border-radius-m) - 1px)}
 .datagrid-table{display:table;width:100%;border-collapse:separate;border-spacing:0;margin:0}
 .datagrid-column,.datagrid-cell{vertical-align:middle;text-align:left;padding:0 12px;height:var(--clr-base-dg-row-height);border-bottom:1px solid var(--cds-alias-object-border-subtle)}
 .datagrid-column{background:var(--cds-alias-object-container-background-shade);color:var(--cds-alias-typography-color-450);font-size:12px;font-weight:600;border-bottom:1px solid var(--cds-alias-object-container-border-color);position:relative;white-space:nowrap}

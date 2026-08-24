@@ -59,11 +59,11 @@ function SettingsModal({ open, config, onClose, onSaved }) {
           <Input id="ospf-rid" className="mono" value={routerId}
             onChange={(e) => setRouterId(e.target.value)} style={{ maxWidth: 180 }} />
         </FormField>
-        <FormField label="Maximum paths" htmlFor="ospf-mp" helper="1..8 (ECMP width)">
+        <FormField label="Maximum Paths" htmlFor="ospf-mp" helper="1..8 (ECMP width)">
           <Input id="ospf-mp" className="mono" value={maxPaths}
             onChange={(e) => setMaxPaths(e.target.value)} style={{ maxWidth: 100 }} />
         </FormField>
-        <FormField label="Passive interfaces" htmlFor="ospf-passive" helper="Comma-separated">
+        <FormField label="Passive Interfaces" htmlFor="ospf-passive" helper="Comma-separated">
           <Input id="ospf-passive" className="mono" value={passive}
             onChange={(e) => setPassive(e.target.value)} style={{ maxWidth: 'none' }} />
         </FormField>
@@ -185,9 +185,9 @@ export default function OspfPage() {
         <>
           <Card
             header={
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: 12 }}>
                 <span className="card-title" style={{ marginRight: 'auto' }}>Process</span>
-                {live ? <Label status="success">running</Label> : <Label>not running</Label>}
+                {live ? <Label status="success">Running</Label> : <Label>Not Running</Label>}
                 <Button sm variant="outline" icon="cog" onClick={() => setModal({ kind: 'settings' })}>
                   Settings
                 </Button>
@@ -198,15 +198,15 @@ export default function OspfPage() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
               <CardBlock title="Router ID"
                 text={live?.router_id || config?.router_id || 'derived'} />
-              <CardBlock title="SPF runs" text={String(live?.spf_runs ?? '—')} />
-              <CardBlock title="Maximum paths" text={config?.maximum_paths || '4'} />
+              <CardBlock title="SPF Runs" text={String(live?.spf_runs ?? '—')} />
+              <CardBlock title="Maximum Paths" text={config?.maximum_paths || '4'} />
               <CardBlock title="Redistribute"
                 text={(config?.redistribute || []).join(', ') || '—'} />
             </div>
           </Card>
           <Card
             header={
-              <div style={{ display: 'flex', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: 12 }}>
                 <span className="card-title" style={{ marginRight: 'auto' }}>Areas</span>
                 <Button sm variant="outline" icon="plus" onClick={() => setModal({ kind: 'area' })}>
                   New Area

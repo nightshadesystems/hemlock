@@ -59,7 +59,7 @@ function SettingsModal({ open, config, onClose, onSaved }) {
       }>
       {error && <Alert status="danger" sm style={{ marginBottom: 12 }}>{error}</Alert>}
       <div className="clr-form-compact">
-        <FormField label="AS number" required htmlFor="bgp-as" helper="asplain, 1..4294967295">
+        <FormField label="AS Number" required htmlFor="bgp-as" helper="asplain, 1..4294967295">
           <Input id="bgp-as" className="mono" value={asNumber}
             onChange={(e) => setAsNumber(e.target.value)} style={{ maxWidth: 160 }} />
         </FormField>
@@ -67,7 +67,7 @@ function SettingsModal({ open, config, onClose, onSaved }) {
           <Input id="bgp-rid" className="mono" value={routerId}
             onChange={(e) => setRouterId(e.target.value)} style={{ maxWidth: 180 }} />
         </FormField>
-        <FormField label="Maximum paths" htmlFor="bgp-mp" helper="1..8 (ECMP width)">
+        <FormField label="Maximum Paths" htmlFor="bgp-mp" helper="1..8 (ECMP width)">
           <Input id="bgp-mp" className="mono" value={maxPaths}
             onChange={(e) => setMaxPaths(e.target.value)} style={{ maxWidth: 100 }} />
         </FormField>
@@ -147,7 +147,7 @@ function NeighborModal({ open, neighbor, onClose, onSaved }) {
       }>
       {error && <Alert status="danger" sm style={{ marginBottom: 12 }}>{error}</Alert>}
       <div className="clr-form-compact">
-        <FormField label="Neighbor address" required htmlFor="nbr-ip">
+        <FormField label="Neighbor Address" required htmlFor="nbr-ip">
           <Input id="nbr-ip" className="mono" value={ip} disabled={editing} autoFocus={!editing}
             onChange={(e) => setIp(e.target.value)} style={{ maxWidth: 200 }} />
         </FormField>
@@ -159,7 +159,7 @@ function NeighborModal({ open, neighbor, onClose, onSaved }) {
           <Input id="nbr-desc" value={description}
             onChange={(e) => setDescription(e.target.value)} style={{ maxWidth: 'none' }} />
         </FormField>
-        <FormField label="eBGP multihop" htmlFor="nbr-hop" helper="1..255; empty = off">
+        <FormField label="eBGP Multihop" htmlFor="nbr-hop" helper="1..255; empty = off">
           <Input id="nbr-hop" className="mono" value={multihop}
             onChange={(e) => setMultihop(e.target.value)} style={{ maxWidth: 100 }} />
         </FormField>
@@ -230,9 +230,9 @@ export default function BgpPage() {
         <>
           <Card
             header={
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: 12 }}>
                 <span className="card-title" style={{ marginRight: 'auto' }}>Process</span>
-                {live ? <Label status="success">running</Label> : <Label>not running</Label>}
+                {live ? <Label status="success">Running</Label> : <Label>Not Running</Label>}
                 <Button sm variant="outline" icon="cog" onClick={() => setModal({ kind: 'settings' })}>
                   Settings
                 </Button>
@@ -249,9 +249,9 @@ export default function BgpPage() {
           </Card>
           <Card
             header={
-              <div style={{ display: 'flex', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: 12 }}>
                 <span className="card-title" style={{ marginRight: 'auto' }}>Neighbors</span>
-                <Button sm variant="primary" icon="plus" onClick={() => setModal({ kind: 'neighbor' })}>
+                <Button sm variant="outline" icon="plus" onClick={() => setModal({ kind: 'neighbor' })}>
                   New Neighbor
                 </Button>
               </div>

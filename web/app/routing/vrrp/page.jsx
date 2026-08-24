@@ -162,7 +162,7 @@ export default function VrrpPage() {
             <Card
               key={`${group.interface}-${group.group}`}
               header={
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: 12 }}>
                   <span className="card-title" style={{ marginRight: 'auto' }}>
                     {group.interface} · group {group.group}
                   </span>
@@ -175,7 +175,7 @@ export default function VrrpPage() {
               }
             >
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
-                <CardBlock title="Virtual address(es)"
+                <CardBlock title="Virtual Address(es)"
                   text={(group.addresses || []).join(', ') || '—'} />
                 <CardBlock title="Priority"
                   text={`${group.priority || 100}${group.effective_priority ? ` (effective ${group.effective_priority})` : ''}`} />

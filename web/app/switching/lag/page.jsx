@@ -6,7 +6,7 @@ import { Alert, Badge } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
-import { FormField, Input, Select, Checkbox, MultiSelect } from '@/components/ds/forms';
+import { FormField, Input, Select, Checkbox, MultiSelect, SearchSelect } from '@/components/ds/forms';
 
 const MEMBER_STATUS = {
   bundled: 'success',
@@ -225,9 +225,18 @@ function LagModal({ open, lag, interfaces, lags, vlans, onClose, onSaved }) {
             ]} />
         </FormField>
         {mode === 'access' && (
-          <FormField label="Access VLAN" htmlFor="lag-access-vlan">
-            <Input id="lag-access-vlan" className="mono" value={accessVlan}
-              onChange={(e) => setAccessVlan(e.target.value)} style={{ maxWidth: 120 }} />
+          <FormField label="Access VLAN">
+            <SearchSelect value={accessVlan}
+              onChange={(v) => setAccessVlan(String(v))}
+              placeholder="Unchanged"
+              options={[
+                { value: '', label: 'Unchanged' },
+                ...((vlans || []).some((v) => v.id === 1) ? [] : [{ value: 1, label: '1' }]),
+                ...(vlans || []).map((v) => ({
+                  value: v.id,
+                  label: v.name ? `${v.id} — ${v.name}` : String(v.id),
+                })),
+              ]} />
           </FormField>
         )}
         {mode === 'trunk' && (
