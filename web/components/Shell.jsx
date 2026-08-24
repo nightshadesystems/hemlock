@@ -9,6 +9,7 @@ const TABS = [
   { label: 'Dashboard', href: '/dashboard/' },
   { label: 'Switching', href: '/switching/interfaces/', root: '/switching' },
   { label: 'Routing', href: '/routing/routes/', root: '/routing' },
+  { label: 'Security', href: '/security/acls/', root: '/security' },
   { label: 'System', href: '/system/general/', root: '/system' },
 ];
 
@@ -36,6 +37,16 @@ const SIDE_NAV = {
       { id: '/routing/bgp/', label: 'BGP', icon: 'cloud-network' },
       { id: '/routing/vrrp/', label: 'VRRP', icon: 'link' },
       { id: '/routing/arp/', label: 'ARP / ND', icon: 'network-settings' },
+    ],
+  },
+  '/security': {
+    label: 'Security',
+    items: [
+      { id: '/security/acls/', label: 'ACLs', icon: 'shield' },
+      { id: '/security/copp/', label: 'CoPP', icon: 'firewall' },
+      { id: '/security/port-security/', label: 'Port Security', icon: 'lock' },
+      { id: '/security/dot1x/', label: '802.1X', icon: 'key' },
+      { id: '/security/snooping/', label: 'DHCP Snooping', icon: 'eye' },
     ],
   },
   '/system': {

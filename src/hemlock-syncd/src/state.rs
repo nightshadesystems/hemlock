@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use hemlock_platform::PortDef;
-use hemlock_sai::{Oid, PortId, StormClass};
+use hemlock_sai::{AclFamily, AclFields, AclPacketAction, AclStage, Oid, PolicerSpec, PolicerStats, PortId, StormClass};
 
 /// One front-panel port: manifest definition + live ASIC state + the
 /// operator-facing attributes syncd tracks (description, L3 mode).
@@ -238,6 +238,161 @@ pub struct FibGroup {
 }
 
 pub type SharedFib = Arc<RwLock<FibTable>>;
+
+/// The ACL world: user ACL programs and bindings as pushed by mgmtd,
+/// feature-internal entries (dot1x enforcement, DAI/DHCP-snooping
+/// redirects), and the per-(port, stage) hardware tables they
+/// materialize into.
+///
+/// # Priority bands
+///
+/// Each (port, stage) table holds one flat priority space (higher
+/// wins). syncd partitions it so internal entries always beat user
+/// rules and nothing beats the implicit deny from below:
+///
+/// - internal entries: `2_000_000_000 - seq` — dot1x enforcement and
+///   snooping/DAI redirects; a user rule can never shadow them,
+/// - user rules: `1_000_000_000 - ordinal` (first rule by number =
+///   ordinal 0),
+/// - the implicit deny: priority `1`, with its own match counter.
+#[derive(Debug, Default)]
+pub struct AclWorld {
+    /// User ACLs keyed by name.
+    pub acls: BTreeMap<String, AclProgram>,
+    /// Bindings keyed by (display name — a port or a Port-Channel,
+    /// stage) -> ACL name. Port-Channel bindings expand to their
+    /// members at materialization.
+    pub bindings: BTreeMap<(String, AclStage), String>,
+    /// Internal entries per (physical port, stage). dot1x enforcement
+    /// outranks the snooping/DAI redirects, which outrank user rules.
+    pub internal: BTreeMap<(String, AclStage), InternalAcl>,
+    /// Materialized hardware tables per (physical port, stage).
+    pub tables: BTreeMap<(String, AclStage), PortAclTable>,
+    /// `clear acl counters` baselines keyed by counter oid.
+    pub counter_base: HashMap<u64, u64>,
+}
+
+/// One user ACL as pushed by `EnsureAcl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclProgram {
+    pub family: AclFamily,
+    pub rules: BTreeMap<u32, AclRuleState>,
+}
+
+/// One user rule: match fields plus the operator-facing action set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclRuleState {
+    pub permit: bool,
+    pub log: bool,
+    pub fields: AclFields,
+    pub police: Option<PolicerSpec>,
+}
+
+/// One feature-internal entry (dot1x EAPOL permit / deny-all, snooping
+/// and DAI CPU redirects).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalAclEntry {
+    pub fields: AclFields,
+    pub action: AclPacketAction,
+}
+
+/// One (port, stage)'s internal entries, per owning feature.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InternalAcl {
+    pub dot1x: Vec<InternalAclEntry>,
+    pub snoop: Vec<InternalAclEntry>,
+}
+
+impl InternalAcl {
+    pub fn is_empty(&self) -> bool {
+        self.dot1x.is_empty() && self.snoop.is_empty()
+    }
+
+    /// Band order: dot1x first (highest priority), then snooping/DAI.
+    pub fn ordered(&self) -> impl Iterator<Item = &InternalAclEntry> {
+        self.dot1x.iter().chain(self.snoop.iter())
+    }
+}
+
+/// One materialized (port, stage) table and its live entry objects.
+#[derive(Debug)]
+pub struct PortAclTable {
+    pub table: Oid,
+    pub family: AclFamily,
+    /// The user ACL contributing this table's user band, when bound.
+    pub user_acl: Option<String>,
+    pub entries: BTreeMap<AclEntryKey, AclEntryObjs>,
+}
+
+/// Entry identity within one (port, stage) table. The variant order is
+/// the band order (internal above user above the implicit deny).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AclEntryKey {
+    Internal(u32),
+    User(u32),
+    ImplicitDeny,
+}
+
+/// The SAI objects behind one entry, plus what was programmed so a
+/// re-materialization can leave untouched rules (and their counters)
+/// alone.
+#[derive(Debug, Clone)]
+pub struct AclEntryObjs {
+    pub entry: Oid,
+    pub counter: Option<Oid>,
+    pub policer: Option<Oid>,
+    pub priority: u32,
+    pub fields: AclFields,
+    pub action: AclPacketAction,
+    pub police: Option<PolicerSpec>,
+}
+
+pub type SharedAcls = Arc<RwLock<AclWorld>>;
+
+/// CoPP: per-class trap group + policer state. Class names and
+/// membership are the compiled table in `service.rs`; this holds the
+/// live objects and configured overrides.
+#[derive(Debug, Default)]
+pub struct CoppState {
+    pub classes: BTreeMap<&'static str, CoppClassState>,
+}
+
+/// One CoPP class's live state.
+#[derive(Debug, Clone, Default)]
+pub struct CoppClassState {
+    /// Effective rate/burst (pps/pkts).
+    pub rate: u32,
+    pub burst: u32,
+    /// Rate or burst overridden by config (renders `*` in `show copp`).
+    pub overridden: bool,
+    pub policer: Option<Oid>,
+    /// None for the `default` class (it polices the switch's default
+    /// trap group instead of owning one). Ownership records — the
+    /// class table lives for the switch's lifetime.
+    #[allow(dead_code)]
+    pub group: Option<Oid>,
+    #[allow(dead_code)]
+    pub traps: Vec<Oid>,
+    /// `clear copp counters` baseline.
+    pub base: PolicerStats,
+}
+
+pub type SharedCopp = Arc<RwLock<CoppState>>;
+
+/// Port-security runtime state for one enabled port.
+#[derive(Debug, Clone)]
+pub struct PortSecurityState {
+    pub max: u32,
+    /// Violation action: shutdown (errdisable) vs protect (drop only).
+    pub shutdown: bool,
+    /// Learned secure MACs -> learn time.
+    pub learned: BTreeMap<String, std::time::Instant>,
+    pub violations: u32,
+    pub last_violation: Option<(String, std::time::Instant)>,
+}
+
+/// Port-security state keyed by port name.
+pub type SharedPortSecurity = Arc<RwLock<BTreeMap<String, PortSecurityState>>>;
 
 /// Resolve a SAI port id back to a port name (for event handling).
 pub fn name_for(ports: &HashMap<String, PortState>, id: PortId) -> Option<String> {

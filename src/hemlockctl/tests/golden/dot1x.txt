@@ -1,0 +1,8 @@
+RADIUS servers: 10.42.0.5:1812
+Reauth interval: 3600s
+
+Port   State         Supplicant MAC     Last Auth       Failures
+-----  ------------  -----------------  --------------  --------
+Et10   authorized    00:1c:73:0c:aa:10  0:41:02 ago     0
+Et11   unauthorized  -                  -               2
+Et12   authorized    a0:36:9f:44:be:12  2:10:55 ago     1

@@ -71,6 +71,25 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/bgp/edit", post(bgp_edit))
         .route("/api/vrrp", get(vrrp))
         .route("/api/vrrp/edit", post(vrrp_edit))
+        .route("/api/acls", get(acls))
+        .route("/api/acls/edit", post(acls_edit))
+        .route("/api/acls/bindings/edit", post(acl_bindings_edit))
+        .route("/api/acls/clear", post(acls_clear))
+        .route("/api/copp", get(copp))
+        .route("/api/copp/edit", post(copp_edit))
+        .route("/api/copp/clear", post(copp_clear))
+        .route("/api/port-security", get(port_security))
+        .route("/api/port-security/edit", post(port_security_edit))
+        .route("/api/port-security/clear", post(port_security_clear))
+        .route("/api/dot1x", get(dot1x))
+        .route("/api/dot1x/edit", post(dot1x_edit))
+        .route("/api/dot1x/reauth", post(dot1x_reauth))
+        .route("/api/snooping-sec", get(snooping_sec))
+        .route("/api/snooping-sec/edit", post(snooping_sec_edit))
+        .route(
+            "/api/snooping-sec/bindings/clear",
+            post(snooping_sec_bindings_clear),
+        )
         .route("/api/system", get(system))
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
@@ -1325,6 +1344,580 @@ async fn vrrp_edit(
         crate::routing_edit::apply_vrrp_edit(tree, &edit)
     })
     .await
+}
+
+// ------------------------------------------------------- security suite
+
+fn acl_family_word(family: i32) -> &'static str {
+    match pb::AclFamily::try_from(family) {
+        Ok(pb::AclFamily::Ipv6) => "ipv6",
+        Ok(pb::AclFamily::Mac) => "mac",
+        _ => "ipv4",
+    }
+}
+
+/// Binding direction display: ingress = "in", egress = "out".
+fn acl_direction_word(stage: i32) -> &'static str {
+    match pb::AclStage::try_from(stage) {
+        Ok(pb::AclStage::Egress) => "out",
+        _ => "in",
+    }
+}
+
+fn acl_stage_word(stage: i32) -> &'static str {
+    match pb::AclStage::try_from(stage) {
+        Ok(pb::AclStage::Egress) => "egress",
+        _ => "ingress",
+    }
+}
+
+/// IP protocol numbers back to the config keywords (58 is ICMPv6).
+fn acl_protocol_word(protocol: u32) -> String {
+    match protocol {
+        6 => "tcp".into(),
+        17 => "udp".into(),
+        1 | 58 => "icmp".into(),
+        other => other.to_string(),
+    }
+}
+
+/// An L4 range back to the config's "443" / "67-68" text.
+fn acl_port_text(low: Option<u32>, high: Option<u32>) -> Option<String> {
+    let low = low?;
+    match high {
+        Some(high) if high != low => Some(format!("{low}-{high}")),
+        _ => Some(low.to_string()),
+    }
+}
+
+fn acl_mac_text(mac: &str, mask: &str) -> Option<String> {
+    if mac.is_empty() {
+        return None;
+    }
+    Some(if mask.is_empty() {
+        mac.to_string()
+    } else {
+        format!("{mac}/{mask}")
+    })
+}
+
+fn acl_ethertype_text(ethertype: u32) -> String {
+    match ethertype {
+        0x0800 => "ipv4".into(),
+        0x86dd => "ipv6".into(),
+        0x0806 => "arp".into(),
+        other => format!("0x{other:04x}"),
+    }
+}
+
+/// `GET /api/acls` — syncd's programmed ACLs with live per-rule
+/// counters, port bindings, and per-stage TCAM utilization. Police
+/// values render in the CLI's suffixed form ("10m", "256k", "2000pps").
+async fn acls(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .get_acl_state(pb::GetAclStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    let acls: Vec<serde_json::Value> = response
+        .acls
+        .iter()
+        .map(|acl| {
+            let rules: Vec<serde_json::Value> = acl
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| {
+                    json!({
+                        "number": rule.number,
+                        "action": if rule.permit { "permit" } else { "deny" },
+                        "protocol": rule.protocol.map(acl_protocol_word),
+                        "source": (!rule.source.is_empty()).then(|| rule.source.clone()),
+                        "destination": (!rule.destination.is_empty())
+                            .then(|| rule.destination.clone()),
+                        "source_port": acl_port_text(rule.source_port_low, rule.source_port_high),
+                        "destination_port": acl_port_text(
+                            rule.destination_port_low,
+                            rule.destination_port_high,
+                        ),
+                        "dscp": rule.dscp,
+                        "log": rule.log,
+                        "police": rule.police_rate.map(|rate| json!({
+                            "rate": hemlock_common::net::format_police_rate(rate, rule.police_pps),
+                            "burst": rule.police_burst.map(|burst| {
+                                hemlock_common::net::format_police_burst(burst, rule.police_pps)
+                            }),
+                        })),
+                        "source_mac": acl_mac_text(&rule.source_mac, &rule.source_mac_mask),
+                        "destination_mac": acl_mac_text(
+                            &rule.destination_mac,
+                            &rule.destination_mac_mask,
+                        ),
+                        "ethertype": rule.ethertype.map(acl_ethertype_text),
+                        "matches": acl.matches.get(index).copied().unwrap_or(0),
+                    })
+                })
+                .collect();
+            let total: u64 =
+                acl.matches.iter().sum::<u64>() + acl.implicit_deny_matches;
+            json!({
+                "name": acl.name,
+                "family": acl_family_word(acl.family),
+                "rules": rules,
+                "implicit_deny_matches": acl.implicit_deny_matches,
+                "bindings": acl.bindings.iter().map(|binding| json!({
+                    "port": binding.port,
+                    "direction": acl_direction_word(binding.stage),
+                })).collect::<Vec<_>>(),
+                "total_matches": total,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "acls": acls,
+        "tcam": response.tcam.iter().map(|stage| json!({
+            "stage": acl_stage_word(stage.stage),
+            "used": stage.used,
+            "available": stage.available,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn acls_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::security_edit::AclEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::security_edit::apply_acl_edit(tree, &edit)
+    })
+    .await
+}
+
+async fn acl_bindings_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::security_edit::AclBindingEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::security_edit::apply_acl_binding_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct AclClearRequest {
+    /// Scope to one ACL; absent = every ACL.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /api/acls/clear` — zero the match counters.
+async fn acls_clear(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<AclClearRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .clear_acl_counters(pb::ClearAclCountersRequest {
+            name: request.name.unwrap_or_default(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({ "cleared": response.cleared })))
+}
+
+/// `GET /api/copp` — syncd's class table, matching `show copp`.
+async fn copp(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .get_copp_state(pb::GetCoppStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "classes": response.classes.iter().map(|class| json!({
+            "class": class.class,
+            "rate": class.rate,
+            "burst": class.burst,
+            "overridden": class.overridden,
+            "conforming": class.conforming,
+            "dropped": class.dropped,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn copp_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::security_edit::CoppEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::security_edit::apply_copp_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `POST /api/copp/clear` — zero every class counter.
+async fn copp_clear(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    client
+        .clear_copp_counters(pb::ClearCoppCountersRequest {})
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(Json(json!({ "cleared": true })))
+}
+
+/// `GET /api/port-security` — syncd's per-port view: limits, learned
+/// MACs with ages, violations, errdisable.
+async fn port_security(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .get_port_security_state(pb::GetPortSecurityStateRequest {
+            port: String::new(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "ports": response.ports.iter().map(|entry| json!({
+            "port": entry.port,
+            "maximum": entry.maximum,
+            "violation": if entry.shutdown { "shutdown" } else { "protect" },
+            "learned": entry.learned.iter().map(|mac| json!({
+                "mac": mac.mac,
+                "age_secs": mac.age_secs,
+            })).collect::<Vec<_>>(),
+            "violations": entry.violations,
+            "last_violation_mac": entry.last_violation_mac,
+            "last_violation_secs_ago": entry.last_violation_secs_ago,
+            "errdisabled": entry.errdisabled,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn port_security_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::security_edit::PortSecurityEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::security_edit::apply_port_security_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct PortSecurityClearRequest {
+    /// Scope to one port; absent = every enabled port.
+    #[serde(default)]
+    port: Option<String>,
+}
+
+/// `POST /api/port-security/clear` — forget learned MACs and lift any
+/// errdisable.
+async fn port_security_clear(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<PortSecurityClearRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let response = client
+        .reset_port_security(pb::ResetPortSecurityRequest {
+            port: request.port.unwrap_or_default(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({ "cleared": response.cleared })))
+}
+
+/// `GET /api/dot1x` — the configured RADIUS servers (keys omitted) and
+/// per-port `dot1x` markers from the running config, merged with orch's
+/// authenticator runtime — which degrades gracefully when orch is
+/// unreachable (status comes back null).
+async fn dot1x(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let mut servers: Vec<serde_json::Value> = Vec::new();
+    let mut config_reauth: Option<u32> = None;
+    if let Some((_, security)) = tree.block("security") {
+        if let Some((_, dot1x)) = ConfigTree::blocks_named(security, "dot1x").next() {
+            config_reauth =
+                ConfigTree::leaf_value(dot1x, "reauth-interval").and_then(|v| v.parse().ok());
+            for (keys, body) in ConfigTree::blocks_named(dot1x, "radius-server") {
+                servers.push(json!({
+                    "ip": keys.first().cloned().unwrap_or_default(),
+                    "port": leaf_json(body, "port"),
+                    "timeout": leaf_json(body, "timeout"),
+                    "retransmit": leaf_json(body, "retransmit"),
+                    // The secret never leaves the config.
+                    "has_key": ConfigTree::has_leaf(body, "key"),
+                }));
+            }
+        }
+    }
+    let mut enabled: Vec<String> = Vec::new();
+    if let Some((_, interfaces)) = tree.block("interfaces") {
+        for item in interfaces {
+            if let hemlock_config::Item::Block {
+                name,
+                keys,
+                children,
+            } = item
+            {
+                if keys.is_empty() && ConfigTree::has_leaf(children, "dot1x") {
+                    enabled.push(name.clone());
+                }
+            }
+        }
+    }
+    let live = match orch_client(&state).await {
+        Ok(mut orch) => orch
+            .get_dot1x_state(pb::GetDot1xStateRequest {
+                port: String::new(),
+            })
+            .await
+            .map(|response| response.into_inner())
+            .ok(),
+        Err(_) => None,
+    };
+    let ports: Vec<serde_json::Value> = enabled
+        .iter()
+        .map(|port| {
+            let state = live
+                .as_ref()
+                .and_then(|l| l.ports.iter().find(|p| p.port == *port));
+            json!({
+                "port": port,
+                "status": state.map(|p| p.status.clone()),
+                "supplicant_mac": state.map(|p| p.supplicant_mac.clone()).unwrap_or_default(),
+                "last_auth_secs_ago": state.and_then(|p| p.last_auth_secs_ago),
+                "failures": state.map(|p| p.failures).unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "radius_servers": servers,
+        "reauth_interval": live
+            .as_ref()
+            .map(|l| l.reauth_interval)
+            .or(config_reauth)
+            .unwrap_or(0),
+        "ports": ports,
+        "live": live.is_some(),
+    })))
+}
+
+async fn dot1x_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::security_edit::Dot1xEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::security_edit::apply_dot1x_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct Dot1xReauthRequest {
+    port: String,
+}
+
+/// `POST /api/dot1x/reauth` — force reauthentication on one port.
+async fn dot1x_reauth(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<Dot1xReauthRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .dot1x_reauth(pb::Dot1xReauthRequest { port: request.port })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({ "triggered": response.triggered })))
+}
+
+/// `GET /api/snooping-sec` — DHCP-snooping + DAI config (VLAN lists,
+/// validate checks, trusted ports, static bindings — all from the
+/// running config) merged with orch's binding table and drop counters,
+/// which degrade gracefully when orch is unreachable (config statics
+/// stand in for the binding table).
+async fn snooping_sec(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let mut dhcp_vlans: Vec<u32> = Vec::new();
+    let mut arp_vlans: Vec<u32> = Vec::new();
+    let mut validate: Vec<String> = Vec::new();
+    let mut static_bindings: Vec<serde_json::Value> = Vec::new();
+    if let Some((_, security)) = tree.block("security") {
+        if let Some((_, dhcp)) = ConfigTree::blocks_named(security, "dhcp-snooping").next() {
+            dhcp_vlans = repeated_leaves(dhcp, "vlan")
+                .iter()
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            for item in dhcp {
+                let hemlock_config::Item::Leaf { name, values } = item else {
+                    continue;
+                };
+                if name != "binding" {
+                    continue;
+                }
+                static_bindings.push(json!({
+                    "mac": values.first().cloned().unwrap_or_default(),
+                    "address": values.get(3).cloned().unwrap_or_default(),
+                    "lease_secs": serde_json::Value::Null,
+                    "is_static": true,
+                    "vlan": values.get(2).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
+                    "interface": values.get(5).cloned().unwrap_or_default(),
+                }));
+            }
+        }
+        if let Some((_, arp)) = ConfigTree::blocks_named(security, "arp-inspection").next() {
+            arp_vlans = repeated_leaves(arp, "vlan")
+                .iter()
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            validate = repeated_leaves(arp, "validate");
+        }
+    }
+    let mut dhcp_trusted: Vec<String> = Vec::new();
+    let mut arp_trusted: Vec<String> = Vec::new();
+    if let Some((_, interfaces)) = tree.block("interfaces") {
+        for item in interfaces {
+            let hemlock_config::Item::Block {
+                name,
+                keys,
+                children,
+            } = item
+            else {
+                continue;
+            };
+            if !keys.is_empty() {
+                continue;
+            }
+            if ConfigTree::has_leaf(children, "dhcp-snooping") {
+                dhcp_trusted.push(name.clone());
+            }
+            if ConfigTree::has_leaf(children, "arp-inspection") {
+                arp_trusted.push(name.clone());
+            }
+        }
+    }
+    let live = match orch_client(&state).await {
+        Ok(mut orch) => orch
+            .get_snoop_sec_state(pb::GetSnoopSecStateRequest {})
+            .await
+            .map(|response| response.into_inner())
+            .ok(),
+        Err(_) => None,
+    };
+    let bindings: Vec<serde_json::Value> = match &live {
+        Some(live) => live
+            .bindings
+            .iter()
+            .map(|binding| {
+                json!({
+                    "mac": binding.mac,
+                    "address": binding.address,
+                    "lease_secs": binding.lease_secs,
+                    "is_static": binding.is_static,
+                    "vlan": binding.vlan,
+                    "interface": binding.interface,
+                })
+            })
+            .collect(),
+        None => static_bindings,
+    };
+    Ok(Json(json!({
+        "dhcp": {
+            "vlans": dhcp_vlans,
+            "trusted": dhcp_trusted,
+            "stats": live.as_ref().map(|l| l.dhcp_stats.iter().map(|s| json!({
+                "vlan": s.vlan,
+                "packets": s.packets,
+                "dropped": s.dropped,
+            })).collect::<Vec<_>>()).unwrap_or_default(),
+            "untrusted_server_drops": live
+                .as_ref()
+                .map(|l| l.untrusted_server_drops)
+                .unwrap_or(0),
+        },
+        "arp": {
+            "vlans": arp_vlans,
+            "validate": validate,
+            "trusted": arp_trusted,
+            "stats": live.as_ref().map(|l| l.arp_stats.iter().map(|s| json!({
+                "vlan": s.vlan,
+                "forwarded": s.forwarded,
+                "dropped": s.dropped,
+                "bad_binding": s.bad_binding,
+                "bad_src_mac": s.bad_src_mac,
+            })).collect::<Vec<_>>()).unwrap_or_default(),
+        },
+        "bindings": bindings,
+        "live": live.is_some(),
+    })))
+}
+
+async fn snooping_sec_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::security_edit::SnoopingSecEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::security_edit::apply_snooping_sec_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct SnoopBindingClearRequest {
+    /// Scope to one MAC; absent = every dynamic binding.
+    #[serde(default)]
+    mac: Option<String>,
+}
+
+/// `POST /api/snooping-sec/bindings/clear` — drop dynamic bindings.
+async fn snooping_sec_bindings_clear(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<SnoopBindingClearRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .clear_snoop_binding(pb::ClearSnoopBindingRequest {
+            mac: request.mac.unwrap_or_default(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({ "cleared": response.cleared })))
 }
 
 async fn static_routes_edit(

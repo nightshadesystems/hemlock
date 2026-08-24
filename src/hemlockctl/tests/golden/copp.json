@@ -1,0 +1,110 @@
+{
+  "copp": {
+    "classes": [
+      {
+        "burst": 128,
+        "class": "bpdu",
+        "conforming": 182331,
+        "dropped": 0,
+        "overridden": true,
+        "rate": 512
+      },
+      {
+        "burst": 256,
+        "class": "lacp",
+        "conforming": 92110,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 1000
+      },
+      {
+        "burst": 64,
+        "class": "eapol",
+        "conforming": 412,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 256
+      },
+      {
+        "burst": 256,
+        "class": "igmp",
+        "conforming": 55019,
+        "dropped": 12,
+        "overridden": false,
+        "rate": 1000
+      },
+      {
+        "burst": 256,
+        "class": "mld",
+        "conforming": 1044,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 1000
+      },
+      {
+        "burst": 500,
+        "class": "arp",
+        "conforming": 881236,
+        "dropped": 3402,
+        "overridden": true,
+        "rate": 2000
+      },
+      {
+        "burst": 128,
+        "class": "dhcp",
+        "conforming": 9871,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 512
+      },
+      {
+        "burst": 512,
+        "class": "ospf",
+        "conforming": 771230,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 2000
+      },
+      {
+        "burst": 512,
+        "class": "bgp",
+        "conforming": 44127,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 2000
+      },
+      {
+        "burst": 128,
+        "class": "vrrp",
+        "conforming": 99012,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 512
+      },
+      {
+        "burst": 1024,
+        "class": "ip2me",
+        "conforming": 1288812,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 4000
+      },
+      {
+        "burst": 32,
+        "class": "acl-log",
+        "conforming": 7,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 64
+      },
+      {
+        "burst": 64,
+        "class": "default",
+        "conforming": 1233,
+        "dropped": 88,
+        "overridden": false,
+        "rate": 256
+      }
+    ]
+  }
+}

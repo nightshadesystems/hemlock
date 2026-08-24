@@ -1,0 +1,121 @@
+{
+  "acl": {
+    "acls": [
+      {
+        "bindings": [
+          {
+            "direction": "in",
+            "port": "Ethernet1"
+          }
+        ],
+        "family": "ipv4",
+        "implicit_deny_matches": 3,
+        "name": "EDGE-IN",
+        "rules": [
+          {
+            "destination": "10.42.0.0/16",
+            "log": false,
+            "matches": 18244,
+            "number": 10,
+            "permit": true,
+            "port": "443",
+            "protocol": "tcp",
+            "source": "10.0.0.0/8"
+          },
+          {
+            "destination": "any",
+            "log": false,
+            "matches": 512,
+            "number": 20,
+            "permit": true,
+            "port": "67-68",
+            "protocol": "udp",
+            "source": "any"
+          },
+          {
+            "destination": "any",
+            "log": true,
+            "matches": 7,
+            "number": 30,
+            "permit": false,
+            "protocol": "ip",
+            "source": "192.0.2.0/24"
+          },
+          {
+            "destination": "any",
+            "log": false,
+            "matches": 90211,
+            "number": 40,
+            "permit": true,
+            "police": "10m 256k",
+            "protocol": "ip",
+            "source": "any"
+          }
+        ]
+      },
+      {
+        "bindings": [],
+        "family": "ipv6",
+        "implicit_deny_matches": 0,
+        "name": "MGMT6-IN",
+        "rules": [
+          {
+            "destination": "any",
+            "log": false,
+            "matches": 44,
+            "number": 10,
+            "permit": true,
+            "port": "22",
+            "protocol": "tcp",
+            "source": "2001:db8:9::/48"
+          },
+          {
+            "destination": "any",
+            "log": true,
+            "matches": 0,
+            "number": 20,
+            "permit": false,
+            "protocol": "ipv6",
+            "source": "any"
+          }
+        ]
+      },
+      {
+        "bindings": [],
+        "family": "mac",
+        "implicit_deny_matches": 0,
+        "name": "IOT-MAC",
+        "rules": [
+          {
+            "destination": "any",
+            "log": false,
+            "matches": 1029,
+            "number": 10,
+            "permit": true,
+            "source": "00:1c:73:00:00:00/ff:ff:ff:00:00:00"
+          },
+          {
+            "destination": "any",
+            "log": false,
+            "matches": 15,
+            "number": 20,
+            "permit": false,
+            "source": "any"
+          }
+        ]
+      }
+    ],
+    "tcam": [
+      {
+        "available": 512,
+        "stage": "ingress",
+        "used": 9
+      },
+      {
+        "available": 256,
+        "stage": "egress",
+        "used": 0
+      }
+    ]
+  }
+}

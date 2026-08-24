@@ -1,0 +1,3 @@
+Vlan  Forwarded  Dropped  Bad Binding  Bad Src-MAC
+----  ---------  -------  -----------  -----------
+10    99120      41       38           3

@@ -22,6 +22,10 @@ iproute2
 # routing suite pins the distro package rather than an upstream build.
 frr
 frr-pythontools
+# The 802.1X authenticator (wired driver on the hostif netdevs; hostapd
+# is the RADIUS client). Unlike FRR, orch owns it end to end: it renders
+# the config, manages the process, and watches the control socket.
+hostapd
 ethtool
 iputils-ping
 # setcap for ping's cap_net_raw (see the operator-account section)

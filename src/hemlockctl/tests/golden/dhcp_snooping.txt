@@ -1,0 +1,2 @@
+DHCP snooping is enabled on VLANs: 10, 20
+Trusted interfaces: Po1

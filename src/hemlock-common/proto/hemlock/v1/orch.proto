@@ -45,6 +45,27 @@ service Orch {
   rpc GetVrrpState(GetVrrpStateRequest) returns (GetVrrpStateResponse);
   // `clear routing bgp <neighbor|*>`.
   rpc ClearBgp(ClearBgpRequest) returns (ClearBgpResponse);
+
+  // --- 802.1X (hostapd-backed authenticator) ---------------------------
+  // Full desired dot1x state (declarative). orch owns hostapd end to
+  // end: it renders the config, manages the process, watches the
+  // control socket, and flips port authorization via syncd.
+  rpc SetDot1xConfig(SetDot1xConfigRequest) returns (SetDot1xConfigResponse);
+  // Runtime auth state for `show dot1x ...`.
+  rpc GetDot1xState(GetDot1xStateRequest) returns (GetDot1xStateResponse);
+  // `clear dot1x interface <port>`: force reauthentication.
+  rpc Dot1xReauth(Dot1xReauthRequest) returns (Dot1xReauthResponse);
+
+  // --- DHCP snooping + dynamic ARP inspection --------------------------
+  // Full desired snooping/DAI state (declarative). The engine drives
+  // the CPU redirects into syncd, validates trapped packets, maintains
+  // the binding table, and re-injects valid frames.
+  rpc SetSnoopSecConfig(SetSnoopSecConfigRequest) returns (SetSnoopSecConfigResponse);
+  // Bindings + statistics for `show dhcp snooping` / `show arp
+  // inspection`.
+  rpc GetSnoopSecState(GetSnoopSecStateRequest) returns (GetSnoopSecStateResponse);
+  // `clear dhcp snooping binding [<mac>]` (dynamics only).
+  rpc ClearSnoopBinding(ClearSnoopBindingRequest) returns (ClearSnoopBindingResponse);
 }
 
 message GetOrchStatusRequest {}
@@ -449,4 +470,126 @@ message ClearBgpRequest {
 
 message ClearBgpResponse {
   bool cleared = 1;
+}
+
+// --- 802.1X -------------------------------------------------------------
+
+message RadiusServerConfig {
+  string ip = 1;
+  // Shared secret; rendered into hostapd's config (mode 0600), never
+  // echoed back in state.
+  string key = 2;
+  uint32 port = 3;
+  uint32 timeout_secs = 4;
+  uint32 retransmit = 5;
+}
+
+message SetDot1xConfigRequest {
+  // Tried in order.
+  repeated RadiusServerConfig radius_servers = 1;
+  // Seconds; 0 = reauthentication off.
+  uint32 reauth_interval = 2;
+  // Ports running the authenticator.
+  repeated string ports = 3;
+}
+
+message SetDot1xConfigResponse {}
+
+message GetDot1xStateRequest {
+  // Scope to one port; "" = every dot1x port.
+  string port = 1;
+}
+
+message Dot1xPortState {
+  string port = 1;
+  // "authorized" | "unauthorized".
+  string status = 2;
+  // Colon-lowercase; "" while no supplicant is heard.
+  string supplicant_mac = 3;
+  optional uint64 last_auth_secs_ago = 4;
+  uint32 failures = 5;
+}
+
+message GetDot1xStateResponse {
+  // Display forms ("10.42.0.5:1812"), in config order.
+  repeated string radius_servers = 1;
+  uint32 reauth_interval = 2;
+  repeated Dot1xPortState ports = 3;
+}
+
+message Dot1xReauthRequest {
+  string port = 1;
+}
+
+message Dot1xReauthResponse {
+  bool triggered = 1;
+}
+
+// --- DHCP snooping + DAI ------------------------------------------------
+
+message StaticBindingConfig {
+  string mac = 1;
+  uint32 vlan = 2;
+  string address = 3;
+  string interface = 4;
+}
+
+message SetSnoopSecConfigRequest {
+  repeated uint32 dhcp_vlans = 1;
+  repeated uint32 arp_vlans = 2;
+  // "src-mac" | "dst-mac" | "ip"; empty = default (src-mac).
+  repeated string validate = 3;
+  // Trusted interfaces (ports or Port-Channels).
+  repeated string dhcp_trusted = 4;
+  repeated string arp_trusted = 5;
+  repeated StaticBindingConfig static_bindings = 6;
+}
+
+message SetSnoopSecConfigResponse {}
+
+message GetSnoopSecStateRequest {}
+
+message SnoopBindingState {
+  string mac = 1;
+  string address = 2;
+  // Remaining lease; unset for statics.
+  optional uint64 lease_secs = 3;
+  bool is_static = 4;
+  uint32 vlan = 5;
+  string interface = 6;
+}
+
+message SnoopVlanStats {
+  uint32 vlan = 1;
+  uint64 packets = 2;
+  uint64 dropped = 3;
+}
+
+message DaiVlanStats {
+  uint32 vlan = 1;
+  uint64 forwarded = 2;
+  uint64 dropped = 3;
+  uint64 bad_binding = 4;
+  uint64 bad_src_mac = 5;
+}
+
+message GetSnoopSecStateResponse {
+  repeated uint32 dhcp_vlans = 1;
+  repeated string dhcp_trusted = 2;
+  repeated SnoopBindingState bindings = 3;
+  repeated SnoopVlanStats dhcp_stats = 4;
+  uint64 untrusted_server_drops = 5;
+  repeated uint32 arp_vlans = 6;
+  repeated string validate = 7;
+  repeated string arp_trusted = 8;
+  repeated DaiVlanStats arp_stats = 9;
+}
+
+message ClearSnoopBindingRequest {
+  // Scope to one MAC; "" = every dynamic binding.
+  string mac = 1;
+}
+
+message ClearSnoopBindingResponse {
+  uint32 cleared = 1;
 }

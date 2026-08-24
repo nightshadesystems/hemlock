@@ -8,10 +8,12 @@
 //! raw sockets on those netdevs directly rather than proxying packets
 //! over gRPC.
 
+mod dot1x;
 mod frrshow;
 mod lacp;
 mod rib;
 mod snoop;
+mod snoopsec;
 mod stp;
 #[cfg(target_os = "linux")]
 mod transport;
@@ -43,6 +45,8 @@ struct OrchService {
     igmp: snoop::Engine,
     mld: snoop::Engine,
     rib: rib::Engine,
+    dot1x: dot1x::Engine,
+    snoopsec: snoopsec::Engine,
 }
 
 impl OrchService {
@@ -469,6 +473,207 @@ impl Orch for OrchService {
         }))
     }
 
+    async fn set_dot1x_config(
+        &self,
+        request: Request<pb::SetDot1xConfigRequest>,
+    ) -> Result<Response<pb::SetDot1xConfigResponse>, Status> {
+        let req = request.into_inner();
+        let mut radius = Vec::with_capacity(req.radius_servers.len());
+        for server in req.radius_servers {
+            radius.push(dot1x::Radius {
+                ip: server.ip,
+                key: server.key,
+                port: u16::try_from(server.port)
+                    .map_err(|_| Status::invalid_argument("bad radius port"))?,
+                timeout: u16::try_from(server.timeout_secs)
+                    .map_err(|_| Status::invalid_argument("bad radius timeout"))?,
+                retransmit: u16::try_from(server.retransmit)
+                    .map_err(|_| Status::invalid_argument("bad radius retransmit"))?,
+            });
+        }
+        self.dot1x.set_config(dot1x::Config {
+            radius,
+            reauth_interval: req.reauth_interval,
+            ports: req.ports.into_iter().collect(),
+        });
+        Ok(Response::new(pb::SetDot1xConfigResponse {}))
+    }
+
+    async fn get_dot1x_state(
+        &self,
+        request: Request<pb::GetDot1xStateRequest>,
+    ) -> Result<Response<pb::GetDot1xStateResponse>, Status> {
+        let filter = request.into_inner().port;
+        let snapshot = self.dot1x.snapshot();
+        if !filter.is_empty() && !snapshot.ports.iter().any(|p| p.port == filter) {
+            return Err(Status::not_found(format!(
+                "dot1x is not enabled on {filter}"
+            )));
+        }
+        Ok(Response::new(pb::GetDot1xStateResponse {
+            radius_servers: snapshot
+                .radius
+                .iter()
+                .map(|r| format!("{}:{}", r.ip, r.port))
+                .collect(),
+            reauth_interval: snapshot.reauth_interval,
+            ports: snapshot
+                .ports
+                .into_iter()
+                .filter(|p| filter.is_empty() || p.port == filter)
+                .map(|p| pb::Dot1xPortState {
+                    port: p.port,
+                    status: if p.authorized {
+                        "authorized".into()
+                    } else {
+                        "unauthorized".into()
+                    },
+                    supplicant_mac: p.supplicant.unwrap_or_default(),
+                    last_auth_secs_ago: p.last_auth.map(|t| t.elapsed().as_secs()),
+                    failures: p.failures,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn dot1x_reauth(
+        &self,
+        request: Request<pb::Dot1xReauthRequest>,
+    ) -> Result<Response<pb::Dot1xReauthResponse>, Status> {
+        let port = request.into_inner().port;
+        Ok(Response::new(pb::Dot1xReauthResponse {
+            triggered: self.dot1x.reauth(&port),
+        }))
+    }
+
+    // The closure's Err is a tonic Status; its size is tonic's business.
+    #[allow(clippy::result_large_err)]
+    async fn set_snoop_sec_config(
+        &self,
+        request: Request<pb::SetSnoopSecConfigRequest>,
+    ) -> Result<Response<pb::SetSnoopSecConfigResponse>, Status> {
+        let req = request.into_inner();
+        let vlan16 = |raw: u32| {
+            u16::try_from(raw)
+                .ok()
+                .filter(|v| (1..=4094).contains(v))
+                .ok_or_else(|| Status::invalid_argument(format!("bad VLAN {raw}")))
+        };
+        let mut config = snoopsec::Config {
+            dhcp_trusted: req.dhcp_trusted.into_iter().collect(),
+            arp_trusted: req.arp_trusted.into_iter().collect(),
+            ..snoopsec::Config::default()
+        };
+        for vlan in req.dhcp_vlans {
+            config.dhcp_vlans.insert(vlan16(vlan)?);
+        }
+        for vlan in req.arp_vlans {
+            config.arp_vlans.insert(vlan16(vlan)?);
+        }
+        for check in req.validate {
+            config.validate.insert(match check.as_str() {
+                "src-mac" => snoopsec::Validate::SrcMac,
+                "dst-mac" => snoopsec::Validate::DstMac,
+                "ip" => snoopsec::Validate::Ip,
+                other => {
+                    return Err(Status::invalid_argument(format!(
+                        "bad validate {other:?}"
+                    )));
+                }
+            });
+        }
+        for binding in req.static_bindings {
+            let ip: std::net::Ipv4Addr = binding
+                .address
+                .parse()
+                .map_err(|_| Status::invalid_argument(format!("bad address {:?}", binding.address)))?;
+            config.statics.insert(
+                (binding.mac, vlan16(binding.vlan)?),
+                snoopsec::StaticBinding {
+                    ip,
+                    interface: binding.interface,
+                },
+            );
+        }
+        self.snoopsec.set_config(config);
+        Ok(Response::new(pb::SetSnoopSecConfigResponse {}))
+    }
+
+    async fn get_snoop_sec_state(
+        &self,
+        _request: Request<pb::GetSnoopSecStateRequest>,
+    ) -> Result<Response<pb::GetSnoopSecStateResponse>, Status> {
+        let snapshot = self.snoopsec.snapshot();
+        Ok(Response::new(pb::GetSnoopSecStateResponse {
+            dhcp_vlans: snapshot.dhcp_vlans.iter().map(|v| u32::from(*v)).collect(),
+            dhcp_trusted: snapshot.dhcp_trusted,
+            bindings: snapshot
+                .bindings
+                .iter()
+                .map(|b| pb::SnoopBindingState {
+                    mac: b.mac.clone(),
+                    address: b.ip.to_string(),
+                    lease_secs: b.lease_secs,
+                    is_static: b.lease_secs.is_none(),
+                    vlan: u32::from(b.vlan),
+                    interface: b.interface.clone(),
+                })
+                .collect(),
+            dhcp_stats: snapshot
+                .dhcp_stats
+                .iter()
+                .map(|(vlan, stats)| pb::SnoopVlanStats {
+                    vlan: u32::from(*vlan),
+                    packets: stats.packets,
+                    dropped: stats.dropped,
+                })
+                .collect(),
+            untrusted_server_drops: snapshot.untrusted_server_drops,
+            arp_vlans: snapshot.arp_vlans.iter().map(|v| u32::from(*v)).collect(),
+            validate: snapshot
+                .validate
+                .iter()
+                .map(|v| {
+                    match v {
+                        snoopsec::Validate::SrcMac => "src-mac",
+                        snoopsec::Validate::DstMac => "dst-mac",
+                        snoopsec::Validate::Ip => "ip",
+                    }
+                    .to_string()
+                })
+                .collect(),
+            arp_trusted: snapshot.arp_trusted,
+            arp_stats: snapshot
+                .arp_stats
+                .iter()
+                .map(|(vlan, stats)| pb::DaiVlanStats {
+                    vlan: u32::from(*vlan),
+                    forwarded: stats.forwarded,
+                    dropped: stats.dropped,
+                    bad_binding: stats.bad_binding,
+                    bad_src_mac: stats.bad_src_mac,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn clear_snoop_binding(
+        &self,
+        request: Request<pb::ClearSnoopBindingRequest>,
+    ) -> Result<Response<pb::ClearSnoopBindingResponse>, Status> {
+        let mac = request.into_inner().mac;
+        let mac = if mac.is_empty() {
+            None
+        } else {
+            Some(
+                hemlock_common::net::parse_mac(&mac).map_err(Status::invalid_argument)?,
+            )
+        };
+        Ok(Response::new(pb::ClearSnoopBindingResponse {
+            cleared: self.snoopsec.clear_bindings(mac.as_deref()),
+        }))
+    }
+
     async fn get_lacp_state(
         &self,
         _request: Request<pb::GetLacpStateRequest>,
@@ -559,6 +764,10 @@ async fn main() -> Result<()> {
     } = stp_io;
     let (igmp_engine, igmp_io) = snoop::Engine::spawn(snoop::Family::Igmp, system_mac);
     let (mld_engine, mld_io) = snoop::Engine::spawn(snoop::Family::Mld, system_mac);
+    let (dot1x_engine, dot1x_io) = dot1x::Engine::spawn();
+    let (snoopsec_engine, snoopsec_io) = snoopsec::Engine::spawn(Some(
+        std::path::PathBuf::from("/var/lib/hemlock/dhcp-bindings.json"),
+    ));
 
     // Gates -> syncd SetLagMembers; STP states -> SetPortStpState;
     // BPDU-guard trips -> SetPortErrdisable; snooping group/mrouter
@@ -583,6 +792,29 @@ async fn main() -> Result<()> {
             drop((packet_in, packet_out));
         }
     }
+    // The security engines: dot1x authorization flips ride syncd's
+    // SetPortAuthorized (internal ACL entries); the hostapd runtime
+    // consumes the engine's directives. Snooping/DAI redirect programs
+    // ride SetSnoopRedirects, and validated frames re-inject over the
+    // protocol sockets.
+    let dot1x::EngineIo {
+        events_in: dot1x_events,
+        auth_out,
+        directives,
+    } = dot1x_io;
+    tokio::spawn(push_port_auth(syncd.clone(), auth_out));
+    tokio::spawn(dot1x::run_hostapd(directives, dot1x_events));
+    let snoopsec::EngineIo {
+        packet_in: snoopsec_packets,
+        packet_out: snoopsec_out,
+        redirects,
+    } = snoopsec_io;
+    tokio::spawn(push_snoop_redirects(syncd.clone(), redirects));
+    #[cfg(target_os = "linux")]
+    transport::register_snoopsec(snoopsec_packets, snoopsec_out);
+    #[cfg(not(target_os = "linux"))]
+    drop((snoopsec_packets, snoopsec_out));
+
     // The RIB pipeline: kernel netlink (iproute2 dumps) -> engine ->
     // syncd FIB RPCs. The pusher reconciles on every engine change and
     // re-anchors against syncd's own dump periodically (restart resync).
@@ -601,6 +833,7 @@ async fn main() -> Result<()> {
         igmp_engine.clone(),
         mld_engine.clone(),
         rib_engine.clone(),
+        snoopsec_engine.clone(),
     ));
     // Protocol frames <-> the ports' hostif netdevs (Linux only; on dev
     // hosts the engines still run, partnerless).
@@ -626,6 +859,8 @@ async fn main() -> Result<()> {
         igmp: igmp_engine,
         mld: mld_engine,
         rib: rib_engine,
+        dot1x: dot1x_engine,
+        snoopsec: snoopsec_engine,
     };
     let router = tonic::transport::Server::builder().add_service(OrchServer::new(service));
     listen
@@ -714,6 +949,98 @@ async fn push_gates(
             }
             if attempts >= 5 {
                 warn!(group = update.group, "giving up on gate push (5 attempts)");
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Push dot1x authorization flips to syncd (unauthorized installs the
+/// internal permit-EAPOL + deny-all entries; authorized removes them).
+async fn push_port_auth(
+    syncd: IpcEndpoint,
+    mut auth: tokio::sync::mpsc::UnboundedReceiver<(String, bool)>,
+) {
+    while let Some((port, authorized)) = auth.recv().await {
+        let request = pb::SetPortAuthorizedRequest {
+            port: port.clone(),
+            authorized,
+        };
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match syncd.connect().await {
+                Ok(channel) => {
+                    let mut client = pb::syncd_client::SyncdClient::new(channel);
+                    match client.set_port_authorized(request.clone()).await {
+                        Ok(_) => break,
+                        Err(status) => {
+                            warn!(%port, %status, "SetPortAuthorized failed");
+                            if status.code() == tonic::Code::FailedPrecondition {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(error = %e, "cannot reach syncd for port-auth push"),
+            }
+            if attempts >= 5 {
+                warn!(%port, "giving up on port-auth push (5 attempts)");
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Push snooping/DAI redirect programs to syncd (the internal ACL
+/// entries trapping DHCP/ARP on the snooped VLANs' ports).
+async fn push_snoop_redirects(
+    syncd: IpcEndpoint,
+    mut redirects: tokio::sync::mpsc::UnboundedReceiver<snoopsec::RedirectProgram>,
+) {
+    while let Some(program) = redirects.recv().await {
+        let request = pb::SetSnoopRedirectsRequest {
+            dhcp: program
+                .dhcp
+                .iter()
+                .map(|(vlan, untrusted, trusted)| pb::SnoopVlanProgram {
+                    vlan: u32::from(*vlan),
+                    untrusted_ports: untrusted.clone(),
+                    trusted_ports: trusted.clone(),
+                })
+                .collect(),
+            arp: program
+                .arp
+                .iter()
+                .map(|(vlan, untrusted)| pb::SnoopVlanProgram {
+                    vlan: u32::from(*vlan),
+                    untrusted_ports: untrusted.clone(),
+                    trusted_ports: vec![],
+                })
+                .collect(),
+        };
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match syncd.connect().await {
+                Ok(channel) => {
+                    let mut client = pb::syncd_client::SyncdClient::new(channel);
+                    match client.set_snoop_redirects(request.clone()).await {
+                        Ok(_) => break,
+                        Err(status) => {
+                            warn!(%status, "SetSnoopRedirects failed");
+                            if status.code() == tonic::Code::FailedPrecondition {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(error = %e, "cannot reach syncd for snoop-redirect push"),
+            }
+            if attempts >= 5 {
+                warn!("giving up on snoop-redirect push (5 attempts)");
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -850,6 +1177,7 @@ async fn watch_vlans(
     igmp: snoop::Engine,
     mld: snoop::Engine,
     rib: rib::Engine,
+    snoopsec: snoopsec::Engine,
 ) {
     loop {
         if let Ok(channel) = syncd.connect().await {
@@ -903,6 +1231,57 @@ async fn watch_vlans(
                 }
                 igmp.set_vlan_ports(vlan_ports.clone());
                 mld.set_vlan_ports(vlan_ports);
+                // The snooping/DAI view wants physical ports only:
+                // Port-Channels expand to their members (the redirect
+                // entries land on member ports in syncd).
+                let mut po_members: std::collections::BTreeMap<
+                    String,
+                    std::collections::BTreeSet<String>,
+                > = std::collections::BTreeMap::new();
+                for iface in &response.interfaces {
+                    if iface.kind == "port-channel" {
+                        po_members.insert(
+                            iface.name.clone(),
+                            iface.members.iter().cloned().collect(),
+                        );
+                    }
+                }
+                let mut physical_vlan_ports: std::collections::BTreeMap<
+                    u16,
+                    std::collections::BTreeSet<String>,
+                > = std::collections::BTreeMap::new();
+                for iface in &response.interfaces {
+                    if !matches!(iface.kind.as_str(), "ethernet" | "port-channel")
+                        || !iface.ip_addresses.is_empty()
+                    {
+                        continue;
+                    }
+                    let mut vlans: Vec<u16> = Vec::new();
+                    let untagged = if iface.switchport_mode == "trunk" {
+                        iface.native_vlan
+                    } else {
+                        iface.access_vlan
+                    };
+                    vlans.push(u16::try_from(if untagged == 0 { 1 } else { untagged }).unwrap_or(1));
+                    if iface.switchport_mode == "trunk" {
+                        vlans.extend(iface.trunk_vlans.iter().filter_map(|v| u16::try_from(*v).ok()));
+                    }
+                    let targets: Vec<String> = if iface.kind == "port-channel" {
+                        iface.members.clone()
+                    } else {
+                        vec![iface.name.clone()]
+                    };
+                    for vlan in vlans {
+                        physical_vlan_ports
+                            .entry(vlan)
+                            .or_default()
+                            .extend(targets.iter().cloned());
+                    }
+                }
+                snoopsec.set_l2_view(snoopsec::L2View {
+                    vlan_ports: physical_vlan_ports,
+                    po_members,
+                });
                 #[cfg(target_os = "linux")]
                 transport::set_pvids(pvids);
                 #[cfg(not(target_os = "linux"))]

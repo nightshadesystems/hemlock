@@ -1,9 +1,9 @@
 //! Config intents: the typed slices of the config tree mgmtd knows how
 //! to apply. ASIC ports (`interfaces { Ethernet1 { ... } }`) are pushed
-//! to syncd; the OS-side families — management addressing (`interfaces
+//! to syncd; the OS-side families â€” management addressing (`interfaces
 //! { Management1 { address ... } }`), static routes (`routing { static
 //! { <prefix> <next-hop> } }`) and the SSH service (`system { ssh {
-//! ... } }`) — go through the OS applier (`osapply`). The legacy
+//! ... } }`) â€” go through the OS applier (`osapply`). The legacy
 //! `ethernet <name>` keyed form is still accepted for configs persisted
 //! before the format change.
 //!
@@ -63,6 +63,20 @@ pub struct Intents {
     pub mac_table: MacTableIntent,
     /// Mirror sessions (`switching { mirror { session <n> { ... } } }`).
     pub mirror: BTreeMap<u8, MirrorIntent>,
+    /// ACLs (`security { acl { <ipv4|ipv6|mac> <name> { ... } } }`),
+    /// keyed by name â€” unique across all three families, because the
+    /// binding syntax carries no family keyword.
+    pub acls: BTreeMap<String, AclIntent>,
+    /// CoPP class overrides (`security { copp { class <name> { ... } } }`),
+    /// keyed by class name. Absent classes run at compiled defaults.
+    pub copp: BTreeMap<String, CoppClassIntent>,
+    /// 802.1X (`security { dot1x { ... } }`; per-port enables live on
+    /// the port intents).
+    pub dot1x: Dot1xIntent,
+    /// DHCP snooping + dynamic ARP inspection (`security {
+    /// dhcp-snooping ... arp-inspection ... }`; per-port trust flags
+    /// live on the port intents).
+    pub snoop_sec: SnoopSecIntent,
     /// Non-fatal commit notes (empty port-channels, MTU hints).
     pub warnings: Vec<String>,
 }
@@ -161,7 +175,7 @@ impl Default for VrrpIntent {
     }
 }
 
-/// One static route: the whole per-prefix state — an ECMP next-hop set
+/// One static route: the whole per-prefix state â€” an ECMP next-hop set
 /// or a null route, plus the administrative distance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticRoute {
@@ -209,6 +223,15 @@ pub struct InterfaceIntent {
     pub spanning_tree: Option<PortStpIntent>,
     /// Storm control levels, percent with two decimals, keyed by kind.
     pub storm_control: BTreeMap<StormKind, String>,
+    /// ACL bindings (`access-group <name> <in|out>`).
+    pub access_groups: AccessGroups,
+    /// `port-security { ... }` (learn limit + violation action).
+    pub port_security: Option<PortSecurityIntent>,
+    /// `dot1x` marker: 802.1X authenticator on this port.
+    pub dot1x: bool,
+    /// `dhcp-snooping trust` / `arp-inspection trust` markers.
+    pub dhcp_snooping_trust: bool,
+    pub arp_inspection_trust: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -288,6 +311,12 @@ pub struct LagIntent {
     pub fallback_timeout: Option<u16>,
     pub spanning_tree: Option<PortStpIntent>,
     pub storm_control: BTreeMap<StormKind, String>,
+    /// ACL bindings (`access-group <name> <in|out>`; syncd expands
+    /// them to the member ports).
+    pub access_groups: AccessGroups,
+    /// `dhcp-snooping trust` / `arp-inspection trust` markers.
+    pub dhcp_snooping_trust: bool,
+    pub arp_inspection_trust: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +444,183 @@ pub enum MirrorDirection {
     Both,
 }
 
+/// One named ACL (`security { acl { <family> <name> { ... } } }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclIntent {
+    pub family: AclFamily,
+    /// Ordered rules keyed by rule number.
+    pub rules: BTreeMap<u32, AclRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclFamily {
+    Ipv4,
+    Ipv6,
+    Mac,
+}
+
+impl AclFamily {
+    pub fn word(self) -> &'static str {
+        match self {
+            AclFamily::Ipv4 => "ipv4",
+            AclFamily::Ipv6 => "ipv6",
+            AclFamily::Mac => "mac",
+        }
+    }
+}
+
+/// One ACL rule. Field applicability follows the family; the extractor
+/// rejects out-of-family fields. `permit` is required by commit
+/// (`permit;` or `deny;` marker leaf).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AclRule {
+    pub permit: bool,
+    /// IP protocol number (`tcp` = 6, `udp` = 17, `icmp` = 1).
+    pub protocol: Option<u8>,
+    /// Canonical prefixes; None = any.
+    pub source: Option<String>,
+    pub destination: Option<String>,
+    /// Inclusive port ranges (low == high for one port).
+    pub source_port: Option<(u16, u16)>,
+    pub destination_port: Option<(u16, u16)>,
+    pub dscp: Option<u8>,
+    /// Trap+syslog on match, rate-limited via the CoPP acl-log class.
+    pub log: bool,
+    pub police: Option<AclPolice>,
+    /// (canonical MAC, canonical and-mask) pairs.
+    pub source_mac: Option<(String, String)>,
+    pub destination_mac: Option<(String, String)>,
+    pub ethertype: Option<u16>,
+}
+
+/// A rule policer: bits/sec (burst in bytes) or, with `pps`,
+/// packets/sec (burst in packets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AclPolice {
+    pub rate: u64,
+    pub burst: u64,
+    pub pps: bool,
+}
+
+/// A port's ACL bindings (`access-group <name> <in|out>`): one per
+/// direction.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccessGroups {
+    pub ingress: Option<String>,
+    pub egress: Option<String>,
+}
+
+impl AccessGroups {
+    pub fn is_empty(&self) -> bool {
+        self.ingress.is_none() && self.egress.is_none()
+    }
+}
+
+/// One CoPP class override; absent values keep the compiled default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CoppClassIntent {
+    pub rate: Option<u32>,
+    pub burst: Option<u32>,
+}
+
+/// The compiled CoPP class names (`security copp class <name>`); the
+/// full table with default rates lives in syncd.
+pub const COPP_CLASS_NAMES: &[&str] = &[
+    "bpdu", "lacp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
+    "acl-log", "default",
+];
+
+/// `security { dot1x { ... } }`. Per-port enables live on the port
+/// intents (`dot1x` marker).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Dot1xIntent {
+    /// RADIUS servers in config order (tried in order).
+    pub radius_servers: Vec<RadiusServer>,
+    /// Seconds; 0 = reauthentication off (the default).
+    pub reauth_interval: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadiusServer {
+    pub ip: String,
+    /// Shared secret; required by commit when any port enables dot1x.
+    pub key: Option<String>,
+    /// Default 1812.
+    pub port: u16,
+    /// Seconds; default 5.
+    pub timeout: u8,
+    /// Default 3.
+    pub retransmit: u8,
+}
+
+impl Default for RadiusServer {
+    fn default() -> Self {
+        Self {
+            ip: String::new(),
+            key: None,
+            port: 1812,
+            timeout: 5,
+            retransmit: 3,
+        }
+    }
+}
+
+/// DHCP snooping + dynamic ARP inspection. Per-port trust flags live
+/// on the port and LAG intents.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnoopSecIntent {
+    pub dhcp_vlans: BTreeSet<u16>,
+    pub arp_vlans: BTreeSet<u16>,
+    /// DAI validation checks; empty = default (src-mac).
+    pub validate: BTreeSet<ArpValidate>,
+    /// Static bindings keyed by (canonical MAC, VLAN).
+    pub static_bindings: BTreeMap<(String, u16), StaticBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArpValidate {
+    SrcMac,
+    DstMac,
+    Ip,
+}
+
+impl ArpValidate {
+    pub fn word(self) -> &'static str {
+        match self {
+            ArpValidate::SrcMac => "src-mac",
+            ArpValidate::DstMac => "dst-mac",
+            ArpValidate::Ip => "ip",
+        }
+    }
+}
+
+/// One static DHCP-snooping binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticBinding {
+    /// IPv4 address text.
+    pub address: String,
+    pub interface: String,
+}
+
+/// `port-security { maximum <n>; violation <protect|shutdown> }` on a
+/// port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSecurityIntent {
+    /// Default 1.
+    pub maximum: u32,
+    /// Violation action: true = shutdown (errdisable); default protect.
+    pub shutdown: bool,
+}
+
+impl Default for PortSecurityIntent {
+    fn default() -> Self {
+        Self {
+            maximum: 1,
+            shutdown: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MgmtIntent {
     /// None = leave the netdev alone.
@@ -423,7 +629,7 @@ pub struct MgmtIntent {
     pub address: Option<String>,
 }
 
-/// `system { ssh { ... } }` — SSH is on exactly when the block exists.
+/// `system { ssh { ... } }` â€” SSH is on exactly when the block exists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SshIntent {
     pub enabled: bool,
@@ -539,6 +745,40 @@ pub enum IntentError {
 
     #[error("switching: {0}")]
     BadSwitching(String),
+
+    #[error("security: {0}")]
+    BadSecurity(String),
+
+    #[error("security acl {name}: {reason}")]
+    BadAcl { name: String, reason: String },
+
+    #[error("security acl {name} rule {rule}: {reason}")]
+    BadAclRule {
+        name: String,
+        rule: String,
+        reason: String,
+    },
+
+    #[error("interface {name}: access-group: {reason}")]
+    BadAccessGroup { name: String, reason: String },
+
+    #[error("{member}: member of Port-Channel{group}; bind on the Port-Channel")]
+    AccessGroupOnMember { member: String, group: u16 },
+
+    #[error("security copp: {0}")]
+    BadCopp(String),
+
+    #[error("security dot1x: {0}")]
+    BadDot1x(String),
+
+    #[error("interface {name}: port-security: {reason}")]
+    BadPortSecurity { name: String, reason: String },
+
+    #[error("security dhcp-snooping: {0}")]
+    BadDhcpSnooping(String),
+
+    #[error("security arp-inspection: {0}")]
+    BadArpInspection(String),
 }
 
 /// Extract every intent family from a config tree.
@@ -552,6 +792,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
     routing(tree, &mut intents)?;
     protocols(tree, &mut intents)?;
     switching(tree, &mut intents)?;
+    security(tree, &mut intents)?;
     let Some((_, items)) = tree.block("interfaces") else {
         finish_validation(&mut intents)?;
         return Ok(intents);
@@ -639,7 +880,22 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     lacp: port_lacp(children, &ifname)?,
                     spanning_tree: port_stp(children, &ifname)?,
                     storm_control: storm_control(children, &ifname)?,
+                    access_groups: access_groups(children, &ifname)?,
+                    port_security: port_security(children, &ifname)?,
+                    dot1x: ConfigTree::has_leaf(children, "dot1x"),
+                    dhcp_snooping_trust: ConfigTree::has_phrase(children, "dhcp-snooping", "trust"),
+                    arp_inspection_trust: ConfigTree::has_phrase(
+                        children,
+                        "arp-inspection",
+                        "trust",
+                    ),
                 };
+                if intent.dot1x && intent.port_security.is_some() {
+                    return Err(IntentError::BadPortSecurity {
+                        name: ifname,
+                        reason: "port-security and dot1x are mutually exclusive".into(),
+                    });
+                }
                 if intents.ports.insert(ifname.clone(), intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
                 }
@@ -666,6 +922,20 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         reason: "a port-channel cannot join a channel-group".into(),
                     });
                 }
+                if ConfigTree::has_leaf(children, "dot1x") {
+                    return Err(IntentError::BadDot1x(format!(
+                        "{ifname}: dot1x runs on physical ports only"
+                    )));
+                }
+                if ConfigTree::blocks_named(children, "port-security")
+                    .next()
+                    .is_some()
+                {
+                    return Err(IntentError::BadPortSecurity {
+                        name: ifname,
+                        reason: "port-security runs on physical ports only".into(),
+                    });
+                }
                 let intent = LagIntent {
                     admin_up,
                     description: ConfigTree::leaf_value(children, "description")
@@ -676,6 +946,13 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     fallback_timeout: lag_fallback_timeout(children, &ifname)?,
                     spanning_tree: port_stp(children, &ifname)?,
                     storm_control: storm_control(children, &ifname)?,
+                    access_groups: access_groups(children, &ifname)?,
+                    dhcp_snooping_trust: ConfigTree::has_phrase(children, "dhcp-snooping", "trust"),
+                    arp_inspection_trust: ConfigTree::has_phrase(
+                        children,
+                        "arp-inspection",
+                        "trust",
+                    ),
                 };
                 if intents.lags.insert(group, intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
@@ -699,6 +976,26 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     return Err(IntentError::BadChannelGroup {
                         name: ifname,
                         reason: "management ports cannot join a channel-group".into(),
+                    });
+                }
+                if ConfigTree::blocks_named(children, "port-security")
+                    .next()
+                    .is_some()
+                {
+                    return Err(IntentError::BadPortSecurity {
+                        name: ifname,
+                        reason: "port-security is not supported on Management".into(),
+                    });
+                }
+                if ConfigTree::has_leaf(children, "dot1x") {
+                    return Err(IntentError::BadDot1x(format!(
+                        "{ifname}: dot1x is not supported on Management"
+                    )));
+                }
+                if ConfigTree::has_leaf(children, "access-group") {
+                    return Err(IntentError::BadAccessGroup {
+                        name: ifname,
+                        reason: "management ports take no ACL bindings".into(),
                     });
                 }
                 let intent = MgmtIntent { admin_up, address };
@@ -804,6 +1101,565 @@ fn interface_address<'a>(intents: &'a Intents, name: &str) -> Option<Option<&'a 
         .or_else(|| intents.management.get(name).map(|m| m.address.as_ref()))
 }
 
+/// `access-group <name> <in|out>` leaves of one interface.
+fn access_groups(children: &[Item], ifname: &str) -> Result<AccessGroups, IntentError> {
+    let bad = |reason: String| IntentError::BadAccessGroup {
+        name: ifname.to_string(),
+        reason,
+    };
+    let mut groups = AccessGroups::default();
+    for item in children {
+        let Item::Leaf { name, values } = item else {
+            continue;
+        };
+        if name != "access-group" {
+            continue;
+        }
+        let [acl, direction] = values.as_slice() else {
+            return Err(bad("expected `access-group <name> <in|out>`".into()));
+        };
+        let slot = match direction.as_str() {
+            "in" => &mut groups.ingress,
+            "out" => &mut groups.egress,
+            other => {
+                return Err(bad(format!(
+                    "direction must be `in` or `out`, got {other:?}"
+                )));
+            }
+        };
+        if slot.is_some() {
+            return Err(bad(format!("duplicate {direction} binding")));
+        }
+        *slot = Some(acl.clone());
+    }
+    Ok(groups)
+}
+
+/// `port-security { maximum <n>; violation <protect|shutdown> }`.
+fn port_security(
+    children: &[Item],
+    ifname: &str,
+) -> Result<Option<PortSecurityIntent>, IntentError> {
+    let Some((_, body)) = ConfigTree::blocks_named(children, "port-security").next() else {
+        return Ok(None);
+    };
+    let bad = |reason: String| IntentError::BadPortSecurity {
+        name: ifname.to_string(),
+        reason,
+    };
+    let mut intent = PortSecurityIntent::default();
+    for item in body {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match (name.as_str(), values.as_slice()) {
+            ("maximum", [value]) => {
+                intent.maximum = parse_int::<u32>(value, 1..=1024, "maximum").map_err(&bad)?;
+            }
+            ("violation", [value]) => {
+                intent.shutdown = match value.as_str() {
+                    "protect" => false,
+                    "shutdown" => true,
+                    other => {
+                        return Err(bad(format!(
+                            "violation must be `protect` or `shutdown`, got {other:?}"
+                        )));
+                    }
+                };
+            }
+            _ => {
+                return Err(bad(format!("unrecognized statement {name:?}")));
+            }
+        }
+    }
+    Ok(Some(intent))
+}
+
+/// The `security { ... }` block: ACLs, CoPP overrides, dot1x, DHCP
+/// snooping + ARP inspection.
+fn security(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
+    let Some((_, items)) = tree.block("security") else {
+        return Ok(());
+    };
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadSecurity(format!(
+                "unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        if !keys.is_empty() {
+            return Err(IntentError::BadSecurity(format!(
+                "unrecognized block {name:?}"
+            )));
+        }
+        match name.as_str() {
+            "acl" => acls(children, intents)?,
+            "copp" => copp(children, intents)?,
+            "dot1x" => intents.dot1x = dot1x(children)?,
+            "dhcp-snooping" => dhcp_snooping(children, intents)?,
+            "arp-inspection" => arp_inspection(children, intents)?,
+            other => {
+                return Err(IntentError::BadSecurity(format!(
+                    "unrecognized block {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ACL name syntax: letter first, then letters/digits/`_`/`-`, at most
+/// 32 characters.
+fn valid_acl_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// `acl { <ipv4|ipv6|mac> <name> { rule <n> { ... } } }`.
+fn acls(items: &[Item], intents: &mut Intents) -> Result<(), IntentError> {
+    for item in items {
+        let Item::Block {
+            name: family_word,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadSecurity(format!(
+                "acl: unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        let family = match family_word.as_str() {
+            "ipv4" => AclFamily::Ipv4,
+            "ipv6" => AclFamily::Ipv6,
+            "mac" => AclFamily::Mac,
+            other => {
+                return Err(IntentError::BadSecurity(format!(
+                    "acl: unrecognized family {other:?}"
+                )));
+            }
+        };
+        let [name] = keys.as_slice() else {
+            return Err(IntentError::BadSecurity(format!(
+                "acl {family_word} block needs exactly one name key"
+            )));
+        };
+        if !valid_acl_name(name) {
+            return Err(IntentError::BadAcl {
+                name: name.clone(),
+                reason: "bad name (letter first, then letters/digits/_/-, max 32)".into(),
+            });
+        }
+        let intent = AclIntent {
+            family,
+            rules: acl_rules(name, family, children)?,
+        };
+        if intents.acls.insert(name.clone(), intent).is_some() {
+            return Err(IntentError::BadAcl {
+                name: name.clone(),
+                reason: "duplicate ACL name (names are shared across families)".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The `rule <n> { ... }` blocks of one ACL.
+fn acl_rules(
+    acl: &str,
+    family: AclFamily,
+    items: &[Item],
+) -> Result<BTreeMap<u32, AclRule>, IntentError> {
+    let mut rules = BTreeMap::new();
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadAcl {
+                name: acl.to_string(),
+                reason: format!("unrecognized statement {:?}", item.name()),
+            });
+        };
+        if name != "rule" {
+            return Err(IntentError::BadAcl {
+                name: acl.to_string(),
+                reason: format!("unrecognized block {name:?}"),
+            });
+        }
+        let [number_text] = keys.as_slice() else {
+            return Err(IntentError::BadAcl {
+                name: acl.to_string(),
+                reason: "rule block needs exactly one number key".into(),
+            });
+        };
+        let bad = |reason: String| IntentError::BadAclRule {
+            name: acl.to_string(),
+            rule: number_text.clone(),
+            reason,
+        };
+        let number = number_text
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 1 && !number_text.starts_with('0'))
+            .ok_or_else(|| bad(format!("bad rule number {number_text:?} (1..4294967295)")))?;
+        let rule = acl_rule(family, children, &bad)?;
+        if rules.insert(number, rule).is_some() {
+            return Err(bad("duplicate rule number".into()));
+        }
+    }
+    Ok(rules)
+}
+
+/// One rule body, family-gated.
+fn acl_rule(
+    family: AclFamily,
+    children: &[Item],
+    bad: &dyn Fn(String) -> IntentError,
+) -> Result<AclRule, IntentError> {
+    let mut rule = AclRule::default();
+    let mut action: Option<bool> = None;
+    let ip_family = matches!(family, AclFamily::Ipv4 | AclFamily::Ipv6);
+    for item in children {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match (name.as_str(), values.as_slice()) {
+            ("permit", []) | ("deny", []) => {
+                if action.is_some() {
+                    return Err(bad("both permit and deny".into()));
+                }
+                action = Some(name == "permit");
+            }
+            ("protocol", [value]) if ip_family => {
+                rule.protocol = Some(match value.as_str() {
+                    "tcp" => 6,
+                    "udp" => 17,
+                    "icmp" => 1,
+                    other => other
+                        .parse::<u8>()
+                        .map_err(|_| bad(format!("bad protocol {other:?} (tcp|udp|icmp|0-255)")))?,
+                });
+            }
+            ("source", [value]) | ("destination", [value]) if ip_family => {
+                let slot = if name == "source" {
+                    &mut rule.source
+                } else {
+                    &mut rule.destination
+                };
+                if value == "any" {
+                    *slot = None;
+                    continue;
+                }
+                let canonical =
+                    hemlock_common::net::require_canonical_prefix(value).map_err(bad)?;
+                let v6 = canonical.contains(':');
+                if v6 != matches!(family, AclFamily::Ipv6) {
+                    return Err(bad(format!(
+                        "{canonical} does not match the ACL family ({})",
+                        family.word()
+                    )));
+                }
+                *slot = Some(canonical);
+            }
+            ("source-port", [value]) | ("destination-port", [value]) if ip_family => {
+                let range = hemlock_common::net::parse_port_match(value).map_err(bad)?;
+                if name == "source-port" {
+                    rule.source_port = Some(range);
+                } else {
+                    rule.destination_port = Some(range);
+                }
+            }
+            ("dscp", [value]) if ip_family => {
+                rule.dscp = Some(parse_int::<u8>(value, 0..=63, "dscp").map_err(bad)?);
+            }
+            ("log", []) if ip_family => rule.log = true,
+            ("police", [kw_rate, rate, kw_burst, burst])
+                if ip_family && kw_rate == "rate" && kw_burst == "burst" =>
+            {
+                let (rate_value, pps) =
+                    hemlock_common::net::parse_police_rate(rate).map_err(bad)?;
+                let (burst_value, burst_pkts) =
+                    hemlock_common::net::parse_police_burst(burst).map_err(bad)?;
+                let burst_scaled = burst.to_ascii_lowercase().ends_with(['k', 'm', 'g']);
+                if pps && burst_scaled {
+                    return Err(bad("a pps rate takes its burst in packets".into()));
+                }
+                if !pps && burst_pkts {
+                    return Err(bad("a bps rate takes its burst in bytes".into()));
+                }
+                rule.police = Some(AclPolice {
+                    rate: rate_value,
+                    burst: burst_value,
+                    pps,
+                });
+            }
+            ("source-mac", [value]) | ("destination-mac", [value])
+                if family == AclFamily::Mac =>
+            {
+                let (mac_text, mask_text) = match value.split_once('/') {
+                    Some((mac, mask)) => (mac, Some(mask)),
+                    None => (value.as_str(), None),
+                };
+                let mac = hemlock_common::net::parse_mac(mac_text).map_err(bad)?;
+                let mask = match mask_text {
+                    Some(mask) => hemlock_common::net::parse_mac_mask(mask).map_err(bad)?,
+                    None => "ff:ff:ff:ff:ff:ff".into(),
+                };
+                if name == "source-mac" {
+                    rule.source_mac = Some((mac, mask));
+                } else {
+                    rule.destination_mac = Some((mac, mask));
+                }
+            }
+            ("ethertype", [value]) if family == AclFamily::Mac => {
+                rule.ethertype = Some(match value.as_str() {
+                    "ipv4" => 0x0800,
+                    "ipv6" => 0x86dd,
+                    "arp" => 0x0806,
+                    hex => hex
+                        .strip_prefix("0x")
+                        .and_then(|h| u16::from_str_radix(h, 16).ok())
+                        .ok_or_else(|| {
+                            bad(format!("bad ethertype {hex:?} (0x0000-0xffff|ipv4|ipv6|arp)"))
+                        })?,
+                });
+            }
+            _ => {
+                return Err(bad(format!(
+                    "unrecognized statement {name:?} for an {} rule",
+                    family.word()
+                )));
+            }
+        }
+    }
+    let Some(permit) = action else {
+        return Err(bad("needs `permit` or `deny`".into()));
+    };
+    rule.permit = permit;
+    if (rule.source_port.is_some() || rule.destination_port.is_some())
+        && !matches!(rule.protocol, Some(6) | Some(17))
+    {
+        return Err(bad(
+            "source-port/destination-port require protocol tcp or udp".into(),
+        ));
+    }
+    Ok(rule)
+}
+
+/// `copp { class <name> { rate <pps>; burst <pkts> } }`.
+fn copp(items: &[Item], intents: &mut Intents) -> Result<(), IntentError> {
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadCopp(format!(
+                "unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        if name != "class" {
+            return Err(IntentError::BadCopp(format!(
+                "unrecognized block {name:?}"
+            )));
+        }
+        let [class] = keys.as_slice() else {
+            return Err(IntentError::BadCopp("class block needs a name key".into()));
+        };
+        if !COPP_CLASS_NAMES.contains(&class.as_str()) {
+            return Err(IntentError::BadCopp(format!("unknown class {class:?}")));
+        }
+        let bad = |reason: String| IntentError::BadCopp(format!("class {class}: {reason}"));
+        let mut intent = CoppClassIntent::default();
+        for item in children {
+            let Item::Leaf { name, values } = item else {
+                return Err(bad(format!("unrecognized block {:?}", item.name())));
+            };
+            match (name.as_str(), values.as_slice()) {
+                ("rate", [value]) => {
+                    intent.rate =
+                        Some(parse_int::<u32>(value, 1..=10_000_000, "rate").map_err(&bad)?);
+                }
+                ("burst", [value]) => {
+                    intent.burst =
+                        Some(parse_int::<u32>(value, 1..=1_000_000, "burst").map_err(&bad)?);
+                }
+                _ => return Err(bad(format!("unrecognized statement {name:?}"))),
+            }
+        }
+        if intents.copp.insert(class.clone(), intent).is_some() {
+            return Err(IntentError::BadCopp(format!("duplicate class {class:?}")));
+        }
+    }
+    Ok(())
+}
+
+/// `dot1x { radius-server <ip> { ... }; reauth-interval <secs> }`.
+fn dot1x(items: &[Item]) -> Result<Dot1xIntent, IntentError> {
+    let bad = IntentError::BadDot1x;
+    let mut intent = Dot1xIntent::default();
+    for item in items {
+        match item {
+            Item::Block {
+                name,
+                keys,
+                children,
+            } if name == "radius-server" => {
+                let [ip] = keys.as_slice() else {
+                    return Err(bad("radius-server block needs an address key".into()));
+                };
+                let ip: std::net::IpAddr = ip
+                    .parse()
+                    .map_err(|_| bad(format!("bad radius-server address {ip:?}")))?;
+                let mut server = RadiusServer {
+                    ip: ip.to_string(),
+                    ..RadiusServer::default()
+                };
+                let bad_server =
+                    |reason: String| IntentError::BadDot1x(format!("radius-server {ip}: {reason}"));
+                for item in children {
+                    let Item::Leaf { name, values } = item else {
+                        return Err(bad_server(format!(
+                            "unrecognized block {:?}",
+                            item.name()
+                        )));
+                    };
+                    match (name.as_str(), values.as_slice()) {
+                        ("key", [key]) => server.key = Some(key.clone()),
+                        ("port", [value]) => {
+                            server.port =
+                                parse_int::<u16>(value, 1..=65535, "port").map_err(&bad_server)?;
+                        }
+                        ("timeout", [value]) => {
+                            server.timeout =
+                                parse_int::<u8>(value, 1..=60, "timeout").map_err(&bad_server)?;
+                        }
+                        ("retransmit", [value]) => {
+                            server.retransmit = parse_int::<u8>(value, 0..=10, "retransmit")
+                                .map_err(&bad_server)?;
+                        }
+                        _ => {
+                            return Err(bad_server(format!("unrecognized statement {name:?}")));
+                        }
+                    }
+                }
+                if intent.radius_servers.iter().any(|s| s.ip == server.ip) {
+                    return Err(bad(format!("duplicate radius-server {ip}")));
+                }
+                intent.radius_servers.push(server);
+            }
+            Item::Leaf { name, values } if name == "reauth-interval" => {
+                let [value] = values.as_slice() else {
+                    return Err(bad("reauth-interval takes one value".into()));
+                };
+                let secs = parse_int::<u32>(value, 0..=86400, "reauth-interval").map_err(bad)?;
+                if secs != 0 && secs < 60 {
+                    return Err(bad(format!("bad reauth-interval {secs} (0|60-86400)")));
+                }
+                intent.reauth_interval = secs;
+            }
+            other => {
+                return Err(bad(format!(
+                    "unrecognized statement {:?}",
+                    other.name()
+                )));
+            }
+        }
+    }
+    Ok(intent)
+}
+
+/// `dhcp-snooping { vlan <id>; binding <mac> vlan <id> address <ip>
+/// interface <port> }`.
+fn dhcp_snooping(items: &[Item], intents: &mut Intents) -> Result<(), IntentError> {
+    let bad = IntentError::BadDhcpSnooping;
+    for item in items {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match (name.as_str(), values.as_slice()) {
+            ("vlan", [id]) => {
+                let id = parse_vlan_id(id).map_err(bad)?;
+                intents.snoop_sec.dhcp_vlans.insert(id);
+            }
+            ("binding", [mac, kw_vlan, vlan, kw_address, address, kw_interface, interface])
+                if kw_vlan == "vlan" && kw_address == "address" && kw_interface == "interface" =>
+            {
+                let mac = hemlock_common::net::parse_unicast_mac(mac).map_err(bad)?;
+                let vlan = parse_vlan_id(vlan).map_err(bad)?;
+                let ip: std::net::Ipv4Addr = address
+                    .parse()
+                    .map_err(|_| bad(format!("bad binding address {address:?} (IPv4)")))?;
+                let binding = StaticBinding {
+                    address: ip.to_string(),
+                    interface: interface.clone(),
+                };
+                if intents
+                    .snoop_sec
+                    .static_bindings
+                    .insert((mac.clone(), vlan), binding)
+                    .is_some()
+                {
+                    return Err(bad(format!("duplicate binding {mac} vlan {vlan}")));
+                }
+            }
+            _ => {
+                return Err(bad(format!("unrecognized statement {name:?}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `arp-inspection { vlan <id>; validate <src-mac|dst-mac|ip> }`.
+fn arp_inspection(items: &[Item], intents: &mut Intents) -> Result<(), IntentError> {
+    let bad = IntentError::BadArpInspection;
+    for item in items {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match (name.as_str(), values.as_slice()) {
+            ("vlan", [id]) => {
+                let id = parse_vlan_id(id).map_err(bad)?;
+                intents.snoop_sec.arp_vlans.insert(id);
+            }
+            ("validate", [check]) => {
+                let check = match check.as_str() {
+                    "src-mac" => ArpValidate::SrcMac,
+                    "dst-mac" => ArpValidate::DstMac,
+                    "ip" => ArpValidate::Ip,
+                    other => {
+                        return Err(bad(format!(
+                            "bad validate {other:?} (src-mac|dst-mac|ip)"
+                        )));
+                    }
+                };
+                intents.snoop_sec.validate.insert(check);
+            }
+            _ => {
+                return Err(bad(format!("unrecognized statement {name:?}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
     // ARP statics: the named interface must be L3 (carry an address in
     // this same config).
@@ -846,7 +1702,7 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
 
     // VRRP: the parent must carry an address, group addresses are
     // required, and each VIP must fall inside one of the parent's
-    // subnets — an off-subnet VIP on an access switch is a typo, so an
+    // subnets â€” an off-subnet VIP on an access switch is a typo, so an
     // error, not a warning.
     for ((interface, group), vrrp) in &intents.vrrp {
         let bad = |reason: String| IntentError::BadVrrp {
@@ -992,6 +1848,190 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
             }
         }
     }
+
+    // ACL bindings: the named ACL must exist, and a LAG member binds on
+    // its Port-Channel, never directly.
+    let mirror_destinations: BTreeSet<&String> = intents
+        .mirror
+        .values()
+        .filter_map(|m| m.destination.as_ref())
+        .collect();
+    let mut all_bindings: Vec<(String, AccessGroups)> = Vec::new();
+    for (name, port) in &intents.ports {
+        if !port.access_groups.is_empty() {
+            if let Some(cg) = &port.channel_group {
+                return Err(IntentError::AccessGroupOnMember {
+                    member: name.clone(),
+                    group: cg.group,
+                });
+            }
+            all_bindings.push((name.clone(), port.access_groups.clone()));
+        }
+    }
+    for (group, lag) in &intents.lags {
+        if !lag.access_groups.is_empty() {
+            all_bindings.push((format!("Port-Channel{group}"), lag.access_groups.clone()));
+        }
+    }
+    for (name, groups) in &all_bindings {
+        for acl in [&groups.ingress, &groups.egress].into_iter().flatten() {
+            if !intents.acls.contains_key(acl) {
+                return Err(IntentError::BadAccessGroup {
+                    name: name.clone(),
+                    reason: format!("no such ACL {acl:?}"),
+                });
+            }
+        }
+    }
+
+    // dot1x needs a keyed RADIUS server the moment any port enables it.
+    let dot1x_ports: Vec<&String> = intents
+        .ports
+        .iter()
+        .filter(|(_, p)| p.dot1x)
+        .map(|(n, _)| n)
+        .collect();
+    if !dot1x_ports.is_empty()
+        && !intents
+            .dot1x
+            .radius_servers
+            .iter()
+            .any(|s| s.key.is_some())
+    {
+        return Err(IntentError::BadDot1x(
+            "radius-server with key is required".into(),
+        ));
+    }
+    for name in &dot1x_ports {
+        if let Some(port) = intents.ports.get(*name) {
+            if let Some(cg) = &port.channel_group {
+                return Err(IntentError::BadDot1x(format!(
+                    "{name}: member of Port-Channel{}; dot1x runs on standalone ports",
+                    cg.group
+                )));
+            }
+        }
+    }
+
+    // Port security: not on LAG members and not on mirror destinations.
+    for (name, port) in &intents.ports {
+        if port.port_security.is_none() {
+            continue;
+        }
+        if let Some(cg) = &port.channel_group {
+            return Err(IntentError::BadPortSecurity {
+                name: name.clone(),
+                reason: format!(
+                    "member of Port-Channel{}; port-security and channel-group are mutually exclusive",
+                    cg.group
+                ),
+            });
+        }
+        if mirror_destinations.contains(name) {
+            return Err(IntentError::BadPortSecurity {
+                name: name.clone(),
+                reason: "mirror destinations take no port-security".into(),
+            });
+        }
+    }
+
+    // DAI leans on the snooping binding table: an inspected VLAN wants
+    // DHCP snooping (or at least one static binding covering it).
+    for vlan in &intents.snoop_sec.arp_vlans {
+        let covered = intents.snoop_sec.dhcp_vlans.contains(vlan)
+            || intents
+                .snoop_sec
+                .static_bindings
+                .keys()
+                .any(|(_, binding_vlan)| binding_vlan == vlan);
+        if !covered {
+            return Err(IntentError::BadArpInspection(format!(
+                "vlan {vlan} needs dhcp-snooping vlan {vlan} (or a static binding) to validate against"
+            )));
+        }
+    }
+
+    // Which VLANs an L2 interface carries (its own switchport, or its
+    // Port-Channel's for members).
+    let carries_vlan = |intents: &Intents, name: &str, vlan: u16| -> bool {
+        let switchport = intents
+            .ports
+            .get(name)
+            .map(|p| match &p.channel_group {
+                Some(cg) => intents
+                    .lags
+                    .get(&cg.group)
+                    .map(|lag| lag.switchport.clone())
+                    .unwrap_or(None),
+                None => p.switchport.clone(),
+            })
+            .or_else(|| {
+                name.strip_prefix("Port-Channel")
+                    .and_then(|d| d.parse::<u16>().ok())
+                    .and_then(|group| intents.lags.get(&group))
+                    .map(|lag| lag.switchport.clone())
+            });
+        match switchport {
+            None => false,
+            Some(None) => vlan == 1,
+            Some(Some(sp)) => match sp.mode {
+                SwitchportMode::Access | SwitchportMode::Dot1qTunnel => {
+                    sp.access_vlan.unwrap_or(1) == vlan
+                }
+                SwitchportMode::Trunk => {
+                    sp.trunk_vlans.contains(&vlan) || sp.native_vlan.unwrap_or(1) == vlan
+                }
+            },
+        }
+    };
+
+    // Static bindings name existing interfaces carrying their VLAN.
+    for ((mac, vlan), binding) in &intents.snoop_sec.static_bindings {
+        let exists = intents.ports.contains_key(&binding.interface)
+            || binding
+                .interface
+                .strip_prefix("Port-Channel")
+                .and_then(|d| d.parse::<u16>().ok())
+                .map(|group| intents.lags.contains_key(&group))
+                .unwrap_or(false);
+        if !exists {
+            return Err(IntentError::BadDhcpSnooping(format!(
+                "binding {mac} vlan {vlan}: no such interface {:?}",
+                binding.interface
+            )));
+        }
+        if !carries_vlan(intents, &binding.interface, *vlan) {
+            return Err(IntentError::BadDhcpSnooping(format!(
+                "binding {mac} vlan {vlan}: {} does not carry VLAN {vlan}",
+                binding.interface
+            )));
+        }
+    }
+
+    // Trust flags on interfaces that carry no snooped/inspected VLAN
+    // are inert â€” a commit note, not an error.
+    let mut trust_notes = Vec::new();
+    {
+        let snooped: Vec<u16> = intents.snoop_sec.dhcp_vlans.iter().copied().collect();
+        let inspected: Vec<u16> = intents.snoop_sec.arp_vlans.iter().copied().collect();
+        let mut check = |name: &str, feature: &str, trusted: bool, vlans: &[u16]| {
+            if trusted && !vlans.iter().any(|vlan| carries_vlan(intents, name, *vlan)) {
+                trust_notes.push(format!(
+                    "{name}: {feature} trust has no effect (the interface carries no such VLAN)"
+                ));
+            }
+        };
+        for (name, port) in &intents.ports {
+            check(name, "dhcp-snooping", port.dhcp_snooping_trust, &snooped);
+            check(name, "arp-inspection", port.arp_inspection_trust, &inspected);
+        }
+        for (group, lag) in &intents.lags {
+            let name = format!("Port-Channel{group}");
+            check(&name, "dhcp-snooping", lag.dhcp_snooping_trust, &snooped);
+            check(&name, "arp-inspection", lag.arp_inspection_trust, &inspected);
+        }
+    }
+    intents.warnings.extend(trust_notes);
 
     Ok(())
 }
@@ -1386,7 +2426,7 @@ fn ssh(tree: &ConfigTree) -> Result<SshIntent, IntentError> {
     Ok(intent)
 }
 
-/// `system { http }` / `system { https }` — pure block presence.
+/// `system { http }` / `system { https }` â€” pure block presence.
 fn web(tree: &ConfigTree) -> WebIntent {
     let Some((_, system)) = tree.block("system") else {
         return WebIntent::default();
@@ -1703,7 +2743,7 @@ fn bgp_intent(children: &[Item]) -> Result<BgpIntent, IntentError> {
 
 fn static_routes(children: &[Item]) -> Result<BTreeMap<String, StaticRoute>, IntentError> {
     let mut routes: BTreeMap<String, StaticRoute> = BTreeMap::new();
-    // Explicit `distance` values seen per prefix — distance is
+    // Explicit `distance` values seen per prefix â€” distance is
     // per-prefix, so explicit values on different lines must agree
     // (lines without one inherit rather than conflict).
     let mut explicit_distance: BTreeMap<String, u8> = BTreeMap::new();
@@ -1774,7 +2814,7 @@ fn static_routes(children: &[Item]) -> Result<BTreeMap<String, StaticRoute>, Int
     Ok(routes)
 }
 
-/// `arp { <ip> interface <name> mac <mac> }` — one leaf per address.
+/// `arp { <ip> interface <name> mac <mac> }` â€” one leaf per address.
 fn arp_statics(children: &[Item]) -> Result<BTreeMap<String, ArpStatic>, IntentError> {
     let mut statics = BTreeMap::new();
     for item in children {
@@ -1955,7 +2995,7 @@ fn snooping(items: &[Item], family: &'static str) -> Result<SnoopingIntent, Inte
     };
     for item in items {
         let (key, children): (&str, &[Item]) = match item {
-            // `vlan 10 { ... }` — per-VLAN settings.
+            // `vlan 10 { ... }` â€” per-VLAN settings.
             Item::Block {
                 name,
                 keys,
@@ -1964,7 +3004,7 @@ fn snooping(items: &[Item], family: &'static str) -> Result<SnoopingIntent, Inte
                 [key] => (key, children),
                 _ => return Err(bad("vlan block needs exactly one id key".into())),
             },
-            // `vlan 10` — the bare enabled form.
+            // `vlan 10` â€” the bare enabled form.
             Item::Leaf { name, values } if name == "vlan" => match values.as_slice() {
                 [key] => (key, &[]),
                 _ => return Err(bad("expected `vlan <id>`".into())),
@@ -2277,7 +3317,7 @@ pub struct NetdevChange {
     pub name: String,
     pub admin_up: Option<bool>,
     pub set_address: Option<String>,
-    /// Previous address to remove first — an address change is del +
+    /// Previous address to remove first â€” an address change is del +
     /// add, since `ip addr replace` only replaces an identical local
     /// address.
     pub del_address: Option<String>,
@@ -2303,7 +3343,7 @@ impl NetdevChange {
 
 /// One static-route change for the OS applier. Both sides travel
 /// because the configured distance is the kernel metric, and the metric
-/// is part of a kernel route's identity — a distance change must delete
+/// is part of a kernel route's identity â€” a distance change must delete
 /// the old route, not just replace at the new metric.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteChange {
@@ -2382,7 +3422,7 @@ impl VrrpMacvlanChange {
     }
 }
 
-/// The macvlan netdev name for one (interface, group) — compact so the
+/// The macvlan netdev name for one (interface, group) â€” compact so the
 /// worst case ("vrrp4-v4094-255") still fits IFNAMSIZ.
 pub fn vrrp_macvlan_name(interface: &str, group: u8) -> String {
     let compact = if let Some(id) = interface.strip_prefix("Vlan") {
@@ -3121,6 +4161,289 @@ pub fn diff_mirror(running: &Intents, candidate: &Intents) -> Vec<MirrorChange> 
         }
     }
     changes
+}
+
+// --- security-suite diffs --------------------------------------------
+
+pub struct AclChange {
+    pub name: String,
+    /// The full wanted ACL; None = remove it.
+    pub ensure: Option<AclIntent>,
+}
+
+impl AclChange {
+    pub fn describe(&self) -> String {
+        match &self.ensure {
+            Some(acl) => format!(
+                "security acl {} ({}, {} rule(s))",
+                self.name,
+                acl.family.word(),
+                acl.rules.len()
+            ),
+            None => format!("security acl {} removed", self.name),
+        }
+    }
+}
+
+/// Diff the ACL definitions, candidate against running.
+pub fn diff_acls(running: &Intents, candidate: &Intents) -> Vec<AclChange> {
+    let mut changes = Vec::new();
+    for (name, wanted) in &candidate.acls {
+        if running.acls.get(name) != Some(wanted) {
+            changes.push(AclChange {
+                name: name.clone(),
+                ensure: Some(wanted.clone()),
+            });
+        }
+    }
+    for name in running.acls.keys() {
+        if !candidate.acls.contains_key(name) {
+            changes.push(AclChange {
+                name: name.clone(),
+                ensure: None,
+            });
+        }
+    }
+    changes
+}
+
+/// Every ACL binding of a config: (interface, egress?) -> ACL name.
+/// Port-Channel bindings ride under their display name (syncd expands
+/// them to members).
+pub fn acl_bindings(intents: &Intents) -> BTreeMap<(String, bool), String> {
+    let mut bindings = BTreeMap::new();
+    let mut add = |name: &str, groups: &AccessGroups| {
+        if let Some(acl) = &groups.ingress {
+            bindings.insert((name.to_string(), false), acl.clone());
+        }
+        if let Some(acl) = &groups.egress {
+            bindings.insert((name.to_string(), true), acl.clone());
+        }
+    };
+    for (name, port) in &intents.ports {
+        add(name, &port.access_groups);
+    }
+    for (group, lag) in &intents.lags {
+        add(&format!("Port-Channel{group}"), &lag.access_groups);
+    }
+    bindings
+}
+
+pub struct AclBindingChange {
+    pub target: String,
+    pub egress: bool,
+    /// The ACL to bind; None = unbind.
+    pub acl: Option<String>,
+}
+
+impl AclBindingChange {
+    fn direction(&self) -> &'static str {
+        if self.egress {
+            "out"
+        } else {
+            "in"
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match &self.acl {
+            Some(acl) => format!("access-group {acl} applied to {} ({})", self.target, self.direction()),
+            None => format!("access-group removed from {} ({})", self.target, self.direction()),
+        }
+    }
+}
+
+/// Diff the ACL bindings, candidate against running.
+pub fn diff_acl_bindings(running: &Intents, candidate: &Intents) -> Vec<AclBindingChange> {
+    let running = acl_bindings(running);
+    let wanted = acl_bindings(candidate);
+    let mut changes = Vec::new();
+    for ((target, egress), acl) in &wanted {
+        if running.get(&(target.clone(), *egress)) != Some(acl) {
+            changes.push(AclBindingChange {
+                target: target.clone(),
+                egress: *egress,
+                acl: Some(acl.clone()),
+            });
+        }
+    }
+    for (target, egress) in running.keys() {
+        if !wanted.contains_key(&(target.clone(), *egress)) {
+            changes.push(AclBindingChange {
+                target: target.clone(),
+                egress: *egress,
+                acl: None,
+            });
+        }
+    }
+    changes
+}
+
+pub struct CoppChange {
+    pub class: String,
+    /// The wanted override; None = back to compiled defaults.
+    pub set: Option<CoppClassIntent>,
+}
+
+impl CoppChange {
+    pub fn describe(&self) -> String {
+        match &self.set {
+            Some(intent) => format!(
+                "copp class {}: rate {} burst {}",
+                self.class,
+                intent
+                    .rate
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "default".into()),
+                intent
+                    .burst
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "default".into()),
+            ),
+            None => format!("copp class {} restored to defaults", self.class),
+        }
+    }
+}
+
+/// Diff the CoPP class overrides, candidate against running.
+pub fn diff_copp(running: &Intents, candidate: &Intents) -> Vec<CoppChange> {
+    let mut changes = Vec::new();
+    for (class, wanted) in &candidate.copp {
+        if running.copp.get(class) != Some(wanted) {
+            changes.push(CoppChange {
+                class: class.clone(),
+                set: Some(wanted.clone()),
+            });
+        }
+    }
+    for class in running.copp.keys() {
+        if !candidate.copp.contains_key(class) {
+            changes.push(CoppChange {
+                class: class.clone(),
+                set: None,
+            });
+        }
+    }
+    changes
+}
+
+/// The per-port port-security programs of a config.
+pub fn port_security_state(intents: &Intents) -> BTreeMap<String, PortSecurityIntent> {
+    intents
+        .ports
+        .iter()
+        .filter_map(|(name, port)| port.port_security.map(|ps| (name.clone(), ps)))
+        .collect()
+}
+
+pub struct PortSecurityChange {
+    pub port: String,
+    /// The wanted program; None = unconfigure.
+    pub set: Option<PortSecurityIntent>,
+}
+
+impl PortSecurityChange {
+    pub fn describe(&self) -> String {
+        match &self.set {
+            Some(ps) => format!(
+                "port-security on {}: maximum {} violation {}",
+                self.port,
+                ps.maximum,
+                if ps.shutdown { "shutdown" } else { "protect" }
+            ),
+            None => format!("port-security removed from {}", self.port),
+        }
+    }
+}
+
+/// Diff the port-security programs, candidate against running.
+pub fn diff_port_security(running: &Intents, candidate: &Intents) -> Vec<PortSecurityChange> {
+    let running = port_security_state(running);
+    let wanted = port_security_state(candidate);
+    let mut changes = Vec::new();
+    for (port, ps) in &wanted {
+        if running.get(port) != Some(ps) {
+            changes.push(PortSecurityChange {
+                port: port.clone(),
+                set: Some(*ps),
+            });
+        }
+    }
+    for port in running.keys() {
+        if !wanted.contains_key(port) {
+            changes.push(PortSecurityChange {
+                port: port.clone(),
+                set: None,
+            });
+        }
+    }
+    changes
+}
+
+/// The whole dot1x state orch consumes: the global intent plus the
+/// enabled-port set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Dot1xState {
+    pub intent: Dot1xIntent,
+    pub ports: BTreeSet<String>,
+}
+
+pub fn dot1x_state(intents: &Intents) -> Dot1xState {
+    Dot1xState {
+        intent: intents.dot1x.clone(),
+        ports: intents
+            .ports
+            .iter()
+            .filter(|(_, p)| p.dot1x)
+            .map(|(name, _)| name.clone())
+            .collect(),
+    }
+}
+
+/// The whole dot1x state when it changed, else None.
+pub fn diff_dot1x(running: &Intents, candidate: &Intents) -> Option<Dot1xState> {
+    let wanted = dot1x_state(candidate);
+    (dot1x_state(running) != wanted).then_some(wanted)
+}
+
+/// The whole snooping/DAI state orch consumes: the global intent plus
+/// the trust sets.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnoopSecState {
+    pub intent: SnoopSecIntent,
+    pub dhcp_trusted: BTreeSet<String>,
+    pub arp_trusted: BTreeSet<String>,
+}
+
+pub fn snoopsec_state(intents: &Intents) -> SnoopSecState {
+    let mut state = SnoopSecState {
+        intent: intents.snoop_sec.clone(),
+        ..SnoopSecState::default()
+    };
+    for (name, port) in &intents.ports {
+        if port.dhcp_snooping_trust {
+            state.dhcp_trusted.insert(name.clone());
+        }
+        if port.arp_inspection_trust {
+            state.arp_trusted.insert(name.clone());
+        }
+    }
+    for (group, lag) in &intents.lags {
+        let name = format!("Port-Channel{group}");
+        if lag.dhcp_snooping_trust {
+            state.dhcp_trusted.insert(name.clone());
+        }
+        if lag.arp_inspection_trust {
+            state.arp_trusted.insert(name);
+        }
+    }
+    state
+}
+
+/// The whole snooping/DAI state when it changed, else None.
+pub fn diff_snoopsec(running: &Intents, candidate: &Intents) -> Option<SnoopSecState> {
+    let wanted = snoopsec_state(candidate);
+    (snoopsec_state(running) != wanted).then_some(wanted)
 }
 
 #[cfg(test)]
@@ -4633,5 +5956,365 @@ switching {
                 del_address: Some("10.42.10.9/24".into()),
             }]
         );
+    }
+
+    /// The security-suite seed from the spec's Part 1.1.
+    fn security_seed() -> &'static str {
+        r#"
+vlans {
+    vlan 10 {
+    }
+    vlan 20 {
+    }
+}
+security {
+    acl {
+        ipv4 EDGE-IN {
+            rule 10 {
+                permit
+                protocol tcp
+                source 10.0.0.0/8
+                destination 10.42.0.0/16
+                destination-port 443
+            }
+            rule 20 {
+                permit
+                protocol udp
+                destination-port 67-68
+            }
+            rule 30 {
+                deny
+                source 192.0.2.0/24
+                log
+            }
+            rule 40 {
+                permit
+                police rate 10m burst 256k
+            }
+        }
+        ipv6 MGMT6-IN {
+            rule 10 {
+                permit
+                protocol tcp
+                source 2001:db8:9::/48
+                destination-port 22
+            }
+            rule 20 {
+                deny
+                log
+            }
+        }
+        mac IOT-MAC {
+            rule 10 {
+                permit
+                source-mac 00:1c:73:00:00:00/ff:ff:ff:00:00:00
+            }
+            rule 20 {
+                deny
+            }
+        }
+    }
+    copp {
+        class bpdu {
+            rate 512
+            burst 128
+        }
+        class arp {
+            rate 2000
+            burst 500
+        }
+    }
+    dot1x {
+        radius-server 10.42.0.5 {
+            key "s3cret"
+        }
+        reauth-interval 3600
+    }
+    dhcp-snooping {
+        vlan 10
+        vlan 20
+    }
+    arp-inspection {
+        vlan 10
+    }
+}
+interfaces {
+    Ethernet1 {
+        access-group EDGE-IN in
+        switchport {
+            mode trunk
+            trunk vlans 10 20
+        }
+    }
+    Ethernet5 {
+        port-security {
+            maximum 4
+            violation shutdown
+        }
+    }
+    Ethernet10 {
+        dot1x
+    }
+    Port-Channel1 {
+        switchport {
+            mode trunk
+            trunk vlans 10 20
+        }
+        dhcp-snooping trust
+        arp-inspection trust
+    }
+}
+"#
+    }
+
+    #[test]
+    fn security_seed_round_trips_and_extracts() {
+        let tree = parse(security_seed()).unwrap();
+        assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+        let intents = extract(&tree).unwrap();
+
+        // The three families share one namespace.
+        assert_eq!(intents.acls.len(), 3);
+        let edge = &intents.acls["EDGE-IN"];
+        assert_eq!(edge.family, AclFamily::Ipv4);
+        assert_eq!(
+            edge.rules.keys().copied().collect::<Vec<_>>(),
+            vec![10, 20, 30, 40]
+        );
+        assert_eq!(edge.rules[&10].protocol, Some(6));
+        assert_eq!(edge.rules[&10].source.as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(edge.rules[&10].destination_port, Some((443, 443)));
+        assert_eq!(edge.rules[&20].destination_port, Some((67, 68)));
+        assert!(edge.rules[&30].log && !edge.rules[&30].permit);
+        assert_eq!(
+            edge.rules[&40].police,
+            Some(AclPolice {
+                rate: 10_000_000,
+                burst: 256_000,
+                pps: false
+            })
+        );
+        assert_eq!(intents.acls["MGMT6-IN"].family, AclFamily::Ipv6);
+        let iot = &intents.acls["IOT-MAC"];
+        assert_eq!(iot.family, AclFamily::Mac);
+        assert_eq!(
+            iot.rules[&10].source_mac,
+            Some(("00:1c:73:00:00:00".into(), "ff:ff:ff:00:00:00".into()))
+        );
+
+        // CoPP overrides, dot1x, snooping/DAI.
+        assert_eq!(intents.copp.len(), 2);
+        assert_eq!(intents.copp["bpdu"].rate, Some(512));
+        assert_eq!(intents.copp["arp"].burst, Some(500));
+        let radius = &intents.dot1x.radius_servers;
+        assert_eq!(radius.len(), 1);
+        assert_eq!(radius[0].key.as_deref(), Some("s3cret"));
+        assert_eq!((radius[0].port, radius[0].timeout, radius[0].retransmit), (1812, 5, 3));
+        assert_eq!(intents.dot1x.reauth_interval, 3600);
+        assert_eq!(
+            intents.snoop_sec.dhcp_vlans.iter().copied().collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert!(intents.snoop_sec.arp_vlans.contains(&10));
+
+        // Per-port folds.
+        assert_eq!(
+            intents.ports["Ethernet1"].access_groups.ingress.as_deref(),
+            Some("EDGE-IN")
+        );
+        let ps = intents.ports["Ethernet5"].port_security.unwrap();
+        assert_eq!((ps.maximum, ps.shutdown), (4, true));
+        assert!(intents.ports["Ethernet10"].dot1x);
+        assert!(intents.lags[&1].dhcp_snooping_trust);
+        assert!(intents.lags[&1].arp_inspection_trust);
+
+        // The Port-Channel carries the snooped VLANs, so no trust
+        // notes; the only warning is the memberless port-channel.
+        assert_eq!(
+            intents.warnings,
+            vec!["Port-Channel1 has no member ports".to_string()]
+        );
+    }
+
+    #[test]
+    fn acl_validation() {
+        // A rule needs permit or deny by commit.
+        let tree =
+            parse("security { acl { ipv4 A { rule 10 { protocol tcp } } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        // L4 ports require tcp or udp.
+        let tree =
+            parse("security { acl { ipv4 A { rule 10 { permit\ndestination-port 443 } } } }")
+                .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        // Prefixes must be canonical, in the ACL's family.
+        let tree =
+            parse("security { acl { ipv4 A { rule 10 { permit\nsource 10.0.0.1/8 } } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        let tree = parse("security { acl { ipv4 A { rule 10 { permit\nsource 2001:db8::/32 } } } }")
+            .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        // MAC fields don't ride IP families and vice versa.
+        let tree =
+            parse("security { acl { ipv4 A { rule 10 { permit\nsource-mac 00:00:5e:00:00:01 } } } }")
+                .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        let tree = parse("security { acl { mac A { rule 10 { permit\ndscp 10 } } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        // A pps rate takes its burst in packets.
+        let tree = parse(
+            "security { acl { ipv4 A { rule 10 { permit\npolice rate 2000pps burst 256k } } } }",
+        )
+        .unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAclRule { .. })));
+        // Names: letter first; unique across families.
+        let tree = parse("security { acl { ipv4 9BAD { } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAcl { .. })));
+        let tree = parse("security { acl { ipv4 DUP { } mac DUP { } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadAcl { .. })));
+        // Unknown security sub-block.
+        let tree = parse("security { banana { } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadSecurity(_))));
+    }
+
+    #[test]
+    fn security_cross_validation() {
+        // A binding must name an existing ACL.
+        let tree = parse("interfaces { Ethernet1 { access-group NOPE in } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadAccessGroup { .. })
+        ));
+        // A LAG member binds on the Port-Channel.
+        let tree = parse(
+            "security { acl { ipv4 A { } } }\ninterfaces { Port-Channel1 { }\nEthernet1 { channel-group 1 mode active\naccess-group A in } }",
+        )
+        .unwrap();
+        assert_eq!(
+            extract(&tree).unwrap_err().to_string(),
+            "Ethernet1: member of Port-Channel1; bind on the Port-Channel"
+        );
+        // dot1x needs a keyed RADIUS server once a port enables it.
+        let tree = parse("interfaces { Ethernet1 { dot1x } }").unwrap();
+        assert_eq!(
+            extract(&tree).unwrap_err().to_string(),
+            "security dot1x: radius-server with key is required"
+        );
+        // dot1x and port-security are mutually exclusive on a port.
+        let tree = parse(
+            "security { dot1x { radius-server 10.0.0.1 { key x } } }\ninterfaces { Ethernet1 { dot1x\nport-security { } } }",
+        )
+        .unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadPortSecurity { .. })
+        ));
+        // Port-security refuses LAG members and Management.
+        let tree = parse(
+            "interfaces { Port-Channel1 { }\nEthernet1 { channel-group 1 mode active\nport-security { } } }",
+        )
+        .unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadPortSecurity { .. })
+        ));
+        let tree = parse("interfaces { Management1 { port-security { } } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadPortSecurity { .. })
+        ));
+        // DAI leans on DHCP snooping (or a covering static binding).
+        let tree = parse("security { arp-inspection { vlan 10 } }").unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadArpInspection(_))
+        ));
+        let covered = parse(
+            "vlans { vlan 10 { } }\nsecurity { arp-inspection { vlan 10 }\ndhcp-snooping { binding 00:50:56:be:ef:99 vlan 10 address 10.0.10.50 interface Ethernet1 } }\ninterfaces { Ethernet1 { switchport { mode access\naccess vlan 10 } } }",
+        )
+        .unwrap();
+        assert!(extract(&covered).is_ok());
+        // A static binding needs an interface carrying its VLAN.
+        let tree = parse(
+            "vlans { vlan 10 { } }\nsecurity { dhcp-snooping { vlan 10\nbinding 00:50:56:be:ef:99 vlan 10 address 10.0.10.50 interface Ethernet7 } }",
+        )
+        .unwrap();
+        assert!(matches!(
+            extract(&tree),
+            Err(IntentError::BadDhcpSnooping(_))
+        ));
+        // Trust on an interface with no snooped VLAN is a note.
+        let tree = parse(
+            "vlans { vlan 10 { } }\nsecurity { dhcp-snooping { vlan 10 } }\ninterfaces { Ethernet1 { dhcp-snooping trust } }",
+        )
+        .unwrap();
+        let intents = extract(&tree).unwrap();
+        assert!(intents.warnings.iter().any(|w| w.contains("trust has no effect")));
+        // CoPP classes are the fixed set.
+        let tree = parse("security { copp { class banana { rate 1 } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadCopp(_))));
+    }
+
+    #[test]
+    fn security_diffs_report_minimal_deltas() {
+        let running = intents_of(security_seed());
+        let mut candidate = intents_of(security_seed());
+
+        // Nothing changed: no deltas.
+        assert!(diff_acls(&running, &candidate).is_empty());
+        assert!(diff_acl_bindings(&running, &candidate).is_empty());
+        assert!(diff_copp(&running, &candidate).is_empty());
+        assert!(diff_port_security(&running, &candidate).is_empty());
+        assert!(diff_dot1x(&running, &candidate).is_none());
+        assert!(diff_snoopsec(&running, &candidate).is_none());
+
+        // Edit one rule: only that ACL re-ensures.
+        candidate
+            .acls
+            .get_mut("EDGE-IN")
+            .unwrap()
+            .rules
+            .get_mut(&20)
+            .unwrap()
+            .destination_port = Some((68, 69));
+        let changes = diff_acls(&running, &candidate);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, "EDGE-IN");
+        assert!(changes[0].ensure.is_some());
+
+        // Drop a binding and add another: one unbind, one bind.
+        candidate.ports.get_mut("Ethernet1").unwrap().access_groups = AccessGroups::default();
+        candidate
+            .lags
+            .get_mut(&1)
+            .unwrap()
+            .access_groups
+            .egress = Some("MGMT6-IN".into());
+        let changes = diff_acl_bindings(&running, &candidate);
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .any(|c| c.target == "Ethernet1" && !c.egress && c.acl.is_none()));
+        assert!(changes
+            .iter()
+            .any(|c| c.target == "Port-Channel1" && c.egress && c.acl.as_deref() == Some("MGMT6-IN")));
+
+        // A dropped CoPP override restores the compiled default.
+        candidate.copp.remove("bpdu");
+        let changes = diff_copp(&running, &candidate);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].set.is_none());
+
+        // Port-security and the whole-state families.
+        candidate.ports.get_mut("Ethernet5").unwrap().port_security = None;
+        let changes = diff_port_security(&running, &candidate);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].set.is_none());
+        candidate.dot1x.reauth_interval = 7200;
+        assert!(diff_dot1x(&running, &candidate).is_some());
+        candidate.snoop_sec.arp_vlans.clear();
+        let snoopsec = diff_snoopsec(&running, &candidate).unwrap();
+        assert!(snoopsec.intent.arp_vlans.is_empty());
+        assert!(snoopsec.dhcp_trusted.contains("Port-Channel1"));
     }
 }

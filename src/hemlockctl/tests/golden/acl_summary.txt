@@ -1,0 +1,10 @@
+ACL          Family  Rules  Bindings
+-----------  ------  -----  -----------------
+EDGE-IN      ipv4    4      Et1 (in)
+MGMT6-IN     ipv6    2      -
+IOT-MAC      mac     2      -
+
+TCAM utilization:
+  Stage    Used   Available
+  ingress  9      512
+  egress   0      256

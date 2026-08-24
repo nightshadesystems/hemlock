@@ -17,9 +17,10 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 
 use crate::{
-    ffi, FdbAction, FdbEventKind, IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget,
+    ffi, AclAction, AclFamily, AclFields, AclPacketAction, AclStage, FdbAction, FdbEventKind,
+    IpPrefix, Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget,
     SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo,
-    SwitchInit,
+    SwitchInit, TrapKind,
 };
 
 /// SAI profile key/value store handed to the vendor library. Static because
@@ -202,6 +203,9 @@ pub struct VendorSai {
     next_hop_api: *mut ffi::sai_next_hop_api_t,
     next_hop_group_api: *mut ffi::sai_next_hop_group_api_t,
     my_mac_api: *mut ffi::sai_my_mac_api_t,
+    /// Soft-probed like MY_MAC: a vendor blob refusing the ACL api
+    /// leaves this null and the ACL capabilities off.
+    acl_api: *mut ffi::sai_acl_api_t,
     /// `sai_query_attribute_capability`, when the library exports it
     /// (optional in the SAI spec; absent = assume supported and let the
     /// call fail with a real status).
@@ -215,6 +219,14 @@ pub struct VendorSai {
     >,
     /// Storm-control policers this backend created, per (port, class).
     storm_policers: HashMap<(u64, StormClass), ffi::sai_object_id_t>,
+    /// ACL tables this backend created, and each entry's ACL-range
+    /// objects (L4 port ranges live in their own SAI objects; they are
+    /// removed with the entry).
+    acl_tables: HashMap<u64, AclStage>,
+    acl_entry_ranges: HashMap<u64, Vec<ffi::sai_object_id_t>>,
+    /// Hostif user-defined traps ([`TrapKind::AclLog`]) — removed
+    /// through their own api call, unlike protocol traps.
+    user_traps: std::collections::HashSet<u64>,
     /// LAG object ids this backend created (PVID dispatches to the LAG
     /// attribute for these).
     lags: std::collections::HashSet<u64>,
@@ -394,6 +406,12 @@ impl VendorSai {
             if api_query(ffi::_sai_api_t::SAI_API_MY_MAC, &mut my_mac_api) != 0 {
                 my_mac_api = std::ptr::null_mut();
             }
+            // ACL likewise: a refused table turns the ACL capabilities
+            // off instead of failing boot.
+            let mut acl_api: *mut c_void = std::ptr::null_mut();
+            if api_query(ffi::_sai_api_t::SAI_API_ACL, &mut acl_api) != 0 {
+                acl_api = std::ptr::null_mut();
+            }
             (
                 switch_api as *mut ffi::sai_switch_api_t,
                 port_api as *mut ffi::sai_port_api_t,
@@ -414,6 +432,7 @@ impl VendorSai {
                 next_hop_api as *mut ffi::sai_next_hop_api_t,
                 next_hop_group_api as *mut ffi::sai_next_hop_group_api_t,
                 my_mac_api as *mut ffi::sai_my_mac_api_t,
+                acl_api as *mut ffi::sai_acl_api_t,
             )
         };
         let (
@@ -436,6 +455,7 @@ impl VendorSai {
             next_hop_api,
             next_hop_group_api,
             my_mac_api,
+            acl_api,
         ) = apis;
         // SAFETY: symbol lookup only; the fn pointer is copied out and
         // the library stays mapped for our whole lifetime.
@@ -472,8 +492,12 @@ impl VendorSai {
             next_hop_api,
             next_hop_group_api,
             my_mac_api,
+            acl_api,
             query_capability,
             storm_policers: HashMap::new(),
+            acl_tables: HashMap::new(),
+            acl_entry_ranges: HashMap::new(),
+            user_traps: std::collections::HashSet::new(),
             stp_ports: HashMap::new(),
             lags: std::collections::HashSet::new(),
             switch_oid: None,
@@ -1047,6 +1071,80 @@ impl VendorSai {
             )
         }
     }
+
+    /// The ACL api table, or a clear error when the vendor blob refused
+    /// to serve it (the capability probe then reads unsupported, so a
+    /// commit never reaches this).
+    fn acl_api(&self) -> Result<*mut ffi::sai_acl_api_t, SaiError> {
+        if self.acl_api.is_null() {
+            return Err(SaiError::Other("SAI serves no ACL api table".into()));
+        }
+        Ok(self.acl_api)
+    }
+
+    fn sai_packet_action(action: AclPacketAction) -> i32 {
+        use ffi::_sai_packet_action_t as pa;
+        (match action {
+            AclPacketAction::Forward => pa::SAI_PACKET_ACTION_FORWARD,
+            AclPacketAction::Drop => pa::SAI_PACKET_ACTION_DROP,
+            AclPacketAction::Trap => pa::SAI_PACKET_ACTION_TRAP,
+            AclPacketAction::Copy => pa::SAI_PACKET_ACTION_COPY,
+        }) as i32
+    }
+
+    /// The saihostif.h trap type for a protocol trap; None for the
+    /// user-defined ACL-log trap, which rides its own object family.
+    fn sai_trap_type(kind: TrapKind) -> Option<u32> {
+        use ffi::_sai_hostif_trap_type_t as trap;
+        Some(match kind {
+            TrapKind::ArpRequest => trap::SAI_HOSTIF_TRAP_TYPE_ARP_REQUEST,
+            TrapKind::ArpResponse => trap::SAI_HOSTIF_TRAP_TYPE_ARP_RESPONSE,
+            TrapKind::Ip2me => trap::SAI_HOSTIF_TRAP_TYPE_IP2ME,
+            TrapKind::Stp => trap::SAI_HOSTIF_TRAP_TYPE_STP,
+            TrapKind::Lacp => trap::SAI_HOSTIF_TRAP_TYPE_LACP,
+            TrapKind::Eapol => trap::SAI_HOSTIF_TRAP_TYPE_EAPOL,
+            TrapKind::IgmpQuery => trap::SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_QUERY,
+            TrapKind::IgmpLeave => trap::SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_LEAVE,
+            TrapKind::IgmpV1Report => trap::SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_V1_REPORT,
+            TrapKind::IgmpV2Report => trap::SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_V2_REPORT,
+            TrapKind::IgmpV3Report => trap::SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_V3_REPORT,
+            TrapKind::MldV1V2 => trap::SAI_HOSTIF_TRAP_TYPE_IPV6_MLD_V1_V2,
+            TrapKind::MldV1Report => trap::SAI_HOSTIF_TRAP_TYPE_IPV6_MLD_V1_REPORT,
+            TrapKind::MldV1Done => trap::SAI_HOSTIF_TRAP_TYPE_IPV6_MLD_V1_DONE,
+            TrapKind::MldV2Report => trap::SAI_HOSTIF_TRAP_TYPE_MLD_V2_REPORT,
+            TrapKind::Dhcp => trap::SAI_HOSTIF_TRAP_TYPE_DHCP,
+            TrapKind::Ospf => trap::SAI_HOSTIF_TRAP_TYPE_OSPF,
+            TrapKind::Bgp => trap::SAI_HOSTIF_TRAP_TYPE_BGP,
+            TrapKind::Vrrp => trap::SAI_HOSTIF_TRAP_TYPE_VRRP,
+            TrapKind::AclLog => return None,
+        })
+    }
+
+    /// Update one policer's CIR/CBS in place.
+    fn set_policer_rate_attrs(
+        &self,
+        policer: ffi::sai_object_id_t,
+        spec: PolicerSpec,
+    ) -> Result<(), SaiError> {
+        // SAFETY: valid policer api table; attrs outlive the calls.
+        let set = unsafe {
+            (*self.policer_api)
+                .set_policer_attribute
+                .ok_or(SaiError::Other(
+                    "policer api lacks set_policer_attribute".into(),
+                ))?
+        };
+        use ffi::_sai_policer_attr_t as attr;
+        let mut cir = Self::zeroed_attr(attr::SAI_POLICER_ATTR_CIR);
+        cir.value.u64_ = if spec.pps { spec.rate } else { spec.rate / 8 };
+        let mut cbs = Self::zeroed_attr(attr::SAI_POLICER_ATTR_CBS);
+        cbs.value.u64_ = spec.burst;
+        // SAFETY: attrs outlive the calls.
+        unsafe {
+            check("set_policer_attribute(CIR)", set(policer, &cir))?;
+            check("set_policer_attribute(CBS)", set(policer, &cbs))
+        }
+    }
 }
 
 fn path_to_cstring(path: &Path) -> Result<CString, SaiError> {
@@ -1452,56 +1550,10 @@ impl SaiBackend for VendorSai {
 
     fn setup_host_punt(&mut self) -> Result<(), SaiError> {
         let switch = self.switch_oid()?;
-        let defaults = self.defaults()?;
 
-        // SAFETY per block below: valid hostif api table from
-        // sai_api_query; attr arrays outlive the calls.
-        let create_trap = unsafe {
-            (*self.hostif_api)
-                .create_hostif_trap
-                .ok_or(SaiError::Other(
-                    "hostif api lacks create_hostif_trap".into(),
-                ))?
-        };
-        use ffi::_sai_hostif_trap_attr_t as trap_attr;
-        use ffi::_sai_hostif_trap_type_t as trap_type;
-        use ffi::_sai_packet_action_t as action;
-        // ARP is copied (L2 flooding keeps working on switched ports);
-        // traffic to the switch's own addresses is trapped outright.
-        let traps: [(&'static str, u32, u32); 3] = [
-            (
-                "create_hostif_trap(ARP_REQUEST)",
-                trap_type::SAI_HOSTIF_TRAP_TYPE_ARP_REQUEST,
-                action::SAI_PACKET_ACTION_COPY,
-            ),
-            (
-                "create_hostif_trap(ARP_RESPONSE)",
-                trap_type::SAI_HOSTIF_TRAP_TYPE_ARP_RESPONSE,
-                action::SAI_PACKET_ACTION_COPY,
-            ),
-            (
-                "create_hostif_trap(IP2ME)",
-                trap_type::SAI_HOSTIF_TRAP_TYPE_IP2ME,
-                action::SAI_PACKET_ACTION_TRAP,
-            ),
-        ];
-        for (call, trap, packet_action) in traps {
-            let mut type_attr = Self::zeroed_attr(trap_attr::SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE);
-            type_attr.value.s32 = trap as i32;
-            let mut action_attr = Self::zeroed_attr(trap_attr::SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION);
-            action_attr.value.s32 = packet_action as i32;
-            let mut group_attr = Self::zeroed_attr(trap_attr::SAI_HOSTIF_TRAP_ATTR_TRAP_GROUP);
-            group_attr.value.oid = defaults.trap_group;
-            let attrs = [type_attr, action_attr, group_attr];
-            let mut oid: ffi::sai_object_id_t = 0;
-            // SAFETY: attr array outlives the call.
-            unsafe {
-                check(
-                    call,
-                    create_trap(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
-                )?;
-            }
-        }
+        // The protocol traps themselves (ARP, IP2ME, and the rest of
+        // the CoPP class table) are created by syncd's CoPP program
+        // after boot; this call installs only the delivery path.
 
         // Wildcard table entry: every trapped packet is delivered on the
         // netdev of its ingress physical port.
@@ -1529,7 +1581,7 @@ impl SaiBackend for VendorSai {
                 create_entry(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
             )?;
         }
-        tracing::info!("CPU punt path installed (ARP copy, IP2ME trap, netdev delivery)");
+        tracing::info!("CPU punt delivery path installed (wildcard netdev delivery)");
         Ok(())
     }
 
@@ -2116,6 +2168,40 @@ impl SaiBackend for VendorSai {
                 false,
             );
 
+        // ACLs: the api table may have been refused outright; stages
+        // probe individually (Helix4's egress TCAM is optional in some
+        // SAI builds).
+        // SAFETY: null check before the fn-pointer presence read.
+        let acl_fns = !self.acl_api.is_null()
+            && unsafe { (*self.acl_api).create_acl_table.is_some() };
+        let acl_ingress = acl_fns
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_PORT,
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_INGRESS_ACL,
+                true,
+            );
+        let acl_egress = acl_fns
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_PORT,
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_EGRESS_ACL,
+                true,
+            );
+        let acl_entry_policer = acl_fns
+            && policer_fns
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_ACL_ENTRY,
+                ffi::_sai_acl_entry_attr_t::SAI_ACL_ENTRY_ATTR_ACTION_SET_POLICER,
+                false,
+            );
+        let port_learn_limit = self.attr_supported(
+            object::SAI_OBJECT_TYPE_BRIDGE_PORT,
+            ffi::_sai_bridge_port_attr_t::SAI_BRIDGE_PORT_ATTR_MAX_LEARNED_ADDRESSES,
+            true,
+        );
+        // SAFETY: valid hostif api table (fn-pointer presence read).
+        let copp = policer_fns
+            && unsafe { (*self.hostif_api).create_hostif_trap_group.is_some() };
+
         Ok(SaiCapabilities {
             lag: self.attr_supported(
                 object::SAI_OBJECT_TYPE_LAG,
@@ -2154,6 +2240,11 @@ impl SaiBackend for VendorSai {
             ecmp_width,
             ipv6,
             my_mac,
+            acl_ingress,
+            acl_egress,
+            acl_entry_policer,
+            port_learn_limit,
+            copp,
         })
     }
 
@@ -2895,6 +2986,754 @@ impl SaiBackend for VendorSai {
                     set(vlan_oid, &type_attr),
                 )
             }
+        }
+    }
+
+    fn create_acl_table(&mut self, stage: AclStage, family: AclFamily) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let api = self.acl_api()?;
+        // SAFETY: valid acl api table; buffers outlive the call.
+        let create = unsafe {
+            (*api)
+                .create_acl_table
+                .ok_or(SaiError::Other("acl api lacks create_acl_table".into()))?
+        };
+        use ffi::_sai_acl_table_attr_t as attr;
+        let mut attrs: Vec<ffi::sai_attribute_t> = Vec::new();
+
+        let mut stage_attr = Self::zeroed_attr(attr::SAI_ACL_TABLE_ATTR_ACL_STAGE);
+        stage_attr.value.s32 = match stage {
+            AclStage::Ingress => ffi::_sai_acl_stage_t::SAI_ACL_STAGE_INGRESS,
+            AclStage::Egress => ffi::_sai_acl_stage_t::SAI_ACL_STAGE_EGRESS,
+        } as i32;
+        attrs.push(stage_attr);
+
+        let mut bind_points =
+            [ffi::_sai_acl_bind_point_type_t::SAI_ACL_BIND_POINT_TYPE_PORT as i32];
+        let mut bind_attr = Self::zeroed_attr(attr::SAI_ACL_TABLE_ATTR_ACL_BIND_POINT_TYPE_LIST);
+        bind_attr.value.s32list.count = bind_points.len() as u32;
+        bind_attr.value.s32list.list = bind_points.as_mut_ptr();
+        attrs.push(bind_attr);
+
+        // The family's match-field set. Every family carries the outer
+        // VLAN id (internal snooping/DAI entries scope by VLAN).
+        let field_ids: &[u32] = match family {
+            AclFamily::Ipv4 => &[
+                attr::SAI_ACL_TABLE_ATTR_FIELD_SRC_IP,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_DST_IP,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_IP_PROTOCOL,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_L4_SRC_PORT,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_L4_DST_PORT,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_DSCP,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_OUTER_VLAN_ID,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_ETHER_TYPE,
+            ],
+            AclFamily::Ipv6 => &[
+                attr::SAI_ACL_TABLE_ATTR_FIELD_SRC_IPV6,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_DST_IPV6,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_IP_PROTOCOL,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_L4_SRC_PORT,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_L4_DST_PORT,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_DSCP,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_OUTER_VLAN_ID,
+            ],
+            AclFamily::Mac => &[
+                attr::SAI_ACL_TABLE_ATTR_FIELD_SRC_MAC,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_DST_MAC,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_ETHER_TYPE,
+                attr::SAI_ACL_TABLE_ATTR_FIELD_OUTER_VLAN_ID,
+            ],
+        };
+        for id in field_ids {
+            let mut field = Self::zeroed_attr(*id);
+            field.value.booldata = true;
+            attrs.push(field);
+        }
+
+        // L4 port ranges ride ACL range objects; the table declares the
+        // range types it accepts.
+        let mut range_types = [
+            ffi::_sai_acl_range_type_t::SAI_ACL_RANGE_TYPE_L4_SRC_PORT_RANGE as i32,
+            ffi::_sai_acl_range_type_t::SAI_ACL_RANGE_TYPE_L4_DST_PORT_RANGE as i32,
+        ];
+        if family != AclFamily::Mac {
+            let mut range_attr =
+                Self::zeroed_attr(attr::SAI_ACL_TABLE_ATTR_FIELD_ACL_RANGE_TYPE);
+            range_attr.value.s32list.count = range_types.len() as u32;
+            range_attr.value.s32list.list = range_types.as_mut_ptr();
+            attrs.push(range_attr);
+        }
+
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array and its list buffers outlive the call.
+        unsafe {
+            check(
+                "create_acl_table",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        self.acl_tables.insert(oid, stage);
+        Ok(Oid(oid))
+    }
+
+    fn remove_acl_table(&mut self, table: Oid) -> Result<(), SaiError> {
+        let api = self.acl_api()?;
+        // SAFETY: valid acl api table.
+        unsafe {
+            let remove = (*api)
+                .remove_acl_table
+                .ok_or(SaiError::Other("acl api lacks remove_acl_table".into()))?;
+            check("remove_acl_table", remove(table.0))?;
+        }
+        self.acl_tables.remove(&table.0);
+        Ok(())
+    }
+
+    fn create_acl_entry(
+        &mut self,
+        table: Oid,
+        priority: u32,
+        fields: &AclFields,
+        action: &AclAction,
+    ) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let api = self.acl_api()?;
+        // SAFETY per block below: valid acl api table; buffers outlive
+        // the calls.
+        let create = unsafe {
+            (*api)
+                .create_acl_entry
+                .ok_or(SaiError::Other("acl api lacks create_acl_entry".into()))?
+        };
+        use ffi::_sai_acl_entry_attr_t as attr;
+        let mut attrs: Vec<ffi::sai_attribute_t> = Vec::new();
+
+        let mut table_attr = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_TABLE_ID);
+        table_attr.value.oid = table.0;
+        attrs.push(table_attr);
+        let mut prio_attr = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_PRIORITY);
+        prio_attr.value.u32_ = priority;
+        attrs.push(prio_attr);
+
+        let ip_field = |id: u32, ip: IpPrefix| {
+            let mut a = Self::zeroed_attr(id);
+            a.value.aclfield.enable = true;
+            match ip.0 {
+                std::net::IpAddr::V4(v4) => {
+                    let mask: u32 = if ip.1 == 0 { 0 } else { u32::MAX << (32 - ip.1) };
+                    a.value.aclfield.data.ip4 = u32::from_ne_bytes(v4.octets());
+                    a.value.aclfield.mask.ip4 = mask.to_be();
+                }
+                std::net::IpAddr::V6(v6) => {
+                    let mask: u128 = if ip.1 == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - ip.1)
+                    };
+                    a.value.aclfield.data.ip6 = v6.octets();
+                    a.value.aclfield.mask.ip6 = mask.to_be_bytes();
+                }
+            }
+            a
+        };
+        if let Some(src) = fields.src_ip {
+            let id = if src.0.is_ipv4() {
+                attr::SAI_ACL_ENTRY_ATTR_FIELD_SRC_IP
+            } else {
+                attr::SAI_ACL_ENTRY_ATTR_FIELD_SRC_IPV6
+            };
+            attrs.push(ip_field(id, src));
+        }
+        if let Some(dst) = fields.dst_ip {
+            let id = if dst.0.is_ipv4() {
+                attr::SAI_ACL_ENTRY_ATTR_FIELD_DST_IP
+            } else {
+                attr::SAI_ACL_ENTRY_ATTR_FIELD_DST_IPV6
+            };
+            attrs.push(ip_field(id, dst));
+        }
+        if let Some(protocol) = fields.protocol {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_FIELD_IP_PROTOCOL);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.u8_ = protocol;
+            a.value.aclfield.mask.u8_ = 0xff;
+            attrs.push(a);
+        }
+        if let Some(dscp) = fields.dscp {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_FIELD_DSCP);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.u8_ = dscp;
+            a.value.aclfield.mask.u8_ = 0x3f;
+            attrs.push(a);
+        }
+        if let Some((mac, mask)) = fields.src_mac {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_FIELD_SRC_MAC);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.mac = mac;
+            a.value.aclfield.mask.mac = mask;
+            attrs.push(a);
+        }
+        if let Some((mac, mask)) = fields.dst_mac {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_FIELD_DST_MAC);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.mac = mac;
+            a.value.aclfield.mask.mac = mask;
+            attrs.push(a);
+        }
+        if let Some(ethertype) = fields.ethertype {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_FIELD_ETHER_TYPE);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.u16_ = ethertype;
+            a.value.aclfield.mask.u16_ = 0xffff;
+            attrs.push(a);
+        }
+        if let Some(vlan) = fields.vlan {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_FIELD_OUTER_VLAN_ID);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.u16_ = vlan;
+            a.value.aclfield.mask.u16_ = 0xfff;
+            attrs.push(a);
+        }
+
+        // Exact L4 ports use the u16 field; real ranges become ACL
+        // range objects referenced from the entry (removed with it).
+        let mut range_oids: Vec<ffi::sai_object_id_t> = Vec::new();
+        let exact_port = |attrs: &mut Vec<ffi::sai_attribute_t>, id: u32, port: u16| {
+            let mut a = Self::zeroed_attr(id);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.u16_ = port;
+            a.value.aclfield.mask.u16_ = 0xffff;
+            attrs.push(a);
+        };
+        for (ports, exact_id, range_type) in [
+            (
+                fields.src_port,
+                attr::SAI_ACL_ENTRY_ATTR_FIELD_L4_SRC_PORT,
+                ffi::_sai_acl_range_type_t::SAI_ACL_RANGE_TYPE_L4_SRC_PORT_RANGE,
+            ),
+            (
+                fields.dst_port,
+                attr::SAI_ACL_ENTRY_ATTR_FIELD_L4_DST_PORT,
+                ffi::_sai_acl_range_type_t::SAI_ACL_RANGE_TYPE_L4_DST_PORT_RANGE,
+            ),
+        ] {
+            let Some((low, high)) = ports else { continue };
+            if low == high {
+                exact_port(&mut attrs, exact_id, low);
+                continue;
+            }
+            // SAFETY: valid acl api table; attrs outlive the call.
+            let create_range = unsafe {
+                (*api)
+                    .create_acl_range
+                    .ok_or(SaiError::Other("acl api lacks create_acl_range".into()))?
+            };
+            use ffi::_sai_acl_range_attr_t as range_attr;
+            let mut type_attr = Self::zeroed_attr(range_attr::SAI_ACL_RANGE_ATTR_TYPE);
+            type_attr.value.s32 = range_type as i32;
+            let mut limit_attr = Self::zeroed_attr(range_attr::SAI_ACL_RANGE_ATTR_LIMIT);
+            limit_attr.value.u32range.min = low as u32;
+            limit_attr.value.u32range.max = high as u32;
+            let range_attrs = [type_attr, limit_attr];
+            let mut range_oid: ffi::sai_object_id_t = 0;
+            // SAFETY: attr array outlives the call.
+            unsafe {
+                check(
+                    "create_acl_range",
+                    create_range(
+                        &mut range_oid,
+                        switch,
+                        range_attrs.len() as u32,
+                        range_attrs.as_ptr(),
+                    ),
+                )?;
+            }
+            range_oids.push(range_oid);
+        }
+        if !range_oids.is_empty() {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_FIELD_ACL_RANGE_TYPE);
+            a.value.aclfield.enable = true;
+            a.value.aclfield.data.objlist.count = range_oids.len() as u32;
+            a.value.aclfield.data.objlist.list = range_oids.as_mut_ptr();
+            attrs.push(a);
+        }
+
+        let mut action_attr = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION);
+        action_attr.value.aclaction.enable = true;
+        action_attr.value.aclaction.parameter.s32 = Self::sai_packet_action(action.action);
+        attrs.push(action_attr);
+        if let Some(counter) = action.counter {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_ACTION_COUNTER);
+            a.value.aclaction.enable = true;
+            a.value.aclaction.parameter.oid = counter.0;
+            attrs.push(a);
+        }
+        if let Some(policer) = action.policer {
+            let mut a = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_ACTION_SET_POLICER);
+            a.value.aclaction.enable = true;
+            a.value.aclaction.parameter.oid = policer.0;
+            attrs.push(a);
+        }
+
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array and its list buffers outlive the call.
+        let created = unsafe {
+            check(
+                "create_acl_entry",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )
+        };
+        if let Err(err) = created {
+            // Roll orphan range objects back before surfacing.
+            // SAFETY: valid acl api table.
+            unsafe {
+                if let Some(remove_range) = (*api).remove_acl_range {
+                    for range in range_oids {
+                        let _ = remove_range(range);
+                    }
+                }
+            }
+            return Err(err);
+        }
+        if !range_oids.is_empty() {
+            self.acl_entry_ranges.insert(oid, range_oids);
+        }
+        Ok(Oid(oid))
+    }
+
+    fn set_acl_entry_action(&mut self, entry: Oid, action: &AclAction) -> Result<(), SaiError> {
+        let api = self.acl_api()?;
+        // SAFETY: valid acl api table; attrs outlive the calls.
+        let set = unsafe {
+            (*api)
+                .set_acl_entry_attribute
+                .ok_or(SaiError::Other("acl api lacks set_acl_entry_attribute".into()))?
+        };
+        use ffi::_sai_acl_entry_attr_t as attr;
+        let mut action_attr = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION);
+        action_attr.value.aclaction.enable = true;
+        action_attr.value.aclaction.parameter.s32 = Self::sai_packet_action(action.action);
+        let mut counter_attr = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_ACTION_COUNTER);
+        counter_attr.value.aclaction.enable = action.counter.is_some();
+        counter_attr.value.aclaction.parameter.oid = action.counter.map(|c| c.0).unwrap_or(0);
+        let mut policer_attr = Self::zeroed_attr(attr::SAI_ACL_ENTRY_ATTR_ACTION_SET_POLICER);
+        policer_attr.value.aclaction.enable = action.policer.is_some();
+        policer_attr.value.aclaction.parameter.oid = action.policer.map(|p| p.0).unwrap_or(0);
+        // SAFETY: attrs outlive the calls.
+        unsafe {
+            check(
+                "set_acl_entry_attribute(ACTION_PACKET_ACTION)",
+                set(entry.0, &action_attr),
+            )?;
+            check(
+                "set_acl_entry_attribute(ACTION_COUNTER)",
+                set(entry.0, &counter_attr),
+            )?;
+            check(
+                "set_acl_entry_attribute(ACTION_SET_POLICER)",
+                set(entry.0, &policer_attr),
+            )
+        }
+    }
+
+    fn remove_acl_entry(&mut self, entry: Oid) -> Result<(), SaiError> {
+        let api = self.acl_api()?;
+        // SAFETY: valid acl api table.
+        unsafe {
+            let remove = (*api)
+                .remove_acl_entry
+                .ok_or(SaiError::Other("acl api lacks remove_acl_entry".into()))?;
+            check("remove_acl_entry", remove(entry.0))?;
+            // The entry's range objects go with it.
+            if let Some(ranges) = self.acl_entry_ranges.remove(&entry.0) {
+                if let Some(remove_range) = (*api).remove_acl_range {
+                    for range in ranges {
+                        let _ = remove_range(range);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn create_acl_counter(&mut self, table: Oid) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let api = self.acl_api()?;
+        // SAFETY: valid acl api table; attr array outlives the call.
+        let create = unsafe {
+            (*api)
+                .create_acl_counter
+                .ok_or(SaiError::Other("acl api lacks create_acl_counter".into()))?
+        };
+        use ffi::_sai_acl_counter_attr_t as attr;
+        let mut table_attr = Self::zeroed_attr(attr::SAI_ACL_COUNTER_ATTR_TABLE_ID);
+        table_attr.value.oid = table.0;
+        let mut packets_attr = Self::zeroed_attr(attr::SAI_ACL_COUNTER_ATTR_ENABLE_PACKET_COUNT);
+        packets_attr.value.booldata = true;
+        let attrs = [table_attr, packets_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_acl_counter",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_acl_counter(&mut self, counter: Oid) -> Result<(), SaiError> {
+        let api = self.acl_api()?;
+        // SAFETY: valid acl api table.
+        unsafe {
+            let remove = (*api)
+                .remove_acl_counter
+                .ok_or(SaiError::Other("acl api lacks remove_acl_counter".into()))?;
+            check("remove_acl_counter", remove(counter.0))
+        }
+    }
+
+    fn get_acl_counter(&mut self, counter: Oid) -> Result<u64, SaiError> {
+        let api = self.acl_api()?;
+        // SAFETY: valid acl api table; attr outlives the call; union
+        // read matches the u64 attr.
+        unsafe {
+            let get = (*api).get_acl_counter_attribute.ok_or(SaiError::Other(
+                "acl api lacks get_acl_counter_attribute".into(),
+            ))?;
+            let mut attr =
+                Self::zeroed_attr(ffi::_sai_acl_counter_attr_t::SAI_ACL_COUNTER_ATTR_PACKETS);
+            check("get_acl_counter_attribute(PACKETS)", get(counter.0, 1, &mut attr))?;
+            Ok(attr.value.u64_)
+        }
+    }
+
+    fn bind_port_acl(
+        &mut self,
+        port: PortId,
+        stage: AclStage,
+        table: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let id = match stage {
+            AclStage::Ingress => ffi::_sai_port_attr_t::SAI_PORT_ATTR_INGRESS_ACL,
+            AclStage::Egress => ffi::_sai_port_attr_t::SAI_PORT_ATTR_EGRESS_ACL,
+        };
+        let mut attr = Self::zeroed_attr(id);
+        attr.value.oid = table.map(|t| t.0).unwrap_or(0);
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check("set_port_attribute(INGRESS/EGRESS_ACL)", set(port.0, &attr))
+        }
+    }
+
+    fn acl_available_entries(&mut self, stage: AclStage) -> Result<u32, SaiError> {
+        self.switch_oid()?;
+        let api = self.acl_api()?;
+        // Free entries are a per-table attribute; without a live table
+        // at the stage the honest answer is unknown, reported as 0.
+        let Some((&table, _)) = self.acl_tables.iter().find(|(_, s)| **s == stage) else {
+            return Ok(0);
+        };
+        // SAFETY: valid acl api table; attr outlives the call; union
+        // read matches the u32 attr.
+        unsafe {
+            let get = (*api).get_acl_table_attribute.ok_or(SaiError::Other(
+                "acl api lacks get_acl_table_attribute".into(),
+            ))?;
+            let mut attr = Self::zeroed_attr(
+                ffi::_sai_acl_table_attr_t::SAI_ACL_TABLE_ATTR_AVAILABLE_ACL_ENTRY,
+            );
+            if get(table, 1, &mut attr) != 0 {
+                return Ok(0);
+            }
+            Ok(attr.value.u32_)
+        }
+    }
+
+    fn create_policer(&mut self, spec: PolicerSpec) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid policer api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.policer_api)
+                .create_policer
+                .ok_or(SaiError::Other("policer api lacks create_policer".into()))?
+        };
+        use ffi::_sai_policer_attr_t as attr;
+        let mut meter_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_METER_TYPE);
+        meter_attr.value.s32 = if spec.pps {
+            ffi::_sai_meter_type_t::SAI_METER_TYPE_PACKETS
+        } else {
+            ffi::_sai_meter_type_t::SAI_METER_TYPE_BYTES
+        } as i32;
+        let mut mode_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_MODE);
+        mode_attr.value.s32 = ffi::_sai_policer_mode_t::SAI_POLICER_MODE_SR_TCM as i32;
+        let mut cir_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_CIR);
+        cir_attr.value.u64_ = if spec.pps { spec.rate } else { spec.rate / 8 };
+        let mut cbs_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_CBS);
+        cbs_attr.value.u64_ = spec.burst;
+        let mut red_attr = Self::zeroed_attr(attr::SAI_POLICER_ATTR_RED_PACKET_ACTION);
+        red_attr.value.s32 = ffi::_sai_packet_action_t::SAI_PACKET_ACTION_DROP as i32;
+        let attrs = [meter_attr, mode_attr, cir_attr, cbs_attr, red_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_policer(SR_TCM)",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn set_policer(&mut self, policer: Oid, spec: PolicerSpec) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        self.set_policer_rate_attrs(policer.0, spec)
+    }
+
+    fn remove_policer(&mut self, policer: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid policer api table.
+        unsafe {
+            let remove = (*self.policer_api)
+                .remove_policer
+                .ok_or(SaiError::Other("policer api lacks remove_policer".into()))?;
+            check("remove_policer", remove(policer.0))
+        }
+    }
+
+    fn policer_stats(&mut self, policer: Oid) -> Result<PolicerStats, SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid policer api table; buffers outlive the call.
+        let get_stats = unsafe {
+            (*self.policer_api)
+                .get_policer_stats
+                .ok_or(SaiError::Other(
+                    "policer api lacks get_policer_stats".into(),
+                ))?
+        };
+        let ids = [
+            ffi::_sai_policer_stat_t::SAI_POLICER_STAT_GREEN_PACKETS as ffi::sai_stat_id_t,
+            ffi::_sai_policer_stat_t::SAI_POLICER_STAT_RED_PACKETS as ffi::sai_stat_id_t,
+        ];
+        let mut values = [0u64; 2];
+        // SAFETY: id and value buffers sized identically.
+        unsafe {
+            check(
+                "get_policer_stats(GREEN/RED_PACKETS)",
+                get_stats(policer.0, ids.len() as u32, ids.as_ptr(), values.as_mut_ptr()),
+            )?;
+        }
+        Ok(PolicerStats {
+            conforming: values[0],
+            dropped: values[1],
+        })
+    }
+
+    fn create_hostif_trap_group(&mut self, policer: Option<Oid>) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid hostif api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.hostif_api)
+                .create_hostif_trap_group
+                .ok_or(SaiError::Other(
+                    "hostif api lacks create_hostif_trap_group".into(),
+                ))?
+        };
+        let mut attrs: Vec<ffi::sai_attribute_t> = Vec::new();
+        if let Some(policer) = policer {
+            let mut a = Self::zeroed_attr(
+                ffi::_sai_hostif_trap_group_attr_t::SAI_HOSTIF_TRAP_GROUP_ATTR_POLICER,
+            );
+            a.value.oid = policer.0;
+            attrs.push(a);
+        }
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_hostif_trap_group",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_hostif_trap_group(&mut self, group: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid hostif api table.
+        unsafe {
+            let remove = (*self.hostif_api)
+                .remove_hostif_trap_group
+                .ok_or(SaiError::Other(
+                    "hostif api lacks remove_hostif_trap_group".into(),
+                ))?;
+            check("remove_hostif_trap_group", remove(group.0))
+        }
+    }
+
+    fn create_hostif_trap(
+        &mut self,
+        kind: TrapKind,
+        trap_only: bool,
+        group: Oid,
+    ) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let Some(trap_type) = Self::sai_trap_type(kind) else {
+            // The ACL-log trap is a user-defined trap object.
+            // SAFETY: valid hostif api table; attr array outlives the
+            // call.
+            let create = unsafe {
+                (*self.hostif_api)
+                    .create_hostif_user_defined_trap
+                    .ok_or(SaiError::Other(
+                        "hostif api lacks create_hostif_user_defined_trap".into(),
+                    ))?
+            };
+            use ffi::_sai_hostif_user_defined_trap_attr_t as attr;
+            let mut type_attr = Self::zeroed_attr(attr::SAI_HOSTIF_USER_DEFINED_TRAP_ATTR_TYPE);
+            type_attr.value.s32 = ffi::_sai_hostif_user_defined_trap_type_t::SAI_HOSTIF_USER_DEFINED_TRAP_TYPE_ACL
+                as i32;
+            let mut group_attr =
+                Self::zeroed_attr(attr::SAI_HOSTIF_USER_DEFINED_TRAP_ATTR_TRAP_GROUP);
+            group_attr.value.oid = if group.0 == 0 {
+                self.defaults()?.trap_group
+            } else {
+                group.0
+            };
+            let attrs = [type_attr, group_attr];
+            let mut oid: ffi::sai_object_id_t = 0;
+            // SAFETY: attr array outlives the call.
+            unsafe {
+                check(
+                    "create_hostif_user_defined_trap(ACL)",
+                    create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+                )?;
+            }
+            self.user_traps.insert(oid);
+            return Ok(Oid(oid));
+        };
+        // SAFETY: valid hostif api table; attr array outlives the call.
+        let create = unsafe {
+            (*self.hostif_api)
+                .create_hostif_trap
+                .ok_or(SaiError::Other("hostif api lacks create_hostif_trap".into()))?
+        };
+        use ffi::_sai_hostif_trap_attr_t as attr;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE);
+        type_attr.value.s32 = trap_type as i32;
+        let mut action_attr = Self::zeroed_attr(attr::SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION);
+        action_attr.value.s32 = if trap_only {
+            ffi::_sai_packet_action_t::SAI_PACKET_ACTION_TRAP
+        } else {
+            ffi::_sai_packet_action_t::SAI_PACKET_ACTION_COPY
+        } as i32;
+        let mut group_attr = Self::zeroed_attr(attr::SAI_HOSTIF_TRAP_ATTR_TRAP_GROUP);
+        // Oid(0) = the switch default trap group.
+        group_attr.value.oid = if group.0 == 0 {
+            self.defaults()?.trap_group
+        } else {
+            group.0
+        };
+        let attrs = [type_attr, action_attr, group_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_hostif_trap",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_hostif_trap(&mut self, trap: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        if self.user_traps.remove(&trap.0) {
+            // SAFETY: valid hostif api table.
+            return unsafe {
+                let remove = (*self.hostif_api)
+                    .remove_hostif_user_defined_trap
+                    .ok_or(SaiError::Other(
+                        "hostif api lacks remove_hostif_user_defined_trap".into(),
+                    ))?;
+                check("remove_hostif_user_defined_trap", remove(trap.0))
+            };
+        }
+        // SAFETY: valid hostif api table.
+        unsafe {
+            let remove = (*self.hostif_api)
+                .remove_hostif_trap
+                .ok_or(SaiError::Other("hostif api lacks remove_hostif_trap".into()))?;
+            check("remove_hostif_trap", remove(trap.0))
+        }
+    }
+
+    fn set_default_trap_group_policer(&mut self, policer: Option<Oid>) -> Result<(), SaiError> {
+        let defaults = self.defaults()?;
+        // SAFETY: valid hostif api table; attr outlives the call.
+        unsafe {
+            let set = (*self.hostif_api)
+                .set_hostif_trap_group_attribute
+                .ok_or(SaiError::Other(
+                    "hostif api lacks set_hostif_trap_group_attribute".into(),
+                ))?;
+            let mut attr = Self::zeroed_attr(
+                ffi::_sai_hostif_trap_group_attr_t::SAI_HOSTIF_TRAP_GROUP_ATTR_POLICER,
+            );
+            attr.value.oid = policer.map(|p| p.0).unwrap_or(0);
+            check(
+                "set_hostif_trap_group_attribute(POLICER)",
+                set(defaults.trap_group, &attr),
+            )
+        }
+    }
+
+    fn set_port_learn_limit(&mut self, port: PortId, limit: Option<u32>) -> Result<(), SaiError> {
+        let bridge_port = self.bridge_port_of(port)?;
+        // SAFETY: valid bridge api table; attr outlives the call.
+        unsafe {
+            let set = (*self.bridge_api)
+                .set_bridge_port_attribute
+                .ok_or(SaiError::Other(
+                    "bridge api lacks set_bridge_port_attribute".into(),
+                ))?;
+            let mut attr = Self::zeroed_attr(
+                ffi::_sai_bridge_port_attr_t::SAI_BRIDGE_PORT_ATTR_MAX_LEARNED_ADDRESSES,
+            );
+            // 0 = no limit, per saibridge.h.
+            attr.value.u32_ = limit.unwrap_or(0);
+            check(
+                "set_bridge_port_attribute(MAX_LEARNED_ADDRESSES)",
+                set(bridge_port, &attr),
+            )
+        }
+    }
+
+    fn set_port_learning(&mut self, port: PortId, learn: bool) -> Result<(), SaiError> {
+        let bridge_port = self.bridge_port_of(port)?;
+        // SAFETY: valid bridge api table; attr outlives the call.
+        unsafe {
+            let set = (*self.bridge_api)
+                .set_bridge_port_attribute
+                .ok_or(SaiError::Other(
+                    "bridge api lacks set_bridge_port_attribute".into(),
+                ))?;
+            let mut attr = Self::zeroed_attr(
+                ffi::_sai_bridge_port_attr_t::SAI_BRIDGE_PORT_ATTR_FDB_LEARNING_MODE,
+            );
+            attr.value.s32 = if learn {
+                ffi::_sai_bridge_port_fdb_learning_mode_t::SAI_BRIDGE_PORT_FDB_LEARNING_MODE_HW
+            } else {
+                ffi::_sai_bridge_port_fdb_learning_mode_t::SAI_BRIDGE_PORT_FDB_LEARNING_MODE_DISABLE
+            } as i32;
+            check(
+                "set_bridge_port_attribute(FDB_LEARNING_MODE)",
+                set(bridge_port, &attr),
+            )
         }
     }
 }

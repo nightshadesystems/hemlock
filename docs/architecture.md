@@ -72,7 +72,7 @@ daemons, the configuration model, and the image/installer pipeline.
 | `hemlock-syncd` | bin | The only ASIC owner: switch create, port bring-up, port state gRPC |
 | `hemlock-pmon` | bin | Manifest-driven environment monitoring + fan control |
 | `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring |
-| `hemlock-orch` | bin | Protocol engines: LACP, spanning tree, IGMP/MLD snooping; packet I/O; the kernel-RIB → syncd FIB pipeline; FRR state queries |
+| `hemlock-orch` | bin | Protocol engines: LACP, spanning tree, IGMP/MLD snooping, 802.1X (hostapd), DHCP snooping + DAI; packet I/O; the kernel-RIB → syncd FIB pipeline; FRR state queries |
 | `hemlock-webd` | bin | Web console: serves the exported Next.js UI (`web/`) + JSON API over HTTP/HTTPS; config-driven via `set system http`/`https` |
 | `hemlock-config` | lib | Curly-brace config language: lexer, parser, tree |
 | `hemlockctl` | bin | Operator CLI |
@@ -131,15 +131,25 @@ mock and vendor in lockstep — with VLAN/switchport programming, the FDB
 learn/age/move notifications), storm-control policers, mirror sessions,
 LAGs (a LAG is created *as a `PortId`*, so VLAN membership, PVID, FDB and
 storm calls take LAG ids transparently), STP instances + per-port STP
-state, and L2MC groups for snooping-constrained multicast.
+state, and L2MC groups for snooping-constrained multicast. The security
+suite added ACL tables/entries/counters (with L4-port-range objects and
+per-entry policers), standalone policers, hostif trap groups + protocol
+traps, per-port FDB learn limits/learning mode (with
+`SaiEvent::LearnLimitViolation`), and port ACL binding.
 
 The vendor backend also answers a **capability probe**
 (`SaiBackend::capabilities`, via `sai_query_attribute_capability`): which
-of LAG, STP, FDB flush/aging, L2MC, storm policers, mirroring, and
-outer-TPID rewrite this platform's SAI actually implements. syncd runs
+of LAG, STP, FDB flush/aging, L2MC, storm policers, mirroring,
+outer-TPID rewrite, ingress/egress ACL stages, per-ACL-entry policers,
+port learn limits, and trap groups (CoPP) this platform's SAI actually
+implements — the Helix4's ContentAware TCAM is small (IPv6 entries are
+double-wide) and `show acl summary` reports live utilization from the
+per-table `AVAILABLE_ACL_ENTRY` attribute. syncd runs
 the probe once at startup and every RPC that needs a missing capability
 fails cleanly with `% <feature> is not supported by this platform's SAI`
-— configuration is never silently dropped on the floor.
+— configuration is never silently dropped on the floor. Egress ACL
+bindings, rule `police`, port-security, and CoPP overrides each fail
+commit this way when unsupported, never silently no-op.
 
 **Mock backend** (`mock-sai`, default feature): pure Rust, constructed from
 the platform port table. Links follow admin state and emit the same
@@ -185,6 +195,42 @@ with move counters plus configured statics) — `show mac address-table`
 and the paged `DumpFdb` RPC serve from the mirror rather than dumping the
 ASIC. syncd also re-derives storm-control policer rates on link-speed
 changes, since levels are configured as a percentage of link speed.
+
+**The ACL engine** (`security.rs`) is the security suite's foundation:
+user ACLs *and* the enforcement other features need — dot1x
+unauthorized-port entries, DHCP-snooping/DAI CPU redirects — are all
+expressed through the same machinery. Every (physical port, stage) with
+anything to filter gets exactly one hardware table (a Port-Channel
+binding expands to the members and follows membership churn), and syncd
+owns the partitioning of the table's priority space into bands:
+
+- **internal band** (`2_000_000_000 - seq`): dot1x enforcement first,
+  then the snooping/DAI redirects — a user rule can never shadow them;
+- **user band** (`1_000_000_000 - ordinal`): the bound ACL's rules in
+  rule-number order;
+- **implicit deny** (priority 1), carrying its own match counter.
+
+`EnsureAcl` is declarative and diffed inside syncd by rule number, so an
+edit to one rule leaves the other rules' counter objects (and their
+match counts) alone. `clear acl counters` is baseline subtraction, not
+object churn.
+
+**CoPP** owns the CPU-bound protocol traps. The class table is compiled
+into syncd (bpdu, lacp, eapol, igmp, mld, arp, dhcp, ospf, bgp, vrrp,
+ip2me, acl-log, default — fixed membership, not user-definable): at
+startup each class gets a pps policer and its own trap group with the
+member traps; the `default` class polices the switch's default trap
+group instead. The DHCP trap is a *copy* (hardware keeps forwarding;
+the snooping redirects override that per port), and on a SAI without
+trap groups the ARP/IP2ME punt traps still install unpoliced so L3 host
+services keep working. Config can only override a class's rate/burst
+(`show copp` marks overrides with `*`).
+
+**Port security** rides the FDB event stream: learn events fill each
+secured port's learned set, a learn past the limit (or an injected
+`LearnLimitViolation`) records a violation and applies the action —
+`protect` freezes hardware learning, `shutdown` errdisables the port
+(recovered by `clear port-security`).
 
 ## hemlock-pmon
 
@@ -267,6 +313,31 @@ summaries, VRRP status) is queried live from `vtysh -c '... json'` by
 orch's `frrshow` module — orch owns vtysh access; hemlockctl and webd
 ask orch, and a dead FRR degrades to `% ospf is not running`.
 
+**802.1X (`dot1x.rs`).** hostapd is the authenticator (wired driver on
+the hostif netdevs) and the RADIUS client. Unlike FRR — where mgmtd
+renders the config and orch only queries — **orch owns hostapd end to
+end**: dot1x runtime auth state must drive dataplane changes, so mgmtd
+pushes the intent over `SetDot1xConfig` and orch renders the per-port
+hostapd configs (mode 0600 — they carry the RADIUS secret), manages the
+process, watches the control sockets, and flips port authorization via
+syncd's `SetPortAuthorized` (the internal permit-EAPOL + deny-all ACL
+entries). The control socket is abstracted as an event stream, so
+engine tests run against a scripted hostapd-ctrl simulator.
+`clear dot1x interface <port>` is a REAUTHENTICATE poke at hostapd.
+
+**DHCP snooping + DAI (`snoopsec.rs`).** DHCP on snooped VLANs traps to
+the CPU from untrusted ports and copies from trusted ports (binding
+learn), via syncd's `SetSnoopRedirects` internal-ACL program recomputed
+from config + the live VLAN membership view. The engine validates
+trapped client messages (server messages from untrusted ports drop and
+count; chaddr must match the L2 source), maintains the lease-tracked
+binding table — persisted across restarts in
+`/var/lib/hemlock/dhcp-bindings.json` — and re-injects valid frames
+toward the trusted side. DAI validates trapped ARP against the bindings
++ statics + the configured `validate` checks, re-injecting within the
+VLAN or dropping with a counted reason and a syslog line. The CoPP
+dhcp/arp classes bound the CPU load of both paths.
+
 **Packet I/O decision**: engines exchange PDUs over Linux `AF_PACKET`
 sockets (`transport.rs`, via the `nix` crate — bound with `getifaddrs`
 link addresses so no `unsafe` sockaddr construction is needed, keeping
@@ -308,9 +379,15 @@ commit.
   `intents.rs` without touching the lifecycle machinery. The families so
   far: interface admin-state/description/addresses, VLANs (including
   `state suspend`), switchport modes (access/trunk/dot1q-tunnel), static
-  routes, system (hostname, users, http/https), and the switching suite —
+  routes, system (hostname, users, http/https), the switching suite —
   LAGs + LACP, spanning tree, MAC table (aging + statics), IGMP/MLD
-  snooping, storm control, and mirror sessions. Cross-object validation
+  snooping, storm control, and mirror sessions — and the security suite:
+  ACLs (with per-port/LAG bindings), CoPP class overrides, port
+  security, 802.1X, and DHCP snooping + ARP inspection. RADIUS shared
+  secrets are the first secrets the config tree stores: they persist
+  in the clear on-box like the rest of the tree, render into hostapd's
+  config mode 0600, and display as `<hidden>` in `show configuration`
+  (the redaction convention new secret leaves follow). Cross-object validation
   (e.g. "a LAG member's L2 config lives on the Port-Channel", mirror
   destination exclusivity) runs at load/commit before anything is pushed.
   An interface removed from the config reverts to defaults (admin up, no

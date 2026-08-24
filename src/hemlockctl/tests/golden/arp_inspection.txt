@@ -1,0 +1,7 @@
+ARP inspection is enabled on VLANs: 10
+Validate: src-mac
+Trusted interfaces: Po1
+
+Vlan  Forwarded  Dropped  Bad Binding  Bad Src-MAC
+----  ---------  -------  -----------  -----------
+10    99120      41       38           3

@@ -120,6 +120,59 @@ service Syncd {
   // What the transit FIB currently holds, for orch's reconciler: after
   // an orch restart it deletes entries the kernel no longer wants.
   rpc DumpFib(DumpFibRequest) returns (DumpFibResponse);
+
+  // --- ACLs (security suite) --------------------------------------------
+  // Whole-ACL declarative program: ordered rules with match fields and
+  // actions. Diffed inside syncd by rule number, so an edit to one rule
+  // leaves the other rules' counter objects (and match counts) alone.
+  rpc EnsureAcl(EnsureAclRequest) returns (EnsureAclResponse);
+  // Remove an ACL; it must no longer be bound anywhere.
+  rpc RemoveAcl(RemoveAclRequest) returns (RemoveAclResponse);
+  // Bind an ACL to a port at a stage. A Port-Channel binding expands to
+  // the member ports (and follows membership churn). Internal entries
+  // (dot1x enforcement, DAI/DHCP-snooping redirects) live in
+  // syncd-managed priority bands above user rules.
+  rpc BindPortAcl(BindPortAclRequest) returns (BindPortAclResponse);
+  rpc UnbindPortAcl(UnbindPortAclRequest) returns (UnbindPortAclResponse);
+  // Per-rule match counters (implicit deny included), bindings, and
+  // TCAM utilization per stage.
+  rpc GetAclState(GetAclStateRequest) returns (GetAclStateResponse);
+  // Baseline the match counters (`clear acl counters [<name>]`).
+  rpc ClearAclCounters(ClearAclCountersRequest) returns (ClearAclCountersResponse);
+
+  // --- Control-plane policing -------------------------------------------
+  // Override one class's policer rate/burst (absent values restore the
+  // compiled defaults). Classes and trap membership are a compiled
+  // table, not user-definable.
+  rpc SetCoppClass(SetCoppClassRequest) returns (SetCoppClassResponse);
+  // Per-class conforming/dropped counters for `show copp`.
+  rpc GetCoppState(GetCoppStateRequest) returns (GetCoppStateResponse);
+  rpc ClearCoppCounters(ClearCoppCountersRequest) returns (ClearCoppCountersResponse);
+
+  // --- Port security ----------------------------------------------------
+  // Learn limit + violation action on a port.
+  rpc SetPortSecurity(SetPortSecurityRequest) returns (SetPortSecurityResponse);
+  // Unconfigure port-security on a port (limits removed, secure MACs
+  // forgotten, learning restored).
+  rpc ClearPortSecurity(ClearPortSecurityRequest) returns (ClearPortSecurityResponse);
+  // Learned MACs, violation counts, last violation.
+  rpc GetPortSecurityState(GetPortSecurityStateRequest) returns (GetPortSecurityStateResponse);
+  // `clear port-security [interface <port>]`: flush learned MACs and
+  // violation counters, re-enable an errdisabled port.
+  rpc ResetPortSecurity(ResetPortSecurityRequest) returns (ResetPortSecurityResponse);
+
+  // --- 802.1X port enforcement ------------------------------------------
+  // Flip a port's authorization: unauthorized installs the internal
+  // permit-EAPOL + deny-all entries; authorized removes them. Driven by
+  // orch's dot1x engine.
+  rpc SetPortAuthorized(SetPortAuthorizedRequest) returns (SetPortAuthorizedResponse);
+
+  // --- DHCP snooping / DAI redirects ------------------------------------
+  // Declarative per-VLAN CPU redirect program, pushed by orch's
+  // snooping engine: DHCP on untrusted ports traps (validated and
+  // re-injected by orch), on trusted ports copies (binding learn); ARP
+  // on inspected VLANs' untrusted ports traps for DAI validation.
+  rpc SetSnoopRedirects(SetSnoopRedirectsRequest) returns (SetSnoopRedirectsResponse);
 }
 
 message GetSwitchInfoRequest {}
@@ -150,6 +203,16 @@ message SwitchCapabilities {
   bool ipv6 = 11;
   // My-MAC entries (VRRP virtual MACs).
   bool my_mac = 12;
+  // Ingress/egress ACL stages (egress is optional on some SAI builds;
+  // `access-group ... out` fails commit when absent).
+  bool acl_ingress = 13;
+  bool acl_egress = 14;
+  // Per-ACL-entry policers (rule `police ...`).
+  bool acl_entry_policer = 15;
+  // Per-port FDB learn limits (port-security).
+  bool port_learn_limit = 16;
+  // Hostif trap groups with policers (CoPP).
+  bool copp = 17;
 }
 
 message EnsureNeighborRequest {
@@ -741,3 +804,226 @@ message ClearInterfaceAddressRequest {
 }
 
 message ClearInterfaceAddressResponse {}
+
+// --- ACLs (security suite) -------------------------------------------
+
+enum AclFamily {
+  ACL_FAMILY_UNSPECIFIED = 0;
+  ACL_FAMILY_IPV4 = 1;
+  ACL_FAMILY_IPV6 = 2;
+  ACL_FAMILY_MAC = 3;
+}
+
+enum AclStage {
+  ACL_STAGE_UNSPECIFIED = 0;
+  ACL_STAGE_INGRESS = 1;
+  ACL_STAGE_EGRESS = 2;
+}
+
+// One user rule. Field applicability follows the family; unset match
+// fields are don't-care.
+message AclRule {
+  uint32 number = 1;
+  bool permit = 2;
+  // IP protocol number.
+  optional uint32 protocol = 3;
+  // Canonical CIDR prefixes; "" = any.
+  string source = 4;
+  string destination = 5;
+  // Inclusive L4 port ranges (low == high for one port).
+  optional uint32 source_port_low = 6;
+  optional uint32 source_port_high = 7;
+  optional uint32 destination_port_low = 8;
+  optional uint32 destination_port_high = 9;
+  optional uint32 dscp = 10;
+  // Trap a copy to the CPU and syslog it (rate-limited by the CoPP
+  // acl-log class).
+  bool log = 11;
+  // Per-rule policer; pps selects packet metering (burst in packets).
+  optional uint64 police_rate = 12;
+  optional uint64 police_burst = 13;
+  bool police_pps = 14;
+  // MAC-family matches: colon-lowercase address + and-mask ("" mask =
+  // exact match).
+  string source_mac = 15;
+  string source_mac_mask = 16;
+  string destination_mac = 17;
+  string destination_mac_mask = 18;
+  optional uint32 ethertype = 19;
+}
+
+message EnsureAclRequest {
+  string name = 1;
+  AclFamily family = 2;
+  repeated AclRule rules = 3;
+}
+
+message EnsureAclResponse {}
+
+message RemoveAclRequest {
+  string name = 1;
+}
+
+message RemoveAclResponse {}
+
+message BindPortAclRequest {
+  // A port or Port-Channel display name.
+  string port = 1;
+  AclStage stage = 2;
+  string acl = 3;
+}
+
+message BindPortAclResponse {}
+
+message UnbindPortAclRequest {
+  string port = 1;
+  AclStage stage = 2;
+}
+
+message UnbindPortAclResponse {}
+
+message GetAclStateRequest {}
+
+message AclBindingState {
+  string port = 1;
+  AclStage stage = 2;
+}
+
+message AclStateEntry {
+  string name = 1;
+  AclFamily family = 2;
+  repeated AclRule rules = 3;
+  // Match counters parallel to `rules` (summed across bindings).
+  repeated uint64 matches = 4;
+  uint64 implicit_deny_matches = 5;
+  repeated AclBindingState bindings = 6;
+}
+
+message TcamStageState {
+  AclStage stage = 1;
+  // Entries this suite programmed at the stage (IPv6 double-wide).
+  uint32 used = 2;
+  // Free entries as the SAI reports them.
+  uint32 available = 3;
+}
+
+message GetAclStateResponse {
+  repeated AclStateEntry acls = 1;
+  repeated TcamStageState tcam = 2;
+}
+
+message ClearAclCountersRequest {
+  // Scope to one ACL; "" = every ACL.
+  string name = 1;
+}
+
+message ClearAclCountersResponse {
+  uint32 cleared = 1;
+}
+
+// --- Control-plane policing ------------------------------------------
+
+message SetCoppClassRequest {
+  string class = 1;
+  // Absent values restore the compiled defaults.
+  optional uint32 rate = 2;
+  optional uint32 burst = 3;
+}
+
+message SetCoppClassResponse {}
+
+message GetCoppStateRequest {}
+
+message CoppClassState {
+  string class = 1;
+  uint32 rate = 2;
+  uint32 burst = 3;
+  // Config overrides the compiled default (renders `*`).
+  bool overridden = 4;
+  uint64 conforming = 5;
+  uint64 dropped = 6;
+}
+
+message GetCoppStateResponse {
+  repeated CoppClassState classes = 1;
+}
+
+message ClearCoppCountersRequest {}
+
+message ClearCoppCountersResponse {}
+
+// --- Port security ---------------------------------------------------
+
+message SetPortSecurityRequest {
+  string port = 1;
+  uint32 maximum = 2;
+  // Violation action: true = shutdown (errdisable), false = protect.
+  bool shutdown = 3;
+}
+
+message SetPortSecurityResponse {}
+
+message ClearPortSecurityRequest {
+  string port = 1;
+}
+
+message ClearPortSecurityResponse {}
+
+message GetPortSecurityStateRequest {
+  // Scope to one port; "" = every enabled port.
+  string port = 1;
+}
+
+message SecureMacState {
+  string mac = 1;
+  uint64 age_secs = 2;
+}
+
+message PortSecurityEntry {
+  string port = 1;
+  uint32 maximum = 2;
+  bool shutdown = 3;
+  repeated SecureMacState learned = 4;
+  uint32 violations = 5;
+  string last_violation_mac = 6;
+  optional uint64 last_violation_secs_ago = 7;
+  bool errdisabled = 8;
+}
+
+message GetPortSecurityStateResponse {
+  repeated PortSecurityEntry ports = 1;
+}
+
+message ResetPortSecurityRequest {
+  // Scope to one port; "" = every enabled port.
+  string port = 1;
+}
+
+message ResetPortSecurityResponse {
+  uint32 cleared = 1;
+}
+
+// --- 802.1X port enforcement -----------------------------------------
+
+message SetPortAuthorizedRequest {
+  string port = 1;
+  bool authorized = 2;
+}
+
+message SetPortAuthorizedResponse {}
+
+// --- DHCP snooping / DAI redirects -----------------------------------
+
+message SnoopVlanProgram {
+  uint32 vlan = 1;
+  repeated string untrusted_ports = 2;
+  // Meaningful for DHCP only (trusted ports copy for binding learn).
+  repeated string trusted_ports = 3;
+}
+
+message SetSnoopRedirectsRequest {
+  repeated SnoopVlanProgram dhcp = 1;
+  repeated SnoopVlanProgram arp = 2;
+}
+
+message SetSnoopRedirectsResponse {}

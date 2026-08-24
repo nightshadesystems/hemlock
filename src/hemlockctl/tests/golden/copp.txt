@@ -1,0 +1,17 @@
+Class     Rate (pps)  Burst  Conforming     Dropped
+--------  ----------  -----  -------------  --------
+bpdu *    512         128    182331         0
+lacp      1000        256    92110          0
+eapol     256         64     412            0
+igmp      1000        256    55019          12
+mld       1000        256    1044           0
+arp *     2000        500    881236         3402
+dhcp      512         128    9871           0
+ospf      2000        512    771230         0
+bgp       2000        512    44127          0
+vrrp      512         128    99012          0
+ip2me     4000        1024   1288812        0
+acl-log   64          32     7              0
+default   256         64     1233           88
+
+* rates in config override compiled defaults

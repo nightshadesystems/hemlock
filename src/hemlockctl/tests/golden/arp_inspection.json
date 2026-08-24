@@ -1,0 +1,22 @@
+{
+  "arp_inspection": {
+    "statistics": [
+      {
+        "bad_binding": 38,
+        "bad_src_mac": 3,
+        "dropped": 41,
+        "forwarded": 99120,
+        "vlan": 10
+      }
+    ],
+    "trusted": [
+      "Port-Channel1"
+    ],
+    "validate": [
+      "src-mac"
+    ],
+    "vlans": [
+      10
+    ]
+  }
+}

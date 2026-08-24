@@ -1,0 +1,8 @@
+Port-security on Et5: maximum 4, violation shutdown
+Errdisabled: yes
+
+MAC Address        Age
+-----------------  --------
+00:1c:73:0c:aa:05  0:41:02
+a0:36:9f:44:be:05  0:12:07
+00:50:56:be:ef:05  0:01:33

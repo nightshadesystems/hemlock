@@ -14,8 +14,9 @@ use hemlock_platform::PortDef;
 use tokio::sync::mpsc;
 
 use crate::{
-    FdbAction, IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend,
-    SaiCapabilities, SaiError, SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo,
+    AclAction, AclFamily, AclFields, AclStage, FdbAction, IpPrefix, Oid, PolicerSpec,
+    PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities,
+    SaiError, SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo, TrapKind,
 };
 
 /// Synthetic OIDs: obviously fake, stable, and readable in logs.
@@ -36,6 +37,18 @@ const MOCK_NEXT_HOP_OID_BASE: u64 = 0x2100_0000_0000_c000;
 const MOCK_NHG_OID_BASE: u64 = 0x2100_0000_0000_d000;
 const MOCK_NHG_MEMBER_OID_BASE: u64 = 0x2100_0000_0000_e000;
 const MOCK_MY_MAC_OID_BASE: u64 = 0x2100_0000_0000_f000;
+const MOCK_ACL_TABLE_OID_BASE: u64 = 0x2100_0000_0001_0000;
+const MOCK_ACL_ENTRY_OID_BASE: u64 = 0x2100_0000_0001_1000;
+const MOCK_ACL_COUNTER_OID_BASE: u64 = 0x2100_0000_0001_2000;
+const MOCK_POLICER_OID_BASE: u64 = 0x2100_0000_0001_3000;
+const MOCK_TRAP_GROUP_OID_BASE: u64 = 0x2100_0000_0001_4000;
+const MOCK_TRAP_OID_BASE: u64 = 0x2100_0000_0001_5000;
+
+/// The mock TCAM's entry capacity per stage — Helix4-shaped numbers so
+/// `show acl summary` has something honest to report (IPv6 entries
+/// count double-wide, like the real ContentAware slices).
+const MOCK_ACL_INGRESS_CAPACITY: u32 = 512;
+const MOCK_ACL_EGRESS_CAPACITY: u32 = 256;
 
 /// The default 802.1Q VLAN's synthetic OID (the base itself; `alloc`
 /// starts above it), so FDB events on VLAN 1 can be mapped back.
@@ -96,6 +109,20 @@ pub struct MockSai {
     nh_groups: std::collections::HashSet<Oid>,
     nh_group_members: HashMap<Oid, (Oid, Oid)>,
     my_macs: HashMap<Oid, (Option<u16>, [u8; 6])>,
+    /// Security-suite model: ACL tables/entries/counters and port
+    /// bindings, standalone policers, hostif trap groups + traps, and
+    /// per-port learn limits/learning state.
+    acl_tables: HashMap<Oid, (AclStage, AclFamily)>,
+    acl_entries: HashMap<Oid, (Oid, u32, AclFields, AclAction)>,
+    acl_counters: HashMap<Oid, (Oid, u64)>,
+    acl_bindings: HashMap<(PortId, AclStage), Oid>,
+    policers: HashMap<Oid, (PolicerSpec, PolicerStats)>,
+    trap_groups: HashMap<Oid, Option<Oid>>,
+    traps: HashMap<Oid, (TrapKind, bool, Oid)>,
+    learn_limits: HashMap<PortId, u32>,
+    learning_off: std::collections::HashSet<PortId>,
+    default_trap_group_policer: Option<Oid>,
+    synthetic_counters: bool,
     next_oid: u64,
 }
 
@@ -140,6 +167,17 @@ impl MockSai {
             nh_groups: std::collections::HashSet::new(),
             nh_group_members: HashMap::new(),
             my_macs: HashMap::new(),
+            acl_tables: HashMap::new(),
+            acl_entries: HashMap::new(),
+            acl_counters: HashMap::new(),
+            acl_bindings: HashMap::new(),
+            policers: HashMap::new(),
+            trap_groups: HashMap::new(),
+            traps: HashMap::new(),
+            learn_limits: HashMap::new(),
+            learning_off: std::collections::HashSet::new(),
+            default_trap_group_policer: None,
+            synthetic_counters: false,
             next_oid: 0,
         }
     }
@@ -151,9 +189,17 @@ impl MockSai {
     }
 
     /// A sender that injects SAI events as if the ASIC produced them
-    /// (tests: simulated FDB learns/ages/moves).
+    /// (tests: simulated FDB learns/ages/moves, learn-limit
+    /// violations).
     pub fn event_injector(&self) -> mpsc::UnboundedSender<SaiEvent> {
         self.events_tx.clone()
+    }
+
+    /// Make ACL match counters and policer stats advance on every read
+    /// (tests: clear-counters baselines, CoPP accumulation). The mock
+    /// forwards nothing, so counters honestly stay 0 unless asked.
+    pub fn enable_synthetic_counters(&mut self) {
+        self.synthetic_counters = true;
     }
 
     /// The synthetic OID the mock reports for a VLAN number (the
@@ -214,6 +260,45 @@ impl MockSai {
             return Err(SaiError::Other("IPv6 is not supported".into()));
         }
         Ok(())
+    }
+
+    /// An entry's counter/policer references must name live objects in
+    /// the same table's world.
+    fn require_acl_action_refs(&self, table: Oid, action: &AclAction) -> Result<(), SaiError> {
+        if let Some(counter) = action.counter {
+            match self.acl_counters.get(&counter) {
+                Some((counter_table, _)) if *counter_table == table => {}
+                Some(_) => {
+                    return Err(SaiError::Other(format!(
+                        "ACL counter {counter} belongs to another table"
+                    )))
+                }
+                None => return Err(SaiError::Other(format!("no such ACL counter {counter}"))),
+            }
+        }
+        if let Some(policer) = action.policer {
+            if !self.policers.contains_key(&policer) {
+                return Err(SaiError::Other(format!("no such policer {policer}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// TCAM slices consumed at a stage (IPv6 entries are double-wide).
+    fn acl_entries_used(&self, stage: AclStage) -> u32 {
+        self.acl_entries
+            .values()
+            .filter_map(|(table, ..)| self.acl_tables.get(table))
+            .filter(|(table_stage, _)| *table_stage == stage)
+            .map(|(_, family)| if *family == AclFamily::Ipv6 { 2 } else { 1 })
+            .sum()
+    }
+
+    fn acl_capacity(&self, stage: AclStage) -> u32 {
+        match stage {
+            AclStage::Ingress => MOCK_ACL_INGRESS_CAPACITY,
+            AclStage::Egress => MOCK_ACL_EGRESS_CAPACITY,
+        }
     }
 }
 
@@ -1006,13 +1091,402 @@ impl SaiBackend for MockSai {
         }
         Ok(())
     }
+
+    fn create_acl_table(&mut self, stage: AclStage, family: AclFamily) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        let oid = self.alloc(MOCK_ACL_TABLE_OID_BASE);
+        self.acl_tables.insert(oid, (stage, family));
+        Ok(oid)
+    }
+
+    fn remove_acl_table(&mut self, table: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if !self.acl_tables.contains_key(&table) {
+            return Err(SaiError::Other(format!("no such ACL table {table}")));
+        }
+        // Like the real ASIC: a table with live entries, counters, or
+        // bindings refuses removal.
+        if self.acl_entries.values().any(|(t, ..)| *t == table) {
+            return Err(SaiError::Other(format!("ACL table {table} has entries")));
+        }
+        if self.acl_counters.values().any(|(t, _)| *t == table) {
+            return Err(SaiError::Other(format!("ACL table {table} has counters")));
+        }
+        if self.acl_bindings.values().any(|t| *t == table) {
+            return Err(SaiError::Other(format!("ACL table {table} is bound")));
+        }
+        self.acl_tables.remove(&table);
+        Ok(())
+    }
+
+    fn create_acl_entry(
+        &mut self,
+        table: Oid,
+        priority: u32,
+        fields: &AclFields,
+        action: &AclAction,
+    ) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        let Some((stage, family)) = self.acl_tables.get(&table).copied() else {
+            return Err(SaiError::Other(format!("no such ACL table {table}")));
+        };
+        self.require_acl_action_refs(table, action)?;
+        // TCAM capacity: refuse past the stage's slice budget, like
+        // the real ContentAware would (TABLE_FULL).
+        let width = if family == AclFamily::Ipv6 { 2 } else { 1 };
+        if self.acl_entries_used(stage) + width > self.acl_capacity(stage) {
+            return Err(SaiError::Status {
+                call: "create_acl_entry",
+                status: -12, // SAI_STATUS_TABLE_FULL
+            });
+        }
+        let oid = self.alloc(MOCK_ACL_ENTRY_OID_BASE);
+        self.acl_entries
+            .insert(oid, (table, priority, fields.clone(), *action));
+        Ok(oid)
+    }
+
+    fn set_acl_entry_action(&mut self, entry: Oid, action: &AclAction) -> Result<(), SaiError> {
+        self.require_switch()?;
+        let Some(&(table, ..)) = self.acl_entries.get(&entry) else {
+            return Err(SaiError::Other(format!("no such ACL entry {entry}")));
+        };
+        self.require_acl_action_refs(table, action)?;
+        if let Some((.., stored)) = self.acl_entries.get_mut(&entry) {
+            *stored = *action;
+        }
+        Ok(())
+    }
+
+    fn remove_acl_entry(&mut self, entry: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.acl_entries.remove(&entry).is_none() {
+            return Err(SaiError::Other(format!("no such ACL entry {entry}")));
+        }
+        Ok(())
+    }
+
+    fn create_acl_counter(&mut self, table: Oid) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if !self.acl_tables.contains_key(&table) {
+            return Err(SaiError::Other(format!("no such ACL table {table}")));
+        }
+        let oid = self.alloc(MOCK_ACL_COUNTER_OID_BASE);
+        self.acl_counters.insert(oid, (table, 0));
+        Ok(oid)
+    }
+
+    fn remove_acl_counter(&mut self, counter: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if !self.acl_counters.contains_key(&counter) {
+            return Err(SaiError::Other(format!("no such ACL counter {counter}")));
+        }
+        if self
+            .acl_entries
+            .values()
+            .any(|(.., action)| action.counter == Some(counter))
+        {
+            return Err(SaiError::Other(format!(
+                "ACL counter {counter} is still referenced"
+            )));
+        }
+        self.acl_counters.remove(&counter);
+        Ok(())
+    }
+
+    fn get_acl_counter(&mut self, counter: Oid) -> Result<u64, SaiError> {
+        self.require_switch()?;
+        let synthetic = self.synthetic_counters;
+        let Some((_, packets)) = self.acl_counters.get_mut(&counter) else {
+            return Err(SaiError::Other(format!("no such ACL counter {counter}")));
+        };
+        if synthetic {
+            *packets += 7;
+        }
+        Ok(*packets)
+    }
+
+    fn bind_port_acl(
+        &mut self,
+        port: PortId,
+        stage: AclStage,
+        table: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        match table {
+            Some(table) => {
+                let Some((table_stage, _)) = self.acl_tables.get(&table) else {
+                    return Err(SaiError::Other(format!("no such ACL table {table}")));
+                };
+                if *table_stage != stage {
+                    return Err(SaiError::Other(format!(
+                        "ACL table {table} is not a {stage:?} table"
+                    )));
+                }
+                self.acl_bindings.insert((port, stage), table);
+            }
+            None => {
+                self.acl_bindings.remove(&(port, stage));
+            }
+        }
+        Ok(())
+    }
+
+    fn acl_available_entries(&mut self, stage: AclStage) -> Result<u32, SaiError> {
+        self.require_switch()?;
+        Ok(self.acl_capacity(stage) - self.acl_entries_used(stage))
+    }
+
+    fn create_policer(&mut self, spec: PolicerSpec) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        let oid = self.alloc(MOCK_POLICER_OID_BASE);
+        self.policers.insert(oid, (spec, PolicerStats::default()));
+        Ok(oid)
+    }
+
+    fn set_policer(&mut self, policer: Oid, spec: PolicerSpec) -> Result<(), SaiError> {
+        self.require_switch()?;
+        let Some((stored, _)) = self.policers.get_mut(&policer) else {
+            return Err(SaiError::Other(format!("no such policer {policer}")));
+        };
+        *stored = spec;
+        Ok(())
+    }
+
+    fn remove_policer(&mut self, policer: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if !self.policers.contains_key(&policer) {
+            return Err(SaiError::Other(format!("no such policer {policer}")));
+        }
+        if self.trap_groups.values().any(|p| *p == Some(policer))
+            || self.default_trap_group_policer == Some(policer)
+        {
+            return Err(SaiError::Other(format!(
+                "policer {policer} is attached to a trap group"
+            )));
+        }
+        if self
+            .acl_entries
+            .values()
+            .any(|(.., action)| action.policer == Some(policer))
+        {
+            return Err(SaiError::Other(format!(
+                "policer {policer} is attached to an ACL entry"
+            )));
+        }
+        self.policers.remove(&policer);
+        Ok(())
+    }
+
+    fn policer_stats(&mut self, policer: Oid) -> Result<PolicerStats, SaiError> {
+        self.require_switch()?;
+        let synthetic = self.synthetic_counters;
+        let Some((_, stats)) = self.policers.get_mut(&policer) else {
+            return Err(SaiError::Other(format!("no such policer {policer}")));
+        };
+        if synthetic {
+            stats.conforming += 11;
+            stats.dropped += 3;
+        }
+        Ok(*stats)
+    }
+
+    fn create_hostif_trap_group(&mut self, policer: Option<Oid>) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if let Some(policer) = policer {
+            if !self.policers.contains_key(&policer) {
+                return Err(SaiError::Other(format!("no such policer {policer}")));
+            }
+        }
+        let oid = self.alloc(MOCK_TRAP_GROUP_OID_BASE);
+        self.trap_groups.insert(oid, policer);
+        Ok(oid)
+    }
+
+    fn remove_hostif_trap_group(&mut self, group: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if !self.trap_groups.contains_key(&group) {
+            return Err(SaiError::Other(format!("no such trap group {group}")));
+        }
+        if self.traps.values().any(|(.., g)| *g == group) {
+            return Err(SaiError::Other(format!("trap group {group} has traps")));
+        }
+        self.trap_groups.remove(&group);
+        Ok(())
+    }
+
+    fn create_hostif_trap(
+        &mut self,
+        kind: TrapKind,
+        trap_only: bool,
+        group: Oid,
+    ) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        // Oid(0) = the switch default trap group, which always exists.
+        if group.0 != 0 && !self.trap_groups.contains_key(&group) {
+            return Err(SaiError::Other(format!("no such trap group {group}")));
+        }
+        if self.traps.values().any(|(k, ..)| *k == kind) {
+            return Err(SaiError::Other(format!("trap {kind:?} already exists")));
+        }
+        let oid = self.alloc(MOCK_TRAP_OID_BASE);
+        self.traps.insert(oid, (kind, trap_only, group));
+        Ok(oid)
+    }
+
+    fn remove_hostif_trap(&mut self, trap: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.traps.remove(&trap).is_none() {
+            return Err(SaiError::Other(format!("no such trap {trap}")));
+        }
+        Ok(())
+    }
+
+    fn set_default_trap_group_policer(&mut self, policer: Option<Oid>) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if let Some(policer) = policer {
+            if !self.policers.contains_key(&policer) {
+                return Err(SaiError::Other(format!("no such policer {policer}")));
+            }
+        }
+        self.default_trap_group_policer = policer;
+        Ok(())
+    }
+
+    fn set_port_learn_limit(&mut self, port: PortId, limit: Option<u32>) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        match limit {
+            Some(limit) => {
+                self.learn_limits.insert(port, limit);
+            }
+            None => {
+                self.learn_limits.remove(&port);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_port_learning(&mut self, port: PortId, learn: bool) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        if learn {
+            self.learning_off.remove(&port);
+        } else {
+            self.learning_off.insert(port);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::FdbEventKind;
+    use crate::{AclPacketAction, FdbEventKind};
+
+    #[test]
+    fn acl_policer_and_trap_lifecycle() {
+        let mut sai = MockSai::new(port_table(2));
+        sai.create_switch().unwrap();
+        let ports: Vec<PortId> = sai.ports().unwrap().into_iter().map(|p| p.id).collect();
+
+        // Table + counter + entry, bound to a port.
+        let table = sai
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+        let counter = sai.create_acl_counter(table).unwrap();
+        let fields = AclFields {
+            src_ip: Some(("10.0.0.0".parse().unwrap(), 8)),
+            protocol: Some(6),
+            dst_port: Some((443, 443)),
+            ..Default::default()
+        };
+        let action = AclAction {
+            action: AclPacketAction::Forward,
+            counter: Some(counter),
+            policer: None,
+        };
+        let entry = sai.create_acl_entry(table, 100, &fields, &action).unwrap();
+        sai.bind_port_acl(ports[0], AclStage::Ingress, Some(table))
+            .unwrap();
+        assert_eq!(sai.acl_bindings[&(ports[0], AclStage::Ingress)], table);
+        assert_eq!(sai.get_acl_counter(counter).unwrap(), 0);
+
+        // Dependency rules, like the real ASIC: live entries, a
+        // referenced counter, and a bound table all refuse removal.
+        assert!(sai.remove_acl_table(table).is_err());
+        assert!(sai.remove_acl_counter(counter).is_err());
+
+        // TCAM accounting: one IPv4 entry used; IPv6 counts double.
+        assert_eq!(sai.acl_available_entries(AclStage::Ingress).unwrap(), 511);
+        let table6 = sai
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv6)
+            .unwrap();
+        let deny = AclAction {
+            action: AclPacketAction::Drop,
+            counter: None,
+            policer: None,
+        };
+        let entry6 = sai
+            .create_acl_entry(table6, 10, &AclFields::default(), &deny)
+            .unwrap();
+        assert_eq!(sai.acl_available_entries(AclStage::Ingress).unwrap(), 509);
+        assert_eq!(sai.acl_available_entries(AclStage::Egress).unwrap(), 256);
+
+        // A stage-mismatched binding is refused.
+        assert!(sai
+            .bind_port_acl(ports[0], AclStage::Egress, Some(table))
+            .is_err());
+
+        // Policers attach to entries and trap groups; both hold a
+        // reference that blocks removal.
+        let policer = sai
+            .create_policer(PolicerSpec {
+                pps: true,
+                rate: 512,
+                burst: 128,
+            })
+            .unwrap();
+        let group = sai.create_hostif_trap_group(Some(policer)).unwrap();
+        let trap = sai.create_hostif_trap(TrapKind::Stp, true, group).unwrap();
+        assert!(sai.create_hostif_trap(TrapKind::Stp, true, group).is_err());
+        assert!(sai.remove_policer(policer).is_err());
+        assert!(sai.remove_hostif_trap_group(group).is_err());
+        sai.remove_hostif_trap(trap).unwrap();
+        sai.remove_hostif_trap_group(group).unwrap();
+        sai.set_policer(
+            policer,
+            PolicerSpec {
+                pps: true,
+                rate: 2000,
+                burst: 500,
+            },
+        )
+        .unwrap();
+        assert_eq!(sai.policers[&policer].0.rate, 2000);
+        sai.remove_policer(policer).unwrap();
+
+        // Learn limits and learning state.
+        sai.set_port_learn_limit(ports[1], Some(4)).unwrap();
+        assert_eq!(sai.learn_limits[&ports[1]], 4);
+        sai.set_port_learning(ports[1], false).unwrap();
+        assert!(sai.learning_off.contains(&ports[1]));
+        sai.set_port_learning(ports[1], true).unwrap();
+        sai.set_port_learn_limit(ports[1], None).unwrap();
+        assert!(sai.learn_limits.is_empty());
+
+        // Ordered teardown: entry, counter, unbind, table.
+        sai.remove_acl_entry(entry).unwrap();
+        sai.remove_acl_counter(counter).unwrap();
+        assert!(sai.remove_acl_table(table).is_err());
+        sai.bind_port_acl(ports[0], AclStage::Ingress, None).unwrap();
+        sai.remove_acl_table(table).unwrap();
+        sai.remove_acl_entry(entry6).unwrap();
+        sai.remove_acl_table(table6).unwrap();
+        assert_eq!(sai.acl_available_entries(AclStage::Ingress).unwrap(), 512);
+    }
 
     fn port_table(n: usize) -> Vec<PortDef> {
         (0..n)

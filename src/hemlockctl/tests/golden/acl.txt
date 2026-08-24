@@ -1,0 +1,19 @@
+IPv4 access list EDGE-IN
+        10 permit tcp 10.0.0.0/8 10.42.0.0/16 eq 443 [match 18244]
+        20 permit udp any any eq 67-68 [match 512]
+        30 deny ip 192.0.2.0/24 any log [match 7]
+        40 permit ip any any police 10m 256k [match 90211]
+        implicit deny ip any any [match 3]
+        Applied: Ethernet1 in
+
+IPv6 access list MGMT6-IN
+        10 permit tcp 2001:db8:9::/48 any eq 22 [match 44]
+        20 deny ipv6 any any log [match 0]
+        implicit deny ipv6 any any [match 0]
+        Applied: none
+
+MAC access list IOT-MAC
+        10 permit 00:1c:73:00:00:00/ff:ff:ff:00:00:00 any [match 1029]
+        20 deny any any [match 15]
+        implicit deny any any [match 0]
+        Applied: none

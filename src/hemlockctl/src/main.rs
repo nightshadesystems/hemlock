@@ -15,6 +15,7 @@ mod motd;
 mod pager;
 mod platform;
 mod routing;
+mod security;
 mod show;
 mod switching;
 mod upgrade;

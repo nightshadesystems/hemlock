@@ -83,6 +83,7 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
     let helper_state = Arc::new(Mutex::new(complete::State {
         mode: CliMode::Operational,
         ports: Vec::new(),
+        acls: Vec::new(),
     }));
     let mut rl: rustyline::Editor<CliHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::new()?;
@@ -93,10 +94,13 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
     // Keep the completer's interface-name cache fresh from syncd; a dead
     // or restarting syncd just means stale/no port completion, never an
     // error at the prompt. The management port is an OS netdev, not a
-    // syncd port, so it joins the cache from the manifest.
+    // syncd port, so it joins the cache from the manifest. The ACL-name
+    // cache rides the same sweep, from the mgmtd candidate (so a
+    // just-configured ACL completes before it commits).
     {
         let state = helper_state.clone();
         let syncd = endpoints.syncd.clone();
+        let mgmtd = endpoints.mgmtd.clone();
         let management = management_interface();
         tokio::spawn(async move {
             loop {
@@ -113,6 +117,22 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
                         names.push(management.clone());
                         if let Ok(mut state) = state.lock() {
                             state.ports = names;
+                        }
+                    }
+                }
+                if let Ok(channel) = mgmtd.connect().await {
+                    let mut client = pb::mgmt_client::MgmtClient::new(channel);
+                    if let Ok(response) = client
+                        .get_config(pb::GetConfigRequest {
+                            source: pb::ConfigSource::Candidate as i32,
+                        })
+                        .await
+                    {
+                        let names = hemlock_config::parse(&response.into_inner().text)
+                            .map(|tree| candidate_acl_names(&tree))
+                            .unwrap_or_default();
+                        if let Ok(mut state) = state.lock() {
+                            state.acls = names;
                         }
                     }
                 }
@@ -158,11 +178,11 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
             } else {
                 ""
             };
-            let (cli_mode, ports) = match helper_state.lock() {
-                Ok(state) => (state.mode, state.ports.clone()),
-                Err(_) => (CliMode::Operational, Vec::new()),
+            let (cli_mode, ports, acls) = match helper_state.lock() {
+                Ok(state) => (state.mode, state.ports.clone(), state.acls.clone()),
+                Err(_) => (CliMode::Operational, Vec::new(), Vec::new()),
             };
-            let options = complete::help_candidates(cli_mode, &tokens, partial, &ports);
+            let options = complete::help_candidates(cli_mode, &tokens, partial, &ports, &acls);
             if options.is_empty() {
                 println!("  <cr>");
             } else {
@@ -298,13 +318,41 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             stay(Mode::Operational)
         }
         "clear" => {
-            let clear_topics: &[&str] = &["counters", "mac-table", "arp", "routing"];
+            let clear_topics: &[&str] = &[
+                "counters",
+                "mac-table",
+                "arp",
+                "routing",
+                "acl",
+                "copp",
+                "port-security",
+                "dhcp",
+                "dot1x",
+            ];
             match words.get(1).map(|w| resolve(w, clear_topics)).transpose()? {
                 Some("arp") => {
                     crate::routing::cmd::clear_arp(&endpoints.orch, &words[2..]).await?;
                 }
                 Some("routing") => {
                     crate::routing::cmd::clear_routing(&endpoints.orch, &words[2..]).await?;
+                }
+                Some("acl") => {
+                    crate::security::cmd::clear_acl_counters(&endpoints.syncd, &words[2..])
+                        .await?;
+                }
+                Some("copp") => {
+                    crate::security::cmd::clear_copp_counters(&endpoints.syncd, &words[2..])
+                        .await?;
+                }
+                Some("port-security") => {
+                    crate::security::cmd::clear_port_security(&endpoints.syncd, &words[2..])
+                        .await?;
+                }
+                Some("dhcp") => {
+                    crate::security::cmd::clear_dhcp_binding(&endpoints.orch, &words[2..]).await?;
+                }
+                Some("dot1x") => {
+                    crate::security::cmd::clear_dot1x(&endpoints.orch, &words[2..]).await?;
                 }
                 _ => crate::switching::cmd::clear(&endpoints.syncd, &words[1..]).await?,
             }
@@ -349,10 +397,21 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show routing ospf [neighbor|interface] OSPF process / adjacencies");
             println!("  show routing bgp [summary|neighbors <ip>]  BGP table / peers");
             println!("  show vrrp [brief]                      VRRP group state");
+            println!("  show acl [<name>|summary]              access lists + match counters");
+            println!("  show copp                              control-plane policing classes");
+            println!("  show port-security [interface <port>]  learn limits and violations");
+            println!("  show dot1x [interface <port>]          802.1X port authentication");
+            println!("  show dhcp snooping [binding|statistics]  DHCP snooping state");
+            println!("  show arp inspection [statistics]       dynamic ARP inspection");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
             println!("  clear mac-table [vlan <id>] [interface <port>]   flush dynamic MACs");
+            println!("  clear acl counters [<name>]            baseline ACL match counters");
+            println!("  clear copp counters                    baseline CoPP counters");
+            println!("  clear port-security [interface <port>] reset learned MACs / errdisable");
+            println!("  clear dhcp snooping binding [<mac>]    drop dynamic snooping bindings");
+            println!("  clear dot1x interface <port>           force 802.1X reauthentication");
             println!("  configure | conf                       enter configuration mode");
             println!("  upgrade <image.bin> [force] [reboot]   install an OS image (via mgmtd)");
             println!("  bash                                   drop to the Linux shell");
@@ -390,6 +449,26 @@ async fn upgrade_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), St
         .map_err(fmt_err)
 }
 
+/// The ACL names a config tree defines (`security { acl { <family>
+/// <name> ... } }`), sorted — the completer's ACL-name cache.
+fn candidate_acl_names(tree: &hemlock_config::ConfigTree) -> Vec<String> {
+    let Some((_, items)) = tree.block("security") else {
+        return Vec::new();
+    };
+    let Some((_, acl)) = hemlock_config::ConfigTree::blocks_named(items, "acl").next() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = acl
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Block { keys, .. } => keys.first().cloned(),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Platform overlay directory for manifest-driven display (management
 /// port name); overridable for tests and dev hosts.
 fn platform_dir() -> String {
@@ -422,8 +501,13 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "arp",
         "routing",
         "vrrp",
+        "acl",
+        "copp",
+        "port-security",
+        "dot1x",
+        "dhcp",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -477,9 +561,29 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             family @ ("ip" | "ipv6") => {
                 crate::routing::cmd::show_family(endpoints, family == "ipv6", &words[1..]).await
             }
-            "arp" => crate::routing::cmd::show_neighbors(&endpoints.orch, false, &words[1..]).await,
+            "arp" => {
+                // `show arp inspection ...` belongs to the security
+                // suite; anything else stays the neighbor table.
+                if let Some(next) = words.get(1) {
+                    if resolve(next, &["inspection"]).is_ok() {
+                        return crate::security::cmd::show_arp_inspection(
+                            &endpoints.orch,
+                            &words[2..],
+                        )
+                        .await;
+                    }
+                }
+                crate::routing::cmd::show_neighbors(&endpoints.orch, false, &words[1..]).await
+            }
             "routing" => crate::routing::cmd::show_routing(&endpoints.orch, &words[1..]).await,
             "vrrp" => crate::routing::cmd::show_vrrp(&endpoints.orch, &words[1..]).await,
+            "acl" => crate::security::cmd::show_acl(&endpoints.syncd, &words[1..]).await,
+            "copp" => crate::security::cmd::show_copp(&endpoints.syncd, &words[1..]).await,
+            "port-security" => {
+                crate::security::cmd::show_port_security(&endpoints.syncd, &words[1..]).await
+            }
+            "dot1x" => crate::security::cmd::show_dot1x(&endpoints.orch, &words[1..]).await,
+            "dhcp" => crate::security::cmd::show_dhcp(&endpoints.orch, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -607,15 +711,30 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!(
                 "                                    | advertisement-interval <1-40> | no-preempt]"
             );
+            println!("  set security acl <ipv4|ipv6|mac> <name> rule <n> <permit|deny>");
+            println!("  set security acl <fam> <name> rule <n> [protocol|source|destination|");
+            println!("                    source-port|destination-port|dscp|log|police rate <r> burst <b>|");
+            println!("                    source-mac|destination-mac|ethertype ...]");
+            println!("  set security copp class <name> [rate <pps> | burst <pkts>]");
+            println!("  set security dot1x radius-server <ip> [key <secret>|port|timeout|retransmit]");
+            println!("  set security dot1x reauth-interval <0|60-86400>");
+            println!("  set security dhcp-snooping [vlan <id> | binding <mac> vlan <id> address <ip> interface <port>]");
+            println!("  set security arp-inspection [vlan <id> | validate <src-mac|dst-mac|ip>]");
+            println!("  set interfaces <port> access-group <name> <in|out>");
+            println!("  set interfaces <port> port-security [maximum <1-1024>|violation <protect|shutdown>]");
+            println!("  set interfaces <port> dot1x");
+            println!("  set interfaces <port|Po> dhcp-snooping trust | arp-inspection trust");
             println!(
                 "  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport|"
             );
-            println!("                            channel-group|lacp|spanning-tree|storm-control|min-links ...]");
+            println!("                            channel-group|lacp|spanning-tree|storm-control|min-links|");
+            println!("                            access-group|port-security|dot1x|dhcp-snooping|arp-inspection ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
             println!("  delete routing [static [<prefix> [<next-hop>]] | arp [<ip>]]");
             println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
             println!("  delete switching [mac-table|mirror ...]");
+            println!("  delete security [acl|copp|dot1x|dhcp-snooping|arp-inspection ...]");
             println!("  show                      show the candidate configuration");
             println!(
                 "  commit [confirmed <s>]    apply the candidate (auto-rollback unless confirmed)"
@@ -640,7 +759,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
     let verb = if delete { "delete" } else { "set" };
     let Some(top) = words.first() else {
         return Err(format!(
-            "% Usage: {verb} <interfaces|system|routing|vlans|protocols|switching> ..."
+            "% Usage: {verb} <interfaces|system|routing|vlans|protocols|switching|security> ..."
         ));
     };
     match resolve(
@@ -652,6 +771,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
             "vlans",
             "protocols",
             "switching",
+            "security",
         ],
     )? {
         "interfaces" => config_interfaces(endpoints, &words[1..], delete).await,
@@ -660,6 +780,942 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
         "vlans" => config_vlans(endpoints, &words[1..], delete).await,
         "protocols" => config_protocols(endpoints, &words[1..], delete).await,
         "switching" => config_switching(endpoints, &words[1..], delete).await,
+        "security" => config_security(endpoints, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// The compiled CoPP class names — completion and validation offer
+/// exactly these (the full table with default rates lives in syncd).
+const COPP_CLASSES: &[&str] = &[
+    "bpdu", "lacp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
+    "acl-log", "default",
+];
+
+/// ACL name syntax (letter first, then letters/digits/_/-, max 32) —
+/// checked at the prompt for immediate feedback; mgmtd re-validates.
+fn valid_acl_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// `set interfaces <port> access-group <name> <in|out>` /
+/// `delete interfaces <port> access-group [in|out]`.
+async fn config_access_group(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if delete {
+        let direction = match words.first() {
+            Some(word) => Some(resolve(word, &["in", "out"])?.to_string()),
+            None => None,
+        };
+        if let Some(extra) = words.get(1) {
+            return Err(format!("% Invalid input: {extra:?}"));
+        }
+        return edit_interface(endpoints, port, move |eth| {
+            eth.retain(|item| {
+                !matches!(item, hemlock_config::Item::Leaf { name, values }
+                    if name == "access-group"
+                        && direction
+                            .as_deref()
+                            .map(|d| values.get(1).map(String::as_str) == Some(d))
+                            .unwrap_or(true))
+            });
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let (Some(name), Some(direction)) = (words.first(), words.get(1)) else {
+        return Err(format!(
+            "% Usage: set interfaces {port} access-group <name> <in|out>"
+        ));
+    };
+    if !valid_acl_name(name) {
+        return Err(format!(
+            "% bad ACL name {name:?} (letter first, then letters/digits/_/-, max 32)"
+        ));
+    }
+    let direction = resolve(direction, &["in", "out"])?.to_string();
+    if let Some(extra) = words.get(2) {
+        return Err(format!("% Invalid input: {extra:?}"));
+    }
+    let name = name.to_string();
+    edit_interface(endpoints, port, move |eth| {
+        // One binding per direction: replace any previous one.
+        eth.retain(|item| {
+            !matches!(item, hemlock_config::Item::Leaf { name, values }
+                if name == "access-group"
+                    && values.get(1).map(String::as_str) == Some(direction.as_str()))
+        });
+        push_leaf(eth, "access-group", vec![name, direction]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set interfaces <port> port-security [maximum <1-1024> |
+/// violation <protect|shutdown>]`.
+async fn config_port_security(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if words.is_empty() {
+        return edit_interface(endpoints, port, move |eth| {
+            if delete {
+                ConfigTree::remove_block(eth, "port-security", &[]);
+            } else {
+                // Enables with the defaults (maximum 1, protect).
+                ConfigTree::ensure_block(eth, "port-security", &[]);
+            }
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    match resolve(words[0], &["maximum", "violation", "sticky"])? {
+        // Deferred by the security suite.
+        "sticky" => Err("% sticky port-security MACs are not supported".into()),
+        "maximum" => {
+            if delete {
+                return edit_interface(endpoints, port, |eth| {
+                    if let Some(ps) = block_children_mut(eth, "port-security") {
+                        ConfigTree::remove_leaf(ps, "maximum");
+                    }
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = words.get(1) else {
+                return Err(format!(
+                    "% Usage: set interfaces {port} port-security maximum <1-1024>"
+                ));
+            };
+            let value = int_arg::<u32>(value, 1..=1024, "maximum")?.to_string();
+            edit_interface(endpoints, port, move |eth| {
+                let ps = ConfigTree::ensure_block(eth, "port-security", &[]);
+                ConfigTree::set_leaf(ps, "maximum", vec![value]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "violation" => {
+            if delete {
+                return edit_interface(endpoints, port, |eth| {
+                    if let Some(ps) = block_children_mut(eth, "port-security") {
+                        ConfigTree::remove_leaf(ps, "violation");
+                    }
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = words.get(1) else {
+                return Err(format!(
+                    "% Usage: set interfaces {port} port-security violation <protect|shutdown>"
+                ));
+            };
+            let action = resolve(value, &["protect", "shutdown"])?.to_string();
+            edit_interface(endpoints, port, move |eth| {
+                let ps = ConfigTree::ensure_block(eth, "port-security", &[]);
+                ConfigTree::set_leaf(ps, "violation", vec![action]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete security <acl|copp|dot1x|dhcp-snooping|arp-inspection> ...`.
+async fn config_security(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            ConfigTree::remove_block(&mut tree.items, "security", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(format!(
+            "% Usage: {verb} security <acl|copp|dot1x|dhcp-snooping|arp-inspection> ..."
+        ));
+    };
+    match resolve(
+        first,
+        &[
+            "acl",
+            "copp",
+            "dot1x",
+            "dhcp-snooping",
+            "arp-inspection",
+            "ra-guard",
+            "dhcpv6-snooping",
+        ],
+    )? {
+        // Deferred by the security suite.
+        "ra-guard" => Err("% IPv6 RA-guard is not supported".into()),
+        "dhcpv6-snooping" => Err("% DHCPv6 snooping is not supported".into()),
+        "acl" => config_acl(endpoints, &words[1..], delete).await,
+        "copp" => config_copp(endpoints, &words[1..], delete).await,
+        "dot1x" => config_dot1x(endpoints, &words[1..], delete).await,
+        "dhcp-snooping" => config_dhcp_snooping(endpoints, &words[1..], delete).await,
+        "arp-inspection" => config_arp_inspection(endpoints, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// Remove an emptied `security { <sub> { ... } }` chain bottom-up.
+fn prune_security(tree: &mut hemlock_config::ConfigTree) {
+    let security = tree.block_mut("security");
+    security.retain(|item| {
+        !matches!(item, hemlock_config::Item::Block { children, .. } if children.is_empty())
+    });
+    remove_block_if_empty(tree, "security");
+}
+
+/// `set|delete security acl <ipv4|ipv6|mac> <name> [rule <n> ...]`.
+async fn config_acl(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage =
+        move || format!("% Usage: {verb} security acl <ipv4|ipv6|mac> <name> [rule <n> ...]");
+    let Some(family_word) = words.first() else {
+        return Err(usage());
+    };
+    let family = resolve(family_word, &["ipv4", "ipv6", "mac"])?.to_string();
+    let Some(name) = words.get(1) else {
+        return Err(usage());
+    };
+    if !valid_acl_name(name) {
+        return Err(format!(
+            "% bad ACL name {name:?} (letter first, then letters/digits/_/-, max 32)"
+        ));
+    }
+    let name = name.to_string();
+    let rest = &words[2..];
+
+    // A closure editing the ACL's block (created on `set` paths).
+    let family_for_edit = family.clone();
+    let name_for_edit = name.clone();
+    let edit_acl = move |edit: BlockEdit| {
+        let family = family_for_edit.clone();
+        let name = name_for_edit.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let security = tree.block_mut("security");
+                let acl = ConfigTree::ensure_block(security, "acl", &[]);
+                let block = ConfigTree::ensure_block(acl, &family, &[&name]);
+                edit(block);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+    // The delete twin navigates without creating and prunes upward.
+    let family_for_delete = family.clone();
+    let name_for_delete = name.clone();
+    let delete_in_acl = move |edit: BlockEdit| {
+        let family = family_for_delete.clone();
+        let name = name_for_delete.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let Some(security) = block_children_mut(&mut tree.items, "security") else {
+                    return;
+                };
+                let Some(acl) = block_children_mut(security, "acl") else {
+                    return;
+                };
+                if let Some(block) = keyed_block_children_mut(acl, &family, &name) {
+                    edit(block);
+                }
+                ConfigTree::remove_block(acl, &family, &[&name]);
+                prune_security(tree);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+
+    if rest.is_empty() {
+        return if delete {
+            delete_in_acl(Box::new(|block| block.clear())).await
+        } else {
+            edit_acl(Box::new(|_| {})).await
+        };
+    }
+    resolve(rest[0], &["rule"])?;
+    let Some(number_text) = rest.get(1) else {
+        return Err(usage());
+    };
+    let number = number_text
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n >= 1 && !number_text.starts_with('0'))
+        .ok_or_else(|| format!("% bad rule number {number_text:?} (1..4294967295)"))?
+        .to_string();
+    let body = &rest[2..];
+
+    if body.is_empty() {
+        return if delete {
+            let number = number.clone();
+            edit_config(endpoints, move |tree| {
+                let Some(security) = block_children_mut(&mut tree.items, "security") else {
+                    return;
+                };
+                let Some(acl) = block_children_mut(security, "acl") else {
+                    return;
+                };
+                if let Some(block) = keyed_block_children_mut(acl, &family, &name) {
+                    ConfigTree::remove_block(block, "rule", &[&number]);
+                }
+                // An emptied ACL block stays (the ACL still exists).
+                prune_security_rules_only(tree);
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            let number = number.clone();
+            edit_acl(Box::new(move |block| {
+                ConfigTree::ensure_block(block, "rule", &[&number]);
+            }))
+            .await
+        };
+    }
+
+    // Field grammar, family-gated.
+    let ip_family = family != "mac";
+    let keywords: &[&str] = if ip_family {
+        &[
+            "permit",
+            "deny",
+            "protocol",
+            "source",
+            "destination",
+            "source-port",
+            "destination-port",
+            "dscp",
+            "log",
+            "police",
+            "time-range",
+        ]
+    } else {
+        &[
+            "permit",
+            "deny",
+            "source-mac",
+            "destination-mac",
+            "ethertype",
+            "time-range",
+        ]
+    };
+    let keyword = resolve(body[0], keywords)?;
+    if keyword == "time-range" {
+        // Deferred by the security suite.
+        return Err("% time-based ACLs are not supported".into());
+    }
+    let value = body.get(1).map(|v| v.to_string());
+    let extra = body.get(2..).unwrap_or_default();
+    let usage_family = family.clone();
+    let usage_name = name.clone();
+    let usage_number = number.clone();
+    let rule_usage = move |form: &str| {
+        format!("% Usage: set security acl {usage_family} {usage_name} rule {usage_number} {form}")
+    };
+
+    // Validate + canonicalize the field at the prompt.
+    let (leaf, values): (String, Vec<String>) = match keyword {
+        marker @ ("permit" | "deny" | "log") => {
+            if value.is_some() {
+                return Err(format!("% Invalid input: {:?}", body[1]));
+            }
+            (marker.to_string(), vec![])
+        }
+        "protocol" => {
+            let Some(value) = value else {
+                return Err(rule_usage("protocol <tcp|udp|icmp|0-255>"));
+            };
+            let canonical = match value.as_str() {
+                "tcp" | "udp" | "icmp" => value.clone(),
+                other => int_arg::<u8>(other, 0..=255, "protocol")?.to_string(),
+            };
+            ("protocol".into(), vec![canonical])
+        }
+        slot @ ("source" | "destination") => {
+            let Some(value) = value else {
+                return Err(rule_usage(&format!("{slot} <prefix|any>")));
+            };
+            let canonical = if value == "any" {
+                value
+            } else {
+                let canonical = hemlock_common::net::require_canonical_prefix(&value)
+                    .map_err(|e| format!("% {e}"))?;
+                if canonical.contains(':') != (family == "ipv6") {
+                    return Err(format!(
+                        "% {canonical} does not match the ACL family ({family})"
+                    ));
+                }
+                canonical
+            };
+            (slot.into(), vec![canonical])
+        }
+        slot @ ("source-port" | "destination-port") => {
+            let Some(value) = value else {
+                return Err(rule_usage(&format!("{slot} <port|a-b>")));
+            };
+            hemlock_common::net::parse_port_match(&value).map_err(|e| format!("% {e}"))?;
+            (slot.into(), vec![value])
+        }
+        "dscp" => {
+            let Some(value) = value else {
+                return Err(rule_usage("dscp <0-63>"));
+            };
+            (
+                "dscp".into(),
+                vec![int_arg::<u8>(&value, 0..=63, "dscp")?.to_string()],
+            )
+        }
+        "police" => {
+            if delete {
+                ("police".into(), vec![])
+            } else {
+                let [kw_rate, rate, kw_burst, burst] =
+                    body.get(1..5).unwrap_or_default()
+                else {
+                    return Err(rule_usage("police rate <bps|pps> burst <bytes|pkts>"));
+                };
+                resolve(kw_rate, &["rate"])?;
+                resolve(kw_burst, &["burst"])?;
+                let (_, pps) =
+                    hemlock_common::net::parse_police_rate(rate).map_err(|e| format!("% {e}"))?;
+                let (_, burst_pkts) =
+                    hemlock_common::net::parse_police_burst(burst).map_err(|e| format!("% {e}"))?;
+                let scaled = burst.to_ascii_lowercase().ends_with(['k', 'm', 'g']);
+                if pps && scaled {
+                    return Err("% a pps rate takes its burst in packets".into());
+                }
+                if !pps && burst_pkts {
+                    return Err("% a bps rate takes its burst in bytes".into());
+                }
+                if let Some(extra) = body.get(5) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                (
+                    "police".into(),
+                    vec![
+                        "rate".into(),
+                        rate.to_string(),
+                        "burst".into(),
+                        burst.to_string(),
+                    ],
+                )
+            }
+        }
+        slot @ ("source-mac" | "destination-mac") => {
+            let Some(value) = value else {
+                return Err(rule_usage(&format!("{slot} <mac>[/<mask>]")));
+            };
+            let canonical = match value.split_once('/') {
+                Some((mac, mask)) => format!(
+                    "{}/{}",
+                    hemlock_common::net::parse_mac(mac).map_err(|e| format!("% {e}"))?,
+                    hemlock_common::net::parse_mac_mask(mask).map_err(|e| format!("% {e}"))?
+                ),
+                None => hemlock_common::net::parse_mac(&value).map_err(|e| format!("% {e}"))?,
+            };
+            (slot.into(), vec![canonical])
+        }
+        "ethertype" => {
+            let Some(value) = value else {
+                return Err(rule_usage("ethertype <0x0000-0xffff|ipv4|ipv6|arp>"));
+            };
+            let canonical = match value.as_str() {
+                "ipv4" | "ipv6" | "arp" => value.clone(),
+                hex => {
+                    hex.strip_prefix("0x")
+                        .and_then(|h| u16::from_str_radix(h, 16).ok())
+                        .ok_or_else(|| {
+                            format!("% bad ethertype {hex:?} (0x0000-0xffff|ipv4|ipv6|arp)")
+                        })?;
+                    hex.to_string()
+                }
+            };
+            ("ethertype".into(), vec![canonical])
+        }
+        _ => unreachable!(),
+    };
+    if keyword != "police" {
+        if let Some(extra) = extra.first() {
+            if !(delete && keyword != "permit" && keyword != "deny") {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+        }
+    }
+
+    let number = number.clone();
+    edit_acl(Box::new(move |block| {
+        let rule = ConfigTree::ensure_block(block, "rule", &[&number]);
+        if delete {
+            ConfigTree::remove_leaf(rule, &leaf);
+        } else {
+            if leaf == "permit" {
+                ConfigTree::remove_leaf(rule, "deny");
+            }
+            if leaf == "deny" {
+                ConfigTree::remove_leaf(rule, "permit");
+            }
+            ConfigTree::set_leaf(rule, &leaf, values);
+        }
+    }))
+    .await
+}
+
+/// Drop emptied `rule` blocks nowhere — rules keep meaning while their
+/// block exists — but prune an emptied acl/copp chain after a removal.
+fn prune_security_rules_only(tree: &mut hemlock_config::ConfigTree) {
+    let security = tree.block_mut("security");
+    if let Some(acl) = block_children_mut(security, "acl") {
+        // ACL blocks with no rules stay: the ACL exists (implicit deny).
+        let _ = acl;
+    }
+    remove_block_if_empty(tree, "security");
+}
+
+/// `set|delete security copp class <name> [rate <pps> | burst <pkts>]`.
+async fn config_copp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || format!("% Usage: {verb} security copp class <name> [rate <pps> | burst <pkts>]");
+    let Some(first) = words.first() else {
+        if delete {
+            return edit_config(endpoints, |tree| {
+                if let Some(security) = block_children_mut(&mut tree.items, "security") {
+                    ConfigTree::remove_block(security, "copp", &[]);
+                }
+                prune_security(tree);
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        return Err(usage());
+    };
+    resolve(first, &["class"])?;
+    let Some(class_word) = words.get(1) else {
+        return Err(usage());
+    };
+    let class = resolve(class_word, COPP_CLASSES)?.to_string();
+    let rest = &words[2..];
+    if rest.is_empty() {
+        return if delete {
+            edit_config(endpoints, move |tree| {
+                let Some(security) = block_children_mut(&mut tree.items, "security") else {
+                    return;
+                };
+                if let Some(copp) = block_children_mut(security, "copp") {
+                    ConfigTree::remove_block(copp, "class", &[&class]);
+                }
+                prune_security(tree);
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            edit_config(endpoints, move |tree| {
+                let security = tree.block_mut("security");
+                let copp = ConfigTree::ensure_block(security, "copp", &[]);
+                ConfigTree::ensure_block(copp, "class", &[&class]);
+            })
+            .await
+            .map_err(fmt_err)
+        };
+    }
+    let knob = resolve(rest[0], &["rate", "burst"])?.to_string();
+    if delete {
+        return edit_config(endpoints, move |tree| {
+            let Some(security) = block_children_mut(&mut tree.items, "security") else {
+                return;
+            };
+            let Some(copp) = block_children_mut(security, "copp") else {
+                return;
+            };
+            if let Some(block) = keyed_block_children_mut(copp, "class", &class) {
+                ConfigTree::remove_leaf(block, &knob);
+            }
+            prune_security(tree);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(value) = rest.get(1) else {
+        return Err(format!("% Usage: set security copp class {class} {knob} <n>"));
+    };
+    let value = if knob == "rate" {
+        int_arg::<u32>(value, 1..=10_000_000, "rate")?.to_string()
+    } else {
+        int_arg::<u32>(value, 1..=1_000_000, "burst")?.to_string()
+    };
+    edit_config(endpoints, move |tree| {
+        let security = tree.block_mut("security");
+        let copp = ConfigTree::ensure_block(security, "copp", &[]);
+        let block = ConfigTree::ensure_block(copp, "class", &[&class]);
+        ConfigTree::set_leaf(block, &knob, vec![value]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete security dot1x [radius-server <ip> [...] |
+/// reauth-interval <0|60-86400>]`.
+async fn config_dot1x(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} security dot1x <radius-server <ip> [key|port|timeout|retransmit ...] | reauth-interval <0|60-86400>>"
+        )
+    };
+    let Some(first) = words.first() else {
+        if delete {
+            return edit_config(endpoints, |tree| {
+                if let Some(security) = block_children_mut(&mut tree.items, "security") {
+                    ConfigTree::remove_block(security, "dot1x", &[]);
+                }
+                prune_security(tree);
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        return Err(usage());
+    };
+    match resolve(first, &["radius-server", "reauth-interval"])? {
+        "reauth-interval" => {
+            if delete {
+                return edit_config(endpoints, |tree| {
+                    let Some(security) = block_children_mut(&mut tree.items, "security") else {
+                        return;
+                    };
+                    if let Some(dot1x) = block_children_mut(security, "dot1x") {
+                        ConfigTree::remove_leaf(dot1x, "reauth-interval");
+                    }
+                    prune_security(tree);
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = words.get(1) else {
+                return Err(usage());
+            };
+            let secs = int_arg::<u32>(value, 0..=86400, "reauth-interval")?;
+            if secs != 0 && secs < 60 {
+                return Err(format!("% bad reauth-interval {secs} (0|60-86400)"));
+            }
+            let secs = secs.to_string();
+            edit_config(endpoints, move |tree| {
+                let security = tree.block_mut("security");
+                let dot1x = ConfigTree::ensure_block(security, "dot1x", &[]);
+                ConfigTree::set_leaf(dot1x, "reauth-interval", vec![secs]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "radius-server" => {
+            let Some(ip_word) = words.get(1) else {
+                return Err(usage());
+            };
+            let ip: std::net::IpAddr = ip_word
+                .parse()
+                .map_err(|_| format!("% bad radius-server address {ip_word:?}"))?;
+            let ip = ip.to_string();
+            let rest = &words[2..];
+            if rest.is_empty() {
+                return if delete {
+                    edit_config(endpoints, move |tree| {
+                        let Some(security) = block_children_mut(&mut tree.items, "security")
+                        else {
+                            return;
+                        };
+                        if let Some(dot1x) = block_children_mut(security, "dot1x") {
+                            ConfigTree::remove_block(dot1x, "radius-server", &[&ip]);
+                        }
+                        prune_security(tree);
+                    })
+                    .await
+                    .map_err(fmt_err)
+                } else {
+                    edit_config(endpoints, move |tree| {
+                        let security = tree.block_mut("security");
+                        let dot1x = ConfigTree::ensure_block(security, "dot1x", &[]);
+                        ConfigTree::ensure_block(dot1x, "radius-server", &[&ip]);
+                    })
+                    .await
+                    .map_err(fmt_err)
+                };
+            }
+            let knob = resolve(rest[0], &["key", "port", "timeout", "retransmit"])?.to_string();
+            if delete {
+                return edit_config(endpoints, move |tree| {
+                    let Some(security) = block_children_mut(&mut tree.items, "security") else {
+                        return;
+                    };
+                    let Some(dot1x) = block_children_mut(security, "dot1x") else {
+                        return;
+                    };
+                    if let Some(server) = keyed_block_children_mut(dot1x, "radius-server", &ip) {
+                        ConfigTree::remove_leaf(server, &knob);
+                    }
+                    prune_security(tree);
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = rest.get(1) else {
+                return Err(format!(
+                    "% Usage: set security dot1x radius-server {ip} {knob} <value>"
+                ));
+            };
+            let value = match knob.as_str() {
+                "key" => value.to_string(),
+                "port" => int_arg::<u16>(value, 1..=65535, "port")?.to_string(),
+                "timeout" => int_arg::<u8>(value, 1..=60, "timeout")?.to_string(),
+                "retransmit" => int_arg::<u8>(value, 0..=10, "retransmit")?.to_string(),
+                _ => unreachable!(),
+            };
+            edit_config(endpoints, move |tree| {
+                let security = tree.block_mut("security");
+                let dot1x = ConfigTree::ensure_block(security, "dot1x", &[]);
+                let server = ConfigTree::ensure_block(dot1x, "radius-server", &[&ip]);
+                ConfigTree::set_leaf(server, &knob, vec![value]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete security <dhcp-snooping|arp-inspection> vlan <id>` and
+/// friends. The shared vlan-list handling lives here.
+fn security_vlan_edit(feature: &'static str, id: String, delete: bool) -> BlockEdit {
+    Box::new(move |block| {
+        if delete {
+            block.retain(|item| {
+                !matches!(item, hemlock_config::Item::Leaf { name, values }
+                    if name == "vlan" && values.first() == Some(&id))
+            });
+        } else {
+            let present = block.iter().any(|item| {
+                matches!(item, hemlock_config::Item::Leaf { name, values }
+                    if name == "vlan" && values.first() == Some(&id))
+            });
+            if !present {
+                push_leaf(block, "vlan", vec![id.clone()]);
+            }
+        }
+        let _ = feature;
+    })
+}
+
+/// Apply a block edit under `security { <feature> { ... } }`, creating
+/// on set and pruning on delete.
+async fn edit_security_feature(
+    endpoints: &Endpoints,
+    feature: &'static str,
+    delete: bool,
+    edit: BlockEdit,
+) -> Result<(), String> {
+    edit_config(endpoints, move |tree| {
+        if delete {
+            let Some(security) = block_children_mut(&mut tree.items, "security") else {
+                return;
+            };
+            if let Some(block) = block_children_mut(security, feature) {
+                edit(block);
+            }
+            let security = tree.block_mut("security");
+            security.retain(|item| {
+                !matches!(item, hemlock_config::Item::Block { name, children, .. }
+                    if name == feature && children.is_empty())
+            });
+            remove_block_if_empty(tree, "security");
+        } else {
+            let security = tree.block_mut("security");
+            let block = ConfigTree::ensure_block(security, feature, &[]);
+            edit(block);
+        }
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete security dhcp-snooping <vlan <id> | binding <mac> vlan
+/// <id> address <ipv4> interface <port>>`.
+async fn config_dhcp_snooping(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} security dhcp-snooping <vlan <id> | binding <mac> vlan <id> address <ipv4> interface <port>>"
+        )
+    };
+    let Some(first) = words.first() else {
+        if delete {
+            return edit_security_feature(endpoints, "dhcp-snooping", true, Box::new(|b| b.clear()))
+                .await;
+        }
+        return Err(usage());
+    };
+    match resolve(first, &["vlan", "binding", "option-82", "information"])? {
+        // Deferred by the security suite.
+        "option-82" | "information" => Err("% DHCP option-82 insertion is not supported".into()),
+        "vlan" => {
+            let Some(id) = words.get(1) else {
+                return Err(usage());
+            };
+            let id = parse_vlan_arg(id)?.to_string();
+            edit_security_feature(
+                endpoints,
+                "dhcp-snooping",
+                delete,
+                security_vlan_edit("dhcp-snooping", id, delete),
+            )
+            .await
+        }
+        "binding" => {
+            let Some(mac_word) = words.get(1) else {
+                return Err(usage());
+            };
+            let mac =
+                hemlock_common::net::parse_unicast_mac(mac_word).map_err(|e| format!("% {e}"))?;
+            if delete {
+                if let Some(extra) = words.get(2) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_security_feature(
+                    endpoints,
+                    "dhcp-snooping",
+                    true,
+                    Box::new(move |block| {
+                        block.retain(|item| {
+                            !matches!(item, hemlock_config::Item::Leaf { name, values }
+                                if name == "binding" && values.first() == Some(&mac))
+                        });
+                    }),
+                )
+                .await;
+            }
+            let [kw_vlan, vlan, kw_address, address, kw_interface, port] =
+                words.get(2..8).unwrap_or_default()
+            else {
+                return Err(usage());
+            };
+            resolve(kw_vlan, &["vlan"])?;
+            resolve(kw_address, &["address"])?;
+            resolve(kw_interface, &["interface"])?;
+            let vlan = parse_vlan_arg(vlan)?.to_string();
+            let ip: std::net::Ipv4Addr = address
+                .parse()
+                .map_err(|_| format!("% bad binding address {address:?} (IPv4)"))?;
+            let port = match port_channel_interface(port) {
+                Some(name) => name,
+                None => {
+                    let known = list_port_names(endpoints).await.map_err(fmt_err)?;
+                    canonical_port(port, &known)?
+                }
+            };
+            let values = vec![
+                mac.clone(),
+                "vlan".into(),
+                vlan,
+                "address".into(),
+                ip.to_string(),
+                "interface".into(),
+                port,
+            ];
+            edit_security_feature(
+                endpoints,
+                "dhcp-snooping",
+                false,
+                Box::new(move |block| {
+                    // One binding per (mac, vlan): replace it.
+                    block.retain(|item| {
+                        !matches!(item, hemlock_config::Item::Leaf { name, values: v }
+                            if name == "binding"
+                                && v.first() == Some(&mac)
+                                && v.get(2) == values.get(2))
+                    });
+                    push_leaf(block, "binding", values.clone());
+                }),
+            )
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete security arp-inspection <vlan <id> | validate
+/// <src-mac|dst-mac|ip>>`.
+async fn config_arp_inspection(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} security arp-inspection <vlan <id> | validate <src-mac|dst-mac|ip>>"
+        )
+    };
+    let Some(first) = words.first() else {
+        if delete {
+            return edit_security_feature(
+                endpoints,
+                "arp-inspection",
+                true,
+                Box::new(|b| b.clear()),
+            )
+            .await;
+        }
+        return Err(usage());
+    };
+    match resolve(first, &["vlan", "validate"])? {
+        "vlan" => {
+            let Some(id) = words.get(1) else {
+                return Err(usage());
+            };
+            let id = parse_vlan_arg(id)?.to_string();
+            edit_security_feature(
+                endpoints,
+                "arp-inspection",
+                delete,
+                security_vlan_edit("arp-inspection", id, delete),
+            )
+            .await
+        }
+        "validate" => {
+            let Some(check) = words.get(1) else {
+                return Err(usage());
+            };
+            let check = resolve(check, &["src-mac", "dst-mac", "ip"])?.to_string();
+            edit_security_feature(
+                endpoints,
+                "arp-inspection",
+                delete,
+                Box::new(move |block| {
+                    block.retain(|item| {
+                        !matches!(item, hemlock_config::Item::Leaf { name, values }
+                            if name == "validate" && values.first() == Some(&check))
+                    });
+                    if !delete {
+                        push_leaf(block, "validate", vec![check.clone()]);
+                    }
+                }),
+            )
+            .await
+        }
         _ => unreachable!(),
     }
 }
@@ -825,19 +1881,40 @@ async fn config_interfaces(
             "storm-control",
             "min-links",
             "vrrp",
+            "access-group",
+            "port-security",
+            "dot1x",
+            "dhcp-snooping",
+            "arp-inspection",
         ],
     )?;
     // SVIs carry an address (and, with the routing suite, VRRP groups)
     // and nothing else.
-    if port.starts_with("Vlan") && !matches!(subcommand, "address" | "vrrp") {
-        return Err(format!(
-            "% {subcommand} is not supported on VLAN interfaces"
-        ));
+    if port.starts_with("Vlan") {
+        // Deferred by the security suite: ACLs bind to ports only.
+        if subcommand == "access-group" {
+            return Err("% VLAN ACLs are not supported (port bindings only)".into());
+        }
+        if !matches!(subcommand, "address" | "vrrp") {
+            return Err(format!(
+                "% {subcommand} is not supported on VLAN interfaces"
+            ));
+        }
     }
     if port.starts_with("Management")
         && matches!(
             subcommand,
-            "channel-group" | "lacp" | "spanning-tree" | "storm-control" | "min-links" | "vrrp"
+            "channel-group"
+                | "lacp"
+                | "spanning-tree"
+                | "storm-control"
+                | "min-links"
+                | "vrrp"
+                | "access-group"
+                | "port-security"
+                | "dot1x"
+                | "dhcp-snooping"
+                | "arp-inspection"
         )
     {
         return Err(format!(
@@ -845,13 +1922,75 @@ async fn config_interfaces(
         ));
     }
     let is_lag = port.starts_with("Port-Channel");
-    if is_lag && matches!(subcommand, "address" | "channel-group" | "vrrp") {
+    if is_lag
+        && matches!(
+            subcommand,
+            "address" | "channel-group" | "vrrp" | "port-security" | "dot1x"
+        )
+    {
         return Err(format!(
             "% {subcommand} is not supported on port-channel interfaces"
         ));
     }
     if !is_lag && subcommand == "min-links" {
         return Err("% min-links is only supported on port-channel interfaces".into());
+    }
+    match subcommand {
+        "access-group" => {
+            return config_access_group(endpoints, &port, &rest[1..], delete).await;
+        }
+        "port-security" => {
+            return config_port_security(endpoints, &port, &rest[1..], delete).await;
+        }
+        "dot1x" => {
+            if let Some(extra) = rest.get(1) {
+                // The deferred dot1x extensions fail at parse.
+                if resolve(extra, &["vlan"]).is_ok() {
+                    return Err("% dot1x dynamic VLAN assignment is not supported".into());
+                }
+                if resolve(extra, &["mac-auth-bypass"]).is_ok() {
+                    return Err("% dot1x MAC-auth-bypass is not supported".into());
+                }
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            return edit_interface(endpoints, &port, move |eth| {
+                if delete {
+                    ConfigTree::remove_leaf(eth, "dot1x");
+                } else {
+                    ConfigTree::set_leaf(eth, "dot1x", vec![]);
+                }
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        feature @ ("dhcp-snooping" | "arp-inspection") => {
+            // `dhcp-snooping trust` / `arp-inspection trust` markers.
+            match rest.get(1) {
+                Some(word) => {
+                    resolve(word, &["trust"])?;
+                    if let Some(extra) = rest.get(2) {
+                        return Err(format!("% Invalid input: {extra:?}"));
+                    }
+                }
+                None if !delete => {
+                    return Err(format!(
+                        "% Usage: set interfaces {port} {feature} trust"
+                    ));
+                }
+                None => {}
+            }
+            let feature = feature.to_string();
+            return edit_interface(endpoints, &port, move |eth| {
+                if delete {
+                    ConfigTree::remove_leaf(eth, &feature);
+                } else {
+                    ConfigTree::set_phrase(eth, &feature, "trust", vec![]);
+                }
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        _ => {}
     }
     match subcommand {
         "channel-group" => {
@@ -3441,6 +4580,31 @@ fn spawn_shell() {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acl_names_validate_at_the_prompt() {
+        assert!(valid_acl_name("EDGE-IN"));
+        assert!(valid_acl_name("a"));
+        assert!(valid_acl_name("A2345678901234567890123456789012")); // 32
+        assert!(!valid_acl_name("A23456789012345678901234567890123")); // 33
+        assert!(!valid_acl_name("9BAD"));
+        assert!(!valid_acl_name("-BAD"));
+        assert!(!valid_acl_name(""));
+        assert!(!valid_acl_name("has space"));
+    }
+
+    #[test]
+    fn candidate_acl_names_come_from_the_security_block() {
+        let tree = hemlock_config::parse(
+            "security { acl { ipv4 EDGE-IN { } mac IOT-MAC { } ipv6 MGMT6-IN { } } }",
+        )
+        .unwrap();
+        assert_eq!(
+            candidate_acl_names(&tree),
+            vec!["EDGE-IN", "IOT-MAC", "MGMT6-IN"]
+        );
+        assert!(candidate_acl_names(&hemlock_config::ConfigTree::default()).is_empty());
+    }
 
     #[test]
     fn prefix_resolution_is_eos_like() {

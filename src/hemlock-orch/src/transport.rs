@@ -69,6 +69,55 @@ pub fn register_snoop(
     });
 }
 
+type SnoopsecSink = RwLock<Option<mpsc::UnboundedSender<(String, u16, Vec<u8>)>>>;
+
+fn snoopsec_sink() -> &'static SnoopsecSink {
+    static SINK: OnceLock<SnoopsecSink> = OnceLock::new();
+    SINK.get_or_init(Default::default)
+}
+
+/// Attach the DHCP-snooping/DAI engine: trapped ARP frames and
+/// DHCP-over-UDP frames go to `packet_in`; validated re-injections
+/// transmit like any other protocol frame.
+pub fn register_snoopsec(
+    packet_in: mpsc::UnboundedSender<(String, u16, Vec<u8>)>,
+    mut packet_out: mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+) {
+    if let Ok(mut sink) = snoopsec_sink().write() {
+        *sink = Some(packet_in);
+    }
+    tokio::spawn(async move {
+        while let Some((port, frame)) = packet_out.recv().await {
+            transmit(&port, frame).await;
+        }
+    });
+}
+
+/// Is this frame ARP, or DHCP inside IPv4/UDP? (The security engine's
+/// pre-filter; the CoPP arp/dhcp classes bound the rate upstream.)
+fn snoopsec_relevant(ethertype: u16, frame: &[u8]) -> bool {
+    match ethertype {
+        0x0806 => true,
+        0x0800 => {
+            let Some(ip) = frame.get(14..) else {
+                return false;
+            };
+            if ip.len() < 20 || ip[0] >> 4 != 4 || ip[9] != 17 {
+                return false;
+            }
+            let ihl = usize::from(ip[0] & 0xf) * 4;
+            let Some(dport) = ip
+                .get(ihl + 2..ihl + 4)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]))
+            else {
+                return false;
+            };
+            matches!(dport, 67 | 68)
+        }
+        _ => false,
+    }
+}
+
 async fn transmit(port: &str, frame: Vec<u8>) {
     let fd = sockets().lock().ok().and_then(|map| map.get(port).cloned());
     let Some(fd) = fd else { return };
@@ -236,6 +285,17 @@ fn spawn_reader(
                                     if *wanted == ethertype {
                                         let _ = sink.send((port.clone(), vlan, frame.to_vec()));
                                     }
+                                }
+                            }
+                        } else if snoopsec_relevant(ethertype, frame) {
+                            let vlan = pvids()
+                                .read()
+                                .ok()
+                                .and_then(|map| map.get(&port).copied())
+                                .unwrap_or(1);
+                            if let Ok(sink) = snoopsec_sink().read() {
+                                if let Some(sink) = sink.as_ref() {
+                                    let _ = sink.send((port.clone(), vlan, frame.to_vec()));
                                 }
                             }
                         }

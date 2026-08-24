@@ -12,6 +12,7 @@
 mod actor;
 mod ifstats;
 mod netdev;
+mod security;
 mod service;
 mod state;
 
@@ -103,6 +104,15 @@ async fn main() -> Result<()> {
     }
 
     let handle = std::sync::Arc::new(handle);
+
+    // The CoPP class table: protocol traps into per-class policed trap
+    // groups (or unpoliced ARP/IP2ME punt when the SAI lacks trap
+    // groups). Best-effort like the punt path itself.
+    if let Err(err) = security::program_copp(&handle).await {
+        tracing::warn!(%err, "CoPP class table not programmed; CPU punt may be degraded");
+    }
+    // Port-security: watch FDB learns and learn-limit violations.
+    tokio::spawn(security::port_security_watch(handle.clone()));
 
     // Interface statistics: counters, rates, link history for
     // `show interfaces ...`. Default load interval 300s (EOS parity).

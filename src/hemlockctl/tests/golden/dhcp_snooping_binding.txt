@@ -1,0 +1,6 @@
+MAC Address        IP Address     Lease (sec)  Type     VLAN  Interface
+-----------------  -------------  -----------  -------  ----  ---------
+00:1c:73:0c:aa:01  10.0.10.101    85122        dynamic  10    Et1
+a0:36:9f:44:be:02  10.0.10.102    84330        dynamic  10    Et3
+00:50:56:be:ef:99  10.0.20.50     -            static   20    Et7
+Total number of bindings: 3

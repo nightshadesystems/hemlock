@@ -1,0 +1,3 @@
+Port   Max  Learned  Violation  Action    Last Violation
+-----  ---  -------  ---------  --------  -----------------------------
+Et5    4    3        1          shutdown  00:50:56:be:ef:44 (0:02:11 ago)

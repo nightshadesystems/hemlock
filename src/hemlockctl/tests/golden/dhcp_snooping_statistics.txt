@@ -1,0 +1,4 @@
+                    Packets   Dropped
+Vlan 10             18822     14
+Vlan 20             4021      0
+Server msgs from untrusted ports dropped: 14

@@ -211,6 +211,17 @@ pub struct SaiCapabilities {
     /// the pinned v1.11.0 headers, but a vendor blob may still refuse
     /// the object.
     pub my_mac: bool,
+    /// Ingress ACL tables bindable to ports.
+    pub acl_ingress: bool,
+    /// Egress ACL tables (Helix4's egress TCAM is optional in some SAI
+    /// builds; `access-group ... out` fails commit when absent).
+    pub acl_egress: bool,
+    /// Per-ACL-entry policers (`police rate ... burst ...`).
+    pub acl_entry_policer: bool,
+    /// Per-port FDB learn limits (port-security).
+    pub port_learn_limit: bool,
+    /// Hostif trap groups with attachable policers (CoPP).
+    pub copp: bool,
 }
 
 impl SaiCapabilities {
@@ -229,6 +240,11 @@ impl SaiCapabilities {
             ecmp_width: 64,
             ipv6: true,
             my_mac: true,
+            acl_ingress: true,
+            acl_egress: true,
+            acl_entry_policer: true,
+            port_learn_limit: true,
+            copp: true,
         }
     }
 }
@@ -239,6 +255,112 @@ pub enum StormClass {
     Broadcast,
     Multicast,
     UnknownUnicast,
+}
+
+/// Which pipeline stage an ACL table filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AclStage {
+    Ingress,
+    Egress,
+}
+
+/// The match-field family an ACL table carries. Helix4's ContentAware
+/// TCAM slices are typed, so tables are created per family (IPv6
+/// entries consume double-wide slices).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AclFamily {
+    Ipv4,
+    Ipv6,
+    Mac,
+}
+
+/// The match fields of one ACL entry. `None` = don't care.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AclFields {
+    pub src_ip: Option<IpPrefix>,
+    pub dst_ip: Option<IpPrefix>,
+    /// IP protocol number.
+    pub protocol: Option<u8>,
+    /// Inclusive L4 port ranges.
+    pub src_port: Option<(u16, u16)>,
+    pub dst_port: Option<(u16, u16)>,
+    pub dscp: Option<u8>,
+    /// (address, and-mask) pairs.
+    pub src_mac: Option<([u8; 6], [u8; 6])>,
+    pub dst_mac: Option<([u8; 6], [u8; 6])>,
+    pub ethertype: Option<u16>,
+    /// Outer VLAN id (internal DHCP-snooping/DAI entries scope their
+    /// CPU redirects to the snooped VLANs).
+    pub vlan: Option<u16>,
+}
+
+/// What happens to a matching packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclPacketAction {
+    Forward,
+    Drop,
+    /// CPU only: punted, dropped in the forwarding plane (deny+log,
+    /// DAI/DHCP-snooping validation redirects).
+    Trap,
+    /// Forward and copy to the CPU (permit+log, trusted-port DHCP
+    /// binding learn).
+    Copy,
+}
+
+/// The action set of one ACL entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AclAction {
+    pub action: AclPacketAction,
+    /// Match counter attached to the entry.
+    pub counter: Option<Oid>,
+    /// Per-entry policer (`police rate ... burst ...`).
+    pub policer: Option<Oid>,
+}
+
+/// A standalone policer: ACL entry policers and CoPP trap-group
+/// policers. Storm-control keeps its own internal policer lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicerSpec {
+    /// Packets/sec when true, bits/sec when false.
+    pub pps: bool,
+    pub rate: u64,
+    /// Packets when `pps`, bytes otherwise.
+    pub burst: u64,
+}
+
+/// Cumulative policer counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicerStats {
+    pub conforming: u64,
+    pub dropped: u64,
+}
+
+/// One CPU-bound protocol trap, SAI-granular (`saihostif.h` trap
+/// types). CoPP's class table in syncd groups these into operator
+/// classes with one policer per class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TrapKind {
+    ArpRequest,
+    ArpResponse,
+    Ip2me,
+    Stp,
+    Lacp,
+    Eapol,
+    IgmpQuery,
+    IgmpLeave,
+    IgmpV1Report,
+    IgmpV2Report,
+    IgmpV3Report,
+    MldV1V2,
+    MldV1Report,
+    MldV1Done,
+    MldV2Report,
+    Dhcp,
+    Ospf,
+    Bgp,
+    Vrrp,
+    /// ACL `log` copies (a user-defined trap).
+    AclLog,
 }
 
 /// Where a static FDB entry sends its frames.
@@ -292,6 +414,13 @@ pub enum SaiEvent {
         mac: [u8; 6],
         /// The entry's port; None on age/flush without one.
         port: Option<PortId>,
+    },
+    /// A port at its learn limit saw a new source MAC (port-security
+    /// violation). Surfaced from the FDB event callback's
+    /// learn-discard notifications.
+    LearnLimitViolation {
+        port: PortId,
+        mac: [u8; 6],
     },
 }
 
@@ -371,10 +500,11 @@ pub trait SaiBackend: Send {
 
     // --- Host-services L3 -----------------------------------------------
 
-    /// Install the CPU punt path: ARP request/response copies and an
-    /// IP2ME trap into the default trap group, delivered to the ingress
-    /// port's netdev via a wildcard hostif table entry. Called once
-    /// after `create_switch`.
+    /// Install the CPU punt delivery path: a wildcard hostif table
+    /// entry delivering every trapped packet on its ingress port's
+    /// netdev. The protocol traps themselves (ARP, IP2ME, and the rest)
+    /// are created through the hostif-trap calls by syncd's CoPP class
+    /// program. Called once after `create_switch`.
     fn setup_host_punt(&mut self) -> Result<(), SaiError>;
 
     /// Create a NETDEV host interface for a port; the kernel sees a
@@ -617,4 +747,105 @@ pub trait SaiBackend: Send {
         vlan: Option<Oid>,
         l2mc: Option<Oid>,
     ) -> Result<(), SaiError>;
+
+    // --- ACLs (security suite) ---------------------------------------------
+
+    /// Create an ACL table for one stage and match-field family, port
+    /// bind point. syncd materializes one table per (port, stage) and
+    /// owns the priority-space partitioning between internal and user
+    /// entries.
+    fn create_acl_table(&mut self, stage: AclStage, family: AclFamily) -> Result<Oid, SaiError>;
+
+    /// Remove an ACL table; its entries and counters must already be
+    /// gone and no port may still bind it.
+    fn remove_acl_table(&mut self, table: Oid) -> Result<(), SaiError>;
+
+    /// Create an entry. Higher `priority` wins.
+    fn create_acl_entry(
+        &mut self,
+        table: Oid,
+        priority: u32,
+        fields: &AclFields,
+        action: &AclAction,
+    ) -> Result<Oid, SaiError>;
+
+    /// Update an entry's action set in place (the counter object
+    /// survives, so unrelated edits don't reset match counts).
+    fn set_acl_entry_action(&mut self, entry: Oid, action: &AclAction) -> Result<(), SaiError>;
+
+    fn remove_acl_entry(&mut self, entry: Oid) -> Result<(), SaiError>;
+
+    /// Create a packet-count match counter in a table.
+    fn create_acl_counter(&mut self, table: Oid) -> Result<Oid, SaiError>;
+
+    /// Remove a counter; no entry may still reference it.
+    fn remove_acl_counter(&mut self, counter: Oid) -> Result<(), SaiError>;
+
+    /// Cumulative matched packets.
+    fn get_acl_counter(&mut self, counter: Oid) -> Result<u64, SaiError>;
+
+    /// Bind a table to a (port-like) object's stage; None unbinds.
+    fn bind_port_acl(
+        &mut self,
+        port: PortId,
+        stage: AclStage,
+        table: Option<Oid>,
+    ) -> Result<(), SaiError>;
+
+    /// Remaining free ACL entries at a stage (SAI
+    /// `AVAILABLE_ACL_ENTRY`), for `show acl summary`'s TCAM
+    /// utilization.
+    fn acl_available_entries(&mut self, stage: AclStage) -> Result<u32, SaiError>;
+
+    // --- Standalone policers (ACL entries, CoPP trap groups) ---------------
+
+    fn create_policer(&mut self, spec: PolicerSpec) -> Result<Oid, SaiError>;
+
+    /// Update a policer's rate/burst in place (its meter type is fixed
+    /// at create).
+    fn set_policer(&mut self, policer: Oid, spec: PolicerSpec) -> Result<(), SaiError>;
+
+    /// Remove a policer; no entry or trap group may still reference it.
+    fn remove_policer(&mut self, policer: Oid) -> Result<(), SaiError>;
+
+    /// Cumulative green (conforming) and red (dropped) packet counts.
+    fn policer_stats(&mut self, policer: Oid) -> Result<PolicerStats, SaiError>;
+
+    // --- Hostif traps (CoPP) -----------------------------------------------
+
+    /// Create a trap group carrying `policer` (None = unpoliced).
+    fn create_hostif_trap_group(&mut self, policer: Option<Oid>) -> Result<Oid, SaiError>;
+
+    /// Remove a trap group; its traps must have moved elsewhere.
+    fn remove_hostif_trap_group(&mut self, group: Oid) -> Result<(), SaiError>;
+
+    /// Create a protocol trap into a trap group. `trap_only` punts to
+    /// the CPU exclusively; false copies (the packet still forwards).
+    /// `Oid(0)` targets the switch's default trap group (the no-CoPP
+    /// fallback path).
+    fn create_hostif_trap(
+        &mut self,
+        kind: TrapKind,
+        trap_only: bool,
+        group: Oid,
+    ) -> Result<Oid, SaiError>;
+
+    fn remove_hostif_trap(&mut self, trap: Oid) -> Result<(), SaiError>;
+
+    /// Attach (or detach, with None) a policer on the switch's default
+    /// trap group — the CoPP `default` class, policing every trap not
+    /// steered into a named class group.
+    fn set_default_trap_group_policer(&mut self, policer: Option<Oid>) -> Result<(), SaiError>;
+
+    // --- Port security -----------------------------------------------------
+
+    /// Cap dynamic FDB learning on a port; None removes the limit. At
+    /// the limit, new source MACs raise
+    /// [`SaiEvent::LearnLimitViolation`].
+    fn set_port_learn_limit(&mut self, port: PortId, limit: Option<u32>) -> Result<(), SaiError>;
+
+    /// Enable/disable hardware source-MAC learning on a port (the
+    /// `protect` violation action freezes the table instead of
+    /// shutting the port).
+    fn set_port_learning(&mut self, port: PortId, learn: bool) -> Result<(), SaiError>;
 }

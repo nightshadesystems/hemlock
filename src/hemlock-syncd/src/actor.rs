@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 use hemlock_platform::Platform;
 use hemlock_sai::{
-    FdbAction, FdbEventKind, IpPrefix, Oid, PortCounters, PortId, QueueCounters, RouteTarget,
-    SaiBackend, SaiCapabilities, SaiError, SaiEvent, StormClass, StpPortState, SwitchInfo,
+    AclAction, AclFamily, AclFields, AclStage, FdbAction, FdbEventKind, IpPrefix, Oid,
+    PolicerSpec, PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend,
+    SaiCapabilities, SaiError, SaiEvent, StormClass, StpPortState, SwitchInfo, TrapKind,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -261,6 +262,94 @@ pub enum SaiCmd {
         my_mac: Oid,
         reply: oneshot::Sender<Result<(), SaiError>>,
     },
+    CreateAclTable {
+        stage: AclStage,
+        family: AclFamily,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveAclTable {
+        table: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateAclEntry {
+        table: Oid,
+        priority: u32,
+        fields: Box<AclFields>,
+        action: AclAction,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    SetAclEntryAction {
+        entry: Oid,
+        action: AclAction,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemoveAclEntry {
+        entry: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateAclCounter {
+        table: Oid,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveAclCounter {
+        counter: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    GetAclCounter {
+        counter: Oid,
+        reply: oneshot::Sender<Result<u64, SaiError>>,
+    },
+    BindPortAcl {
+        port: PortId,
+        stage: AclStage,
+        table: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    AclAvailableEntries {
+        stage: AclStage,
+        reply: oneshot::Sender<Result<u32, SaiError>>,
+    },
+    CreatePolicer {
+        spec: PolicerSpec,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    SetPolicer {
+        policer: Oid,
+        spec: PolicerSpec,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemovePolicer {
+        policer: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    PolicerStats {
+        policer: Oid,
+        reply: oneshot::Sender<Result<PolicerStats, SaiError>>,
+    },
+    CreateHostifTrapGroup {
+        policer: Option<Oid>,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    CreateHostifTrap {
+        kind: TrapKind,
+        trap_only: bool,
+        group: Oid,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    SetDefaultTrapGroupPolicer {
+        policer: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortLearnLimit {
+        port: PortId,
+        limit: Option<u32>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortLearning {
+        port: PortId,
+        learn: bool,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
 }
 
 /// A port's oper status changed (already applied to shared state).
@@ -279,6 +368,14 @@ pub struct FdbNotify {
     /// Colon-separated lowercase.
     pub mac: String,
     pub port: Option<String>,
+}
+
+/// A port at its learn limit saw a new source MAC (port-security).
+#[derive(Debug, Clone)]
+pub struct ViolationNotify {
+    pub port: String,
+    /// Colon-separated lowercase.
+    pub mac: String,
 }
 
 pub struct SaiHandle {
@@ -307,9 +404,17 @@ pub struct SaiHandle {
     /// The transit FIB (routes, deduplicated next hops/groups,
     /// neighbors, My-MAC entries) as programmed by orch.
     pub fib: crate::state::SharedFib,
+    /// The security suite's shared model: user ACLs + bindings and the
+    /// per-port materialized programs, CoPP class state, per-port
+    /// port-security state.
+    pub acls: crate::state::SharedAcls,
+    pub copp: crate::state::SharedCopp,
+    pub port_security: crate::state::SharedPortSecurity,
     cmd_tx: mpsc::Sender<SaiCmd>,
     pub events: broadcast::Sender<OperEvent>,
     pub fdb_events: broadcast::Sender<FdbNotify>,
+    /// Learn-limit violations (port-security engine input).
+    pub violations: broadcast::Sender<ViolationNotify>,
 }
 
 impl SaiHandle {
@@ -709,6 +814,160 @@ impl SaiHandle {
         self.call(|reply| SaiCmd::RemoveMyMac { my_mac, reply })
             .await
     }
+
+    pub async fn create_acl_table(
+        &self,
+        stage: AclStage,
+        family: AclFamily,
+    ) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateAclTable {
+            stage,
+            family,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_acl_table(&self, table: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveAclTable { table, reply })
+            .await
+    }
+
+    pub async fn create_acl_entry(
+        &self,
+        table: Oid,
+        priority: u32,
+        fields: AclFields,
+        action: AclAction,
+    ) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateAclEntry {
+            table,
+            priority,
+            fields: Box::new(fields),
+            action,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_acl_entry_action(
+        &self,
+        entry: Oid,
+        action: AclAction,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetAclEntryAction {
+            entry,
+            action,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_acl_entry(&self, entry: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveAclEntry { entry, reply })
+            .await
+    }
+
+    pub async fn create_acl_counter(&self, table: Oid) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateAclCounter { table, reply })
+            .await
+    }
+
+    pub async fn remove_acl_counter(&self, counter: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveAclCounter { counter, reply })
+            .await
+    }
+
+    pub async fn get_acl_counter(&self, counter: Oid) -> Result<u64, SaiError> {
+        self.call(|reply| SaiCmd::GetAclCounter { counter, reply })
+            .await
+    }
+
+    pub async fn bind_port_acl(
+        &self,
+        port: PortId,
+        stage: AclStage,
+        table: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::BindPortAcl {
+            port,
+            stage,
+            table,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn acl_available_entries(&self, stage: AclStage) -> Result<u32, SaiError> {
+        self.call(|reply| SaiCmd::AclAvailableEntries { stage, reply })
+            .await
+    }
+
+    pub async fn create_policer(&self, spec: PolicerSpec) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreatePolicer { spec, reply })
+            .await
+    }
+
+    pub async fn set_policer(&self, policer: Oid, spec: PolicerSpec) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPolicer {
+            policer,
+            spec,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_policer(&self, policer: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemovePolicer { policer, reply })
+            .await
+    }
+
+    pub async fn policer_stats(&self, policer: Oid) -> Result<PolicerStats, SaiError> {
+        self.call(|reply| SaiCmd::PolicerStats { policer, reply })
+            .await
+    }
+
+    pub async fn create_hostif_trap_group(&self, policer: Option<Oid>) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateHostifTrapGroup { policer, reply })
+            .await
+    }
+
+    pub async fn create_hostif_trap(
+        &self,
+        kind: TrapKind,
+        trap_only: bool,
+        group: Oid,
+    ) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateHostifTrap {
+            kind,
+            trap_only,
+            group,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_default_trap_group_policer(
+        &self,
+        policer: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetDefaultTrapGroupPolicer { policer, reply })
+            .await
+    }
+
+    pub async fn set_port_learn_limit(
+        &self,
+        port: PortId,
+        limit: Option<u32>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortLearnLimit { port, limit, reply })
+            .await
+    }
+
+    pub async fn set_port_learning(&self, port: PortId, learn: bool) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortLearning { port, learn, reply })
+            .await
+    }
 }
 
 pub struct SaiActor;
@@ -827,6 +1086,92 @@ impl SaiActor {
                         }
                         SaiCmd::RemoveMyMac { my_mac, reply } => {
                             let _ = reply.send(backend.remove_my_mac(my_mac));
+                        }
+                        SaiCmd::CreateAclTable {
+                            stage,
+                            family,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.create_acl_table(stage, family));
+                        }
+                        SaiCmd::RemoveAclTable { table, reply } => {
+                            let _ = reply.send(backend.remove_acl_table(table));
+                        }
+                        SaiCmd::CreateAclEntry {
+                            table,
+                            priority,
+                            fields,
+                            action,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(backend.create_acl_entry(table, priority, &fields, &action));
+                        }
+                        SaiCmd::SetAclEntryAction {
+                            entry,
+                            action,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_acl_entry_action(entry, &action));
+                        }
+                        SaiCmd::RemoveAclEntry { entry, reply } => {
+                            let _ = reply.send(backend.remove_acl_entry(entry));
+                        }
+                        SaiCmd::CreateAclCounter { table, reply } => {
+                            let _ = reply.send(backend.create_acl_counter(table));
+                        }
+                        SaiCmd::RemoveAclCounter { counter, reply } => {
+                            let _ = reply.send(backend.remove_acl_counter(counter));
+                        }
+                        SaiCmd::GetAclCounter { counter, reply } => {
+                            let _ = reply.send(backend.get_acl_counter(counter));
+                        }
+                        SaiCmd::BindPortAcl {
+                            port,
+                            stage,
+                            table,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.bind_port_acl(port, stage, table));
+                        }
+                        SaiCmd::AclAvailableEntries { stage, reply } => {
+                            let _ = reply.send(backend.acl_available_entries(stage));
+                        }
+                        SaiCmd::CreatePolicer { spec, reply } => {
+                            let _ = reply.send(backend.create_policer(spec));
+                        }
+                        SaiCmd::SetPolicer {
+                            policer,
+                            spec,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_policer(policer, spec));
+                        }
+                        SaiCmd::RemovePolicer { policer, reply } => {
+                            let _ = reply.send(backend.remove_policer(policer));
+                        }
+                        SaiCmd::PolicerStats { policer, reply } => {
+                            let _ = reply.send(backend.policer_stats(policer));
+                        }
+                        SaiCmd::CreateHostifTrapGroup { policer, reply } => {
+                            let _ = reply.send(backend.create_hostif_trap_group(policer));
+                        }
+                        SaiCmd::CreateHostifTrap {
+                            kind,
+                            trap_only,
+                            group,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.create_hostif_trap(kind, trap_only, group));
+                        }
+                        SaiCmd::SetDefaultTrapGroupPolicer { policer, reply } => {
+                            let _ = reply.send(backend.set_default_trap_group_policer(policer));
+                        }
+                        SaiCmd::SetPortLearnLimit { port, limit, reply } => {
+                            let _ = reply.send(backend.set_port_learn_limit(port, limit));
+                        }
+                        SaiCmd::SetPortLearning { port, learn, reply } => {
+                            let _ = reply.send(backend.set_port_learning(port, learn));
                         }
                         SaiCmd::CreateVlan { id, reply } => {
                             let _ = reply.send(backend.create_vlan(id));
@@ -986,6 +1331,7 @@ impl SaiActor {
         // Event pump: apply SAI notifications to shared state, then fan out.
         let (events, _) = broadcast::channel(256);
         let (fdb_events, _) = broadcast::channel(1024);
+        let (violations, _) = broadcast::channel(256);
         tokio::spawn(pump_events(
             sai_events,
             ports.clone(),
@@ -994,6 +1340,7 @@ impl SaiActor {
             switch.default_vlan_oid,
             events.clone(),
             fdb_events.clone(),
+            violations.clone(),
         ));
 
         Ok(SaiHandle {
@@ -1011,9 +1358,13 @@ impl SaiActor {
             l2mc: crate::state::SharedL2mc::default(),
             unknown_mcast: crate::state::SharedUnknownMcast::default(),
             fib: crate::state::SharedFib::default(),
+            acls: crate::state::SharedAcls::default(),
+            copp: crate::state::SharedCopp::default(),
+            port_security: crate::state::SharedPortSecurity::default(),
             cmd_tx,
             events,
             fdb_events,
+            violations,
         })
     }
 }
@@ -1125,9 +1476,21 @@ async fn pump_events(
     default_vlan_oid: u64,
     out: broadcast::Sender<OperEvent>,
     fdb_out: broadcast::Sender<FdbNotify>,
+    violations_out: broadcast::Sender<ViolationNotify>,
 ) {
     while let Some(event) = sai_events.recv().await {
         match event {
+            SaiEvent::LearnLimitViolation { port, mac } => {
+                let Some(name) = ports.read().ok().and_then(|table| name_for(&table, port))
+                else {
+                    warn!(%port, "learn-limit violation on unknown port");
+                    continue;
+                };
+                let _ = violations_out.send(ViolationNotify {
+                    port: name,
+                    mac: format_mac(mac),
+                });
+            }
             SaiEvent::PortOperStatus { port, up } => {
                 let name = {
                     let Ok(mut table) = ports.write() else { break };

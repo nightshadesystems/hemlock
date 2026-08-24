@@ -1,0 +1,29 @@
+{
+  "dot1x": {
+    "ports": [
+      {
+        "failures": 0,
+        "last_auth_secs_ago": 2462,
+        "port": "Ethernet10",
+        "status": "authorized",
+        "supplicant_mac": "00:1c:73:0c:aa:10"
+      },
+      {
+        "failures": 2,
+        "port": "Ethernet11",
+        "status": "unauthorized"
+      },
+      {
+        "failures": 1,
+        "last_auth_secs_ago": 7855,
+        "port": "Ethernet12",
+        "status": "authorized",
+        "supplicant_mac": "a0:36:9f:44:be:12"
+      }
+    ],
+    "radius_servers": [
+      "10.42.0.5:1812"
+    ],
+    "reauth_interval_secs": 3600
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "port_security": [
+    {
+      "errdisabled": true,
+      "last_violation_mac": "00:50:56:be:ef:44",
+      "last_violation_secs_ago": 131,
+      "learned": [
+        {
+          "age_secs": 2462,
+          "mac": "00:1c:73:0c:aa:05"
+        },
+        {
+          "age_secs": 727,
+          "mac": "a0:36:9f:44:be:05"
+        },
+        {
+          "age_secs": 93,
+          "mac": "00:50:56:be:ef:05"
+        }
+      ],
+      "maximum": 4,
+      "port": "Ethernet5",
+      "shutdown": true,
+      "violations": 1
+    }
+  ]
+}

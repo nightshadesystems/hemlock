@@ -1,0 +1,27 @@
+{
+  "dhcp_snooping_binding": [
+    {
+      "interface": "Ethernet1",
+      "ip": "10.0.10.101",
+      "is_static": false,
+      "lease_secs": 85122,
+      "mac": "00:1c:73:0c:aa:01",
+      "vlan": 10
+    },
+    {
+      "interface": "Ethernet3",
+      "ip": "10.0.10.102",
+      "is_static": false,
+      "lease_secs": 84330,
+      "mac": "a0:36:9f:44:be:02",
+      "vlan": 10
+    },
+    {
+      "interface": "Ethernet7",
+      "ip": "10.0.20.50",
+      "is_static": true,
+      "mac": "00:50:56:be:ef:99",
+      "vlan": 20
+    }
+  ]
+}

@@ -220,18 +220,64 @@ pub async fn configuration(
         }
     }
 
+    // RADIUS shared secrets never render: the security suite is the
+    // first family to store one, so it sets the convention — secret
+    // leaves display as `<hidden>` (recorded in docs/architecture.md).
+    redact_secrets(&mut tree);
+
     // Canonical top-level order: system, vlans, interfaces, routing,
-    // then anything else in its original order (sort is stable).
+    // security, then anything else in its original order (sort is
+    // stable).
     tree.items.sort_by_key(|item| match item.name() {
         "system" => 0,
         "vlans" => 1,
         "interfaces" => 2,
         "routing" => 3,
-        _ => 4,
+        "security" => 4,
+        _ => 5,
     });
 
     crate::pager::page(&tree.to_text());
     Ok(())
+}
+
+/// Replace every `security { dot1x { radius-server <ip> { key ... } } }`
+/// secret with `<hidden>` before display.
+fn redact_secrets(tree: &mut hemlock_config::ConfigTree) {
+    use hemlock_config::Item;
+    let Some(security) = tree
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            Item::Block { name, children, .. } if name == "security" => Some(children),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    for item in security.iter_mut() {
+        let Item::Block { name, children, .. } = item else {
+            continue;
+        };
+        if name != "dot1x" {
+            continue;
+        }
+        for server in children.iter_mut() {
+            let Item::Block { name, children, .. } = server else {
+                continue;
+            };
+            if name != "radius-server" {
+                continue;
+            }
+            for leaf in children.iter_mut() {
+                if let Item::Leaf { name, values } = leaf {
+                    if name == "key" {
+                        *values = vec!["<hidden>".into()];
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Admin-state marker present? (`shutdown` / `no shutdown`; the legacy

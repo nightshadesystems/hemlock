@@ -52,7 +52,7 @@ pub struct Inventory {
 pub type SharedNetdevs = Arc<RwLock<HashMap<String, NetdevSample>>>;
 
 pub struct SyncdService {
-    handle: Arc<SaiHandle>,
+    pub(crate) handle: Arc<SaiHandle>,
     engine: SharedEngine,
     netdevs: SharedNetdevs,
     inventory: Inventory,
@@ -523,7 +523,7 @@ impl SyncdService {
 impl SyncdService {
     /// A capability gate: commits that need an absent SAI capability
     /// fail cleanly with the platform error, never silently no-op.
-    fn require_capability(&self, supported: bool, family: &str) -> Result<(), Status> {
+    pub(crate) fn require_capability(&self, supported: bool, family: &str) -> Result<(), Status> {
         if supported {
             Ok(())
         } else {
@@ -534,7 +534,7 @@ impl SyncdService {
     }
 
     /// A request MAC as bytes, canonicalized.
-    fn mac_bytes(text: &str) -> Result<([u8; 6], String), Status> {
+    pub(crate) fn mac_bytes(text: &str) -> Result<([u8; 6], String), Status> {
         let canonical = hemlock_common::net::parse_mac(text).map_err(Status::invalid_argument)?;
         let mut mac = [0u8; 6];
         for (i, part) in canonical.split(':').enumerate() {
@@ -808,7 +808,7 @@ impl SyncdService {
         }
     }
 
-    fn port_sai_id(&self, name: &str) -> Result<hemlock_sai::PortId, Status> {
+    pub(crate) fn port_sai_id(&self, name: &str) -> Result<hemlock_sai::PortId, Status> {
         let table = self
             .handle
             .ports
@@ -1136,7 +1136,7 @@ fn storm_class_proto(class: hemlock_sai::StormClass) -> pb::StormClass {
 }
 
 /// The group number of a port-channel name (`Port-Channel1` -> 1).
-fn lag_group_of(name: &str) -> Option<u16> {
+pub(crate) fn lag_group_of(name: &str) -> Option<u16> {
     let digits = name.strip_prefix("Port-Channel")?;
     digits
         .parse::<u16>()
@@ -1178,6 +1178,11 @@ impl pb::syncd_server::Syncd for SyncdService {
                 ecmp_width: caps.ecmp_width,
                 ipv6: caps.ipv6,
                 my_mac: caps.my_mac,
+                acl_ingress: caps.acl_ingress,
+                acl_egress: caps.acl_egress,
+                acl_entry_policer: caps.acl_entry_policer,
+                port_learn_limit: caps.port_learn_limit,
+                copp: caps.copp,
             }),
         }))
     }
@@ -2742,6 +2747,7 @@ impl pb::syncd_server::Syncd for SyncdService {
             .filter(|name| !wanted.contains_key(*name))
             .cloned()
             .collect();
+        let stale_for_acls = stale.clone();
         for name in stale {
             let port_id = self.port_sai_id(&name)?;
             let member = members.remove(&name).expect("key from members");
@@ -2829,14 +2835,21 @@ impl pb::syncd_server::Syncd for SyncdService {
                     .map_err(sai)?;
             }
         }
-        let mut lags = self
-            .handle
-            .lags
-            .write()
-            .map_err(|_| Status::internal("lag table poisoned"))?;
-        if let Some(lag) = lags.get_mut(&group) {
-            lag.members = members;
+        {
+            let mut lags = self
+                .handle
+                .lags
+                .write()
+                .map_err(|_| Status::internal("lag table poisoned"))?;
+            if let Some(lag) = lags.get_mut(&group) {
+                lag.members = members;
+            }
         }
+        // Membership changed: re-expand the Port-Channel's ACL bindings
+        // (stale members drop the entries, current members carry them).
+        let current: Vec<String> = wanted.keys().cloned().collect();
+        self.refresh_lag_acls(group, &stale_for_acls, &current)
+            .await?;
         Ok(Response::new(pb::SetLagMembersResponse {}))
     }
 
@@ -3595,6 +3608,139 @@ impl pb::syncd_server::Syncd for SyncdService {
             neighbors: fib.neighbors.len() as u32,
             next_hop_groups: fib.groups.len() as u32,
         }))
+    }
+
+    // --- ACLs (security suite) ---------------------------------------
+
+    async fn ensure_acl(
+        &self,
+        request: Request<pb::EnsureAclRequest>,
+    ) -> Result<Response<pb::EnsureAclResponse>, Status> {
+        self.ensure_acl_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::EnsureAclResponse {}))
+    }
+
+    async fn remove_acl(
+        &self,
+        request: Request<pb::RemoveAclRequest>,
+    ) -> Result<Response<pb::RemoveAclResponse>, Status> {
+        self.remove_acl_impl(&request.into_inner().name).await?;
+        Ok(Response::new(pb::RemoveAclResponse {}))
+    }
+
+    async fn bind_port_acl(
+        &self,
+        request: Request<pb::BindPortAclRequest>,
+    ) -> Result<Response<pb::BindPortAclResponse>, Status> {
+        self.bind_port_acl_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::BindPortAclResponse {}))
+    }
+
+    async fn unbind_port_acl(
+        &self,
+        request: Request<pb::UnbindPortAclRequest>,
+    ) -> Result<Response<pb::UnbindPortAclResponse>, Status> {
+        self.unbind_port_acl_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::UnbindPortAclResponse {}))
+    }
+
+    async fn get_acl_state(
+        &self,
+        _request: Request<pb::GetAclStateRequest>,
+    ) -> Result<Response<pb::GetAclStateResponse>, Status> {
+        Ok(Response::new(self.acl_state_impl().await?))
+    }
+
+    async fn clear_acl_counters(
+        &self,
+        request: Request<pb::ClearAclCountersRequest>,
+    ) -> Result<Response<pb::ClearAclCountersResponse>, Status> {
+        let cleared = self
+            .clear_acl_counters_impl(&request.into_inner().name)
+            .await?;
+        Ok(Response::new(pb::ClearAclCountersResponse { cleared }))
+    }
+
+    // --- Control-plane policing --------------------------------------
+
+    async fn set_copp_class(
+        &self,
+        request: Request<pb::SetCoppClassRequest>,
+    ) -> Result<Response<pb::SetCoppClassResponse>, Status> {
+        self.set_copp_class_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::SetCoppClassResponse {}))
+    }
+
+    async fn get_copp_state(
+        &self,
+        _request: Request<pb::GetCoppStateRequest>,
+    ) -> Result<Response<pb::GetCoppStateResponse>, Status> {
+        Ok(Response::new(self.copp_state_impl().await?))
+    }
+
+    async fn clear_copp_counters(
+        &self,
+        _request: Request<pb::ClearCoppCountersRequest>,
+    ) -> Result<Response<pb::ClearCoppCountersResponse>, Status> {
+        self.clear_copp_counters_impl().await?;
+        Ok(Response::new(pb::ClearCoppCountersResponse {}))
+    }
+
+    // --- Port security -----------------------------------------------
+
+    async fn set_port_security(
+        &self,
+        request: Request<pb::SetPortSecurityRequest>,
+    ) -> Result<Response<pb::SetPortSecurityResponse>, Status> {
+        self.set_port_security_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::SetPortSecurityResponse {}))
+    }
+
+    async fn clear_port_security(
+        &self,
+        request: Request<pb::ClearPortSecurityRequest>,
+    ) -> Result<Response<pb::ClearPortSecurityResponse>, Status> {
+        self.clear_port_security_impl(&request.into_inner().port)
+            .await?;
+        Ok(Response::new(pb::ClearPortSecurityResponse {}))
+    }
+
+    async fn get_port_security_state(
+        &self,
+        request: Request<pb::GetPortSecurityStateRequest>,
+    ) -> Result<Response<pb::GetPortSecurityStateResponse>, Status> {
+        Ok(Response::new(
+            self.port_security_state_impl(&request.into_inner().port)
+                .await?,
+        ))
+    }
+
+    async fn reset_port_security(
+        &self,
+        request: Request<pb::ResetPortSecurityRequest>,
+    ) -> Result<Response<pb::ResetPortSecurityResponse>, Status> {
+        let cleared = self
+            .reset_port_security_impl(&request.into_inner().port)
+            .await?;
+        Ok(Response::new(pb::ResetPortSecurityResponse { cleared }))
+    }
+
+    // --- 802.1X / snooping enforcement -------------------------------
+
+    async fn set_port_authorized(
+        &self,
+        request: Request<pb::SetPortAuthorizedRequest>,
+    ) -> Result<Response<pb::SetPortAuthorizedResponse>, Status> {
+        self.set_port_authorized_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::SetPortAuthorizedResponse {}))
+    }
+
+    async fn set_snoop_redirects(
+        &self,
+        request: Request<pb::SetSnoopRedirectsRequest>,
+    ) -> Result<Response<pb::SetSnoopRedirectsResponse>, Status> {
+        self.set_snoop_redirects_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::SetSnoopRedirectsResponse {}))
     }
 }
 
@@ -4909,5 +5055,572 @@ lanes = [1, 2]
             .await
             .unwrap();
         assert!(!handle.vlans.read().unwrap().contains_key(&10));
+    }
+
+    fn acl_rule(number: u32, permit: bool) -> pb::AclRule {
+        pb::AclRule {
+            number,
+            permit,
+            ..Default::default()
+        }
+    }
+
+    fn edge_in_rules() -> Vec<pb::AclRule> {
+        vec![
+            pb::AclRule {
+                protocol: Some(6),
+                source: "10.0.0.0/8".into(),
+                destination: "10.42.0.0/16".into(),
+                destination_port_low: Some(443),
+                destination_port_high: Some(443),
+                ..acl_rule(10, true)
+            },
+            pb::AclRule {
+                protocol: Some(17),
+                destination_port_low: Some(67),
+                destination_port_high: Some(68),
+                ..acl_rule(20, true)
+            },
+            pb::AclRule {
+                source: "192.0.2.0/24".into(),
+                log: true,
+                ..acl_rule(30, false)
+            },
+            pb::AclRule {
+                police_rate: Some(10_000_000),
+                police_burst: Some(256_000),
+                police_pps: false,
+                ..acl_rule(40, true)
+            },
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn security_acl_suite_over_mock_sai() {
+        let platform = test_platform();
+        let backend = Box::new(hemlock_sai::mock::MockSai::new(platform.ports.clone()));
+        let handle = Arc::new(SaiActor::spawn(backend, &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+        use hemlock_sai::AclStage;
+        let ingress = pb::AclStage::Ingress as i32;
+
+        // Whole-ACL program + binding materializes one table with the
+        // four rules and the implicit deny.
+        service
+            .ensure_acl(Request::new(pb::EnsureAclRequest {
+                name: "EDGE-IN".into(),
+                family: pb::AclFamily::Ipv4 as i32,
+                rules: edge_in_rules(),
+            }))
+            .await
+            .unwrap();
+        service
+            .bind_port_acl(Request::new(pb::BindPortAclRequest {
+                port: "Ethernet1".into(),
+                stage: ingress,
+                acl: "EDGE-IN".into(),
+            }))
+            .await
+            .unwrap();
+        let (rule10, rule20) = {
+            let world = handle.acls.read().unwrap();
+            let table = &world.tables[&("Ethernet1".to_string(), AclStage::Ingress)];
+            assert_eq!(table.entries.len(), 5);
+            assert_eq!(table.user_acl.as_deref(), Some("EDGE-IN"));
+            assert!(table
+                .entries
+                .contains_key(&crate::state::AclEntryKey::ImplicitDeny));
+            // Rule 40 carries its policer.
+            assert!(table.entries[&crate::state::AclEntryKey::User(40)]
+                .policer
+                .is_some());
+            (
+                table.entries[&crate::state::AclEntryKey::User(10)].clone(),
+                table.entries[&crate::state::AclEntryKey::User(20)].clone(),
+            )
+        };
+
+        let state = service
+            .get_acl_state(Request::new(pb::GetAclStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.acls.len(), 1);
+        assert_eq!(state.acls[0].rules.len(), 4);
+        assert_eq!(state.acls[0].matches.len(), 4);
+        assert_eq!(state.acls[0].bindings.len(), 1);
+        assert_eq!(state.acls[0].bindings[0].port, "Ethernet1");
+        let tcam_ingress = state
+            .tcam
+            .iter()
+            .find(|t| t.stage == ingress)
+            .unwrap();
+        assert_eq!(tcam_ingress.used, 5);
+        assert_eq!(tcam_ingress.available, 507);
+
+        // Diff minimality: editing rule 20 leaves rule 10's entry and
+        // counter objects untouched; rule 20 keeps its counter across
+        // the recreate.
+        let mut rules = edge_in_rules();
+        rules[1].destination_port_low = Some(68);
+        rules[1].destination_port_high = Some(69);
+        service
+            .ensure_acl(Request::new(pb::EnsureAclRequest {
+                name: "EDGE-IN".into(),
+                family: pb::AclFamily::Ipv4 as i32,
+                rules,
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.acls.read().unwrap();
+            let table = &world.tables[&("Ethernet1".to_string(), AclStage::Ingress)];
+            let new10 = &table.entries[&crate::state::AclEntryKey::User(10)];
+            let new20 = &table.entries[&crate::state::AclEntryKey::User(20)];
+            assert_eq!(new10.entry, rule10.entry);
+            assert_eq!(new10.counter, rule10.counter);
+            assert_ne!(new20.entry, rule20.entry);
+            assert_eq!(new20.counter, rule20.counter);
+        }
+
+        // Internal priority bands: an unauthorized dot1x port's
+        // entries always outrank every user rule.
+        service
+            .set_port_authorized(Request::new(pb::SetPortAuthorizedRequest {
+                port: "Ethernet1".into(),
+                authorized: false,
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.acls.read().unwrap();
+            let table = &world.tables[&("Ethernet1".to_string(), AclStage::Ingress)];
+            assert_eq!(table.entries.len(), 7);
+            let min_internal = table
+                .entries
+                .iter()
+                .filter(|(k, _)| matches!(k, crate::state::AclEntryKey::Internal(_)))
+                .map(|(_, o)| o.priority)
+                .min()
+                .unwrap();
+            let max_user = table
+                .entries
+                .iter()
+                .filter(|(k, _)| !matches!(k, crate::state::AclEntryKey::Internal(_)))
+                .map(|(_, o)| o.priority)
+                .max()
+                .unwrap();
+            assert!(
+                min_internal > max_user,
+                "a user rule must never shadow the dot1x internal entries"
+            );
+        }
+        service
+            .set_port_authorized(Request::new(pb::SetPortAuthorizedRequest {
+                port: "Ethernet1".into(),
+                authorized: true,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.acls.read().unwrap().tables[&("Ethernet1".to_string(), AclStage::Ingress)]
+                .entries
+                .len(),
+            5
+        );
+
+        // Snooping/DAI redirects materialize internal-only tables (no
+        // implicit deny), declaratively replaced.
+        service
+            .set_snoop_redirects(Request::new(pb::SetSnoopRedirectsRequest {
+                dhcp: vec![pb::SnoopVlanProgram {
+                    vlan: 10,
+                    untrusted_ports: vec!["Ethernet2".into()],
+                    trusted_ports: vec![],
+                }],
+                arp: vec![pb::SnoopVlanProgram {
+                    vlan: 10,
+                    untrusted_ports: vec!["Ethernet2".into()],
+                    trusted_ports: vec![],
+                }],
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.acls.read().unwrap();
+            let table = &world.tables[&("Ethernet2".to_string(), AclStage::Ingress)];
+            assert_eq!(table.entries.len(), 2);
+            assert!(table.user_acl.is_none());
+            assert!(!table
+                .entries
+                .contains_key(&crate::state::AclEntryKey::ImplicitDeny));
+        }
+        service
+            .set_snoop_redirects(Request::new(pb::SetSnoopRedirectsRequest::default()))
+            .await
+            .unwrap();
+        assert!(!handle
+            .acls
+            .read()
+            .unwrap()
+            .tables
+            .contains_key(&("Ethernet2".to_string(), AclStage::Ingress)));
+
+        // A Port-Channel binding expands to the members and follows
+        // membership churn.
+        service
+            .create_lag(Request::new(pb::CreateLagRequest {
+                group: 1,
+                description: String::new(),
+                admin_up: true,
+            }))
+            .await
+            .unwrap();
+        service
+            .set_lag_members(Request::new(pb::SetLagMembersRequest {
+                group: 1,
+                members: vec![pb::LagMemberSpec {
+                    port: "Ethernet2".into(),
+                    enabled: true,
+                }],
+            }))
+            .await
+            .unwrap();
+        service
+            .bind_port_acl(Request::new(pb::BindPortAclRequest {
+                port: "Port-Channel1".into(),
+                stage: ingress,
+                acl: "EDGE-IN".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(handle
+            .acls
+            .read()
+            .unwrap()
+            .tables
+            .contains_key(&("Ethernet2".to_string(), AclStage::Ingress)));
+        service
+            .set_lag_members(Request::new(pb::SetLagMembersRequest {
+                group: 1,
+                members: vec![],
+            }))
+            .await
+            .unwrap();
+        assert!(!handle
+            .acls
+            .read()
+            .unwrap()
+            .tables
+            .contains_key(&("Ethernet2".to_string(), AclStage::Ingress)));
+        service
+            .unbind_port_acl(Request::new(pb::UnbindPortAclRequest {
+                port: "Port-Channel1".into(),
+                stage: ingress,
+            }))
+            .await
+            .unwrap();
+
+        // An ACL in use refuses removal; unbinding frees it and tears
+        // the table down.
+        let err = service
+            .remove_acl(Request::new(pb::RemoveAclRequest {
+                name: "EDGE-IN".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.message(), "ACL EDGE-IN is in use");
+        service
+            .unbind_port_acl(Request::new(pb::UnbindPortAclRequest {
+                port: "Ethernet1".into(),
+                stage: ingress,
+            }))
+            .await
+            .unwrap();
+        assert!(handle.acls.read().unwrap().tables.is_empty());
+        service
+            .remove_acl(Request::new(pb::RemoveAclRequest {
+                name: "EDGE-IN".into(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn security_copp_and_port_security_over_mock_sai() {
+        let platform = test_platform();
+        let mut mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        mock.enable_synthetic_counters();
+        let injector = mock.event_injector();
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        crate::security::program_copp(&handle).await.unwrap();
+        tokio::spawn(crate::security::port_security_watch(handle.clone()));
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        // The compiled class table renders whole; overrides flag `*`
+        // and absent values restore the defaults.
+        let state = service
+            .get_copp_state(Request::new(pb::GetCoppStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.classes.len(), 13);
+        let bpdu = state.classes.iter().find(|c| c.class == "bpdu").unwrap();
+        assert_eq!((bpdu.rate, bpdu.burst, bpdu.overridden), (512, 128, false));
+        service
+            .set_copp_class(Request::new(pb::SetCoppClassRequest {
+                class: "bpdu".into(),
+                rate: Some(999),
+                burst: None,
+            }))
+            .await
+            .unwrap();
+        let state = service
+            .get_copp_state(Request::new(pb::GetCoppStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let bpdu = state.classes.iter().find(|c| c.class == "bpdu").unwrap();
+        assert_eq!((bpdu.rate, bpdu.burst, bpdu.overridden), (999, 128, true));
+        // Counters accumulate in the mock; clearing baselines them.
+        assert!(bpdu.conforming > 0);
+        let before = bpdu.conforming;
+        service
+            .clear_copp_counters(Request::new(pb::ClearCoppCountersRequest {}))
+            .await
+            .unwrap();
+        let state = service
+            .get_copp_state(Request::new(pb::GetCoppStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let bpdu = state.classes.iter().find(|c| c.class == "bpdu").unwrap();
+        assert!(bpdu.conforming < before);
+        let err = service
+            .set_copp_class(Request::new(pb::SetCoppClassRequest {
+                class: "banana".into(),
+                rate: Some(1),
+                burst: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Port security: learn events fill the secure set; the learn
+        // past the limit is a violation (protect freezes learning).
+        service
+            .set_port_security(Request::new(pb::SetPortSecurityRequest {
+                port: "Ethernet2".into(),
+                maximum: 2,
+                shutdown: false,
+            }))
+            .await
+            .unwrap();
+        let (port_id, bv_id) = {
+            let ports = handle.ports.read().unwrap();
+            (ports["Ethernet2"].sai_id, handle.default_vlan_oid)
+        };
+        let learn = |mac: [u8; 6]| hemlock_sai::SaiEvent::Fdb {
+            kind: hemlock_sai::FdbEventKind::Learned,
+            bv_id,
+            mac,
+            port: Some(port_id),
+        };
+        injector.send(learn([0, 0x50, 0x56, 0xbe, 0xef, 1])).unwrap();
+        injector.send(learn([0, 0x50, 0x56, 0xbe, 0xef, 2])).unwrap();
+        injector.send(learn([0, 0x50, 0x56, 0xbe, 0xef, 3])).unwrap();
+        for _ in 0..200 {
+            let done = {
+                let table = handle.port_security.read().unwrap();
+                table
+                    .get("Ethernet2")
+                    .map(|s| s.violations == 1 && s.learned.len() == 2)
+                    .unwrap_or(false)
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let state = service
+            .get_port_security_state(Request::new(pb::GetPortSecurityStateRequest {
+                port: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.ports.len(), 1);
+        assert_eq!(state.ports[0].learned.len(), 2);
+        assert_eq!(state.ports[0].violations, 1);
+        assert_eq!(state.ports[0].last_violation_mac, "00:50:56:be:ef:03");
+        assert!(!state.ports[0].errdisabled);
+
+        // Shutdown action: an injected learn-limit violation
+        // errdisables the port; reset re-enables and flushes.
+        service
+            .set_port_security(Request::new(pb::SetPortSecurityRequest {
+                port: "Ethernet2".into(),
+                maximum: 2,
+                shutdown: true,
+            }))
+            .await
+            .unwrap();
+        injector
+            .send(hemlock_sai::SaiEvent::LearnLimitViolation {
+                port: port_id,
+                mac: [0, 0x50, 0x56, 0xbe, 0xef, 4],
+            })
+            .unwrap();
+        for _ in 0..200 {
+            let done = handle
+                .ports
+                .read()
+                .unwrap()
+                .get("Ethernet2")
+                .map(|p| p.errdisable_reason.as_deref() == Some("port-security"))
+                .unwrap_or(false);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let state = service
+            .get_port_security_state(Request::new(pb::GetPortSecurityStateRequest {
+                port: "Ethernet2".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(state.ports[0].errdisabled);
+        assert_eq!(state.ports[0].violations, 2);
+        let cleared = service
+            .reset_port_security(Request::new(pb::ResetPortSecurityRequest {
+                port: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .cleared;
+        assert_eq!(cleared, 1);
+        let state = service
+            .get_port_security_state(Request::new(pb::GetPortSecurityStateRequest {
+                port: "Ethernet2".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!state.ports[0].errdisabled);
+        assert_eq!(state.ports[0].violations, 0);
+        assert!(state.ports[0].learned.is_empty());
+
+        // Unconfiguring forgets the port entirely.
+        service
+            .clear_port_security(Request::new(pb::ClearPortSecurityRequest {
+                port: "Ethernet2".into(),
+            }))
+            .await
+            .unwrap();
+        let state = service
+            .get_port_security_state(Request::new(pb::GetPortSecurityStateRequest {
+                port: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(state.ports.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn security_capabilities_gate_cleanly() {
+        let platform = test_platform();
+        let mut mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        mock.set_capabilities(hemlock_sai::SaiCapabilities {
+            acl_egress: false,
+            acl_entry_policer: false,
+            port_learn_limit: false,
+            copp: false,
+            ..hemlock_sai::SaiCapabilities::all()
+        });
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle,
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+        service
+            .ensure_acl(Request::new(pb::EnsureAclRequest {
+                name: "EDGE-IN".into(),
+                family: pb::AclFamily::Ipv4 as i32,
+                rules: edge_in_rules(),
+            }))
+            .await
+            .unwrap();
+
+        let err = service
+            .bind_port_acl(Request::new(pb::BindPortAclRequest {
+                port: "Ethernet1".into(),
+                stage: pb::AclStage::Egress as i32,
+                acl: "EDGE-IN".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "egress ACLs are not supported by this platform's SAI"
+        );
+
+        // EDGE-IN's rule 40 polices, and this platform has no per-entry
+        // policers.
+        let err = service
+            .bind_port_acl(Request::new(pb::BindPortAclRequest {
+                port: "Ethernet1".into(),
+                stage: pb::AclStage::Ingress as i32,
+                acl: "EDGE-IN".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "per-rule policers are not supported by this platform's SAI"
+        );
+
+        let err = service
+            .set_port_security(Request::new(pb::SetPortSecurityRequest {
+                port: "Ethernet1".into(),
+                maximum: 4,
+                shutdown: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "port-security is not supported by this platform's SAI"
+        );
+
+        let err = service
+            .set_copp_class(Request::new(pb::SetCoppClassRequest {
+                class: "bpdu".into(),
+                rate: Some(100),
+                burst: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "control-plane policing is not supported by this platform's SAI"
+        );
     }
 }

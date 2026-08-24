@@ -113,6 +113,47 @@ impl Engine {
                 }
             }
         }
+        // Security-suite capability gates: probed once, so a commit
+        // needing an absent stage/policer/learn-limit fails at
+        // validation with the platform error, before anything applies.
+        let bindings = intents::acl_bindings(&wanted);
+        let needs_security_caps = !bindings.is_empty()
+            || !intents::port_security_state(&wanted).is_empty()
+            || !wanted.copp.is_empty();
+        if needs_security_caps {
+            if let Ok(mut client) = self.syncd_client().await {
+                if let Ok(info) = client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
+                    let caps = info.into_inner().capabilities.unwrap_or_default();
+                    if !bindings.is_empty() && !caps.acl_ingress {
+                        anyhow::bail!("ACLs are not supported by this platform's SAI");
+                    }
+                    if bindings.keys().any(|(_, egress)| *egress) && !caps.acl_egress {
+                        anyhow::bail!("egress ACLs are not supported by this platform's SAI");
+                    }
+                    let bound_polices = bindings.values().any(|acl| {
+                        wanted
+                            .acls
+                            .get(acl)
+                            .map(|a| a.rules.values().any(|r| r.police.is_some()))
+                            .unwrap_or(false)
+                    });
+                    if bound_polices && !caps.acl_entry_policer {
+                        anyhow::bail!(
+                            "per-rule policers are not supported by this platform's SAI"
+                        );
+                    }
+                    if !intents::port_security_state(&wanted).is_empty() && !caps.port_learn_limit
+                    {
+                        anyhow::bail!("port-security is not supported by this platform's SAI");
+                    }
+                    if !wanted.copp.is_empty() && !caps.copp {
+                        anyhow::bail!(
+                            "control-plane policing is not supported by this platform's SAI"
+                        );
+                    }
+                }
+            }
+        }
         let port_references = !wanted.ports.is_empty()
             || !wanted.mac_table.statics.is_empty()
             || !wanted.mirror.is_empty()
@@ -336,6 +377,103 @@ impl Engine {
             .await?;
         }
 
+        // The security suite: ACL definitions + bindings, CoPP class
+        // overrides, and port-security ride syncd; dot1x and
+        // snooping/DAI are whole-state pushes to their orch engines
+        // (which drive the enforcement back into syncd).
+        let acl_changes = intents::diff_acls(&running_intents, &wanted_intents);
+        let acl_binding_changes = intents::diff_acl_bindings(&running_intents, &wanted_intents);
+        let copp_changes = intents::diff_copp(&running_intents, &wanted_intents);
+        let psec_changes = intents::diff_port_security(&running_intents, &wanted_intents);
+        let dot1x_change = intents::diff_dot1x(&running_intents, &wanted_intents);
+        let snoopsec_change = intents::diff_snoopsec(&running_intents, &wanted_intents);
+        if !acl_changes.is_empty()
+            || !acl_binding_changes.is_empty()
+            || !copp_changes.is_empty()
+            || !psec_changes.is_empty()
+        {
+            let mut client = self.syncd_client().await?;
+            // Definitions before the bindings that reference them;
+            // unbinds before removals so a dropped ACL is free by the
+            // time it goes.
+            for change in acl_changes.iter().filter(|c| c.ensure.is_some()) {
+                let ensure = change.ensure.as_ref().expect("filtered on is_some");
+                client
+                    .ensure_acl(acl_request(&change.name, ensure))
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+            for change in acl_binding_changes.iter().filter(|c| c.acl.is_none()) {
+                client
+                    .unbind_port_acl(pb::UnbindPortAclRequest {
+                        port: change.target.clone(),
+                        stage: acl_stage(change.egress),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+            for change in acl_binding_changes.iter().filter(|c| c.acl.is_some()) {
+                client
+                    .bind_port_acl(pb::BindPortAclRequest {
+                        port: change.target.clone(),
+                        stage: acl_stage(change.egress),
+                        acl: change.acl.clone().expect("filtered on is_some"),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+            for change in acl_changes.iter().filter(|c| c.ensure.is_none()) {
+                client
+                    .remove_acl(pb::RemoveAclRequest {
+                        name: change.name.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+            for change in &copp_changes {
+                client
+                    .set_copp_class(pb::SetCoppClassRequest {
+                        class: change.class.clone(),
+                        rate: change.set.as_ref().and_then(|s| s.rate),
+                        burst: change.set.as_ref().and_then(|s| s.burst),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+            for change in &psec_changes {
+                match &change.set {
+                    Some(ps) => {
+                        client
+                            .set_port_security(pb::SetPortSecurityRequest {
+                                port: change.port.clone(),
+                                maximum: ps.maximum,
+                                shutdown: ps.shutdown,
+                            })
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                    None => {
+                        client
+                            .clear_port_security(pb::ClearPortSecurityRequest {
+                                port: change.port.clone(),
+                            })
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                }
+            }
+        }
+        if let Some(dot1x) = &dot1x_change {
+            self.push_dot1x_config(dot1x)
+                .await
+                .context("pushing dot1x config to orch")?;
+        }
+        if let Some(snoopsec) = &snoopsec_change {
+            self.push_snoopsec_config(snoopsec)
+                .await
+                .context("pushing dhcp-snooping/arp-inspection config to orch")?;
+        }
+
         // Spanning tree: MST instances in syncd, then the full state to
         // the orch engine (which drives the port states back into
         // syncd).
@@ -435,6 +573,24 @@ impl Engine {
         described.extend(mac_changes.describe());
         described.extend(storm_changes.iter().map(intents::StormChange::describe));
         described.extend(mirror_changes.iter().map(intents::MirrorChange::describe));
+        described.extend(acl_changes.iter().map(intents::AclChange::describe));
+        described.extend(
+            acl_binding_changes
+                .iter()
+                .map(intents::AclBindingChange::describe),
+        );
+        described.extend(copp_changes.iter().map(intents::CoppChange::describe));
+        described.extend(
+            psec_changes
+                .iter()
+                .map(intents::PortSecurityChange::describe),
+        );
+        if dot1x_change.is_some() {
+            described.push("dot1x configuration updated".into());
+        }
+        if snoopsec_change.is_some() {
+            described.push("dhcp-snooping/arp-inspection configuration updated".into());
+        }
         if frr_changed {
             described.push("frr configuration updated (ospf/bgp/vrrp)".into());
         }
@@ -547,6 +703,75 @@ impl Engine {
             })
             .await
             .context("SetSnoopingConfig")?;
+        Ok(())
+    }
+
+    /// Push the whole dot1x state to orch (which owns hostapd and
+    /// drives port authorization into syncd).
+    async fn push_dot1x_config(&self, wanted: &intents::Dot1xState) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_dot1x_config(pb::SetDot1xConfigRequest {
+                radius_servers: wanted
+                    .intent
+                    .radius_servers
+                    .iter()
+                    .map(|server| pb::RadiusServerConfig {
+                        ip: server.ip.clone(),
+                        key: server.key.clone().unwrap_or_default(),
+                        port: u32::from(server.port),
+                        timeout_secs: u32::from(server.timeout),
+                        retransmit: u32::from(server.retransmit),
+                    })
+                    .collect(),
+                reauth_interval: wanted.intent.reauth_interval,
+                ports: wanted.ports.iter().cloned().collect(),
+            })
+            .await
+            .context("SetDot1xConfig")?;
+        Ok(())
+    }
+
+    /// Push the whole snooping/DAI state to orch (which drives the CPU
+    /// redirects into syncd and validates the trapped traffic).
+    async fn push_snoopsec_config(&self, wanted: &intents::SnoopSecState) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_snoop_sec_config(pb::SetSnoopSecConfigRequest {
+                dhcp_vlans: wanted
+                    .intent
+                    .dhcp_vlans
+                    .iter()
+                    .map(|v| u32::from(*v))
+                    .collect(),
+                arp_vlans: wanted
+                    .intent
+                    .arp_vlans
+                    .iter()
+                    .map(|v| u32::from(*v))
+                    .collect(),
+                validate: wanted
+                    .intent
+                    .validate
+                    .iter()
+                    .map(|v| v.word().to_string())
+                    .collect(),
+                dhcp_trusted: wanted.dhcp_trusted.iter().cloned().collect(),
+                arp_trusted: wanted.arp_trusted.iter().cloned().collect(),
+                static_bindings: wanted
+                    .intent
+                    .static_bindings
+                    .iter()
+                    .map(|((mac, vlan), binding)| pb::StaticBindingConfig {
+                        mac: mac.clone(),
+                        vlan: u32::from(*vlan),
+                        address: binding.address.clone(),
+                        interface: binding.interface.clone(),
+                    })
+                    .collect(),
+            })
+            .await
+            .context("SetSnoopSecConfig")?;
         Ok(())
     }
 
@@ -779,6 +1004,67 @@ fn vrrp_my_macs(intents: &Intents) -> std::collections::BTreeSet<(u32, String)> 
 }
 
 /// The full wanted switchport program as a syncd request.
+fn acl_stage(egress: bool) -> i32 {
+    (if egress {
+        pb::AclStage::Egress
+    } else {
+        pb::AclStage::Ingress
+    }) as i32
+}
+
+/// A whole-ACL declarative program for syncd.
+fn acl_request(name: &str, acl: &intents::AclIntent) -> pb::EnsureAclRequest {
+    pb::EnsureAclRequest {
+        name: name.to_string(),
+        family: (match acl.family {
+            intents::AclFamily::Ipv4 => pb::AclFamily::Ipv4,
+            intents::AclFamily::Ipv6 => pb::AclFamily::Ipv6,
+            intents::AclFamily::Mac => pb::AclFamily::Mac,
+        }) as i32,
+        rules: acl
+            .rules
+            .iter()
+            .map(|(number, rule)| pb::AclRule {
+                number: *number,
+                permit: rule.permit,
+                protocol: rule.protocol.map(u32::from),
+                source: rule.source.clone().unwrap_or_default(),
+                destination: rule.destination.clone().unwrap_or_default(),
+                source_port_low: rule.source_port.map(|(low, _)| u32::from(low)),
+                source_port_high: rule.source_port.map(|(_, high)| u32::from(high)),
+                destination_port_low: rule.destination_port.map(|(low, _)| u32::from(low)),
+                destination_port_high: rule.destination_port.map(|(_, high)| u32::from(high)),
+                dscp: rule.dscp.map(u32::from),
+                log: rule.log,
+                police_rate: rule.police.map(|p| p.rate),
+                police_burst: rule.police.map(|p| p.burst),
+                police_pps: rule.police.map(|p| p.pps).unwrap_or(false),
+                source_mac: rule
+                    .source_mac
+                    .as_ref()
+                    .map(|(mac, _)| mac.clone())
+                    .unwrap_or_default(),
+                source_mac_mask: rule
+                    .source_mac
+                    .as_ref()
+                    .map(|(_, mask)| mask.clone())
+                    .unwrap_or_default(),
+                destination_mac: rule
+                    .destination_mac
+                    .as_ref()
+                    .map(|(mac, _)| mac.clone())
+                    .unwrap_or_default(),
+                destination_mac_mask: rule
+                    .destination_mac
+                    .as_ref()
+                    .map(|(_, mask)| mask.clone())
+                    .unwrap_or_default(),
+                ethertype: rule.ethertype.map(u32::from),
+            })
+            .collect(),
+    }
+}
+
 fn switchport_request(name: &str, sp: &intents::SwitchportIntent) -> pb::SetPortSwitchportRequest {
     pb::SetPortSwitchportRequest {
         name: name.to_string(),

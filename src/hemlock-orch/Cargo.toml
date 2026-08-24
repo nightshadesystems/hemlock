@@ -17,10 +17,15 @@ tonic = { workspace = true }
 clap = { workspace = true }
 # iproute2 JSON parsing (the RIB kernel feed) and vtysh JSON (FRR shows).
 serde_json = { workspace = true }
+# The DHCP-snooping binding store (persisted across restarts).
+serde = { workspace = true }
 
 # LACPDU transport over the member ports' hostif netdevs.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["socket", "net"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

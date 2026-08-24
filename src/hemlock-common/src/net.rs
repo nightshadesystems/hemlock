@@ -88,6 +88,120 @@ pub fn parse_unicast_mac(text: &str) -> Result<String, String> {
     Ok(mac)
 }
 
+/// A MAC and-mask, canonicalized to colon-separated lowercase. Same
+/// accepted forms as [`parse_mac`]; any bit pattern is a valid mask
+/// (`ff:ff:ff:00:00:00` matches an OUI).
+pub fn parse_mac_mask(text: &str) -> Result<String, String> {
+    parse_mac(text).map_err(|_| format!("bad MAC mask {text:?}"))
+}
+
+/// An ACL policer rate: bits/sec with an optional `k`/`m`/`g` suffix
+/// (`10m` = 10,000,000 bps) or packets/sec with a `pps` suffix
+/// (`2000pps`). Returns the numeric rate and whether it is in pps.
+pub fn parse_police_rate(text: &str) -> Result<(u64, bool), String> {
+    let bad = || format!("bad rate {text:?} (<bps>[k|m|g] or <n>pps)");
+    let lower = text.to_ascii_lowercase();
+    let (digits, unit) = split_unit(&lower);
+    let value: u64 = if digits.is_empty() {
+        return Err(bad());
+    } else {
+        digits.parse().map_err(|_| bad())?
+    };
+    let (rate, pps) = match unit {
+        "" => (value, false),
+        "k" => (value.checked_mul(1_000).ok_or_else(bad)?, false),
+        "m" => (value.checked_mul(1_000_000).ok_or_else(bad)?, false),
+        "g" => (value.checked_mul(1_000_000_000).ok_or_else(bad)?, false),
+        "pps" => (value, true),
+        _ => return Err(bad()),
+    };
+    if rate == 0 {
+        return Err(bad());
+    }
+    Ok((rate, pps))
+}
+
+/// An ACL policer burst: bytes with an optional `k`/`m`/`g` suffix
+/// (`256k` = 256,000 bytes) or packets with a `pkts` suffix. Returns
+/// the numeric burst and whether it is in packets.
+pub fn parse_police_burst(text: &str) -> Result<(u64, bool), String> {
+    let bad = || format!("bad burst {text:?} (<bytes>[k|m|g] or <n>pkts)");
+    let lower = text.to_ascii_lowercase();
+    let (digits, unit) = split_unit(&lower);
+    let value: u64 = if digits.is_empty() {
+        return Err(bad());
+    } else {
+        digits.parse().map_err(|_| bad())?
+    };
+    let (burst, pkts) = match unit {
+        "" => (value, false),
+        "k" => (value.checked_mul(1_000).ok_or_else(bad)?, false),
+        "m" => (value.checked_mul(1_000_000).ok_or_else(bad)?, false),
+        "g" => (value.checked_mul(1_000_000_000).ok_or_else(bad)?, false),
+        "pkts" => (value, true),
+        _ => return Err(bad()),
+    };
+    if burst == 0 {
+        return Err(bad());
+    }
+    Ok((burst, pkts))
+}
+
+/// A canonical rendering of a rate/burst pair back to the suffixed
+/// config/show form (`10000000,false` -> `10m`; `2000,true` -> `2000pps`).
+pub fn format_police_rate(rate: u64, pps: bool) -> String {
+    if pps {
+        return format!("{rate}pps");
+    }
+    format_scaled(rate)
+}
+
+/// The burst analog of [`format_police_rate`] (`pkts` suffix).
+pub fn format_police_burst(burst: u64, pkts: bool) -> String {
+    if pkts {
+        return format!("{burst}pkts");
+    }
+    format_scaled(burst)
+}
+
+fn format_scaled(value: u64) -> String {
+    for (factor, suffix) in [(1_000_000_000, "g"), (1_000_000, "m"), (1_000, "k")] {
+        if value >= factor && value % factor == 0 {
+            return format!("{}{suffix}", value / factor);
+        }
+    }
+    value.to_string()
+}
+
+fn split_unit(text: &str) -> (&str, &str) {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    (&text[..end], &text[end..])
+}
+
+/// A layer-4 port match: a single port (`443`) or an inclusive range
+/// (`67-68`, low < high). Canonical form is the input with any
+/// degenerate range collapsed — but degenerate/reversed ranges are
+/// errors, never rewritten.
+pub fn parse_port_match(text: &str) -> Result<(u16, u16), String> {
+    let bad = || format!("bad port {text:?} (<0-65535> or <a>-<b>)");
+    match text.split_once('-') {
+        None => {
+            let port: u16 = text.parse().map_err(|_| bad())?;
+            Ok((port, port))
+        }
+        Some((low, high)) => {
+            let low: u16 = low.parse().map_err(|_| bad())?;
+            let high: u16 = high.parse().map_err(|_| bad())?;
+            if low >= high {
+                return Err(format!("bad port range {text:?} (low must be < high)"));
+            }
+            Ok((low, high))
+        }
+    }
+}
+
 /// A storm-control percent level, canonicalized to two decimals
 /// (`10` -> `10.00`, `10.5` -> `10.50`); 0.00..=100.00.
 pub fn parse_storm_level(text: &str) -> Result<String, String> {
@@ -167,6 +281,53 @@ mod tests {
             "host bits set; did you mean 10.99.0.0/16?"
         );
         assert!(require_canonical_prefix("banana/8").is_err());
+    }
+
+    #[test]
+    fn parses_police_rates_and_bursts() {
+        assert_eq!(parse_police_rate("10m").unwrap(), (10_000_000, false));
+        assert_eq!(parse_police_rate("256k").unwrap(), (256_000, false));
+        assert_eq!(parse_police_rate("1g").unwrap(), (1_000_000_000, false));
+        assert_eq!(parse_police_rate("2000pps").unwrap(), (2000, true));
+        assert_eq!(parse_police_rate("512").unwrap(), (512, false));
+        assert!(parse_police_rate("0").is_err());
+        assert!(parse_police_rate("10x").is_err());
+        assert!(parse_police_rate("pps").is_err());
+        assert!(parse_police_rate("").is_err());
+
+        assert_eq!(parse_police_burst("256k").unwrap(), (256_000, false));
+        assert_eq!(parse_police_burst("64pkts").unwrap(), (64, true));
+        assert!(parse_police_burst("64pps").is_err());
+
+        // Round-trips through the canonical rendering.
+        assert_eq!(format_police_rate(10_000_000, false), "10m");
+        assert_eq!(format_police_rate(2000, true), "2000pps");
+        assert_eq!(format_police_burst(256_000, false), "256k");
+        assert_eq!(format_police_burst(64, true), "64pkts");
+        assert_eq!(format_police_rate(1500, false), "1500");
+    }
+
+    #[test]
+    fn parses_port_matches() {
+        assert_eq!(parse_port_match("443").unwrap(), (443, 443));
+        assert_eq!(parse_port_match("67-68").unwrap(), (67, 68));
+        assert!(parse_port_match("68-67").is_err());
+        assert!(parse_port_match("67-67").is_err());
+        assert!(parse_port_match("http").is_err());
+        assert!(parse_port_match("70000").is_err());
+    }
+
+    #[test]
+    fn parses_mac_masks() {
+        assert_eq!(
+            parse_mac_mask("FF:FF:FF:00:00:00").unwrap(),
+            "ff:ff:ff:00:00:00"
+        );
+        assert_eq!(
+            parse_mac_mask("ffff.ff00.0000").unwrap(),
+            "ff:ff:ff:00:00:00"
+        );
+        assert!(parse_mac_mask("ff:ff").is_err());
     }
 
     #[test]
