@@ -1,0 +1,18 @@
+{
+  "qos_wred": {
+    "buffer_kb": 4096,
+    "profiles": [
+      {
+        "drop_probability": 10,
+        "ecn": true,
+        "max_threshold": 256,
+        "min_threshold": 64,
+        "name": "BULK",
+        "references": [
+          "Et1 (q3)"
+        ]
+      }
+    ],
+    "supported": true
+  }
+}

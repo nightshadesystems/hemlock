@@ -1,0 +1,15 @@
+Ethernet1:
+  Trust mode     : dscp
+  Default TC     : 1
+  Port shaper    : none
+
+  Queue  Mode    Weight  Shaper     WRED     ECN
+  -----  ------  ------  ---------  -------  ---
+  7      strict  -       -          -        -
+  6      dwrr    1       -          -        -
+  5      dwrr    40      100 Mbps   -        -
+  4      dwrr    1       -          -        -
+  3      dwrr    30      -          BULK     yes
+  2      dwrr    1       -          -        -
+  1      dwrr    1       -          -        -
+  0      dwrr    1       -          -        -

@@ -14,6 +14,7 @@ mod interfaces;
 mod motd;
 mod pager;
 mod platform;
+mod qos;
 mod routing;
 mod security;
 mod show;

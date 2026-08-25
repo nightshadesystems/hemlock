@@ -113,7 +113,11 @@ pub fn et1() -> Interface {
             queue: "UC3".into(),
             pkts: 12_341_123,
             bytes: 9_812_734_412_334,
-            ..QueueCounters::default()
+            // The WRED-profiled queue: drops and ECN marks land here.
+            dropped_pkts: 1204,
+            dropped_bytes: 1_812_664,
+            wred_dropped: 1187,
+            ecn_marked: 3320,
         },
         QueueCounters {
             queue: "UC4".into(),
@@ -135,6 +139,7 @@ pub fn et1() -> Interface {
             bytes: 88_123_449_812,
             dropped_pkts: 2,
             dropped_bytes: 3028,
+            ..QueueCounters::default()
         },
         QueueCounters {
             queue: "MC0".into(),

@@ -184,6 +184,8 @@ fn random_interface(rng: &mut Rng) -> Interface {
             bytes: rng.u64(),
             dropped_pkts: rng.u64(),
             dropped_bytes: rng.u64(),
+            wred_dropped: rng.u64(),
+            ecn_marked: rng.u64(),
         }];
     }
     i.bins = opt!(

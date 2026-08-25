@@ -1,0 +1,6 @@
+Port   Trust      Def-TC  Strict Qs  Shaper     WRED Qs
+-----  ---------  ------  ---------  ---------  -------
+Et1    dscp       1       7          -          3
+Et2    untrusted  0       -          -          -
+Po1    dscp       0       -          800 Mbps   -
+... 49 ports with default QoS configuration

@@ -203,6 +203,8 @@ fn convert(state: &pb::InterfaceState, platform_model: &str) -> Option<Interface
             bytes: q.bytes,
             dropped_pkts: q.dropped_pkts,
             dropped_bytes: q.dropped_bytes,
+            wred_dropped: q.wred_dropped_pkts,
+            ecn_marked: q.ecn_marked_pkts,
         })
         .collect();
     i.bins = state.bins.as_ref().map(|b| {

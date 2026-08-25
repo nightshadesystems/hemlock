@@ -234,6 +234,10 @@ pub struct QueueCounters {
     pub bytes: u64,
     pub dropped_pkts: u64,
     pub dropped_bytes: u64,
+    /// WRED drops and ECN marks on the queue. Render as 0 where the
+    /// platform's stat probe says it does not serve them.
+    pub wred_dropped: u64,
+    pub ecn_marked: u64,
 }
 
 /// RMON frame-size distribution (`show interfaces counters bins`). The

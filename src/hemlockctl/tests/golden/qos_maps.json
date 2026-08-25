@@ -1,0 +1,78 @@
+{
+  "qos_maps": {
+    "tables": [
+      {
+        "default_note": "0",
+        "entries": [
+          {
+            "key": 8,
+            "value": 1
+          },
+          {
+            "key": 26,
+            "value": 3
+          },
+          {
+            "key": 46,
+            "value": 5
+          }
+        ],
+        "key_label": "DSCP",
+        "table": "dscp-to-tc",
+        "title": "DSCP to Traffic-Class map",
+        "value_label": "TC"
+      },
+      {
+        "default_note": "0",
+        "entries": [
+          {
+            "key": 3,
+            "value": 3
+          },
+          {
+            "key": 5,
+            "value": 5
+          }
+        ],
+        "key_label": "CoS",
+        "table": "cos-to-tc",
+        "title": "CoS to Traffic-Class map",
+        "value_label": "TC"
+      },
+      {
+        "default_note": "no rewrite",
+        "entries": [
+          {
+            "key": 3,
+            "value": 26
+          },
+          {
+            "key": 5,
+            "value": 46
+          }
+        ],
+        "key_label": "TC",
+        "table": "tc-to-dscp",
+        "title": "Traffic-Class to DSCP rewrite map",
+        "value_label": "DSCP"
+      },
+      {
+        "default_note": "no rewrite",
+        "entries": [
+          {
+            "key": 3,
+            "value": 3
+          },
+          {
+            "key": 5,
+            "value": 5
+          }
+        ],
+        "key_label": "TC",
+        "table": "tc-to-cos",
+        "title": "Traffic-Class to CoS rewrite map",
+        "value_label": "CoS"
+      }
+    ]
+  }
+}

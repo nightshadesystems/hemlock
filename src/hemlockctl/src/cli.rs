@@ -410,6 +410,10 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show dot1x [interface <port>]          802.1X port authentication");
             println!("  show dhcp snooping [binding|statistics]  DHCP snooping state");
             println!("  show arp inspection [statistics]       dynamic ARP inspection");
+            println!("  show qos maps                          global DSCP/CoS/TC maps");
+            println!("  show qos wred                          WRED/ECN profiles");
+            println!("  show qos interface <port>              one port's classification + queues");
+            println!("  show qos interfaces                    per-port QoS summary");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -513,8 +517,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "port-security",
         "dot1x",
         "dhcp",
+        "qos",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -591,6 +596,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             }
             "dot1x" => crate::security::cmd::show_dot1x(&endpoints.orch, &words[1..]).await,
             "dhcp" => crate::security::cmd::show_dhcp(&endpoints.orch, &words[1..]).await,
+            "qos" => crate::qos::cmd::show(&endpoints.syncd, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {

@@ -1,0 +1,395 @@
+{
+  "qos_interfaces": {
+    "default_ports": 49,
+    "ports": [
+      {
+        "configured": true,
+        "default_tc": 1,
+        "port": "Ethernet1",
+        "queues": [
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 0,
+            "tx_bytes": 23310021,
+            "tx_packets": 182231,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 1,
+            "tx_bytes": 1288812,
+            "tx_packets": 9912,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 2,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 1204,
+            "ecn": true,
+            "ecn_marked": 3320,
+            "mode": "dwrr",
+            "queue": 3,
+            "tx_bytes": 101233911,
+            "tx_packets": 88123,
+            "weight": 30,
+            "wred_dropped": 1187,
+            "wred_profile": "BULK"
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 4,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 5,
+            "shaper": "100 Mbps",
+            "tx_bytes": 530122831,
+            "tx_packets": 421900,
+            "weight": 40,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 6,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "strict",
+            "queue": 7,
+            "tx_bytes": 8812231,
+            "tx_packets": 77812,
+            "wred_dropped": 0
+          }
+        ],
+        "trust": "dscp"
+      },
+      {
+        "configured": true,
+        "default_tc": 0,
+        "port": "Ethernet2",
+        "queues": [
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 1,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 2,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 3,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 4,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 5,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 6,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 7,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          }
+        ],
+        "trust": "untrusted"
+      },
+      {
+        "configured": true,
+        "default_tc": 0,
+        "port": "Ethernet49",
+        "queues": [
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 1,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 2,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 3,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 4,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 5,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 6,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 7,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          }
+        ],
+        "shaper": "800 Mbps",
+        "trust": "dscp",
+        "via_port_channel": "Port-Channel1"
+      },
+      {
+        "configured": true,
+        "default_tc": 0,
+        "port": "Port-Channel1",
+        "queues": [
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 1,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 2,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 3,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 4,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 5,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 6,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          },
+          {
+            "dropped": 0,
+            "ecn": false,
+            "ecn_marked": 0,
+            "mode": "dwrr",
+            "queue": 7,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "weight": 1,
+            "wred_dropped": 0
+          }
+        ],
+        "shaper": "800 Mbps",
+        "trust": "dscp"
+      }
+    ]
+  }
+}

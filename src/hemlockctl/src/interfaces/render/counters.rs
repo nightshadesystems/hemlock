@@ -182,13 +182,15 @@ pub fn rates(interfaces: &[Interface]) -> String {
 
 /// `show interfaces counters queue` — one row per egress queue per port.
 pub fn queues(interfaces: &[Interface]) -> String {
-    const COLS: [Col; 6] = [
+    const COLS: [Col; 8] = [
         Col::left(10),
         Col::left(3),
         Col::right(16),
         Col::right(21),
         Col::right(18),
         Col::right(18),
+        Col::right(14),
+        Col::right(14),
     ];
     let mut out = Text::new();
     out.row(
@@ -200,6 +202,8 @@ pub fn queues(interfaces: &[Interface]) -> String {
             "Counter/bytes",
             "Dropped/pkts",
             "Dropped/bytes",
+            "WRED/drops",
+            "ECN/marked",
         ],
     );
     for i in super::sorted_tabular(interfaces) {
@@ -213,6 +217,8 @@ pub fn queues(interfaces: &[Interface]) -> String {
                     &q.bytes.to_string(),
                     &q.dropped_pkts.to_string(),
                     &q.dropped_bytes.to_string(),
+                    &q.wred_dropped.to_string(),
+                    &q.ecn_marked.to_string(),
                 ],
             );
         }
