@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 
-use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState};
+use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState, SnmpCommunity, SnmpState};
 
 async fn orch_client(
     orch: &IpcEndpoint,
@@ -93,5 +93,36 @@ pub async fn ntp_state(orch: &IpcEndpoint) -> Result<NtpState> {
         delay_usecs: response.delay_usecs,
         jitter_usecs: response.jitter_usecs,
         last_sync_secs_ago: response.last_sync_secs_ago,
+    })
+}
+
+/// The SNMP agent's settings and the subagent's request counters.
+pub async fn snmp_state(orch: &IpcEndpoint) -> Result<SnmpState> {
+    let response = orch_client(orch)
+        .await?
+        .get_snmp_state(pb::GetSnmpStateRequest {})
+        .await?
+        .into_inner();
+    Ok(SnmpState {
+        enabled: response.enabled,
+        agentx_connected: response.connected,
+        listen_interface: response.listen_interface,
+        listen_address: response.listen_address,
+        location: response.location,
+        contact: response.contact,
+        communities: response
+            .communities
+            .into_iter()
+            .map(|community| SnmpCommunity {
+                name: community.name,
+                source: (!community.source.is_empty()).then_some(community.source),
+            })
+            .collect(),
+        users: response.users,
+        packets_in: response.packets_in,
+        packets_out: response.packets_out,
+        get_requests: response.get_requests,
+        getnext_requests: response.getnext_requests,
+        errors: response.errors,
     })
 }

@@ -2,7 +2,7 @@
 
 use crate::interfaces::table::{pad, Col, Text};
 
-use super::model::{LldpState, NtpState};
+use super::model::{LldpState, NtpState, SnmpState};
 
 /// The abbreviated interface form for tabular output
 /// ("Ethernet1" -> "Et1").
@@ -250,5 +250,66 @@ pub fn ntp(state: &NtpState) -> String {
         Some(secs) => out.line(format!("  Last sync: {} ago", age(secs))),
         None => out.line("  Last sync: unknown"),
     }
+    out.finish()
+}
+
+// ------------------------------------------------- SNMP
+
+/// `show snmp` — the agent's settings and its request counters.
+pub fn snmp(state: &SnmpState) -> String {
+    let mut out = Text::new();
+    if !state.enabled {
+        out.line("SNMP is not configured");
+        return out.finish();
+    }
+    out.line(format!(
+        "SNMP agent is enabled on {} (UDP 161)",
+        state.listen_interface
+    ));
+    out.line(format!("Location : {}", state.location));
+    out.line(format!("Contact  : {}", state.contact));
+    out.blank();
+    let communities: Vec<String> = state
+        .communities
+        .iter()
+        .map(|community| match &community.source {
+            Some(source) => format!("{} (source {source})", community.name),
+            None => community.name.clone(),
+        })
+        .collect();
+    out.line(format!(
+        "Communities (read-only): {}",
+        if communities.is_empty() {
+            "none".to_string()
+        } else {
+            communities.join(", ")
+        }
+    ));
+    out.line(format!(
+        "USM users  (read-only): {}",
+        if state.users.is_empty() {
+            "none".to_string()
+        } else {
+            state
+                .users
+                .iter()
+                .map(|user| format!("{user} (auth SHA, priv AES)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    // The IF-MIB only answers while the subagent holds its session, so
+    // say when it does not rather than letting a poller find gaps.
+    if !state.agentx_connected {
+        out.blank();
+        out.line("The AgentX subagent is not connected; interface MIBs are unavailable.");
+    }
+    out.blank();
+    out.line(format!("Packets in  : {}", state.packets_in));
+    out.line(format!("Packets out : {}", state.packets_out));
+    out.line(format!(
+        "Get requests: {}   GetNext/Bulk: {}   Errors: {}",
+        state.get_requests, state.getnext_requests, state.errors
+    ));
     out.finish()
 }

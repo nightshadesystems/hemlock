@@ -421,6 +421,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show qos interfaces                    per-port QoS summary");
             println!("  show lldp [neighbors [detail]]         LLDP settings and neighbors");
             println!("  show ntp                               NTP client servers and sync");
+            println!("  show snmp                              SNMP agent settings and counters");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -528,8 +529,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "qos",
         "lldp",
         "ntp",
+        "snmp",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -609,6 +611,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "qos" => crate::qos::cmd::show(&endpoints.syncd, &words[1..]).await,
             "lldp" => crate::services::cmd::show_lldp(&endpoints.orch, &words[1..]).await,
             "ntp" => crate::services::cmd::show_ntp(&endpoints.orch, &words[1..]).await,
+            "snmp" => crate::services::cmd::show_snmp(&endpoints.orch, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -793,6 +796,9 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  delete security [acl|copp|dot1x|dhcp-snooping|arp-inspection ...]");
             println!("  delete services [lldp [disable|tx-interval|hold-multiplier]]");
             println!("                  [ntp [server [<host>]]]");
+            println!(
+                "                  [snmp [community [<name>]|location|contact|user [<name>]]]"
+            );
             println!("  delete qos [map [<table> [<key> <value>]] | wred-profile <name> [...]]");
             println!("  show                      show the candidate configuration");
             println!(
@@ -4986,15 +4992,16 @@ async fn config_services(
         .map_err(fmt_err);
     }
     let Some(first) = words.first() else {
-        return Err(format!("% Usage: {verb} services <lldp|ntp> ..."));
+        return Err(format!("% Usage: {verb} services <lldp|ntp|snmp> ..."));
     };
     // Deferred by this suite, rejected at parse rather than ignored.
     if resolve(first, &["ptp"]).is_ok() {
         return Err("% PTP/1588 is not supported".into());
     }
-    match resolve(first, &["lldp", "ntp"])? {
+    match resolve(first, &["lldp", "ntp", "snmp"])? {
         "lldp" => config_lldp(endpoints, &words[1..], delete).await,
         "ntp" => config_ntp(endpoints, &words[1..], delete).await,
+        "snmp" => config_snmp(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
 }
@@ -5186,6 +5193,219 @@ async fn config_ntp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Resu
     })
     .await
     .map_err(fmt_err)
+}
+
+/// SNMP community and USM user names — checked at the prompt for
+/// immediate feedback; mgmtd re-validates.
+fn valid_snmp_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The shortest v3 passphrase USM accepts.
+const MIN_SNMP_PASSWORD: usize = 8;
+
+/// `set|delete services snmp [community <name> [source <prefix>] |
+/// location <text> | contact <text> |
+/// user <name> auth sha <pass> priv aes <pass>]`.
+async fn config_snmp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} services snmp [community <name> [source <prefix>] | location <text> | contact <text> | user <name> auth sha <pass> priv aes <pass>]"
+        )
+    };
+    let edit_snmp = |edit: BlockEdit| async move {
+        edit_config(endpoints, move |tree| {
+            let services = tree.block_mut("services");
+            let block = ConfigTree::ensure_block(services, "snmp", &[]);
+            edit(block);
+        })
+        .await
+        .map_err(fmt_err)
+    };
+    let delete_in_snmp = |edit: BlockEdit| async move {
+        edit_config(endpoints, move |tree| {
+            let services = tree.block_mut("services");
+            if let Some(block) = block_children_mut(services, "snmp") {
+                edit(block);
+                if block.is_empty() {
+                    ConfigTree::remove_block(services, "snmp", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "services");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if words.is_empty() {
+        return if delete {
+            // `delete services snmp` removes the whole agent, including
+            // the empty block that would otherwise keep it running.
+            edit_config(endpoints, |tree| {
+                let services = tree.block_mut("services");
+                ConfigTree::remove_block(services, "snmp", &[]);
+                remove_block_if_empty(tree, "services");
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            // A bare `set services snmp` creates the (empty) block, so
+            // the agent starts with nothing to answer yet.
+            edit_snmp(Box::new(|_| {})).await
+        };
+    }
+    // Deferred by this suite, named rather than silently dropped.
+    for (word, message) in [
+        ("trap", "% SNMP traps and informs are not supported"),
+        ("trap2sink", "% SNMP traps and informs are not supported"),
+        ("informs", "% SNMP traps and informs are not supported"),
+        ("rwcommunity", "% SNMP write access is not supported"),
+        ("rwuser", "% SNMP write access is not supported"),
+    ] {
+        if words[0] == word {
+            return Err(message.into());
+        }
+    }
+    match resolve(words[0], &["community", "location", "contact", "user"])? {
+        "community" => {
+            let Some(name) = words.get(1) else {
+                return if delete {
+                    delete_in_snmp(Box::new(|block| {
+                        ConfigTree::remove_leaf(block, "community")
+                    }))
+                    .await
+                } else {
+                    Err(usage())
+                };
+            };
+            if !valid_snmp_name(name) {
+                return Err(format!("% bad community name {name:?}"));
+            }
+            let name = (*name).to_string();
+            if delete {
+                if words.len() > 2 {
+                    return Err(format!("% Invalid input: {:?}", words[2]));
+                }
+                return delete_in_snmp(Box::new(move |block| {
+                    remove_leaf_matching(block, "community", &[&name]);
+                }))
+                .await;
+            }
+            let mut values = vec![name.clone()];
+            match words.get(2) {
+                None => {}
+                Some(keyword) => {
+                    resolve(keyword, &["source"])?;
+                    let Some(prefix) = words.get(3) else {
+                        return Err(format!(
+                            "% Usage: set services snmp community {name} source <prefix>"
+                        ));
+                    };
+                    if words.len() > 4 {
+                        return Err(format!("% Invalid input: {:?}", words[4]));
+                    }
+                    let prefix = hemlock_common::net::canonical_prefix(prefix)
+                        .map_err(|e| format!("% {e}"))?;
+                    values.push("source".into());
+                    values.push(prefix);
+                }
+            }
+            edit_snmp(Box::new(move |block| {
+                remove_leaf_matching(block, "community", &[&name]);
+                push_leaf(block, "community", values);
+            }))
+            .await
+        }
+        leaf @ ("location" | "contact") => {
+            let name = leaf.to_string();
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                return delete_in_snmp(Box::new(move |block| {
+                    ConfigTree::remove_leaf(block, &name);
+                }))
+                .await;
+            }
+            let text = words[1..].join(" ");
+            if text.is_empty() {
+                return Err(format!("% Usage: set services snmp {leaf} <text>"));
+            }
+            edit_snmp(Box::new(move |block| {
+                ConfigTree::set_leaf(block, &name, vec![text]);
+            }))
+            .await
+        }
+        "user" => {
+            let Some(name) = words.get(1) else {
+                return if delete {
+                    delete_in_snmp(Box::new(|block| ConfigTree::remove_leaf(block, "user"))).await
+                } else {
+                    Err(usage())
+                };
+            };
+            if !valid_snmp_name(name) {
+                return Err(format!("% bad user name {name:?}"));
+            }
+            let name = (*name).to_string();
+            if delete {
+                if words.len() > 2 {
+                    return Err(format!("% Invalid input: {:?}", words[2]));
+                }
+                return delete_in_snmp(Box::new(move |block| {
+                    remove_leaf_matching(block, "user", &[&name]);
+                }))
+                .await;
+            }
+            let [auth_keyword, auth_protocol, auth_password, priv_keyword, priv_protocol, priv_password] =
+                words[2..]
+            else {
+                return Err(format!(
+                    "% Usage: set services snmp user {name} auth sha <pass> priv aes <pass>"
+                ));
+            };
+            resolve(auth_keyword, &["auth"])?;
+            resolve(priv_keyword, &["priv"])?;
+            // Read-only authPriv with fixed protocols: a weaker one is
+            // refused rather than silently swapped for something else.
+            if resolve(auth_protocol, &["sha"]).is_err() {
+                return Err(format!(
+                    "% auth protocol {auth_protocol:?} is not supported (sha only)"
+                ));
+            }
+            if resolve(priv_protocol, &["aes"]).is_err() {
+                return Err(format!(
+                    "% priv protocol {priv_protocol:?} is not supported (aes only)"
+                ));
+            }
+            for password in [auth_password, priv_password] {
+                if password.len() < MIN_SNMP_PASSWORD {
+                    return Err(format!(
+                        "% snmp passwords must be at least {MIN_SNMP_PASSWORD} characters"
+                    ));
+                }
+            }
+            let values = vec![
+                name.clone(),
+                "auth".into(),
+                "sha".into(),
+                auth_password.to_string(),
+                "priv".into(),
+                "aes".into(),
+                priv_password.to_string(),
+            ];
+            edit_snmp(Box::new(move |block| {
+                remove_leaf_matching(block, "user", &[&name]);
+                push_leaf(block, "user", values);
+            }))
+            .await
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// `set|delete switching <mac-table|mirror> ...`.

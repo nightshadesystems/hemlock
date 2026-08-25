@@ -65,6 +65,7 @@ const SIDE_NAV = {
     items: [
       { id: '/services/lldp/', label: 'LLDP', icon: 'nodes' },
       { id: '/services/ntp/', label: 'NTP', icon: 'clock' },
+      { id: '/services/snmp/', label: 'SNMP', icon: 'bell' },
     ],
   },
   '/system': {

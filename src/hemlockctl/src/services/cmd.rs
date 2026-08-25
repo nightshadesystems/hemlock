@@ -1,5 +1,5 @@
 //! Parsing and dispatch for the services-suite operational commands:
-//! `show lldp [neighbors [detail]]`, `show ntp`, and
+//! `show lldp [neighbors [detail]]`, `show ntp`, `show snmp`, and
 //! `clear lldp counters`.
 
 use hemlock_common::ipc::IpcEndpoint;
@@ -90,5 +90,24 @@ pub async fn show_ntp(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
         return page_json("ntp", &state);
     }
     crate::pager::page(&render::ntp(&state));
+    Ok(())
+}
+
+/// `show snmp [| json]`.
+pub async fn show_snmp(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    // Deferred by this suite.
+    if let Some(first) = words.first() {
+        if resolve(first, &["trap", "traps", "informs"]).is_ok() {
+            return Err("% SNMP traps and informs are not supported".into());
+        }
+    }
+    no_more(&words)?;
+    let state = fetch::snmp_state(orch).await.map_err(fmt_err)?;
+    if json {
+        return page_json("snmp", &state);
+    }
+    crate::pager::page(&render::snmp(&state));
     Ok(())
 }

@@ -100,6 +100,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/qos/ports/edit", post(qos_ports_edit))
         .route("/api/lldp", get(lldp))
         .route("/api/lldp/edit", post(lldp_edit))
+        .route("/api/snmp", get(snmp))
+        .route("/api/snmp/edit", post(snmp_edit))
         .route("/api/ntp", get(ntp))
         .route("/api/ntp/edit", post(ntp_edit))
         .route("/api/system", get(system))
@@ -961,6 +963,49 @@ async fn lldp_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::services_edit::apply_lldp_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/snmp` — orch's SNMP view: agent settings plus the AgentX
+/// subagent's request counters.
+async fn snmp(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .get_snmp_state(pb::GetSnmpStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "enabled": response.enabled,
+        "agentx_connected": response.connected,
+        "listen_interface": response.listen_interface,
+        "listen_address": response.listen_address,
+        "location": response.location,
+        "contact": response.contact,
+        "communities": response.communities.iter().map(|community| json!({
+            "name": community.name,
+            "source": community.source,
+        })).collect::<Vec<_>>(),
+        "users": response.users,
+        "packets_in": response.packets_in,
+        "packets_out": response.packets_out,
+        "get_requests": response.get_requests,
+        "getnext_requests": response.getnext_requests,
+        "errors": response.errors,
+    })))
+}
+
+async fn snmp_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::services_edit::SnmpEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::services_edit::apply_snmp_edit(tree, &edit)
     })
     .await
 }

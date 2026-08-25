@@ -1,7 +1,7 @@
 //! Test fixtures behind the services-suite golden outputs: the state
 //! the spec's seed configuration produces on a 52-port E1031.
 
-use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState};
+use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState, SnmpCommunity, SnmpState};
 
 fn neighbor(
     port: &str,
@@ -113,5 +113,35 @@ pub fn ntp_state() -> NtpState {
         delay_usecs: 1204,
         jitter_usecs: 88,
         last_sync_secs_ago: Some(4 * 60 + 12),
+    }
+}
+
+/// The SNMP state the seed produces: two communities (one scoped to
+/// the management subnet), one v3 user, and a poller's worth of
+/// requests already served.
+pub fn snmp_state() -> SnmpState {
+    SnmpState {
+        enabled: true,
+        agentx_connected: true,
+        listen_interface: "Management1".into(),
+        listen_address: "10.42.0.9".into(),
+        location: "rack 4, closet B".into(),
+        contact: "cody@nightshade.systems".into(),
+        communities: vec![
+            SnmpCommunity {
+                name: "public".into(),
+                source: None,
+            },
+            SnmpCommunity {
+                name: "netops".into(),
+                source: Some("10.42.0.0/16".into()),
+            },
+        ],
+        users: vec!["monitor".into()],
+        packets_in: 88_123,
+        packets_out: 88_123,
+        get_requests: 71_022,
+        getnext_requests: 17_101,
+        errors: 0,
     }
 }

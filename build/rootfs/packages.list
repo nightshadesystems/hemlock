@@ -26,6 +26,12 @@ frr-pythontools
 # is the RADIUS client). Unlike FRR, orch owns it end to end: it renders
 # the config, manages the process, and watches the control socket.
 hostapd
+# The SNMP agent. mgmtd renders /etc/snmp/snmpd.conf from the config and
+# starts snmpd only when `services { snmp }` exists; snmpd keeps
+# transport, auth and the system group, while orch's AgentX subagent
+# registers the IF-MIB (kernel netdev counters on the hostifs would not
+# reflect hardware forwarding).
+snmpd
 ethtool
 iputils-ping
 # setcap for ping's cap_net_raw (see the operator-account section)

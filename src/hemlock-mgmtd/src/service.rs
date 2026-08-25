@@ -20,6 +20,7 @@ pub struct Engine {
     orch: IpcEndpoint,
     os: OsApplier,
     frr: crate::frrapply::FrrApplier,
+    snmp: crate::snmpapply::SnmpApplier,
     commit_seq: u64,
     /// Pending commit-confirm: the pre-commit running text to restore if no
     /// confirmation arrives, plus a cancel handle for the timer task.
@@ -40,6 +41,7 @@ impl Engine {
             orch,
             os,
             frr: crate::frrapply::FrrApplier::new(),
+            snmp: crate::snmpapply::SnmpApplier::new(),
             commit_seq: 0,
             pending_confirm: None,
         }
@@ -615,6 +617,19 @@ impl Engine {
                 .context("pushing STP config to orch")?;
         }
 
+        // SNMP: mgmtd renders snmpd.conf below (with the OS pass) and
+        // pushes the same state to orch, whose AgentX subagent serves
+        // the IF-MIB on the socket the render names.
+        let snmp_change = (running_intents.snmp != wanted_intents.snmp
+            || crate::intents::management_address(&running_intents)
+                != crate::intents::management_address(&wanted_intents))
+        .then(|| wanted_intents.clone());
+        if let Some(wanted) = &snmp_change {
+            self.push_snmp_config(wanted)
+                .await
+                .context("pushing snmp config to orch")?;
+        }
+
         // LLDP: the whole wanted state to the orch engine, which owns
         // the advertisement timers and the neighbor table.
         let lldp_change = intents::diff_lldp(&running_intents, &wanted_intents);
@@ -682,6 +697,14 @@ impl Engine {
             self.frr.apply(&wanted_intents);
         }
 
+        // snmpd rides the same render-diff gate: an unrelated commit
+        // leaves the agent (and every established v3 session) alone.
+        let snmpd_changed = crate::snmpapply::render_snmpd(&running_intents)
+            != crate::snmpapply::render_snmpd(&wanted_intents);
+        if snmpd_changed {
+            self.snmp.apply(&wanted_intents);
+        }
+
         self.store.commit(
             new_text,
             &RollbackMeta {
@@ -710,6 +733,9 @@ impl Engine {
         }
         if lldp_change.is_some() {
             described.push("lldp configuration updated".into());
+        }
+        if snmp_change.is_some() {
+            described.push("snmp configuration updated".into());
         }
         described.extend(mac_changes.describe());
         described.extend(storm_changes.iter().map(intents::StormChange::describe));
@@ -857,6 +883,35 @@ impl Engine {
             })
             .await
             .context("SetSnoopingConfig")?;
+        Ok(())
+    }
+
+    /// Push the whole wanted SNMP state to orch (which runs the AgentX
+    /// subagent). Passphrases stay in mgmtd's snmpd.conf render: orch
+    /// never needs them, so they never cross the wire.
+    async fn push_snmp_config(&self, wanted: &Intents) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_snmp_config(pb::SetSnmpConfigRequest {
+                enabled: wanted.snmp.enabled,
+                socket: crate::snmpapply::AGENTX_SOCKET.to_string(),
+                location: wanted.snmp.location.clone().unwrap_or_default(),
+                contact: wanted.snmp.contact.clone().unwrap_or_default(),
+                communities: wanted
+                    .snmp
+                    .communities
+                    .iter()
+                    .map(|community| pb::SnmpCommunityConfig {
+                        name: community.name.clone(),
+                        source: community.source.clone().unwrap_or_default(),
+                    })
+                    .collect(),
+                users: wanted.snmp.users.keys().cloned().collect(),
+                listen_interface: crate::intents::management_name(wanted).unwrap_or_default(),
+                listen_address: crate::intents::management_address(wanted).unwrap_or_default(),
+            })
+            .await
+            .context("SetSnmpConfig")?;
         Ok(())
     }
 
@@ -1260,6 +1315,7 @@ fn needs_syncd_replay(running: &Intents) -> bool {
         // The services families are orch-owned and can be entirely
         // global (LLDP timers touch no interface at all).
         || intents::lldp_state(running) != intents::LldpState::default()
+        || running.snmp != intents::SnmpIntent::default()
 }
 
 fn qos_maps_request(maps: &intents::QosMapsIntent) -> pb::SetQosMapsRequest {
@@ -1439,6 +1495,15 @@ impl Engine {
             applied += 1;
         }
 
+        // SNMP replays to orch whenever it is configured, so the
+        // subagent reopens its AgentX session after a restart.
+        if running.snmp != intents::SnmpIntent::default() {
+            self.push_snmp_config(&running)
+                .await
+                .context("replaying snmp config to orch")?;
+            applied += 1;
+        }
+
         // LLDP replays to orch whenever the running config says
         // anything about it (an all-defaults config needs no push:
         // that is what the engine already runs).
@@ -1601,6 +1666,7 @@ impl Engine {
         let running = Self::parse_intents(&self.store.running()?)?;
         self.os.replay(&running);
         self.frr.apply(&running);
+        self.snmp.apply(&running);
         Ok(())
     }
 }
@@ -1883,6 +1949,8 @@ queue 7 { priority strict } } }
 ",
             "  Ethernet10 { dot1x }
 ",
+            "  Management1 { address 10.42.0.9/24 }
+",
             "}
 ",
             "security {
@@ -1899,7 +1967,8 @@ queue 7 { priority strict } } }
 ",
             "qos { map { dscp-to-tc { dscp 46 tc 5 } } }
 ",
-            "services { lldp { tx-interval 15 } }
+            "services { lldp { tx-interval 15 }
+snmp { community public } }
 ",
         );
         let running = intents_of(text);
@@ -1920,6 +1989,7 @@ queue 7 { priority strict } } }
         assert_ne!(running.qos_maps, intents::QosMapsIntent::default());
         assert!(!intents::port_qos_state(&running).is_empty());
         assert_ne!(intents::lldp_state(&running), intents::LldpState::default());
+        assert_ne!(running.snmp, intents::SnmpIntent::default());
     }
 
     /// LLDP is orch-owned and entirely global-capable, so it gates the
@@ -1932,6 +2002,10 @@ queue 7 { priority strict } } }
         )));
         assert!(needs_syncd_replay(&intents_of(
             "interfaces { Ethernet3 { lldp disable } }"
+        )));
+        assert!(needs_syncd_replay(&intents_of(
+            "interfaces { Management1 { address 10.42.0.9/24 } }
+services { snmp { community public } }"
         )));
     }
 }

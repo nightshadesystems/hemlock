@@ -1,0 +1,27 @@
+{
+  "snmp": {
+    "agentx_connected": true,
+    "communities": [
+      {
+        "name": "public"
+      },
+      {
+        "name": "netops",
+        "source": "10.42.0.0/16"
+      }
+    ],
+    "contact": "cody@nightshade.systems",
+    "enabled": true,
+    "errors": 0,
+    "get_requests": 71022,
+    "getnext_requests": 17101,
+    "listen_address": "10.42.0.9",
+    "listen_interface": "Management1",
+    "location": "rack 4, closet B",
+    "packets_in": 88123,
+    "packets_out": 88123,
+    "users": [
+      "monitor"
+    ]
+  }
+}

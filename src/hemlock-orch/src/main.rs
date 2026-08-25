@@ -8,12 +8,14 @@
 //! raw sockets on those netdevs directly rather than proxying packets
 //! over gRPC.
 
+mod agentx;
 mod dot1x;
 mod frrshow;
 mod lacp;
 mod lldp;
 mod ntpshow;
 mod rib;
+mod snmpsub;
 mod snoop;
 mod snoopsec;
 mod stp;
@@ -45,6 +47,7 @@ struct OrchService {
     engine: lacp::Engine,
     stp: stp::Engine,
     lldp: lldp::Engine,
+    snmp: snmpsub::Engine,
     igmp: snoop::Engine,
     mld: snoop::Engine,
     rib: rib::Engine,
@@ -235,6 +238,55 @@ impl Orch for OrchService {
     ) -> Result<Response<pb::ClearLldpCountersResponse>, Status> {
         let cleared = self.lldp.clear_counters(&request.into_inner().port);
         Ok(Response::new(pb::ClearLldpCountersResponse { cleared }))
+    }
+
+    async fn set_snmp_config(
+        &self,
+        request: Request<pb::SetSnmpConfigRequest>,
+    ) -> Result<Response<pb::SetSnmpConfigResponse>, Status> {
+        let req = request.into_inner();
+        self.snmp.set_config(snmpsub::Config {
+            enabled: req.enabled,
+            socket: req.socket,
+            location: req.location,
+            contact: req.contact,
+            communities: req
+                .communities
+                .into_iter()
+                .map(|community| (community.name, community.source))
+                .collect(),
+            users: req.users,
+            listen_interface: req.listen_interface,
+            listen_address: req.listen_address,
+        });
+        Ok(Response::new(pb::SetSnmpConfigResponse {}))
+    }
+
+    async fn get_snmp_state(
+        &self,
+        _request: Request<pb::GetSnmpStateRequest>,
+    ) -> Result<Response<pb::GetSnmpStateResponse>, Status> {
+        let snapshot = self.snmp.snapshot();
+        Ok(Response::new(pb::GetSnmpStateResponse {
+            enabled: snapshot.config.enabled,
+            connected: snapshot.connected,
+            listen_interface: snapshot.config.listen_interface,
+            listen_address: snapshot.config.listen_address,
+            location: snapshot.config.location,
+            contact: snapshot.config.contact,
+            communities: snapshot
+                .config
+                .communities
+                .into_iter()
+                .map(|(name, source)| pb::SnmpCommunityConfig { name, source })
+                .collect(),
+            users: snapshot.config.users,
+            packets_in: snapshot.packets_in,
+            packets_out: snapshot.packets_out,
+            get_requests: snapshot.get_requests,
+            getnext_requests: snapshot.getnext_requests,
+            errors: snapshot.errors,
+        }))
     }
 
     async fn get_ntp_state(
@@ -854,6 +906,7 @@ async fn main() -> Result<()> {
         states,
         errdisable,
     } = stp_io;
+    let snmp_engine = snmpsub::Engine::new();
     let (lldp_engine, lldp_io) = lldp::Engine::spawn(system_mac);
     let lldp::EngineIo {
         links: lldp_links,
@@ -926,6 +979,11 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     tokio::spawn(rib::run_feed(rib_engine.clone()));
 
+    // The AgentX subagent: it keeps a session with snmpd's master and
+    // answers the IF-MIB from syncd's interface state.
+    #[cfg(target_os = "linux")]
+    tokio::spawn(snmpsub::run(snmp_engine.clone(), syncd.clone()));
+
     // syncd port events -> the engines' link states.
     tokio::spawn(watch_links(syncd.clone(), links, stp_links, lldp_links));
     // The VLAN membership view (query transmission + VLAN
@@ -962,6 +1020,7 @@ async fn main() -> Result<()> {
         engine,
         stp: stp_engine,
         lldp: lldp_engine,
+        snmp: snmp_engine,
         igmp: igmp_engine,
         mld: mld_engine,
         rib: rib_engine,

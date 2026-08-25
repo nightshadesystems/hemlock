@@ -12,6 +12,7 @@ mod frrapply;
 mod intents;
 mod osapply;
 mod service;
+mod snmpapply;
 mod store;
 
 use std::sync::Arc;

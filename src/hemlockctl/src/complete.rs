@@ -152,6 +152,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "qos",
             "lldp",
             "ntp",
+            "snmp",
         ],
         (CliMode::Operational, ["show", "lldp"]) => &["neighbors"],
         (CliMode::Operational, ["show", "lldp", "neighbors"]) => &["detail"],
@@ -238,7 +239,22 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "services",
             "qos",
         ],
-        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp", "ntp"],
+        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp", "ntp", "snmp"],
+        (CliMode::Config, ["set" | "delete", "services", "snmp"]) => {
+            &["community", "location", "contact", "user"]
+        }
+        (CliMode::Config, ["set" | "delete", "services", "snmp", "community" | "user"]) => &[ANY],
+        (CliMode::Config, ["set", "services", "snmp", "community", ANY]) => &["source"],
+        (CliMode::Config, ["set", "services", "snmp", "community", ANY, "source"]) => &[ANY],
+        (CliMode::Config, ["set", "services", "snmp", "user", ANY]) => &["auth"],
+        (CliMode::Config, ["set", "services", "snmp", "user", ANY, "auth"]) => &["sha"],
+        (CliMode::Config, ["set", "services", "snmp", "user", ANY, "auth", "sha"]) => &[ANY],
+        (CliMode::Config, ["set", "services", "snmp", "user", ANY, "auth", "sha", ANY]) => {
+            &["priv"]
+        }
+        (CliMode::Config, ["set", "services", "snmp", "user", ANY, "auth", "sha", ANY, "priv"]) => {
+            &["aes"]
+        }
         (CliMode::Config, ["set" | "delete", "services", "ntp"]) => &["server"],
         (CliMode::Config, ["set" | "delete", "services", "ntp", "server"]) => &[ANY],
         (CliMode::Config, ["set" | "delete", "services", "lldp"]) => {
@@ -1440,7 +1456,32 @@ mod tests {
         let c = candidates(CliMode::Config, &["set"], "serv", &ports());
         assert_eq!(c, vec!["services".to_string()]);
         let c = candidates(CliMode::Config, &["set", "services"], "", &ports());
-        assert_eq!(c, vec!["lldp", "ntp"]);
+        assert_eq!(c, vec!["lldp", "ntp", "snmp"]);
+        let c = candidates(CliMode::Config, &["set", "services", "snmp"], "", &ports());
+        assert_eq!(c, vec!["community", "location", "contact", "user"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "services", "snmp", "user", "monitor"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["auth"]);
+        let c = candidates(
+            CliMode::Config,
+            &[
+                "set",
+                "services",
+                "snmp",
+                "user",
+                "monitor",
+                "auth",
+                "sha",
+                "authpass1",
+            ],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["priv"]);
         let c = candidates(CliMode::Config, &["set", "services", "ntp"], "", &ports());
         assert_eq!(c, vec!["server"]);
         let c = candidates(CliMode::Config, &["set", "services", "lldp"], "", &ports());
@@ -1474,6 +1515,8 @@ mod tests {
         assert_eq!(c, vec!["counters"]);
         let c = candidates(CliMode::Operational, &["show"], "nt", &ports());
         assert_eq!(c, vec!["ntp"]);
+        let c = candidates(CliMode::Operational, &["show"], "snm", &ports());
+        assert_eq!(c, vec!["snmp"]);
     }
 
     #[test]

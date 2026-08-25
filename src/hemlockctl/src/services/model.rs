@@ -97,3 +97,38 @@ pub struct NtpState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_secs_ago: Option<u64>,
 }
+
+// ------------------------------------------------- SNMP
+
+/// One v2c read-only community.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnmpCommunity {
+    pub name: String,
+    /// Source prefix the community answers on; None = anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// `show snmp`: agent settings plus the subagent's request counters.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SnmpState {
+    pub enabled: bool,
+    /// The AgentX subagent holds a session with snmpd's master, so the
+    /// IF-MIB is actually answerable.
+    pub agentx_connected: bool,
+    pub listen_interface: String,
+    pub listen_address: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub location: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub contact: String,
+    pub communities: Vec<SnmpCommunity>,
+    /// v3 USM user names (read-only authPriv; passphrases never leave
+    /// the config).
+    pub users: Vec<String>,
+    pub packets_in: u64,
+    pub packets_out: u64,
+    pub get_requests: u64,
+    pub getnext_requests: u64,
+    pub errors: u64,
+}

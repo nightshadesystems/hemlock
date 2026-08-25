@@ -84,6 +84,9 @@ pub struct Intents {
     /// NTP client (`services { ntp { ... } }`), rendered into
     /// systemd-timesyncd.
     pub ntp: NtpIntent,
+    /// SNMP agent (`services { snmp { ... } }`), rendered into
+    /// snmpd.conf; orch's AgentX subagent serves the IF-MIB.
+    pub snmp: SnmpIntent,
     /// The four global QoS maps (`qos { map { ... } }`).
     pub qos_maps: QosMapsIntent,
     /// Named WRED/ECN profiles (`qos { wred-profile <name> { ... } }`).
@@ -458,6 +461,71 @@ pub struct NtpIntent {
     /// hostnames.
     pub servers: Vec<String>,
 }
+
+/// The management interface's address, without its prefix length —
+/// what snmpd binds to and what `show snmp` names.
+pub fn management_address(intents: &Intents) -> Option<String> {
+    intents
+        .management
+        .values()
+        .filter_map(|mgmt| mgmt.address.as_deref())
+        .filter_map(|cidr| cidr.split('/').next())
+        .map(str::to_string)
+        .next()
+}
+
+/// The management interface's display name (the first configured one).
+pub fn management_name(intents: &Intents) -> Option<String> {
+    intents
+        .management
+        .iter()
+        .find(|(_, mgmt)| mgmt.address.is_some())
+        .map(|(name, _)| name.clone())
+}
+
+/// One SNMP v3 USM user. Read-only `authPriv` only: SHA auth, AES
+/// privacy, no write access (deferred, rejected at parse).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnmpUser {
+    pub auth_password: String,
+    pub priv_password: String,
+}
+
+/// One v2c read-only community.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnmpCommunityIntent {
+    pub name: String,
+    /// Source prefix the community answers on; None = anywhere.
+    pub source: Option<String>,
+}
+
+/// SNMP agent config (`services { snmp { ... } }`). Absent block = the
+/// agent is off; `enabled` records that the block existed at all, so a
+/// bare `snmp { }` still starts a (community-less) agent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnmpIntent {
+    pub enabled: bool,
+    pub location: Option<String>,
+    pub contact: Option<String>,
+    /// v2c read-only communities, in config order — snmpd evaluates
+    /// its `rocommunity` lines in order, so an operator putting a
+    /// source-scoped name ahead of an open one means it.
+    pub communities: Vec<SnmpCommunityIntent>,
+    /// v3 USM users, keyed by name.
+    pub users: BTreeMap<String, SnmpUser>,
+}
+
+/// SNMP community and USM user names: a letter, then letters, digits,
+/// `_` or `-`, at most 32 characters.
+pub fn valid_snmp_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The shortest v3 passphrase USM accepts.
+pub const MIN_SNMP_PASSWORD: usize = 8;
 
 /// The most NTP servers timesyncd is given (it walks the list in
 /// order, so a longer one only slows failover).
@@ -929,6 +997,9 @@ pub enum IntentError {
 
     #[error("services ntp: {0}")]
     BadNtp(String),
+
+    #[error("services snmp: {0}")]
+    BadSnmp(String),
 
     #[error("{name}: {feature} is a physical-port setting")]
     PortServiceOnNonPort { name: String, feature: &'static str },
@@ -2131,6 +2202,16 @@ fn arp_inspection(items: &[Item], intents: &mut Intents) -> Result<(), IntentErr
 }
 
 fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
+    // SNMP listens on the management port only, so snmpd needs an
+    // address to bind. Without one the agent would either not start or
+    // fall back to every interface — neither is what the config asked
+    // for, so it is a commit error rather than a surprise.
+    if intents.snmp.enabled && management_address(intents).is_none() {
+        return Err(IntentError::BadSnmp(
+            "the management interface must carry an address (the agent listens there only)".into(),
+        ));
+    }
+
     // ARP statics: the named interface must be L3 (carry an address in
     // this same config).
     for (ip, arp) in &intents.arp_statics {
@@ -3758,6 +3839,7 @@ fn services(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError>
         match name.as_str() {
             "lldp" => intents.lldp = lldp(children)?,
             "ntp" => intents.ntp = ntp(children)?,
+            "snmp" => intents.snmp = snmp(children)?,
             other => {
                 return Err(IntentError::BadServices(format!(
                     "unrecognized block {other:?}"
@@ -3847,6 +3929,110 @@ fn ntp(items: &[Item]) -> Result<NtpIntent, IntentError> {
         )));
     }
     Ok(NtpIntent { servers })
+}
+
+/// `services { snmp { community ...; location ...; contact ...;
+/// user ... } }`.
+fn snmp(items: &[Item]) -> Result<SnmpIntent, IntentError> {
+    let bad = IntentError::BadSnmp;
+    let mut intent = SnmpIntent {
+        enabled: true,
+        ..SnmpIntent::default()
+    };
+    for item in items {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match name.as_str() {
+            "community" => {
+                let (community, source) = match values.as_slice() {
+                    [community] => (community, None),
+                    [community, keyword, prefix] if keyword == "source" => {
+                        let prefix = hemlock_common::net::canonical_prefix(prefix)
+                            .map_err(|reason| bad(format!("community {community}: {reason}")))?;
+                        (community, Some(prefix))
+                    }
+                    _ => return Err(bad("expected `community <name> [source <prefix>]`".into())),
+                };
+                if !valid_snmp_name(community) {
+                    return Err(bad(format!("bad community name {community:?}")));
+                }
+                if intent.communities.iter().any(|c| c.name == *community) {
+                    return Err(bad(format!("duplicate community {community}")));
+                }
+                intent.communities.push(SnmpCommunityIntent {
+                    name: community.clone(),
+                    source,
+                });
+            }
+            "user" => {
+                let [user, auth_keyword, auth_protocol, auth_password, priv_keyword, priv_protocol, priv_password] =
+                    values.as_slice()
+                else {
+                    return Err(bad(
+                        "expected `user <name> auth sha <pass> priv aes <pass>`".into(),
+                    ));
+                };
+                if !valid_snmp_name(user) {
+                    return Err(bad(format!("bad user name {user:?}")));
+                }
+                if auth_keyword != "auth" || priv_keyword != "priv" {
+                    return Err(bad(
+                        "expected `user <name> auth sha <pass> priv aes <pass>`".into(),
+                    ));
+                }
+                // Read-only authPriv with fixed protocols: weaker ones
+                // are refused rather than silently downgraded.
+                if auth_protocol != "sha" {
+                    return Err(bad(format!(
+                        "user {user}: auth protocol {auth_protocol:?} is not supported (sha only)"
+                    )));
+                }
+                if priv_protocol != "aes" {
+                    return Err(bad(format!(
+                        "user {user}: priv protocol {priv_protocol:?} is not supported (aes only)"
+                    )));
+                }
+                for password in [auth_password, priv_password] {
+                    if password.len() < MIN_SNMP_PASSWORD {
+                        return Err(bad(format!(
+                            "user {user}: passwords must be at least {MIN_SNMP_PASSWORD} characters"
+                        )));
+                    }
+                }
+                let entry = SnmpUser {
+                    auth_password: auth_password.clone(),
+                    priv_password: priv_password.clone(),
+                };
+                if intent.users.insert(user.clone(), entry).is_some() {
+                    return Err(bad(format!("duplicate user {user}")));
+                }
+            }
+            leaf @ ("location" | "contact") => {
+                let [text] = values.as_slice() else {
+                    return Err(bad(format!("expected `{leaf} <text>`")));
+                };
+                let slot = if leaf == "location" {
+                    &mut intent.location
+                } else {
+                    &mut intent.contact
+                };
+                if slot.is_some() {
+                    return Err(bad(format!("duplicate {leaf}")));
+                }
+                *slot = Some(text.clone());
+            }
+            // Deferred by this suite; named rather than ignored.
+            "trap" | "trap2sink" | "informs" | "trapsink" => {
+                return Err(bad("SNMP traps and informs are not supported".into()));
+            }
+            "rwcommunity" | "rwuser" => {
+                return Err(bad("SNMP write access is not supported".into()));
+            }
+            other => return Err(bad(format!("unrecognized statement {other:?}"))),
+        }
+    }
+    Ok(intent)
 }
 
 /// `switching { mac-table { ... } mirror { ... } }`.
@@ -6675,8 +6861,18 @@ services {
         server 10.42.0.5;
         server pool.ntp.org;
     }
+    snmp {
+        community public;
+        community netops source 10.42.0.0/16;
+        location "rack 4, closet B";
+        contact "cody@nightshade.systems";
+        user monitor auth sha "authpass1" priv aes "privpass1";
+    }
 }
 interfaces {
+    Management1 {
+        address 10.42.0.9/24;
+    }
     Ethernet3 {
         lldp disable;
     }
@@ -6695,6 +6891,25 @@ interfaces {
         );
         assert_eq!(lldp_state(&intents).disabled_ports, ["Ethernet3"]);
         assert_eq!(intents.ntp.servers, ["10.42.0.5", "pool.ntp.org"]);
+        // Communities keep config order; the user's passphrases survive
+        // the round trip (redaction is a display-time concern).
+        assert_eq!(
+            intents
+                .snmp
+                .communities
+                .iter()
+                .map(|c| (c.name.as_str(), c.source.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("public", None), ("netops", Some("10.42.0.0/16"))]
+        );
+        assert_eq!(intents.snmp.location.as_deref(), Some("rack 4, closet B"));
+        assert_eq!(
+            intents.snmp.users["monitor"],
+            SnmpUser {
+                auth_password: "authpass1".into(),
+                priv_password: "privpass1".into(),
+            }
+        );
     }
 
     /// NTP: servers in order, deduplicated, capped at four, with the
@@ -6772,6 +6987,76 @@ server pool.ntp.org } }",
             diff_os(&two, &none).describe(),
             ["ntp disabled (no servers)"]
         );
+    }
+
+    /// SNMP: names, passphrase length, fixed protocols, and every
+    /// deferred spelling rejected rather than ignored.
+    #[test]
+    fn snmp_validation() {
+        assert_eq!(intents_of("").snmp, SnmpIntent::default());
+        assert!(!intents_of("").snmp.enabled);
+        // A bare block still enables the agent.
+        let mgmt = "interfaces { Management1 { address 10.42.0.9/24 } }\n";
+        let intents = intents_of(&format!("{mgmt}services {{ snmp {{ }} }}"));
+        assert!(intents.snmp.enabled);
+        assert!(intents.snmp.communities.is_empty());
+
+        for (text, reason) in [
+            ("services { snmp { community 9bad } }", "bad community name"),
+            ("services { snmp { community has-space bad } }", "expected"),
+            (
+                "services { snmp { community public source notaprefix } }",
+                "community public",
+            ),
+            (
+                "services { snmp { community a\ncommunity a } }",
+                "duplicate community",
+            ),
+            (
+                "services { snmp { user 9bad auth sha aaaaaaaa priv aes bbbbbbbb } }",
+                "bad user name",
+            ),
+            (
+                "services { snmp { user m auth md5 aaaaaaaa priv aes bbbbbbbb } }",
+                "auth protocol",
+            ),
+            (
+                "services { snmp { user m auth sha aaaaaaaa priv des bbbbbbbb } }",
+                "priv protocol",
+            ),
+            (
+                "services { snmp { user m auth sha short priv aes bbbbbbbb } }",
+                "at least 8 characters",
+            ),
+            ("services { snmp { user m } }", "expected"),
+            (
+                "services { snmp { location a\nlocation b } }",
+                "duplicate location",
+            ),
+            ("services { snmp { trap 10.0.0.1 } }", "traps and informs"),
+            ("services { snmp { rwcommunity secret } }", "write access"),
+            ("services { snmp { nonesuch } }", "unrecognized statement"),
+        ] {
+            let tree = parse(&format!("{mgmt}{text}")).unwrap();
+            let message = extract(&tree).unwrap_err().to_string();
+            assert!(
+                matches!(extract(&tree), Err(IntentError::BadSnmp(_))),
+                "{text} should be a BadSnmp"
+            );
+            assert!(
+                message.contains(reason),
+                "{text}: {message:?} should mention {reason:?}"
+            );
+        }
+
+        // Names are letter-first, 32 characters at most.
+        assert!(valid_snmp_name("a"));
+        assert!(valid_snmp_name("net_ops-1"));
+        assert!(valid_snmp_name("A2345678901234567890123456789012"));
+        assert!(!valid_snmp_name("A23456789012345678901234567890123"));
+        assert!(!valid_snmp_name("9bad"));
+        assert!(!valid_snmp_name(""));
+        assert!(!valid_snmp_name("has space"));
     }
 
     #[test]

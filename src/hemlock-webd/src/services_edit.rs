@@ -1,4 +1,4 @@
-//! Config edits for the services-suite pages: LLDP and NTP.
+//! Config edits for the services-suite pages: LLDP, NTP and SNMP.
 //!
 //! Same discipline as `edit.rs`: the builders write exactly the leaves
 //! hemlockctl writes, based on the running config, and the result goes
@@ -16,6 +16,17 @@ fn block_children_mut<'a>(items: &'a mut [Item], name: &str) -> Option<&'a mut V
         } if n == name => Some(children),
         _ => None,
     })
+}
+
+/// Drop every leaf named `name` whose leading values match `prefix`.
+fn remove_leaf_matching(items: &mut Vec<Item>, name: &str, prefix: &[&str]) {
+    items.retain(|item| match item {
+        Item::Leaf { name: n, values } if n == name => {
+            !(values.len() >= prefix.len()
+                && values.iter().zip(prefix).all(|(value, want)| value == want))
+        }
+        _ => true,
+    });
 }
 
 fn push_leaf(items: &mut Vec<Item>, name: &str, values: Vec<String>) {
@@ -207,6 +218,172 @@ pub fn apply_ntp_edit(tree: &mut ConfigTree, edit: &NtpEdit) -> Result<(), Strin
     Ok(())
 }
 
+// ------------------------------------------------------------------ SNMP
+
+/// The shortest v3 passphrase USM accepts — the same floor the CLI and
+/// the intent extractor enforce.
+const MIN_SNMP_PASSWORD: usize = 8;
+
+/// SNMP community and USM user names: a letter, then letters, digits,
+/// `_` or `-`, at most 32 characters. mgmtd re-validates.
+fn valid_snmp_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SnmpCommunitySet {
+    pub name: String,
+    /// "" = answers anywhere.
+    #[serde(default)]
+    pub source: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SnmpUserSet {
+    pub name: String,
+    /// Write-only: the page never reads a passphrase back, so an
+    /// absent one on an edit keeps whatever is configured.
+    #[serde(default)]
+    pub auth_password: Option<String>,
+    #[serde(default)]
+    pub priv_password: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SnmpEdit {
+    /// False removes the whole `snmp` block (the agent stops).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub contact: Option<String>,
+    /// When present, replaces the whole community list, in order.
+    #[serde(default)]
+    pub communities: Option<Vec<SnmpCommunitySet>>,
+    /// Users to add or update.
+    #[serde(default)]
+    pub users_set: Vec<SnmpUserSet>,
+    #[serde(default)]
+    pub users_delete: Vec<String>,
+}
+
+/// The `user <name> auth sha <pass> priv aes <pass>` leaf a name
+/// already has, so an edit that omits a passphrase keeps it.
+fn existing_user_passwords(block: &[Item], name: &str) -> Option<(String, String)> {
+    block.iter().find_map(|item| match item {
+        Item::Leaf { name: leaf, values }
+            if leaf == "user" && values.len() == 7 && values[0] == name =>
+        {
+            Some((values[3].clone(), values[6].clone()))
+        }
+        _ => None,
+    })
+}
+
+pub fn apply_snmp_edit(tree: &mut ConfigTree, edit: &SnmpEdit) -> Result<(), String> {
+    if edit.enabled == Some(false) {
+        let services = tree.block_mut("services");
+        ConfigTree::remove_block(services, "snmp", &[]);
+        remove_block_if_empty(tree, "services");
+        return Ok(());
+    }
+    if let Some(communities) = &edit.communities {
+        let mut seen: Vec<&str> = Vec::new();
+        for community in communities {
+            if !valid_snmp_name(&community.name) {
+                return Err(format!("bad community name {:?}", community.name));
+            }
+            if seen.contains(&community.name.as_str()) {
+                return Err(format!("duplicate community {}", community.name));
+            }
+            seen.push(&community.name);
+            if !community.source.is_empty() {
+                hemlock_common::net::canonical_prefix(&community.source)
+                    .map_err(|reason| format!("community {}: {reason}", community.name))?;
+            }
+        }
+    }
+    for user in &edit.users_set {
+        if !valid_snmp_name(&user.name) {
+            return Err(format!("bad user name {:?}", user.name));
+        }
+        for password in [&user.auth_password, &user.priv_password]
+            .into_iter()
+            .flatten()
+        {
+            if password.len() < MIN_SNMP_PASSWORD {
+                return Err(format!(
+                    "user {}: passwords must be at least {MIN_SNMP_PASSWORD} characters",
+                    user.name
+                ));
+            }
+        }
+    }
+
+    let services = tree.block_mut("services");
+    let block = ConfigTree::ensure_block(services, "snmp", &[]);
+    for (leaf, value) in [("location", &edit.location), ("contact", &edit.contact)] {
+        match value.as_deref() {
+            // An empty string clears the leaf; absent leaves it alone.
+            Some("") => ConfigTree::remove_leaf(block, leaf),
+            Some(text) => ConfigTree::set_leaf(block, leaf, vec![text.to_string()]),
+            None => {}
+        }
+    }
+    if let Some(communities) = &edit.communities {
+        ConfigTree::remove_leaf(block, "community");
+        for community in communities {
+            let mut values = vec![community.name.clone()];
+            if !community.source.is_empty() {
+                let prefix = hemlock_common::net::canonical_prefix(&community.source)
+                    .unwrap_or_else(|_| community.source.clone());
+                values.push("source".into());
+                values.push(prefix);
+            }
+            push_leaf(block, "community", values);
+        }
+    }
+    for user in &edit.users_set {
+        let existing = existing_user_passwords(block, &user.name);
+        let (auth, priv_) = match (&user.auth_password, &user.priv_password, existing) {
+            (Some(auth), Some(priv_), _) => (auth.clone(), priv_.clone()),
+            // A partial edit keeps whichever passphrase it omits.
+            (auth, priv_, Some((old_auth, old_priv))) => (
+                auth.clone().unwrap_or(old_auth),
+                priv_.clone().unwrap_or(old_priv),
+            ),
+            _ => {
+                return Err(format!(
+                    "user {}: both passphrases are required for a new user",
+                    user.name
+                ))
+            }
+        };
+        remove_leaf_matching(block, "user", &[&user.name]);
+        push_leaf(
+            block,
+            "user",
+            vec![
+                user.name.clone(),
+                "auth".into(),
+                "sha".into(),
+                auth,
+                "priv".into(),
+                "aes".into(),
+                priv_,
+            ],
+        );
+    }
+    for name in &edit.users_delete {
+        remove_leaf_matching(block, "user", &[name]);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -334,6 +511,160 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.to_text().matches("server 10.0.0.1").count(), 1);
+    }
+
+    #[test]
+    fn snmp_edit_mirrors_cli_shapes() {
+        let mut t = tree("");
+        apply_snmp_edit(
+            &mut t,
+            &SnmpEdit {
+                location: Some("rack 4, closet B".into()),
+                contact: Some("cody@nightshade.systems".into()),
+                communities: Some(vec![
+                    SnmpCommunitySet {
+                        name: "public".into(),
+                        source: String::new(),
+                    },
+                    SnmpCommunitySet {
+                        name: "netops".into(),
+                        source: "10.42.0.0/16".into(),
+                    },
+                ]),
+                users_set: vec![SnmpUserSet {
+                    name: "monitor".into(),
+                    auth_password: Some("authpass1".into()),
+                    priv_password: Some("privpass1".into()),
+                }],
+                ..SnmpEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("community public"));
+        assert!(text.contains("community netops source 10.42.0.0/16"));
+        assert!(text.contains("user monitor auth sha authpass1 priv aes privpass1"));
+        // Community order is the list's order, not alphabetical.
+        assert!(text.find("community public").unwrap() < text.find("community netops").unwrap());
+
+        // Disabling drops the whole block, and `services` with it.
+        apply_snmp_edit(
+            &mut t,
+            &SnmpEdit {
+                enabled: Some(false),
+                ..SnmpEdit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(t.to_text().trim(), "");
+    }
+
+    /// Passphrases are write-only in the UI, so an edit that omits one
+    /// must keep what is configured rather than blanking it.
+    #[test]
+    fn snmp_user_edit_keeps_omitted_passphrases() {
+        let mut t = tree("");
+        apply_snmp_edit(
+            &mut t,
+            &SnmpEdit {
+                users_set: vec![SnmpUserSet {
+                    name: "monitor".into(),
+                    auth_password: Some("authpass1".into()),
+                    priv_password: Some("privpass1".into()),
+                }],
+                ..SnmpEdit::default()
+            },
+        )
+        .unwrap();
+        apply_snmp_edit(
+            &mut t,
+            &SnmpEdit {
+                users_set: vec![SnmpUserSet {
+                    name: "monitor".into(),
+                    auth_password: Some("newauthpass".into()),
+                    priv_password: None,
+                }],
+                ..SnmpEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("user monitor auth sha newauthpass priv aes privpass1"));
+        assert_eq!(text.matches("user monitor").count(), 1);
+
+        // A brand-new user cannot be half-specified.
+        assert!(apply_snmp_edit(
+            &mut t,
+            &SnmpEdit {
+                users_set: vec![SnmpUserSet {
+                    name: "fresh".into(),
+                    auth_password: Some("authpass1".into()),
+                    priv_password: None,
+                }],
+                ..SnmpEdit::default()
+            }
+        )
+        .is_err());
+
+        apply_snmp_edit(
+            &mut t,
+            &SnmpEdit {
+                users_delete: vec!["monitor".into()],
+                ..SnmpEdit::default()
+            },
+        )
+        .unwrap();
+        assert!(!t.to_text().contains("user monitor"));
+    }
+
+    #[test]
+    fn snmp_edit_rejects_what_the_cli_rejects() {
+        let mut t = tree("");
+        let bad = [
+            SnmpEdit {
+                communities: Some(vec![SnmpCommunitySet {
+                    name: "9bad".into(),
+                    source: String::new(),
+                }]),
+                ..SnmpEdit::default()
+            },
+            SnmpEdit {
+                communities: Some(vec![SnmpCommunitySet {
+                    name: "public".into(),
+                    source: "notaprefix".into(),
+                }]),
+                ..SnmpEdit::default()
+            },
+            SnmpEdit {
+                users_set: vec![SnmpUserSet {
+                    name: "monitor".into(),
+                    auth_password: Some("short".into()),
+                    priv_password: Some("privpass1".into()),
+                }],
+                ..SnmpEdit::default()
+            },
+        ];
+        for edit in bad {
+            assert!(apply_snmp_edit(&mut t, &edit).is_err());
+        }
+        // A duplicate in one list is a UI slip, not two communities.
+        assert!(apply_snmp_edit(
+            &mut t,
+            &SnmpEdit {
+                communities: Some(vec![
+                    SnmpCommunitySet {
+                        name: "public".into(),
+                        source: String::new(),
+                    },
+                    SnmpCommunitySet {
+                        name: "public".into(),
+                        source: "10.0.0.0/8".into(),
+                    },
+                ]),
+                ..SnmpEdit::default()
+            }
+        )
+        .is_err());
     }
 
     /// The global disable is independent of the per-port set.

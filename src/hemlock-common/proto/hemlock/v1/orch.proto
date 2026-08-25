@@ -65,6 +65,14 @@ service Orch {
   // `clear lldp counters`: baseline the per-port frame counters.
   rpc ClearLldpCounters(ClearLldpCountersRequest) returns (ClearLldpCountersResponse);
 
+  // --- SNMP (net-snmp master + orch's AgentX subagent) -----------------
+  // Full desired SNMP state (declarative). mgmtd renders snmpd.conf
+  // and owns the agent's transport/auth; orch's subagent registers the
+  // IF-MIB on the AgentX socket named here and answers it from syncd.
+  rpc SetSnmpConfig(SetSnmpConfigRequest) returns (SetSnmpConfigResponse);
+  // Agent settings + request counters for `show snmp`.
+  rpc GetSnmpState(GetSnmpStateRequest) returns (GetSnmpStateResponse);
+
   // --- NTP client (systemd-timesyncd) ----------------------------------
   // Live sync state for `show ntp`. mgmtd renders the timesyncd
   // drop-in; orch owns the `timedatectl` query surface, the way it
@@ -698,4 +706,51 @@ message GetNtpStateResponse {
   // Seconds since the last accepted reply; unset = never, or the
   // timestamp was unreadable.
   optional uint64 last_sync_secs_ago = 10;
+}
+
+// --- SNMP ---------------------------------------------------------------
+
+message SnmpCommunityConfig {
+  string name = 1;
+  // Source prefix the community answers on; "" = anywhere.
+  string source = 2;
+}
+
+message SetSnmpConfigRequest {
+  // False tears the AgentX session down (the block was removed).
+  bool enabled = 1;
+  // The AgentX master socket snmpd was rendered with.
+  string socket = 2;
+  string location = 3;
+  string contact = 4;
+  repeated SnmpCommunityConfig communities = 5;
+  // v3 USM user names. Passphrases stay in mgmtd's snmpd.conf render
+  // and are never pushed here.
+  repeated string users = 6;
+  // Where the agent listens, for display only.
+  string listen_interface = 7;
+  string listen_address = 8;
+}
+
+message SetSnmpConfigResponse {}
+
+message GetSnmpStateRequest {}
+
+message GetSnmpStateResponse {
+  bool enabled = 1;
+  // The subagent holds an open AgentX session with the master.
+  bool connected = 2;
+  string listen_interface = 3;
+  string listen_address = 4;
+  string location = 5;
+  string contact = 6;
+  repeated SnmpCommunityConfig communities = 7;
+  repeated string users = 8;
+  // Requests the master dispatched to the subagent, and the responses
+  // it got back.
+  uint64 packets_in = 9;
+  uint64 packets_out = 10;
+  uint64 get_requests = 11;
+  uint64 getnext_requests = 12;
+  uint64 errors = 13;
 }

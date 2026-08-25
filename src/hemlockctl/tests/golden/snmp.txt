@@ -1,0 +1,10 @@
+SNMP agent is enabled on Management1 (UDP 161)
+Location : rack 4, closet B
+Contact  : cody@nightshade.systems
+
+Communities (read-only): public, netops (source 10.42.0.0/16)
+USM users  (read-only): monitor (auth SHA, priv AES)
+
+Packets in  : 88123
+Packets out : 88123
+Get requests: 71022   GetNext/Bulk: 17101   Errors: 0

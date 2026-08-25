@@ -234,16 +234,19 @@ pub async fn configuration(
         "interfaces" => 2,
         "routing" => 3,
         "security" => 4,
-        _ => 5,
+        "services" => 5,
+        _ => 6,
     });
 
     crate::pager::page(&tree.to_text());
     Ok(())
 }
 
-/// Replace every `security { dot1x { radius-server <ip> { key ... } } }`
-/// secret with `<hidden>` before display.
+/// Replace every stored secret with `<hidden>` before display: RADIUS
+/// shared keys (`security { dot1x { radius-server <ip> { key ... } } }`)
+/// and SNMP v3 passphrases (`services { snmp { user ... } }`).
 fn redact_secrets(tree: &mut hemlock_config::ConfigTree) {
+    redact_snmp_users(tree);
     use hemlock_config::Item;
     let Some(security) = tree.items.iter_mut().find_map(|item| match item {
         Item::Block { name, children, .. } if name == "security" => Some(children),
@@ -271,6 +274,38 @@ fn redact_secrets(tree: &mut hemlock_config::ConfigTree) {
                         *values = vec!["<hidden>".into()];
                     }
                 }
+            }
+        }
+    }
+}
+
+/// `services { snmp { user <name> auth sha <pass> priv aes <pass> } }`:
+/// both passphrases render as `<hidden>`, the protocol keywords stay
+/// so the line still reads as configuration.
+fn redact_snmp_users(tree: &mut hemlock_config::ConfigTree) {
+    use hemlock_config::Item;
+    let Some(services) = tree.items.iter_mut().find_map(|item| match item {
+        Item::Block { name, children, .. } if name == "services" => Some(children),
+        _ => None,
+    }) else {
+        return;
+    };
+    for item in services.iter_mut() {
+        let Item::Block { name, children, .. } = item else {
+            continue;
+        };
+        if name != "snmp" {
+            continue;
+        }
+        for leaf in children.iter_mut() {
+            let Item::Leaf { name, values } = leaf else {
+                continue;
+            };
+            // `<user> auth sha <pass> priv aes <pass>`: the two
+            // passwords sit at index 3 and 6.
+            if name == "user" && values.len() == 7 {
+                values[3] = "<hidden>".into();
+                values[6] = "<hidden>".into();
             }
         }
     }
@@ -406,5 +441,51 @@ mod tests {
                 "Management1"
             ]
         );
+    }
+
+    /// Every stored secret renders as `<hidden>`: RADIUS shared keys
+    /// and both SNMP v3 passphrases. The surrounding keywords stay, so
+    /// the line still reads as configuration.
+    #[test]
+    fn secrets_never_render() {
+        let mut tree = hemlock_config::parse(
+            "security { dot1x { radius-server 10.42.0.5 { key \"s3cret\" } } }
+             services { snmp { community public
+             user monitor auth sha \"authpass1\" priv aes \"privpass1\" } }",
+        )
+        .unwrap();
+        redact_secrets(&mut tree);
+        let text = tree.to_text();
+        assert!(!text.contains("s3cret"), "radius key leaked: {text}");
+        assert!(
+            !text.contains("authpass1"),
+            "auth passphrase leaked: {text}"
+        );
+        assert!(
+            !text.contains("privpass1"),
+            "priv passphrase leaked: {text}"
+        );
+        // The serializer quotes `<hidden>` (it is not a bare token).
+        assert!(text.contains(r#"key "<hidden>""#), "{text}");
+        assert!(
+            text.contains(r#"user monitor auth sha "<hidden>" priv aes "<hidden>""#),
+            "{text}"
+        );
+        // Non-secret leaves are untouched.
+        assert!(text.contains("community public"));
+    }
+
+    /// Redaction is inert on a config that carries no secrets (and on
+    /// one with no `services` block at all).
+    #[test]
+    fn redaction_leaves_ordinary_config_alone() {
+        let mut tree = hemlock_config::parse(
+            "services { ntp { server 10.42.0.5 } }
+vlans { vlan 10 { } }",
+        )
+        .unwrap();
+        let before = tree.to_text();
+        redact_secrets(&mut tree);
+        assert_eq!(tree.to_text(), before);
     }
 }

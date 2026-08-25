@@ -68,3 +68,15 @@ fn ntp() {
         include_str!("../../tests/golden/ntp.json"),
     );
 }
+
+#[test]
+fn snmp() {
+    assert_golden(
+        &render::snmp(&fx::snmp_state()),
+        include_str!("../../tests/golden/snmp.txt"),
+    );
+    assert_golden(
+        &as_json("snmp", &fx::snmp_state()),
+        include_str!("../../tests/golden/snmp.json"),
+    );
+}
