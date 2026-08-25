@@ -474,7 +474,16 @@ status`, `hemlockctl commit`, ...) drives the same daemons for scripting.
 
 At startup mgmtd replays the persisted running config onto syncd (with
 retry), so a restart of either daemon — or the whole box — converges the
-ASIC to the running config.
+ASIC to the running config. syncd and orch hold their programmed state
+in memory only, so the replay has to cover **every** syncd- or
+orch-owned family, in the same dependency order the commit applier
+uses: VLANs before switchports, LAG objects before their protocol
+push, ACL definitions before bindings, WRED profiles before the queues
+that reference them. A family that reaches `Intents` but not
+`replay_running` is silently absent from the ASIC until someone
+commits again — which for an ACL is a fail-open, so the gate deciding
+whether a replay is needed at all is a pure function (`needs_syncd_replay`)
+with a test naming each family.
 
 ## Image and installer
 

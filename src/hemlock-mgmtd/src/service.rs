@@ -1220,6 +1220,13 @@ fn needs_syncd_replay(running: &Intents) -> bool {
         || running.qos_maps != intents::QosMapsIntent::default()
         || !running.wred_profiles.is_empty()
         || !intents::port_qos_state(running).is_empty()
+        // The security families likewise: CoPP overrides and ACL
+        // definitions touch no interface at all.
+        || !running.acls.is_empty()
+        || !running.copp.is_empty()
+        || !intents::port_security_state(running).is_empty()
+        || intents::dot1x_state(running) != intents::Dot1xState::default()
+        || intents::snoopsec_state(running) != intents::SnoopSecState::default()
 }
 
 fn qos_maps_request(maps: &intents::QosMapsIntent) -> pb::SetQosMapsRequest {
@@ -1420,6 +1427,73 @@ impl Engine {
             )
             .await
             .context("replaying switching families")?;
+        }
+
+        // The security suite: ACL definitions before the bindings that
+        // reference them, then CoPP overrides and port-security. syncd
+        // holds all of it in memory, so without the replay a syncd
+        // restart drops every ACL from the ASIC — a fail-open on an
+        // edge filter — until someone commits again.
+        for (name, acl) in &running.acls {
+            client
+                .ensure_acl(acl_request(name, acl))
+                .await
+                .with_context(|| format!("replaying acl {name}"))?;
+            applied += 1;
+        }
+        // A Port-Channel binding whose members orch has not gated up
+        // yet materializes nothing and is re-expanded on the first
+        // SetLagMembers, exactly as it is at commit time.
+        for ((target, egress), acl) in intents::acl_bindings(&running) {
+            client
+                .bind_port_acl(pb::BindPortAclRequest {
+                    port: target.clone(),
+                    stage: acl_stage(egress),
+                    acl,
+                })
+                .await
+                .with_context(|| format!("replaying access-group on {target}"))?;
+            applied += 1;
+        }
+        for (class, class_override) in &running.copp {
+            client
+                .set_copp_class(pb::SetCoppClassRequest {
+                    class: class.clone(),
+                    rate: class_override.rate,
+                    burst: class_override.burst,
+                })
+                .await
+                .with_context(|| format!("replaying copp class {class}"))?;
+            applied += 1;
+        }
+        for (port, security) in intents::port_security_state(&running) {
+            client
+                .set_port_security(pb::SetPortSecurityRequest {
+                    port: port.clone(),
+                    maximum: security.maximum,
+                    shutdown: security.shutdown,
+                })
+                .await
+                .with_context(|| format!("replaying port-security on {port}"))?;
+            applied += 1;
+        }
+
+        // dot1x and snooping/DAI are whole-state pushes to their orch
+        // engines, which drive the enforcement back into syncd — the
+        // same shape as the STP and IGMP/MLD replays above.
+        let dot1x = intents::dot1x_state(&running);
+        if dot1x != intents::Dot1xState::default() {
+            self.push_dot1x_config(&dot1x)
+                .await
+                .context("replaying dot1x config to orch")?;
+            applied += 1;
+        }
+        let snoopsec = intents::snoopsec_state(&running);
+        if snoopsec != intents::SnoopSecState::default() {
+            self.push_snoopsec_config(&snoopsec)
+                .await
+                .context("replaying dhcp-snooping/arp-inspection config to orch")?;
+            applied += 1;
         }
 
         // QoS: profiles before the port programs that reference them,
@@ -1711,5 +1785,82 @@ mod tests {
             "interfaces { Ethernet1 { description uplink } }"
         )));
         assert!(needs_syncd_replay(&intents_of("vlans { vlan 10 { } }")));
+    }
+
+    /// The security families are syncd-owned too, and an ACL or CoPP
+    /// override can exist without touching any interface — so they gate
+    /// the replay on their own. Missing this fails *open*: a syncd
+    /// restart would drop every ACL from the ASIC.
+    #[test]
+    fn security_only_configs_still_replay_to_syncd() {
+        assert!(needs_syncd_replay(&intents_of(
+            "security { acl { ipv4 EDGE-IN { rule 10 { deny } } } }"
+        )));
+        assert!(needs_syncd_replay(&intents_of(
+            "security { copp { class bpdu { rate 512 } } }"
+        )));
+        assert!(needs_syncd_replay(&intents_of(
+            "security { dhcp-snooping { vlan 10 }
+arp-inspection { vlan 10 } }"
+        )));
+    }
+
+    /// Every syncd- or orch-owned family in a full config reaches the
+    /// gate. A family that lands in `Intents` but never in
+    /// `replay_running` is invisible until the next commit, so this
+    /// pins the ones that are wired up.
+    #[test]
+    fn a_full_config_gates_the_replay() {
+        let text = concat!(
+            "vlans { vlan 10 { } }
+",
+            "interfaces {
+",
+            "  Ethernet1 { switchport { mode trunk
+trunk vlans 10 }
+",
+            "    access-group EDGE-IN in
+",
+            "    qos { trust dscp
+queue 7 { priority strict } } }
+",
+            "  Ethernet5 { port-security { maximum 4 } }
+",
+            "  Ethernet10 { dot1x }
+",
+            "}
+",
+            "security {
+",
+            "  acl { ipv4 EDGE-IN { rule 10 { deny } } }
+",
+            "  copp { class bpdu { rate 512 } }
+",
+            "  dot1x { radius-server 10.42.0.5 { key \"s3cret\" } }
+",
+            "  dhcp-snooping { vlan 10 }
+",
+            "}
+",
+            "qos { map { dscp-to-tc { dscp 46 tc 5 } } }
+",
+        );
+        let running = intents_of(text);
+        assert!(needs_syncd_replay(&running));
+        // The pieces the replay walks are all present in the intents.
+        assert!(!running.acls.is_empty());
+        assert!(!intents::acl_bindings(&running).is_empty());
+        assert!(!running.copp.is_empty());
+        assert!(!intents::port_security_state(&running).is_empty());
+        assert_ne!(
+            intents::dot1x_state(&running),
+            intents::Dot1xState::default()
+        );
+        assert_ne!(
+            intents::snoopsec_state(&running),
+            intents::SnoopSecState::default()
+        );
+        assert_ne!(running.qos_maps, intents::QosMapsIntent::default());
+        assert!(!intents::port_qos_state(&running).is_empty());
     }
 }
