@@ -55,6 +55,12 @@ fn lldp_neighbors() {
         &render::lldp_neighbors_detail(&fx::lldp_state()),
         include_str!("../../tests/golden/lldp_neighbors_detail.txt"),
     );
+    // The neighbor views serialize the same state under their own
+    // label, which is what `| json` prints.
+    assert_golden(
+        &as_json("lldp_neighbors", &fx::lldp_state()),
+        include_str!("../../tests/golden/lldp_neighbors.json"),
+    );
 }
 
 #[test]
@@ -122,5 +128,9 @@ fn dhcp_server_leases() {
     assert_golden(
         &render::dhcp_server_leases(&fx::dhcp_server_state()),
         include_str!("../../tests/golden/dhcp_server_leases.txt"),
+    );
+    assert_golden(
+        &as_json("dhcp_server_leases", &fx::dhcp_server_state()),
+        include_str!("../../tests/golden/dhcp_server_leases.json"),
     );
 }

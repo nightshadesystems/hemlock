@@ -1,0 +1,43 @@
+{
+  "dhcp_server_leases": {
+    "leases": [
+      {
+        "address": "10.0.10.101",
+        "expires_at": 1787001247,
+        "hostname": "laptop-jchen",
+        "kind": "dynamic",
+        "mac": "00:1c:73:0c:aa:01",
+        "pool": "LAN-USERS"
+      },
+      {
+        "address": "10.0.10.102",
+        "expires_at": 1786993364,
+        "hostname": "voip-2214",
+        "kind": "dynamic",
+        "mac": "a0:36:9f:44:be:02",
+        "pool": "LAN-USERS"
+      },
+      {
+        "address": "10.0.10.50",
+        "kind": "reservation",
+        "mac": "00:1c:73:0c:aa:01",
+        "pool": "LAN-USERS"
+      }
+    ],
+    "pools": [
+      {
+        "capacity": 101,
+        "dns_servers": [
+          "10.42.0.5",
+          "10.42.0.6"
+        ],
+        "gateway": "10.0.10.1",
+        "in_use": 37,
+        "lease_time": 86400,
+        "name": "LAN-USERS",
+        "network": "10.0.10.0/24",
+        "range": "10.0.10.100 - 10.0.10.200"
+      }
+    ]
+  }
+}

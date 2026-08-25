@@ -218,8 +218,8 @@ impl Engine {
             if let Ok(mut client) = self.syncd_client().await {
                 if let Ok(info) = client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
                     let caps = info.into_inner().capabilities.unwrap_or_default();
-                    if !caps.sflow {
-                        anyhow::bail!("sflow sampling is not supported by this platform's SAI");
+                    if let Some(message) = sflow_capability_error(&wanted, &caps) {
+                        anyhow::bail!(message);
                     }
                 }
             }
@@ -1468,6 +1468,15 @@ fn needs_syncd_replay(running: &Intents) -> bool {
         || !running.dhcp_server.is_empty()
 }
 
+/// Why a probed capability set cannot serve this config's sFlow, if it
+/// cannot. Kept out of [`Engine::validate`] so the rule can be tested
+/// against a capability set directly: getting it wrong means a switch
+/// that reports sampling it never does.
+fn sflow_capability_error(wanted: &Intents, caps: &pb::SwitchCapabilities) -> Option<String> {
+    (wanted.sflow.enabled() && !caps.sflow)
+        .then(|| "sflow sampling is not supported by this platform's SAI".to_string())
+}
+
 /// The front-panel ports sampling is programmed on: every port the
 /// config knows about, minus the ones carrying `sflow disable`. An
 /// empty list (or no collector) is how sampling gets torn down.
@@ -2218,6 +2227,132 @@ services { snmp { community public } }"
         assert!(needs_syncd_replay(&intents_of(
             "services { sflow { collector 10.42.0.20 } }"
         )));
+    }
+
+    /// A platform whose SAI serves no samplepacket objects fails the
+    /// commit with the platform error rather than sampling nothing.
+    #[test]
+    fn sflow_without_the_capability_fails_the_commit() {
+        let with_sflow = intents_of("services { sflow { collector 10.42.0.20 } }");
+        let without = intents_of("");
+        let caps = |sflow| pb::SwitchCapabilities {
+            sflow,
+            ..pb::SwitchCapabilities::default()
+        };
+        assert_eq!(
+            sflow_capability_error(&with_sflow, &caps(false)).as_deref(),
+            Some("sflow sampling is not supported by this platform's SAI")
+        );
+        // A platform that can sample, and a config that does not ask
+        // to, both pass.
+        assert_eq!(sflow_capability_error(&with_sflow, &caps(true)), None);
+        assert_eq!(sflow_capability_error(&without, &caps(false)), None);
+        // A rate with no collector is not "enabled", so it is refused
+        // by the intent extractor rather than by the capability gate.
+        assert!(
+            hemlock_config::parse("services { sflow { sample-rate 4096 } }")
+                .map(|tree| intents::extract(&tree))
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    /// Every services family across a commit-confirm cycle: the same
+    /// gate decisions `apply_and_persist` makes for the commit that
+    /// adds the family, and for the auto-rollback that removes it.
+    ///
+    /// The rollback half is the one that matters: an applier that only
+    /// fires on "config appeared" would leave snmpd and dnsmasq running
+    /// after the window expired, serving a config the box no longer has.
+    #[test]
+    fn services_families_apply_and_roll_back() {
+        let empty = intents_of("");
+        let full = intents_of(concat!(
+            "vlans { vlan 99 { } }\n",
+            "interfaces {\n",
+            "  Management1 { address 10.42.0.9/24 }\n",
+            "  Ethernet3 { lldp disable }\n",
+            "  Ethernet4 { sflow disable }\n",
+            "  Vlan99 { address 10.42.10.9/24\n",
+            "    dhcp-relay server 10.42.0.5 }\n",
+            "}\n",
+            "services {\n",
+            "  lldp { tx-interval 15 }\n",
+            "  ntp { server 10.42.0.5 }\n",
+            "  snmp { community public }\n",
+            "  sflow { collector 10.42.0.20 }\n",
+            "  dhcp-server { pool LAN-USERS {\n",
+            "    network 10.0.10.0/24\n",
+            "    range 10.0.10.100 10.0.10.200\n",
+            "    default-gateway 10.0.10.1 } }\n",
+            "}\n",
+        ));
+
+        // --- the commit: every family reports a change ---
+        assert!(intents::diff_lldp(&empty, &full).is_some());
+        assert!(intents::diff_os(&empty, &full).ntp.is_some());
+        assert!(intents::diff_sflow(&empty, &full).is_some());
+        assert!(intents::diff_snoopsec(&empty, &full).is_some());
+        assert_ne!(empty.snmp, full.snmp);
+        assert_ne!(empty.dhcp_server, full.dhcp_server);
+        // ...and the two rendered services really do render.
+        assert!(crate::snmpapply::render_snmpd(&full).is_some());
+        assert!(crate::dnsmasqapply::render_dnsmasq(&full).is_some());
+        // The sampler is programmed on every port but the disabled one.
+        assert_eq!(sflow_sampled_ports(&full), vec!["Ethernet3".to_string()]);
+
+        // --- the auto-rollback: every family reports the way back ---
+        let back = intents::diff_lldp(&full, &empty).expect("lldp rolls back");
+        assert_eq!(back, intents::LldpState::default());
+        assert_eq!(
+            intents::diff_os(&full, &empty).ntp,
+            Some(intents::NtpIntent::default()),
+            "no servers means timesyncd stops"
+        );
+        let back = intents::diff_sflow(&full, &empty).expect("sflow rolls back");
+        assert!(!back.global.enabled());
+        assert!(
+            sflow_sampled_ports(&empty).is_empty(),
+            "an empty port list is how the sampler is torn down"
+        );
+        let back = intents::diff_snoopsec(&full, &empty).expect("the relay rolls back");
+        assert!(back.relay.is_empty());
+
+        // The two render-gated services stop outright: the render is
+        // None, which is what makes the applier disable the unit.
+        assert!(crate::snmpapply::render_snmpd(&empty).is_none());
+        assert!(crate::dnsmasqapply::render_dnsmasq(&empty).is_none());
+        // ...and the gate that decides whether to apply at all fires,
+        // so `None` actually reaches the applier.
+        assert_ne!(
+            crate::snmpapply::render_snmpd(&full),
+            crate::snmpapply::render_snmpd(&empty)
+        );
+        assert_ne!(
+            crate::dnsmasqapply::render_dnsmasq(&full),
+            crate::dnsmasqapply::render_dnsmasq(&empty)
+        );
+
+        // A commit that touches none of them leaves every service
+        // alone — an unrelated change must not bounce snmpd or dnsmasq.
+        let unrelated = intents_of(&format!(
+            "{}\nswitching {{ mac-table {{ aging-time 600 }} }}",
+            "vlans { vlan 99 { } }"
+        ));
+        let unrelated_twice = intents_of(&format!(
+            "{}\nswitching {{ mac-table {{ aging-time 600 }} }}",
+            "vlans { vlan 99 { } vlan 100 { } }"
+        ));
+        assert_eq!(
+            crate::snmpapply::render_snmpd(&unrelated),
+            crate::snmpapply::render_snmpd(&unrelated_twice)
+        );
+        assert_eq!(
+            crate::dnsmasqapply::render_dnsmasq(&unrelated),
+            crate::dnsmasqapply::render_dnsmasq(&unrelated_twice)
+        );
+        assert_eq!(intents::diff_lldp(&unrelated, &unrelated_twice), None);
+        assert_eq!(intents::diff_sflow(&unrelated, &unrelated_twice), None);
     }
 
     /// The sampled-port list is every configured front-panel port

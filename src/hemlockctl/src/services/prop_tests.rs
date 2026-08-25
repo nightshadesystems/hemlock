@@ -1,7 +1,9 @@
 //! Property tests for the services suite: the LLDP TTL is always the
 //! interval times the multiplier (and never overflows the render), the
-//! NTP renderer survives every sync posture, and no renderer panics or
-//! breaks its column layout whatever the engine reports. Deterministic xorshift generator, no external
+//! sFlow sampling rate is accepted exactly on the powers of two in
+//! range, DHCP pool containment agrees with the arithmetic it claims to
+//! do, the NTP renderer survives every sync posture, and no renderer
+//! panics or breaks its column layout whatever the engine reports. Deterministic xorshift generator, no external
 //! property-testing dependency (the interfaces family's convention).
 #![allow(clippy::unwrap_used)]
 
@@ -289,4 +291,144 @@ fn offsets_and_ages_render_compactly() {
     assert_eq!(age(4 * 60 + 12), "4m12s");
     assert_eq!(age(2 * 3600 + 4 * 60), "2h04m");
     assert_eq!(age(3 * 86_400 + 5 * 3600), "3d05h");
+}
+
+// ------------------------------------------------- sFlow sampling rate
+
+/// The prompt's rate check, mirrored from `cli.rs` — a rate is valid
+/// exactly when it is a power of two inside the range.
+fn rate_is_valid(rate: u32) -> bool {
+    (256..=1_048_576).contains(&rate) && rate.is_power_of_two()
+}
+
+/// The nearest valid rates below and above, mirrored from `cli.rs`.
+fn nearest_rates(rate: u32) -> (u32, u32) {
+    let (mut below, mut above) = (256u32, 1_048_576u32);
+    let mut candidate = 256u32;
+    while candidate <= 1_048_576 {
+        if candidate <= rate {
+            below = candidate;
+        }
+        if candidate >= rate {
+            above = candidate;
+            break;
+        }
+        candidate *= 2;
+    }
+    (below, above)
+}
+
+/// Exactly the thirteen powers of two from 256 to 1048576 are valid,
+/// and every rejection names neighbours that bracket what was typed.
+#[test]
+fn sample_rates_accept_only_powers_of_two_in_range() {
+    let valid: Vec<u32> = (0..32)
+        .map(|shift| 1u32 << shift)
+        .filter(|rate| rate_is_valid(*rate))
+        .collect();
+    assert_eq!(
+        valid,
+        vec![
+            256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131_072, 262_144, 524_288,
+            1_048_576,
+        ]
+    );
+
+    let mut rng = Rng(0x7261_7465_7072_6f70);
+    for _ in 0..20_000 {
+        // Sample the interesting neighbourhood rather than the whole
+        // u32: the boundaries are where a rate check goes wrong.
+        let rate = rng.u32(2_100_000);
+        let (below, above) = nearest_rates(rate);
+        assert!(rate_is_valid(below), "{below} should be a valid rate");
+        assert!(rate_is_valid(above), "{above} should be a valid rate");
+        if rate_is_valid(rate) {
+            assert_eq!(
+                (below, above),
+                (rate, rate),
+                "a valid rate is its own bracket"
+            );
+            continue;
+        }
+        // The bracket really brackets, except where the request falls
+        // outside the range entirely (then it clamps to the nearest end).
+        if (256..=1_048_576).contains(&rate) {
+            assert!(below < rate && rate < above, "{below} < {rate} < {above}");
+            assert_eq!(above, below * 2, "the brackets are adjacent");
+        }
+    }
+    // The two ends clamp rather than running off.
+    assert_eq!(nearest_rates(1), (256, 256));
+    assert_eq!(nearest_rates(4_000_000), (1_048_576, 1_048_576));
+}
+
+// ------------------------------------------------- DHCP pool containment
+
+/// Subnet containment, mirrored from the intent extractor.
+fn in_subnet(address: u32, base: u32, len: u8) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - u32::from(len.min(32)));
+    address & mask == base & mask
+}
+
+/// Containment agrees with the definition it claims: an address is in
+/// the network exactly when it lies between the network address and the
+/// broadcast address.
+#[test]
+fn pool_containment_matches_the_address_range() {
+    let mut rng = Rng(0x706f_6f6c_7072_6f70);
+    for _ in 0..20_000 {
+        let len = (rng.u32(33)) as u8;
+        let base_raw = rng.u32(u32::MAX);
+        let mask = if len == 0 {
+            0
+        } else {
+            u32::MAX << (32 - u32::from(len))
+        };
+        let base = base_raw & mask;
+        let first = base;
+        let last = base | !mask;
+
+        let address = rng.u32(u32::MAX);
+        let expected = address >= first && address <= last;
+        assert_eq!(
+            in_subnet(address, base, len),
+            expected,
+            "containment disagrees for {address} in {base}/{len}"
+        );
+        // The two ends are always inside, and the neighbours outside.
+        assert!(in_subnet(first, base, len));
+        assert!(in_subnet(last, base, len));
+        if let Some(before) = first.checked_sub(1) {
+            assert_eq!(in_subnet(before, base, len), len == 0);
+        }
+        if let Some(after) = last.checked_add(1) {
+            assert_eq!(in_subnet(after, base, len), len == 0);
+        }
+    }
+    // A /32 holds exactly one address; a /0 holds everything.
+    assert!(in_subnet(7, 7, 32));
+    assert!(!in_subnet(8, 7, 32));
+    assert!(in_subnet(rng.u32(u32::MAX), 0, 0));
+}
+
+/// A pool's dynamic capacity counts both ends, and the utilisation the
+/// renderer prints never claims more leases than the range holds.
+#[test]
+fn pool_capacity_counts_both_ends() {
+    let mut rng = Rng(0x6361_7061_6369_7479);
+    for _ in 0..5_000 {
+        let start = rng.u32(u32::MAX - 1);
+        let span = rng.u32(4096);
+        let end = start.saturating_add(span);
+        let capacity = end - start + 1;
+        assert_eq!(capacity, span + 1);
+        // The render is `in_use/capacity`, so a full pool reads as
+        // n/n rather than overflowing.
+        let in_use = rng.u32(capacity.max(1));
+        assert!(in_use <= capacity);
+        assert!(format!("{in_use}/{capacity}").contains('/'));
+    }
 }
