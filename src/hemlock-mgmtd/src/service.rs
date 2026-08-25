@@ -1205,6 +1205,23 @@ fn acl_request(name: &str, acl: &intents::AclIntent) -> pb::EnsureAclRequest {
 }
 
 /// A global-map intent as the syncd request (all four tables at once).
+/// Whether a running config has anything for syncd at boot. Kept out of
+/// [`Engine::replay_running`] so it can be tested without a live syncd:
+/// getting it wrong strands a whole family until the next commit.
+fn needs_syncd_replay(running: &Intents) -> bool {
+    !running.ports.is_empty()
+        || !running.vlans.is_empty()
+        || !running.svis.is_empty()
+        || running.mac_table != intents::MacTableIntent::default()
+        || !running.mirror.is_empty()
+        || !intents::lag_state(running).is_empty()
+        // QoS can be entirely global (maps and profiles with no port
+        // touched), so it needs its own terms here.
+        || running.qos_maps != intents::QosMapsIntent::default()
+        || !running.wred_profiles.is_empty()
+        || !intents::port_qos_state(running).is_empty()
+}
+
 fn qos_maps_request(maps: &intents::QosMapsIntent) -> pb::SetQosMapsRequest {
     let table = |entries: &std::collections::BTreeMap<u8, u8>| -> Vec<pb::QosMapEntry> {
         entries
@@ -1275,13 +1292,7 @@ impl Engine {
     pub async fn replay_running(&self) -> Result<usize> {
         let running = Self::parse_intents(&self.store.running()?)?;
         let lag_state = intents::lag_state(&running);
-        if running.ports.is_empty()
-            && running.vlans.is_empty()
-            && running.svis.is_empty()
-            && running.mac_table == intents::MacTableIntent::default()
-            && running.mirror.is_empty()
-            && lag_state.is_empty()
-        {
+        if !needs_syncd_replay(&running) {
             return Ok(0);
         }
         let mut client = self.syncd_client().await?;
@@ -1409,6 +1420,36 @@ impl Engine {
             )
             .await
             .context("replaying switching families")?;
+        }
+
+        // QoS: profiles before the port programs that reference them,
+        // and the global maps before the ports whose trust mode reads
+        // them — the same ordering the commit applier uses. syncd holds
+        // this state in memory only, so without the replay a syncd
+        // restart would leave the ASIC unclassified until the next
+        // commit.
+        for (name, profile) in &running.wred_profiles {
+            client
+                .ensure_wred_profile(pb::EnsureWredProfileRequest {
+                    profile: Some(wred_profile_request(name, profile)),
+                })
+                .await
+                .with_context(|| format!("replaying qos wred-profile {name}"))?;
+            applied += 1;
+        }
+        if running.qos_maps != intents::QosMapsIntent::default() {
+            client
+                .set_qos_maps(qos_maps_request(&running.qos_maps))
+                .await
+                .context("replaying qos maps")?;
+            applied += 1;
+        }
+        for (port, qos) in intents::port_qos_state(&running) {
+            client
+                .set_port_qos(port_qos_request(&port, &qos))
+                .await
+                .with_context(|| format!("replaying qos for {port}"))?;
+            applied += 1;
         }
 
         // VRRP virtual MACs back into the ASIC's My-MAC table.
@@ -1632,5 +1673,43 @@ impl pb::mgmt_server::Mgmt for MgmtService {
             version: header.version,
             platform: header.platform,
         }))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn intents_of(text: &str) -> Intents {
+        Engine::parse_intents(text).unwrap()
+    }
+
+    /// The boot replay's gate: a config carrying any syncd-owned family
+    /// must reach syncd after a restart. QoS can be entirely global, so
+    /// maps and profiles count on their own — miss that and a restart
+    /// leaves the ASIC unclassified until the next commit.
+    #[test]
+    fn qos_only_configs_still_replay_to_syncd() {
+        assert!(!needs_syncd_replay(&Intents::default()));
+        assert!(!needs_syncd_replay(&intents_of("system { ssh { } }")));
+
+        // Global maps alone, no port touched.
+        assert!(needs_syncd_replay(&intents_of(
+            "qos { map { dscp-to-tc { dscp 46 tc 5 } } }"
+        )));
+        // A profile alone, likewise.
+        assert!(needs_syncd_replay(&intents_of(
+            "qos { wred-profile BULK { min-threshold 64\nmax-threshold 256 } }"
+        )));
+        // A Port-Channel program with no member ports configured.
+        assert!(needs_syncd_replay(&intents_of(
+            "interfaces { Port-Channel1 { qos { trust dscp } } }"
+        )));
+        // And the families that already gated it still do.
+        assert!(needs_syncd_replay(&intents_of(
+            "interfaces { Ethernet1 { description uplink } }"
+        )));
+        assert!(needs_syncd_replay(&intents_of("vlans { vlan 10 { } }")));
     }
 }
