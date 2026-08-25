@@ -65,6 +65,15 @@ service Orch {
   // `clear lldp counters`: baseline the per-port frame counters.
   rpc ClearLldpCounters(ClearLldpCountersRequest) returns (ClearLldpCountersResponse);
 
+  // --- DHCP server (dnsmasq-backed pools) ------------------------------
+  // Full desired pool state (declarative). mgmtd renders the dnsmasq
+  // config and owns the unit; orch reads the lease file and answers
+  // `show dhcp server`.
+  rpc SetDhcpServerConfig(SetDhcpServerConfigRequest) returns (SetDhcpServerConfigResponse);
+  rpc GetDhcpServerState(GetDhcpServerStateRequest) returns (GetDhcpServerStateResponse);
+  // `clear dhcp server lease <ip>`.
+  rpc ClearDhcpLease(ClearDhcpLeaseRequest) returns (ClearDhcpLeaseResponse);
+
   // --- sFlow (export; syncd owns the ASIC sampler) ---------------------
   // Full desired export state (declarative). orch turns sampled frames
   // and counter polls into v5 datagrams and sends them to the
@@ -824,4 +833,63 @@ message GetSflowExportStateResponse {
   uint64 counter_samples = 9;
   uint64 datagrams_sent = 10;
   uint64 datagrams_failed = 11;
+}
+
+// --- DHCP server ---------------------------------------------------------
+
+message DhcpReservationConfig {
+  string mac = 1;
+  string address = 2;
+}
+
+message DhcpPoolConfig {
+  string name = 1;
+  string network = 2;  // canonical CIDR
+  string range_start = 3;
+  string range_end = 4;
+  string gateway = 5;
+  repeated string dns_servers = 6;
+  uint32 lease_time = 7;
+  string domain_name = 8;
+  repeated DhcpReservationConfig reservations = 9;
+}
+
+message SetDhcpServerConfigRequest {
+  // An empty list means no pools: the server is off.
+  repeated DhcpPoolConfig pools = 1;
+}
+
+message SetDhcpServerConfigResponse {}
+
+message GetDhcpServerStateRequest {}
+
+message DhcpPoolState {
+  DhcpPoolConfig config = 1;
+  // Dynamic leases held out of the pool's range.
+  uint32 in_use = 2;
+  // Addresses the range holds.
+  uint32 capacity = 3;
+}
+
+message DhcpLeaseState {
+  string address = 1;
+  string mac = 2;
+  string hostname = 3;
+  // Unix seconds; unset for a reservation with no active lease.
+  optional uint64 expires_at = 4;
+  bool reservation = 5;
+  string pool = 6;
+}
+
+message GetDhcpServerStateResponse {
+  repeated DhcpPoolState pools = 1;
+  repeated DhcpLeaseState leases = 2;
+}
+
+message ClearDhcpLeaseRequest {
+  string address = 1;
+}
+
+message ClearDhcpLeaseResponse {
+  bool cleared = 1;
 }

@@ -2,8 +2,8 @@
 //! the spec's seed configuration produces on a 52-port E1031.
 
 use super::model::{
-    DhcpRelayState, DhcpRelayVlan, LldpNeighbor, LldpPort, LldpState, NtpState, SflowState,
-    SnmpCommunity, SnmpState,
+    DhcpLease, DhcpPool, DhcpRelayState, DhcpRelayVlan, DhcpServerState, LldpNeighbor, LldpPort,
+    LldpState, NtpState, SflowState, SnmpCommunity, SnmpState,
 };
 
 fn neighbor(
@@ -183,5 +183,53 @@ pub fn dhcp_relay_state() -> DhcpRelayState {
             to_client: 1198,
             dropped: 2,
         }],
+    }
+}
+
+/// A fixed instant so the lease expiries render the same on every host
+/// and in every zone: 2026-08-25 21:14:07 UTC.
+const LEASE_EPOCH: u64 = 1_787_001_247;
+
+/// The DHCP-server state the seed produces: one pool at 37 of 101
+/// leases, two dynamic clients and the reservation.
+pub fn dhcp_server_state() -> DhcpServerState {
+    DhcpServerState {
+        pools: vec![DhcpPool {
+            name: "LAN-USERS".into(),
+            network: "10.0.10.0/24".into(),
+            range: "10.0.10.100 - 10.0.10.200".into(),
+            gateway: "10.0.10.1".into(),
+            lease_time: 86400,
+            dns_servers: vec!["10.42.0.5".into(), "10.42.0.6".into()],
+            domain_name: String::new(),
+            in_use: 37,
+            capacity: 101,
+        }],
+        leases: vec![
+            DhcpLease {
+                address: "10.0.10.101".into(),
+                mac: "00:1c:73:0c:aa:01".into(),
+                hostname: "laptop-jchen".into(),
+                expires_at: Some(LEASE_EPOCH),
+                kind: "dynamic".into(),
+                pool: "LAN-USERS".into(),
+            },
+            DhcpLease {
+                address: "10.0.10.102".into(),
+                mac: "a0:36:9f:44:be:02".into(),
+                hostname: "voip-2214".into(),
+                expires_at: Some(LEASE_EPOCH - (2 * 3600 + 11 * 60 + 23)),
+                kind: "dynamic".into(),
+                pool: "LAN-USERS".into(),
+            },
+            DhcpLease {
+                address: "10.0.10.50".into(),
+                mac: "00:1c:73:0c:aa:01".into(),
+                hostname: String::new(),
+                expires_at: None,
+                kind: "reservation".into(),
+                pool: "LAN-USERS".into(),
+            },
+        ],
     }
 }

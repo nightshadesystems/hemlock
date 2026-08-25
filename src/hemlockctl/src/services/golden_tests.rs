@@ -104,3 +104,23 @@ fn dhcp_relay() {
         include_str!("../../tests/golden/dhcp_relay.json"),
     );
 }
+
+#[test]
+fn dhcp_server() {
+    assert_golden(
+        &render::dhcp_server(&fx::dhcp_server_state()),
+        include_str!("../../tests/golden/dhcp_server.txt"),
+    );
+    assert_golden(
+        &as_json("dhcp_server", &fx::dhcp_server_state()),
+        include_str!("../../tests/golden/dhcp_server.json"),
+    );
+}
+
+#[test]
+fn dhcp_server_leases() {
+    assert_golden(
+        &render::dhcp_server_leases(&fx::dhcp_server_state()),
+        include_str!("../../tests/golden/dhcp_server_leases.txt"),
+    );
+}

@@ -21,6 +21,7 @@ pub struct Engine {
     os: OsApplier,
     frr: crate::frrapply::FrrApplier,
     snmp: crate::snmpapply::SnmpApplier,
+    dnsmasq: crate::dnsmasqapply::DnsmasqApplier,
     commit_seq: u64,
     /// Pending commit-confirm: the pre-commit running text to restore if no
     /// confirmation arrives, plus a cancel handle for the timer task.
@@ -42,6 +43,7 @@ impl Engine {
             os,
             frr: crate::frrapply::FrrApplier::new(),
             snmp: crate::snmpapply::SnmpApplier::new(),
+            dnsmasq: crate::dnsmasqapply::DnsmasqApplier::new(),
             commit_seq: 0,
             pending_confirm: None,
         }
@@ -631,6 +633,16 @@ impl Engine {
                 .context("pushing STP config to orch")?;
         }
 
+        // The DHCP server: mgmtd renders the dnsmasq config below (with
+        // the OS pass) and pushes the same pools to orch, which reads
+        // the lease file that render names.
+        let dhcp_server_change = running_intents.dhcp_server != wanted_intents.dhcp_server;
+        if dhcp_server_change {
+            self.push_dhcp_server_config(&wanted_intents)
+                .await
+                .context("pushing dhcp-server config to orch")?;
+        }
+
         // sFlow: syncd owns the ASIC sampler (session + port binds),
         // orch owns the export. syncd goes first — a collector should
         // never be told about a sampler that failed to program.
@@ -742,6 +754,14 @@ impl Engine {
             self.snmp.apply(&wanted_intents);
         }
 
+        // dnsmasq likewise: a restart hands every renewing client a new
+        // transaction, so it happens only when the pools really moved.
+        let dnsmasq_changed = crate::dnsmasqapply::render_dnsmasq(&running_intents)
+            != crate::dnsmasqapply::render_dnsmasq(&wanted_intents);
+        if dnsmasq_changed {
+            self.dnsmasq.apply(&wanted_intents);
+        }
+
         self.store.commit(
             new_text,
             &RollbackMeta {
@@ -776,6 +796,9 @@ impl Engine {
         }
         if sflow_change.is_some() {
             described.push("sflow configuration updated".into());
+        }
+        if dhcp_server_change {
+            described.push("dhcp-server configuration updated".into());
         }
         described.extend(mac_changes.describe());
         described.extend(storm_changes.iter().map(intents::StormChange::describe));
@@ -923,6 +946,53 @@ impl Engine {
             })
             .await
             .context("SetSnoopingConfig")?;
+        Ok(())
+    }
+
+    /// Push the whole wanted pool set to orch, which reads dnsmasq's
+    /// lease file against it.
+    async fn push_dhcp_server_config(&self, wanted: &Intents) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_dhcp_server_config(pb::SetDhcpServerConfigRequest {
+                pools: wanted
+                    .dhcp_server
+                    .iter()
+                    .map(|(name, pool)| {
+                        let (start, end) = pool.range.unwrap_or((
+                            std::net::Ipv4Addr::UNSPECIFIED,
+                            std::net::Ipv4Addr::UNSPECIFIED,
+                        ));
+                        pb::DhcpPoolConfig {
+                            name: name.clone(),
+                            network: pool.network.clone().unwrap_or_default(),
+                            range_start: start.to_string(),
+                            range_end: end.to_string(),
+                            gateway: pool
+                                .default_gateway
+                                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)
+                                .to_string(),
+                            dns_servers: pool
+                                .dns_servers
+                                .iter()
+                                .map(|server| server.to_string())
+                                .collect(),
+                            lease_time: pool.lease(),
+                            domain_name: pool.domain_name.clone().unwrap_or_default(),
+                            reservations: pool
+                                .reservations
+                                .iter()
+                                .map(|(mac, address)| pb::DhcpReservationConfig {
+                                    mac: mac.clone(),
+                                    address: address.to_string(),
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect(),
+            })
+            .await
+            .context("SetDhcpServerConfig")?;
         Ok(())
     }
 
@@ -1395,6 +1465,7 @@ fn needs_syncd_replay(running: &Intents) -> bool {
         || intents::lldp_state(running) != intents::LldpState::default()
         || running.snmp != intents::SnmpIntent::default()
         || intents::sflow_state(running) != intents::SflowState::default()
+        || !running.dhcp_server.is_empty()
 }
 
 /// The front-panel ports sampling is programmed on: every port the
@@ -1593,6 +1664,15 @@ impl Engine {
             applied += 1;
         }
 
+        // The DHCP server replays its pools to orch, so the lease view
+        // matches the config after a restart of either.
+        if !running.dhcp_server.is_empty() {
+            self.push_dhcp_server_config(&running)
+                .await
+                .context("replaying dhcp-server config to orch")?;
+            applied += 1;
+        }
+
         // sFlow replays the sampler into the ASIC and the export
         // config into orch, in the same order a commit uses.
         if intents::sflow_state(&running) != intents::SflowState::default() {
@@ -1786,6 +1866,7 @@ impl Engine {
         self.os.replay(&running);
         self.frr.apply(&running);
         self.snmp.apply(&running);
+        self.dnsmasq.apply(&running);
         Ok(())
     }
 }

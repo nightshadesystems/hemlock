@@ -6,8 +6,8 @@ use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 
 use super::model::{
-    DhcpRelayState, DhcpRelayVlan, LldpNeighbor, LldpPort, LldpState, NtpState, SflowState,
-    SnmpCommunity, SnmpState,
+    DhcpLease, DhcpPool, DhcpRelayState, DhcpRelayVlan, DhcpServerState, LldpNeighbor, LldpPort,
+    LldpState, NtpState, SflowState, SnmpCommunity, SnmpState,
 };
 
 async fn orch_client(
@@ -194,4 +194,59 @@ pub async fn dhcp_relay_state(orch: &IpcEndpoint) -> Result<DhcpRelayState> {
         .collect();
     vlans.sort_by_key(|relay| relay.vlan);
     Ok(DhcpRelayState { vlans })
+}
+
+/// The DHCP server's pools and leases.
+pub async fn dhcp_server_state(orch: &IpcEndpoint) -> Result<DhcpServerState> {
+    let response = orch_client(orch)
+        .await?
+        .get_dhcp_server_state(pb::GetDhcpServerStateRequest {})
+        .await?
+        .into_inner();
+    Ok(DhcpServerState {
+        pools: response
+            .pools
+            .into_iter()
+            .map(|pool| {
+                let config = pool.config.unwrap_or_default();
+                DhcpPool {
+                    name: config.name,
+                    network: config.network,
+                    range: format!("{} - {}", config.range_start, config.range_end),
+                    gateway: config.gateway,
+                    lease_time: config.lease_time,
+                    dns_servers: config.dns_servers,
+                    domain_name: config.domain_name,
+                    in_use: pool.in_use,
+                    capacity: pool.capacity,
+                }
+            })
+            .collect(),
+        leases: response
+            .leases
+            .into_iter()
+            .map(|lease| DhcpLease {
+                address: lease.address,
+                mac: lease.mac,
+                hostname: lease.hostname,
+                expires_at: lease.expires_at,
+                kind: if lease.reservation {
+                    "reservation".into()
+                } else {
+                    "dynamic".into()
+                },
+                pool: lease.pool,
+            })
+            .collect(),
+    })
+}
+
+/// `clear dhcp server lease <ip>`.
+pub async fn clear_dhcp_lease(orch: &IpcEndpoint, address: String) -> Result<bool> {
+    Ok(orch_client(orch)
+        .await?
+        .clear_dhcp_lease(pb::ClearDhcpLeaseRequest { address })
+        .await?
+        .into_inner()
+        .cleared)
 }

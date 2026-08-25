@@ -102,6 +102,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/lldp/edit", post(lldp_edit))
         .route("/api/dhcp", get(dhcp))
         .route("/api/dhcp/relay/edit", post(dhcp_relay_edit))
+        .route("/api/dhcp/server/edit", post(dhcp_server_edit))
+        .route("/api/dhcp/leases/clear", post(dhcp_leases_clear))
         .route("/api/sflow", get(sflow))
         .route("/api/sflow/edit", post(sflow_edit))
         .route("/api/snmp", get(snmp))
@@ -984,6 +986,12 @@ async fn dhcp(
         .await
         .map_err(anyhow::Error::from)?
         .into_inner();
+    // The server half is a separate engine; a page shows both.
+    let server = orch
+        .get_dhcp_server_state(pb::GetDhcpServerStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
     Ok(Json(json!({
         "relay": response.dhcp_relay.iter().map(|relay| json!({
             "vlan": relay.vlan,
@@ -993,7 +1001,68 @@ async fn dhcp(
             "to_client": relay.to_client,
             "dropped": relay.dropped,
         })).collect::<Vec<_>>(),
+        "pools": server.pools.iter().map(|pool| {
+            let config = pool.config.clone().unwrap_or_default();
+            json!({
+                "name": config.name,
+                "network": config.network,
+                "range_start": config.range_start,
+                "range_end": config.range_end,
+                "gateway": config.gateway,
+                "dns_servers": config.dns_servers,
+                "lease_time": config.lease_time,
+                "domain_name": config.domain_name,
+                "reservations": config.reservations.iter().map(|reservation| json!({
+                    "mac": reservation.mac,
+                    "address": reservation.address,
+                })).collect::<Vec<_>>(),
+                "in_use": pool.in_use,
+                "capacity": pool.capacity,
+            })
+        }).collect::<Vec<_>>(),
+        "leases": server.leases.iter().map(|lease| json!({
+            "address": lease.address,
+            "mac": lease.mac,
+            "hostname": lease.hostname,
+            "expires_at": lease.expires_at,
+            "reservation": lease.reservation,
+            "pool": lease.pool,
+        })).collect::<Vec<_>>(),
     })))
+}
+
+async fn dhcp_server_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::services_edit::DhcpServerEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::services_edit::apply_dhcp_server_edit(tree, &edit)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct DhcpLeaseClear {
+    address: String,
+}
+
+/// `POST /api/dhcp/leases/clear` — release one lease. Not a config
+/// edit: it changes dnsmasq's lease file, not the running config.
+async fn dhcp_leases_clear(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<DhcpLeaseClear>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .clear_dhcp_lease(pb::ClearDhcpLeaseRequest {
+            address: request.address,
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({ "cleared": response.cleared })))
 }
 
 async fn dhcp_relay_edit(

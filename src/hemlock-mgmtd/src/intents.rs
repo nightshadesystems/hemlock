@@ -11,6 +11,7 @@
 //! diffed against the running tree and pushed to the owning applier.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 
 use hemlock_common::link::{self, Duplex};
 use hemlock_config::{ConfigTree, Item};
@@ -95,6 +96,9 @@ pub struct Intents {
     /// dhcp-relay server ... } }`), keyed by VLAN id. The relay is a
     /// capability of the snooping engine, so it rides that push.
     pub dhcp_relay: BTreeMap<u16, Vec<std::net::Ipv4Addr>>,
+    /// DHCP server pools (`services { dhcp-server { pool <name> ... } }`),
+    /// keyed by pool name; rendered into dnsmasq.
+    pub dhcp_server: BTreeMap<String, DhcpPoolIntent>,
     /// The four global QoS maps (`qos { map { ... } }`).
     pub qos_maps: QosMapsIntent,
     /// Named WRED/ECN profiles (`qos { wred-profile <name> { ... } }`).
@@ -565,6 +569,66 @@ pub fn nearest_sample_rates(rate: u32) -> (u32, u32) {
         candidate *= 2;
     }
     (below, above)
+}
+
+/// One DHCP server pool.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DhcpPoolIntent {
+    /// The served subnet in canonical CIDR form.
+    pub network: Option<String>,
+    /// The dynamic range, inclusive at both ends.
+    pub range: Option<(Ipv4Addr, Ipv4Addr)>,
+    pub default_gateway: Option<Ipv4Addr>,
+    /// Up to [`MAX_POOL_DNS_SERVERS`], in config order.
+    pub dns_servers: Vec<Ipv4Addr>,
+    /// Seconds; None = default (86400).
+    pub lease_time: Option<u32>,
+    pub domain_name: Option<String>,
+    /// Fixed addresses keyed by canonical MAC.
+    pub reservations: BTreeMap<String, Ipv4Addr>,
+}
+
+impl DhcpPoolIntent {
+    pub fn lease(&self) -> u32 {
+        self.lease_time.unwrap_or(DEFAULT_POOL_LEASE)
+    }
+
+    /// The pool's network as (address, prefix length); None until it
+    /// is configured (validation demands one by commit).
+    pub fn subnet(&self) -> Option<(Ipv4Addr, u8)> {
+        let network = self.network.as_deref()?;
+        let (address, len) = network.split_once('/')?;
+        Some((address.parse().ok()?, len.parse().ok()?))
+    }
+}
+
+/// The default lease, in seconds.
+pub const DEFAULT_POOL_LEASE: u32 = 86_400;
+
+/// The most DNS servers a pool hands out.
+pub const MAX_POOL_DNS_SERVERS: usize = 3;
+
+/// Pool names follow the ACL/WRED convention: a letter, then letters,
+/// digits, `_` or `-`, at most 32 characters.
+pub fn valid_pool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Is `address` inside the network `(base, len)`?
+pub fn in_subnet(address: Ipv4Addr, base: Ipv4Addr, len: u8) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - u32::from(len.min(32)));
+    u32::from(address) & mask == u32::from(base) & mask
+}
+
+/// Do two networks overlap? (Either contains the other's base.)
+pub fn subnets_overlap(left: (Ipv4Addr, u8), right: (Ipv4Addr, u8)) -> bool {
+    in_subnet(right.0, left.0, left.1) || in_subnet(left.0, right.0, right.1)
 }
 
 /// One SNMP v3 USM user. Read-only `authPriv` only: SHA auth, AES
@@ -1090,6 +1154,12 @@ pub enum IntentError {
 
     #[error("{name}: dhcp-relay: {reason}")]
     BadDhcpRelay { name: String, reason: String },
+
+    #[error("services dhcp-server: {0}")]
+    BadDhcpServer(String),
+
+    #[error("services dhcp-server pool {name}: {reason}")]
+    BadDhcpPool { name: String, reason: String },
 
     #[error("{name}: {feature} is a physical-port setting")]
     PortServiceOnNonPort { name: String, feature: &'static str },
@@ -2300,6 +2370,8 @@ fn arp_inspection(items: &[Item], intents: &mut Intents) -> Result<(), IntentErr
 }
 
 fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
+    validate_dhcp_pools(intents)?;
+
     // A relay stamps the SVI's address into giaddr, and the server
     // replies to it. Without one the relay would forward requests
     // nothing could answer, so it is a commit error.
@@ -3290,7 +3362,108 @@ fn storm_control(
     Ok(out)
 }
 
-/// `vlans { vlan <id> { description ... } }`.
+/// Everything about a DHCP pool that only makes sense once every pool
+/// (and every relay) is known: the required leaves, containment, and
+/// the two ways two pools — or a pool and a relay — can collide.
+fn validate_dhcp_pools(intents: &Intents) -> Result<(), IntentError> {
+    let mut reserved_macs: BTreeMap<&String, &String> = BTreeMap::new();
+    let mut subnets: Vec<(&String, (Ipv4Addr, u8))> = Vec::new();
+
+    for (name, pool) in &intents.dhcp_server {
+        let bad = |reason: String| IntentError::BadDhcpPool {
+            name: name.clone(),
+            reason,
+        };
+        // A pool that cannot answer is config that does nothing, so
+        // the three load-bearing leaves are required by commit.
+        let Some(subnet) = pool.subnet() else {
+            return Err(bad("network is required".into()));
+        };
+        let Some((start, end)) = pool.range else {
+            return Err(bad("range is required".into()));
+        };
+        let Some(gateway) = pool.default_gateway else {
+            return Err(bad("default-gateway is required".into()));
+        };
+        for (what, address) in [("range start", start), ("range end", end)] {
+            if !in_subnet(address, subnet.0, subnet.1) {
+                return Err(bad(format!(
+                    "{what} {address} is outside {}",
+                    pool.network.clone().unwrap_or_default()
+                )));
+            }
+        }
+        if !in_subnet(gateway, subnet.0, subnet.1) {
+            return Err(bad(format!(
+                "default-gateway {gateway} is outside {}",
+                pool.network.clone().unwrap_or_default()
+            )));
+        }
+        // A reservation may sit inside or outside the dynamic range —
+        // dnsmasq handles both — but not outside the subnet.
+        for (mac, address) in &pool.reservations {
+            if !in_subnet(*address, subnet.0, subnet.1) {
+                return Err(bad(format!(
+                    "reservation {mac} address {address} is outside {}",
+                    pool.network.clone().unwrap_or_default()
+                )));
+            }
+            if let Some(other) = reserved_macs.insert(mac, name) {
+                if other != name {
+                    return Err(bad(format!(
+                        "reservation {mac} is already reserved in pool {other}"
+                    )));
+                }
+            }
+        }
+        // Overlapping pools would make the answer depend on which one
+        // dnsmasq matched first.
+        for (other, other_subnet) in &subnets {
+            if subnets_overlap(subnet, *other_subnet) {
+                return Err(bad(format!(
+                    "network {} overlaps pool {other}",
+                    pool.network.clone().unwrap_or_default()
+                )));
+            }
+        }
+        subnets.push((name, subnet));
+    }
+
+    // One VLAN cannot both relay and serve: a client would race two
+    // answers, and which one won would depend on timing.
+    for vlan in intents.dhcp_relay.keys() {
+        let name = format!("Vlan{vlan}");
+        let Some(address) = intents
+            .svis
+            .get(&name)
+            .and_then(|svi| svi.address.as_deref())
+        else {
+            continue;
+        };
+        let Ok((address, _)) = hemlock_common::net::parse_cidr(address) else {
+            continue;
+        };
+        let std::net::IpAddr::V4(address) = address else {
+            continue;
+        };
+        for (pool, intent) in &intents.dhcp_server {
+            let Some((base, len)) = intent.subnet() else {
+                continue;
+            };
+            if in_subnet(address, base, len) {
+                return Err(IntentError::BadDhcpRelay {
+                    name,
+                    reason: format!(
+                        "dhcp-relay and a local dhcp-server pool cannot serve the same VLAN (pool {pool})"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `vlans { vlan <id> { ... } }`.
 fn vlans(tree: &ConfigTree) -> Result<BTreeMap<u16, VlanIntent>, IntentError> {
     let mut out = BTreeMap::new();
     let Some((_, items)) = tree.block("vlans") else {
@@ -4040,6 +4213,7 @@ fn services(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError>
             "ntp" => intents.ntp = ntp(children)?,
             "snmp" => intents.snmp = snmp(children)?,
             "sflow" => intents.sflow = sflow(children)?,
+            "dhcp-server" => intents.dhcp_server = dhcp_server(children)?,
             other => {
                 return Err(IntentError::BadServices(format!(
                     "unrecognized block {other:?}"
@@ -4306,6 +4480,159 @@ fn sflow(items: &[Item]) -> Result<SflowIntent, IntentError> {
         )));
     }
     Ok(intent)
+}
+
+/// `services { dhcp-server { pool <name> { ... } } }`.
+fn dhcp_server(items: &[Item]) -> Result<BTreeMap<String, DhcpPoolIntent>, IntentError> {
+    let mut pools = BTreeMap::new();
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadDhcpServer(format!(
+                "unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        if name != "pool" {
+            return Err(IntentError::BadDhcpServer(format!(
+                "unrecognized block {name:?}"
+            )));
+        }
+        let [pool_name] = keys.as_slice() else {
+            return Err(IntentError::BadDhcpServer(
+                "pool block needs exactly one name key".into(),
+            ));
+        };
+        if !valid_pool_name(pool_name) {
+            return Err(IntentError::BadDhcpServer(format!(
+                "bad pool name {pool_name:?}"
+            )));
+        }
+        let pool = dhcp_pool(pool_name, children)?;
+        if pools.insert(pool_name.clone(), pool).is_some() {
+            return Err(IntentError::BadDhcpServer(format!(
+                "duplicate pool {pool_name}"
+            )));
+        }
+    }
+    Ok(pools)
+}
+
+/// One `pool <name> { ... }` body.
+fn dhcp_pool(name: &str, items: &[Item]) -> Result<DhcpPoolIntent, IntentError> {
+    let bad = |reason: String| IntentError::BadDhcpPool {
+        name: name.to_string(),
+        reason,
+    };
+    let ipv4 = |what: &str, text: &String| {
+        text.parse::<Ipv4Addr>()
+            .map_err(|_| bad(format!("bad {what} {text:?}")))
+    };
+    let mut pool = DhcpPoolIntent::default();
+    let mut seen_lease = false;
+    for item in items {
+        let Item::Leaf { name: leaf, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match leaf.as_str() {
+            "network" => {
+                let [prefix] = values.as_slice() else {
+                    return Err(bad("expected `network <prefix>`".into()));
+                };
+                let canonical = hemlock_common::net::require_canonical_prefix(prefix)
+                    .map_err(|reason| bad(format!("network: {reason}")))?;
+                if canonical.contains(':') {
+                    return Err(bad("DHCPv6 pools are not supported".into()));
+                }
+                if pool.network.is_some() {
+                    return Err(bad("duplicate network".into()));
+                }
+                pool.network = Some(canonical);
+            }
+            "range" => {
+                let [start, end] = values.as_slice() else {
+                    return Err(bad("expected `range <start-ip> <end-ip>`".into()));
+                };
+                let start = ipv4("range start", start)?;
+                let end = ipv4("range end", end)?;
+                if u32::from(end) < u32::from(start) {
+                    return Err(bad(format!("range {start} - {end} runs backwards")));
+                }
+                if pool.range.is_some() {
+                    return Err(bad("duplicate range".into()));
+                }
+                pool.range = Some((start, end));
+            }
+            "default-gateway" => {
+                let [address] = values.as_slice() else {
+                    return Err(bad("expected `default-gateway <ipv4>`".into()));
+                };
+                if pool.default_gateway.is_some() {
+                    return Err(bad("duplicate default-gateway".into()));
+                }
+                pool.default_gateway = Some(ipv4("default-gateway", address)?);
+            }
+            "dns-server" => {
+                let [address] = values.as_slice() else {
+                    return Err(bad("expected `dns-server <ipv4>`".into()));
+                };
+                let server = ipv4("dns-server", address)?;
+                if !pool.dns_servers.contains(&server) {
+                    pool.dns_servers.push(server);
+                }
+            }
+            "lease-time" => {
+                let [value] = values.as_slice() else {
+                    return Err(bad("expected `lease-time <300-2592000>`".into()));
+                };
+                if seen_lease {
+                    return Err(bad("duplicate lease-time".into()));
+                }
+                seen_lease = true;
+                pool.lease_time =
+                    Some(parse_int(value, 300u32..=2_592_000, "lease-time").map_err(bad)?);
+            }
+            "domain-name" => {
+                let [text] = values.as_slice() else {
+                    return Err(bad("expected `domain-name <text>`".into()));
+                };
+                if pool.domain_name.is_some() {
+                    return Err(bad("duplicate domain-name".into()));
+                }
+                pool.domain_name = Some(text.clone());
+            }
+            "reservation" => {
+                let [mac, keyword, address] = values.as_slice() else {
+                    return Err(bad("expected `reservation <mac> address <ipv4>`".into()));
+                };
+                if keyword != "address" {
+                    return Err(bad(format!("expected `address`, got {keyword:?}")));
+                }
+                let mac = hemlock_common::net::parse_unicast_mac(mac)
+                    .map_err(|reason| bad(format!("reservation: {reason}")))?;
+                let address = ipv4("reservation address", address)?;
+                if pool.reservations.insert(mac.clone(), address).is_some() {
+                    return Err(bad(format!("duplicate reservation for {mac}")));
+                }
+            }
+            // Deferred by this suite; named rather than ignored.
+            "option-82" | "relay-agent-information" => {
+                return Err(bad("DHCP option-82 is not supported".into()));
+            }
+            other => return Err(bad(format!("unrecognized statement {other:?}"))),
+        }
+    }
+    if pool.dns_servers.len() > MAX_POOL_DNS_SERVERS {
+        return Err(bad(format!(
+            "at most {MAX_POOL_DNS_SERVERS} dns-servers ({} configured)",
+            pool.dns_servers.len()
+        )));
+    }
+    Ok(pool)
 }
 
 /// `switching { mac-table { ... } mirror { ... } }`.
@@ -7183,6 +7510,17 @@ services {
         sample-rate 16384;
         polling-interval 30;
     }
+    dhcp-server {
+        pool LAN-USERS {
+            network 10.0.10.0/24;
+            range 10.0.10.100 10.0.10.200;
+            default-gateway 10.0.10.1;
+            dns-server 10.42.0.5;
+            dns-server 10.42.0.6;
+            lease-time 86400;
+            reservation 00:1c:73:0c:aa:01 address 10.0.10.50;
+        }
+    }
     snmp {
         community public;
         community netops source 10.42.0.0/16;
@@ -7260,6 +7598,19 @@ interfaces {
         assert_eq!(
             snoopsec_state(&intents).relay[&99].1,
             "10.42.10.9".to_string()
+        );
+        let pool = &intents.dhcp_server["LAN-USERS"];
+        assert_eq!(pool.network.as_deref(), Some("10.0.10.0/24"));
+        assert_eq!(
+            pool.range,
+            Some((Ipv4Addr::new(10, 0, 10, 100), Ipv4Addr::new(10, 0, 10, 200)))
+        );
+        assert_eq!(pool.default_gateway, Some(Ipv4Addr::new(10, 0, 10, 1)));
+        assert_eq!(pool.dns_servers.len(), 2);
+        assert_eq!(pool.lease(), 86400);
+        assert_eq!(
+            pool.reservations["00:1c:73:0c:aa:01"],
+            Ipv4Addr::new(10, 0, 10, 50)
         );
         assert_eq!(
             intents.snmp.users["monitor"],
@@ -7608,6 +7959,172 @@ dhcp-relay server 10.42.0.5 } }",
         let change = diff_snoopsec(&candidate, &running).unwrap();
         assert!(change.relay.is_empty());
         assert_eq!(diff_snoopsec(&candidate, &candidate), None);
+    }
+
+    /// DHCP pools: the required leaves, containment, and every way two
+    /// pools (or a pool and a relay) can collide.
+    #[test]
+    fn dhcp_server_validation() {
+        assert!(intents_of("").dhcp_server.is_empty());
+
+        let pool = |body: &str| format!("services {{ dhcp-server {{ pool P {{ {body} }} }} }}");
+        let complete = "network 10.0.10.0/24
+range 10.0.10.100 10.0.10.200
+default-gateway 10.0.10.1";
+        let intents = intents_of(&pool(complete));
+        assert_eq!(intents.dhcp_server["P"].lease(), DEFAULT_POOL_LEASE);
+
+        // The three load-bearing leaves are required by commit.
+        for (body, reason) in [
+            (
+                "range 10.0.10.100 10.0.10.200\ndefault-gateway 10.0.10.1",
+                "network is required",
+            ),
+            (
+                "network 10.0.10.0/24\ndefault-gateway 10.0.10.1",
+                "range is required",
+            ),
+            (
+                "network 10.0.10.0/24\nrange 10.0.10.100 10.0.10.200",
+                "default-gateway is required",
+            ),
+        ] {
+            let tree = parse(&pool(body)).unwrap();
+            assert_eq!(
+                extract(&tree).unwrap_err().to_string(),
+                format!("services dhcp-server pool P: {reason}")
+            );
+        }
+
+        // Everything a pool hands out must sit inside its network.
+        for body in [
+            "network 10.0.10.0/24\nrange 10.0.99.100 10.0.99.200\ndefault-gateway 10.0.10.1",
+            "network 10.0.10.0/24\nrange 10.0.10.100 10.0.10.200\ndefault-gateway 10.0.99.1",
+            "network 10.0.10.0/24\nrange 10.0.10.100 10.0.10.200\ndefault-gateway 10.0.10.1\nreservation 00:11:22:33:44:55 address 10.0.99.5",
+            // ...and a range cannot run backwards.
+            "network 10.0.10.0/24\nrange 10.0.10.200 10.0.10.100\ndefault-gateway 10.0.10.1",
+        ] {
+            let tree = parse(&pool(body)).unwrap();
+            assert!(
+                matches!(extract(&tree), Err(IntentError::BadDhcpPool { .. })),
+                "{body} should be rejected"
+            );
+        }
+
+        // A reservation inside the range is fine — dnsmasq handles it.
+        let intents = intents_of(&pool(
+            "network 10.0.10.0/24
+range 10.0.10.100 10.0.10.200
+default-gateway 10.0.10.1
+reservation 00:11:22:33:44:55 address 10.0.10.150",
+        ));
+        assert_eq!(intents.dhcp_server["P"].reservations.len(), 1);
+
+        // Overlapping pools, and a MAC reserved twice.
+        let two = |a: &str, b: &str| {
+            format!("services {{ dhcp-server {{ pool A {{ {a} }}\npool B {{ {b} }} }} }}")
+        };
+        let tree = parse(&two(
+            "network 10.0.10.0/24\nrange 10.0.10.100 10.0.10.200\ndefault-gateway 10.0.10.1",
+            "network 10.0.10.128/25\nrange 10.0.10.140 10.0.10.150\ndefault-gateway 10.0.10.129",
+        ))
+        .unwrap();
+        let message = extract(&tree).unwrap_err().to_string();
+        assert!(message.contains("overlaps pool"), "{message}");
+        let tree = parse(&two(
+            "network 10.0.10.0/24\nrange 10.0.10.100 10.0.10.200\ndefault-gateway 10.0.10.1\nreservation 00:11:22:33:44:55 address 10.0.10.5",
+            "network 10.0.20.0/24\nrange 10.0.20.100 10.0.20.200\ndefault-gateway 10.0.20.1\nreservation 00:11:22:33:44:55 address 10.0.20.5",
+        ))
+        .unwrap();
+        let message = extract(&tree).unwrap_err().to_string();
+        assert!(message.contains("already reserved in pool"), "{message}");
+
+        // Syntax and the deferred halves.
+        for body in [
+            "network notaprefix",
+            "network 2001:db8::/64",
+            "network 10.0.10.5/24",
+            "range 10.0.10.100",
+            "dns-server 10.0.0.1\ndns-server 10.0.0.2\ndns-server 10.0.0.3\ndns-server 10.0.0.4",
+            "lease-time 299",
+            "lease-time 2592001",
+            "reservation 00:11:22:33:44:55 10.0.10.5",
+            "reservation ff:ff:ff:ff:ff:ff address 10.0.10.5",
+            "option-82",
+            "nonesuch",
+        ] {
+            let tree = parse(&pool(body)).unwrap();
+            assert!(
+                matches!(
+                    extract(&tree),
+                    Err(IntentError::BadDhcpPool { .. } | IntentError::BadDhcpServer(_))
+                ),
+                "{body} should be rejected"
+            );
+        }
+        let tree = parse("services { dhcp-server { pool 9bad { } } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadDhcpServer(_))));
+        assert!(valid_pool_name("LAN-USERS"));
+        assert!(!valid_pool_name("9bad"));
+    }
+
+    /// One VLAN cannot both relay and serve: a client would race two
+    /// answers.
+    #[test]
+    fn a_vlan_cannot_relay_and_serve_at_once() {
+        let text = "vlans { vlan 10 { } }
+interfaces { Vlan10 { address 10.0.10.1/24
+dhcp-relay server 10.42.0.5 } }
+services { dhcp-server { pool LAN-USERS {
+network 10.0.10.0/24
+range 10.0.10.100 10.0.10.200
+default-gateway 10.0.10.1 } } }";
+        let tree = parse(text).unwrap();
+        assert_eq!(
+            extract(&tree).unwrap_err().to_string(),
+            "Vlan10: dhcp-relay: dhcp-relay and a local dhcp-server pool cannot serve the same \
+             VLAN (pool LAN-USERS)"
+        );
+
+        // A relay on a VLAN no pool covers is fine.
+        let text = text
+            .replace("network 10.0.10.0/24", "network 10.0.20.0/24")
+            .replace(
+                "range 10.0.10.100 10.0.10.200",
+                "range 10.0.20.100 10.0.20.200",
+            )
+            .replace(
+                "default-gateway 10.0.10.1 } } }",
+                "default-gateway 10.0.20.1 } } }",
+            );
+        let tree = parse(&text).unwrap();
+        assert!(extract(&tree).is_ok());
+    }
+
+    /// Subnet containment and overlap, which every pool rule leans on.
+    #[test]
+    fn subnet_arithmetic_is_right() {
+        let base = Ipv4Addr::new(10, 0, 10, 0);
+        assert!(in_subnet(Ipv4Addr::new(10, 0, 10, 1), base, 24));
+        assert!(in_subnet(Ipv4Addr::new(10, 0, 10, 255), base, 24));
+        assert!(!in_subnet(Ipv4Addr::new(10, 0, 11, 1), base, 24));
+        assert!(in_subnet(Ipv4Addr::new(10, 0, 11, 1), base, 16));
+        // A /0 contains everything; a /32 only itself.
+        assert!(in_subnet(Ipv4Addr::new(1, 2, 3, 4), base, 0));
+        assert!(!in_subnet(Ipv4Addr::new(10, 0, 10, 1), base, 32));
+
+        assert!(subnets_overlap(
+            (base, 24),
+            (Ipv4Addr::new(10, 0, 10, 128), 25)
+        ));
+        assert!(subnets_overlap(
+            (Ipv4Addr::new(10, 0, 10, 128), 25),
+            (base, 24)
+        ));
+        assert!(!subnets_overlap(
+            (base, 24),
+            (Ipv4Addr::new(10, 0, 11, 0), 24)
+        ));
     }
 
     #[test]

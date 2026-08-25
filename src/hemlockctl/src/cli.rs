@@ -86,6 +86,8 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
         ports: Vec::new(),
         acls: Vec::new(),
         wreds: Vec::new(),
+        pools: Vec::new(),
+        communities: Vec::new(),
     }));
     let mut rl: rustyline::Editor<CliHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::new()?;
@@ -133,9 +135,16 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
                         let tree = hemlock_config::parse(&response.into_inner().text).ok();
                         let acls = tree.as_ref().map(candidate_acl_names).unwrap_or_default();
                         let wreds = tree.as_ref().map(candidate_wred_names).unwrap_or_default();
+                        let pools = tree.as_ref().map(candidate_pool_names).unwrap_or_default();
+                        let communities = tree
+                            .as_ref()
+                            .map(candidate_community_names)
+                            .unwrap_or_default();
                         if let Ok(mut state) = state.lock() {
                             state.acls = acls;
                             state.wreds = wreds;
+                            state.pools = pools;
+                            state.communities = communities;
                         }
                     }
                 }
@@ -181,17 +190,20 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
             } else {
                 ""
             };
-            let (cli_mode, ports, acls, wreds) = match helper_state.lock() {
+            let (cli_mode, ports, names) = match helper_state.lock() {
                 Ok(state) => (
                     state.mode,
                     state.ports.clone(),
-                    state.acls.clone(),
-                    state.wreds.clone(),
+                    complete::Names {
+                        acls: state.acls.clone(),
+                        wreds: state.wreds.clone(),
+                        pools: state.pools.clone(),
+                        communities: state.communities.clone(),
+                    },
                 ),
-                Err(_) => (CliMode::Operational, Vec::new(), Vec::new(), Vec::new()),
+                Err(_) => (CliMode::Operational, Vec::new(), complete::Names::default()),
             };
-            let options =
-                complete::help_candidates(cli_mode, &tokens, partial, &ports, &acls, &wreds);
+            let options = complete::help_candidates(cli_mode, &tokens, partial, &ports, &names);
             if options.is_empty() {
                 println!("  <cr>");
             } else {
@@ -358,7 +370,18 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
                         .await?;
                 }
                 Some("dhcp") => {
-                    crate::security::cmd::clear_dhcp_binding(&endpoints.orch, &words[2..]).await?;
+                    // `clear dhcp snooping binding` is the security
+                    // suite's; `clear dhcp server lease` this one's.
+                    match words.get(2) {
+                        Some(next) if resolve(next, &["server"]).is_ok() => {
+                            crate::services::cmd::clear_dhcp_lease(&endpoints.orch, &words[3..])
+                                .await?;
+                        }
+                        _ => {
+                            crate::security::cmd::clear_dhcp_binding(&endpoints.orch, &words[2..])
+                                .await?;
+                        }
+                    }
                 }
                 Some("dot1x") => {
                     crate::security::cmd::clear_dot1x(&endpoints.orch, &words[2..]).await?;
@@ -415,6 +438,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show dot1x [interface <port>]          802.1X port authentication");
             println!("  show dhcp snooping [binding|statistics]  DHCP snooping state");
             println!("  show dhcp relay                        DHCP relay servers and counters");
+            println!("  show dhcp server [leases]              DHCP pools, utilisation, leases");
             println!("  show arp inspection [statistics]       dynamic ARP inspection");
             println!("  show qos maps                          global DSCP/CoS/TC maps");
             println!("  show qos wred                          WRED/ECN profiles");
@@ -432,6 +456,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  clear copp counters                    baseline CoPP counters");
             println!("  clear port-security [interface <port>] reset learned MACs / errdisable");
             println!("  clear dhcp snooping binding [<mac>]    drop dynamic snooping bindings");
+            println!("  clear dhcp server lease <ip>           release one DHCP lease");
             println!("  clear dot1x interface <port>           force 802.1X reauthentication");
             println!("  clear lldp counters                    baseline LLDP frame counters");
             println!("  configure | conf                       enter configuration mode");
@@ -534,7 +559,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "snmp",
         "sflow",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|dhcp relay|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|dhcp relay|dhcp server|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -617,6 +642,13 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
                     if resolve(next, &["relay"]).is_ok() {
                         return crate::services::cmd::show_dhcp_relay(&endpoints.orch, &words[2..])
                             .await;
+                    }
+                    if resolve(next, &["server"]).is_ok() {
+                        return crate::services::cmd::show_dhcp_server(
+                            &endpoints.orch,
+                            &words[2..],
+                        )
+                        .await;
                     }
                 }
                 crate::security::cmd::show_dhcp(&endpoints.orch, &words[1..]).await
@@ -5032,11 +5064,12 @@ async fn config_services(
     if resolve(first, &["ptp"]).is_ok() {
         return Err("% PTP/1588 is not supported".into());
     }
-    match resolve(first, &["lldp", "ntp", "snmp", "sflow"])? {
+    match resolve(first, &["lldp", "ntp", "snmp", "sflow", "dhcp-server"])? {
         "lldp" => config_lldp(endpoints, &words[1..], delete).await,
         "ntp" => config_ntp(endpoints, &words[1..], delete).await,
         "snmp" => config_snmp(endpoints, &words[1..], delete).await,
         "sflow" => config_sflow(endpoints, &words[1..], delete).await,
+        "dhcp-server" => config_dhcp_server(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
 }
@@ -5741,6 +5774,345 @@ fn candidate_relay_servers(text: &str, port: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The most DNS servers a pool hands out — checked at the prompt for
+/// immediate feedback; mgmtd re-validates.
+const MAX_POOL_DNS_SERVERS: usize = 3;
+
+/// Pool names follow the ACL/WRED convention.
+fn valid_pool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The pool names a config tree defines, sorted — the completer's cache.
+fn candidate_pool_names(tree: &hemlock_config::ConfigTree) -> Vec<String> {
+    let Some((_, services)) = tree.block("services") else {
+        return Vec::new();
+    };
+    let Some((_, server)) = ConfigTree::blocks_named(services, "dhcp-server").next() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = ConfigTree::blocks_named(server, "pool")
+        .filter_map(|(keys, _)| keys.first().cloned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The SNMP community names a config tree defines, sorted — the
+/// completer's cache.
+fn candidate_community_names(tree: &hemlock_config::ConfigTree) -> Vec<String> {
+    let Some((_, services)) = tree.block("services") else {
+        return Vec::new();
+    };
+    let Some((_, snmp)) = ConfigTree::blocks_named(services, "snmp").next() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = snmp
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "community" => {
+                values.first().cloned()
+            }
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// `set|delete services dhcp-server pool <name> [...]`.
+async fn config_dhcp_server(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} services dhcp-server pool <name> [network <prefix> | range <start> <end> | default-gateway <ipv4> | dns-server <ipv4> | lease-time <300-2592000> | domain-name <text> | reservation <mac> address <ipv4>]"
+        )
+    };
+    if words.is_empty() {
+        return if delete {
+            edit_config(endpoints, |tree| {
+                let services = tree.block_mut("services");
+                ConfigTree::remove_block(services, "dhcp-server", &[]);
+                remove_block_if_empty(tree, "services");
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            Err(usage())
+        };
+    }
+    resolve(words[0], &["pool"])?;
+    let Some(name) = words.get(1) else {
+        return Err(usage());
+    };
+    if !valid_pool_name(name) {
+        return Err(format!("% bad pool name {name:?}"));
+    }
+    let pool_name = (*name).to_string();
+
+    let edit_pool = |edit: BlockEdit| {
+        let name = pool_name.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let services = tree.block_mut("services");
+                let server = ConfigTree::ensure_block(services, "dhcp-server", &[]);
+                let pool = ConfigTree::ensure_block(server, "pool", &[&name]);
+                edit(pool);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+    let delete_in_pool = |edit: BlockEdit| {
+        let name = pool_name.clone();
+        async move {
+            edit_config(endpoints, move |tree| {
+                let services = tree.block_mut("services");
+                if let Some(server) = block_children_mut(services, "dhcp-server") {
+                    if let Some(pool) = keyed_block_children_mut(server, "pool", &name) {
+                        edit(pool);
+                    }
+                    if server.is_empty() {
+                        ConfigTree::remove_block(services, "dhcp-server", &[]);
+                    }
+                }
+                remove_block_if_empty(tree, "services");
+            })
+            .await
+            .map_err(fmt_err)
+        }
+    };
+
+    let rest = &words[2..];
+    if rest.is_empty() {
+        return if delete {
+            // `delete ... pool <name>` drops the whole pool.
+            let name = pool_name.clone();
+            edit_config(endpoints, move |tree| {
+                let services = tree.block_mut("services");
+                if let Some(server) = block_children_mut(services, "dhcp-server") {
+                    ConfigTree::remove_block(server, "pool", &[&name]);
+                    if server.is_empty() {
+                        ConfigTree::remove_block(services, "dhcp-server", &[]);
+                    }
+                }
+                remove_block_if_empty(tree, "services");
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            // A bare `set ... pool <name>` creates the (empty) pool.
+            edit_pool(Box::new(|_| {})).await
+        };
+    }
+    // Deferred by this suite, named rather than silently ignored.
+    if matches!(rest[0], "option-82" | "relay-agent-information") {
+        return Err("% DHCP option-82 is not supported".into());
+    }
+    match resolve(
+        rest[0],
+        &[
+            "network",
+            "range",
+            "default-gateway",
+            "dns-server",
+            "lease-time",
+            "domain-name",
+            "reservation",
+        ],
+    )? {
+        "network" => {
+            if delete {
+                return delete_in_pool(Box::new(|pool| ConfigTree::remove_leaf(pool, "network")))
+                    .await;
+            }
+            let Some(prefix) = rest.get(1) else {
+                return Err(usage());
+            };
+            if prefix.contains(':') {
+                return Err("% DHCPv6 pools are not supported".into());
+            }
+            let prefix = hemlock_common::net::require_canonical_prefix(prefix)
+                .map_err(|e| format!("% {e}"))?;
+            edit_pool(Box::new(move |pool| {
+                ConfigTree::set_leaf(pool, "network", vec![prefix]);
+            }))
+            .await
+        }
+        "range" => {
+            if delete {
+                return delete_in_pool(Box::new(|pool| ConfigTree::remove_leaf(pool, "range")))
+                    .await;
+            }
+            let ([Some(start), Some(end)], true) = ([rest.get(1), rest.get(2)], rest.len() == 3)
+            else {
+                return Err(format!(
+                    "% Usage: set services dhcp-server pool {pool_name} range <start-ip> <end-ip>"
+                ));
+            };
+            let start = canonical_ipv4(start)?;
+            let end = canonical_ipv4(end)?;
+            edit_pool(Box::new(move |pool| {
+                ConfigTree::set_leaf(pool, "range", vec![start, end]);
+            }))
+            .await
+        }
+        "default-gateway" => {
+            if delete {
+                return delete_in_pool(Box::new(|pool| {
+                    ConfigTree::remove_leaf(pool, "default-gateway");
+                }))
+                .await;
+            }
+            let Some(address) = rest.get(1) else {
+                return Err(usage());
+            };
+            let address = canonical_ipv4(address)?;
+            edit_pool(Box::new(move |pool| {
+                ConfigTree::set_leaf(pool, "default-gateway", vec![address]);
+            }))
+            .await
+        }
+        "dns-server" => {
+            let Some(address) = rest.get(1) else {
+                return if delete {
+                    delete_in_pool(Box::new(|pool| ConfigTree::remove_leaf(pool, "dns-server")))
+                        .await
+                } else {
+                    Err(usage())
+                };
+            };
+            let address = canonical_ipv4(address)?;
+            if delete {
+                return delete_in_pool(Box::new(move |pool| {
+                    remove_leaf_matching(pool, "dns-server", &[&address]);
+                }))
+                .await;
+            }
+            let candidate = candidate_text(endpoints).await.map_err(fmt_err)?;
+            let existing = candidate_pool_leaves(&candidate, &pool_name, "dns-server");
+            if !existing.contains(&address) && existing.len() >= MAX_POOL_DNS_SERVERS {
+                return Err(format!(
+                    "% at most {MAX_POOL_DNS_SERVERS} dns-servers ({} configured)",
+                    existing.len()
+                ));
+            }
+            edit_pool(Box::new(move |pool| {
+                remove_leaf_matching(pool, "dns-server", &[&address]);
+                push_leaf(pool, "dns-server", vec![address]);
+            }))
+            .await
+        }
+        leaf @ ("lease-time" | "domain-name") => {
+            let name = leaf.to_string();
+            if delete {
+                return delete_in_pool(Box::new(move |pool| {
+                    ConfigTree::remove_leaf(pool, &name);
+                }))
+                .await;
+            }
+            let value = if leaf == "lease-time" {
+                let Some(raw) = rest.get(1) else {
+                    return Err(usage());
+                };
+                int_arg(raw, 300..=2_592_000u32, "lease-time")?.to_string()
+            } else {
+                let text = rest[1..].join(" ");
+                if text.is_empty() {
+                    return Err(usage());
+                }
+                text
+            };
+            edit_pool(Box::new(move |pool| {
+                ConfigTree::set_leaf(pool, &name, vec![value]);
+            }))
+            .await
+        }
+        "reservation" => {
+            let Some(raw_mac) = rest.get(1) else {
+                return if delete {
+                    delete_in_pool(Box::new(|pool| {
+                        ConfigTree::remove_leaf(pool, "reservation")
+                    }))
+                    .await
+                } else {
+                    Err(usage())
+                };
+            };
+            let mac =
+                hemlock_common::net::parse_unicast_mac(raw_mac).map_err(|e| format!("% {e}"))?;
+            if delete {
+                return delete_in_pool(Box::new(move |pool| {
+                    remove_leaf_matching(pool, "reservation", &[&mac]);
+                }))
+                .await;
+            }
+            let ([Some(keyword), Some(address)], true) =
+                ([rest.get(2), rest.get(3)], rest.len() == 4)
+            else {
+                return Err(format!(
+                    "% Usage: set services dhcp-server pool {pool_name} reservation <mac> address <ipv4>"
+                ));
+            };
+            resolve(keyword, &["address"])?;
+            let address = canonical_ipv4(address)?;
+            edit_pool(Box::new(move |pool| {
+                remove_leaf_matching(pool, "reservation", &[&mac]);
+                push_leaf(pool, "reservation", vec![mac, "address".into(), address]);
+            }))
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// One pool's repeated leaf values (dns-server addresses), in order.
+fn candidate_pool_leaves(text: &str, pool: &str, leaf: &str) -> Vec<String> {
+    let Ok(tree) = hemlock_config::parse(text) else {
+        return Vec::new();
+    };
+    let Some((_, services)) = tree.block("services") else {
+        return Vec::new();
+    };
+    let Some((_, server)) = ConfigTree::blocks_named(services, "dhcp-server").next() else {
+        return Vec::new();
+    };
+    let values: Vec<String> = ConfigTree::blocks_named(server, "pool")
+        .find(|(keys, _)| keys.first().map(String::as_str) == Some(pool))
+        .map(|(_, children)| {
+            children
+                .iter()
+                .filter_map(|item| match item {
+                    hemlock_config::Item::Leaf { name, values } if name == leaf => {
+                        values.first().cloned()
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    values
+}
+
+/// An IPv4 address in canonical form; a v6 address names the deferred
+/// DHCPv6 support rather than reading as a typo.
+fn canonical_ipv4(text: &str) -> Result<String, String> {
+    match text.parse::<std::net::Ipv4Addr>() {
+        Ok(address) => Ok(address.to_string()),
+        Err(_) if text.parse::<std::net::Ipv6Addr>().is_ok() => {
+            Err("% DHCPv6 pools are not supported".into())
+        }
+        Err(_) => Err(format!("% bad address {text:?}")),
+    }
 }
 
 /// `set|delete switching <mac-table|mirror> ...`.

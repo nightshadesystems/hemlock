@@ -8,6 +8,7 @@
 //! `osapply`). Further families slot into `intents.rs` + `service.rs`
 //! without changing the lifecycle machinery.
 
+mod dnsmasqapply;
 mod frrapply;
 mod intents;
 mod osapply;

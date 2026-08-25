@@ -182,3 +182,46 @@ pub struct DhcpRelayVlan {
 pub struct DhcpRelayState {
     pub vlans: Vec<DhcpRelayVlan>,
 }
+
+// ------------------------------------------------- DHCP server
+
+/// One configured pool with its live utilisation.
+#[derive(Debug, Clone, Serialize)]
+pub struct DhcpPool {
+    pub name: String,
+    pub network: String,
+    /// Pre-rendered `10.0.10.100 - 10.0.10.200`.
+    pub range: String,
+    pub gateway: String,
+    pub lease_time: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dns_servers: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub domain_name: String,
+    /// Dynamic leases held out of the range, and how many it holds.
+    pub in_use: u32,
+    pub capacity: u32,
+}
+
+/// One lease or reservation.
+#[derive(Debug, Clone, Serialize)]
+pub struct DhcpLease {
+    pub address: String,
+    pub mac: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hostname: String,
+    /// Unix seconds; None for a reservation with no active lease.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    /// "dynamic" | "reservation".
+    pub kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pool: String,
+}
+
+/// `show dhcp server` and `show dhcp server leases`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DhcpServerState {
+    pub pools: Vec<DhcpPool>,
+    pub leases: Vec<DhcpLease>,
+}

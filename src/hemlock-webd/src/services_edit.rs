@@ -1,5 +1,5 @@
 //! Config edits for the services-suite pages: LLDP, NTP, SNMP,
-//! sFlow and the DHCP relay.
+//! sFlow, and the DHCP relay and server.
 //!
 //! Same discipline as `edit.rs`: the builders write exactly the leaves
 //! hemlockctl writes, based on the running config, and the result goes
@@ -607,6 +607,194 @@ fn valid_vlan(id: u16) -> Result<(), String> {
     }
 }
 
+// ----------------------------------------------------------- DHCP server
+
+/// The most DNS servers a pool hands out — the same cap the CLI and the
+/// intent extractor enforce.
+const MAX_POOL_DNS_SERVERS: usize = 3;
+
+/// Pool names follow the ACL/WRED convention. mgmtd re-validates.
+fn valid_pool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DhcpReservationSet {
+    pub mac: String,
+    pub address: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DhcpPoolSet {
+    pub name: String,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub range_start: Option<String>,
+    #[serde(default)]
+    pub range_end: Option<String>,
+    #[serde(default)]
+    pub default_gateway: Option<String>,
+    /// When present, replaces the whole DNS list.
+    #[serde(default)]
+    pub dns_servers: Option<Vec<String>>,
+    /// 0 clears (back to the default 86400).
+    #[serde(default)]
+    pub lease_time: Option<u32>,
+    /// An empty string clears the leaf.
+    #[serde(default)]
+    pub domain_name: Option<String>,
+    /// When present, replaces the whole reservation set.
+    #[serde(default)]
+    pub reservations: Option<Vec<DhcpReservationSet>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DhcpServerEdit {
+    #[serde(default)]
+    pub set: Vec<DhcpPoolSet>,
+    /// Pools to remove entirely.
+    #[serde(default)]
+    pub delete: Vec<String>,
+}
+
+fn ipv4(what: &str, text: &str) -> Result<String, String> {
+    match text.parse::<std::net::Ipv4Addr>() {
+        Ok(address) => Ok(address.to_string()),
+        // DHCPv6 pools are deferred, so a v6 address is not a typo.
+        Err(_) if text.parse::<std::net::Ipv6Addr>().is_ok() => {
+            Err("DHCPv6 pools are not supported".into())
+        }
+        Err(_) => Err(format!("bad {what} {text:?}")),
+    }
+}
+
+pub fn apply_dhcp_server_edit(tree: &mut ConfigTree, edit: &DhcpServerEdit) -> Result<(), String> {
+    for set in &edit.set {
+        if !valid_pool_name(&set.name) {
+            return Err(format!("bad pool name {:?}", set.name));
+        }
+        if let Some(network) = &set.network {
+            let canonical = hemlock_common::net::require_canonical_prefix(network)?;
+            if canonical.contains(':') {
+                return Err("DHCPv6 pools are not supported".into());
+            }
+        }
+        for (what, value) in [
+            ("range start", &set.range_start),
+            ("range end", &set.range_end),
+            ("default-gateway", &set.default_gateway),
+        ] {
+            if let Some(value) = value {
+                ipv4(what, value)?;
+            }
+        }
+        if let Some(servers) = &set.dns_servers {
+            if servers.len() > MAX_POOL_DNS_SERVERS {
+                return Err(format!(
+                    "pool {}: at most {MAX_POOL_DNS_SERVERS} dns-servers ({} given)",
+                    set.name,
+                    servers.len()
+                ));
+            }
+            for server in servers {
+                ipv4("dns-server", server)?;
+            }
+        }
+        if let Some(lease) = set.lease_time {
+            if lease != 0 && !(300..=2_592_000).contains(&lease) {
+                return Err(format!("bad lease-time {lease} (300..2592000)"));
+            }
+        }
+        if let Some(reservations) = &set.reservations {
+            for reservation in reservations {
+                hemlock_common::net::parse_unicast_mac(&reservation.mac)?;
+                ipv4("reservation address", &reservation.address)?;
+            }
+        }
+        // A range is two halves of one leaf: half of it configures
+        // nothing the intent extractor would accept.
+        if set.range_start.is_some() != set.range_end.is_some() {
+            return Err(format!(
+                "pool {}: a range needs both a start and an end",
+                set.name
+            ));
+        }
+    }
+
+    for set in &edit.set {
+        let services = tree.block_mut("services");
+        let server = ConfigTree::ensure_block(services, "dhcp-server", &[]);
+        let pool = ConfigTree::ensure_block(server, "pool", &[&set.name]);
+        if let Some(network) = &set.network {
+            let canonical = hemlock_common::net::require_canonical_prefix(network)
+                .unwrap_or_else(|_| network.clone());
+            ConfigTree::set_leaf(pool, "network", vec![canonical]);
+        }
+        if let (Some(start), Some(end)) = (&set.range_start, &set.range_end) {
+            ConfigTree::set_leaf(pool, "range", vec![start.clone(), end.clone()]);
+        }
+        if let Some(gateway) = &set.default_gateway {
+            ConfigTree::set_leaf(pool, "default-gateway", vec![gateway.clone()]);
+        }
+        if let Some(servers) = &set.dns_servers {
+            ConfigTree::remove_leaf(pool, "dns-server");
+            let mut seen: Vec<&String> = Vec::new();
+            for server in servers {
+                if seen.contains(&server) {
+                    continue;
+                }
+                seen.push(server);
+                push_leaf(pool, "dns-server", vec![server.clone()]);
+            }
+        }
+        match set.lease_time {
+            Some(0) => ConfigTree::remove_leaf(pool, "lease-time"),
+            Some(lease) => ConfigTree::set_leaf(pool, "lease-time", vec![lease.to_string()]),
+            None => {}
+        }
+        match set.domain_name.as_deref() {
+            Some("") => ConfigTree::remove_leaf(pool, "domain-name"),
+            Some(domain) => {
+                ConfigTree::set_leaf(pool, "domain-name", vec![domain.to_string()]);
+            }
+            None => {}
+        }
+        if let Some(reservations) = &set.reservations {
+            ConfigTree::remove_leaf(pool, "reservation");
+            let mut seen: Vec<String> = Vec::new();
+            for reservation in reservations {
+                let mac = hemlock_common::net::parse_unicast_mac(&reservation.mac)
+                    .unwrap_or_else(|_| reservation.mac.clone());
+                if seen.contains(&mac) {
+                    continue;
+                }
+                seen.push(mac.clone());
+                push_leaf(
+                    pool,
+                    "reservation",
+                    vec![mac, "address".into(), reservation.address.clone()],
+                );
+            }
+        }
+    }
+
+    for name in &edit.delete {
+        let services = tree.block_mut("services");
+        if let Some(server) = block_children_mut(services, "dhcp-server") {
+            ConfigTree::remove_block(server, "pool", &[name]);
+            if server.is_empty() {
+                ConfigTree::remove_block(services, "dhcp-server", &[]);
+            }
+        }
+    }
+    remove_block_if_empty(tree, "services");
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1091,6 +1279,134 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.to_text().matches("dhcp-relay server 10.0.0.1").count(), 1);
+    }
+
+    #[test]
+    fn dhcp_server_edit_writes_a_whole_pool() {
+        let mut t = tree("");
+        apply_dhcp_server_edit(
+            &mut t,
+            &DhcpServerEdit {
+                set: vec![DhcpPoolSet {
+                    name: "LAN-USERS".into(),
+                    network: Some("10.0.10.0/24".into()),
+                    range_start: Some("10.0.10.100".into()),
+                    range_end: Some("10.0.10.200".into()),
+                    default_gateway: Some("10.0.10.1".into()),
+                    dns_servers: Some(vec!["10.42.0.5".into(), "10.42.0.6".into()]),
+                    lease_time: Some(86400),
+                    domain_name: None,
+                    reservations: Some(vec![DhcpReservationSet {
+                        mac: "00:1C:73:0C:AA:01".into(),
+                        address: "10.0.10.50".into(),
+                    }]),
+                }],
+                ..DhcpServerEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("network 10.0.10.0/24"));
+        assert!(text.contains("range 10.0.10.100 10.0.10.200"));
+        assert!(text.contains("default-gateway 10.0.10.1"));
+        assert!(text.contains("dns-server 10.42.0.5"));
+        assert!(text.contains("lease-time 86400"));
+        // The MAC is canonicalized on the way in.
+        assert!(text.contains("reservation 00:1c:73:0c:aa:01 address 10.0.10.50"));
+
+        // A replacement list wins outright.
+        apply_dhcp_server_edit(
+            &mut t,
+            &DhcpServerEdit {
+                set: vec![DhcpPoolSet {
+                    name: "LAN-USERS".into(),
+                    network: None,
+                    range_start: None,
+                    range_end: None,
+                    default_gateway: None,
+                    dns_servers: Some(vec!["10.42.0.9".into()]),
+                    lease_time: Some(0),
+                    domain_name: None,
+                    reservations: Some(Vec::new()),
+                }],
+                ..DhcpServerEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("dns-server 10.42.0.9"));
+        assert!(!text.contains("10.42.0.5"));
+        assert!(!text.contains("lease-time"), "0 clears the leaf");
+        assert!(!text.contains("reservation"));
+        // ...and the untouched leaves survive.
+        assert!(text.contains("network 10.0.10.0/24"));
+
+        apply_dhcp_server_edit(
+            &mut t,
+            &DhcpServerEdit {
+                delete: vec!["LAN-USERS".into()],
+                ..DhcpServerEdit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(t.to_text().trim(), "");
+    }
+
+    #[test]
+    fn dhcp_server_edit_rejects_what_the_cli_rejects() {
+        let mut t = tree("");
+        let pool = |edit: DhcpPoolSet| DhcpServerEdit {
+            set: vec![edit],
+            ..DhcpServerEdit::default()
+        };
+        let base = || DhcpPoolSet {
+            name: "P".into(),
+            network: None,
+            range_start: None,
+            range_end: None,
+            default_gateway: None,
+            dns_servers: None,
+            lease_time: None,
+            domain_name: None,
+            reservations: None,
+        };
+        for edit in [
+            pool(DhcpPoolSet {
+                name: "9bad".into(),
+                ..base()
+            }),
+            pool(DhcpPoolSet {
+                network: Some("10.0.10.5/24".into()),
+                ..base()
+            }),
+            pool(DhcpPoolSet {
+                network: Some("2001:db8::/64".into()),
+                ..base()
+            }),
+            // Half a range configures nothing.
+            pool(DhcpPoolSet {
+                range_start: Some("10.0.10.100".into()),
+                ..base()
+            }),
+            pool(DhcpPoolSet {
+                lease_time: Some(299),
+                ..base()
+            }),
+            pool(DhcpPoolSet {
+                dns_servers: Some((1..=4).map(|n| format!("10.0.0.{n}")).collect()),
+                ..base()
+            }),
+            pool(DhcpPoolSet {
+                reservations: Some(vec![DhcpReservationSet {
+                    mac: "ff:ff:ff:ff:ff:ff".into(),
+                    address: "10.0.10.5".into(),
+                }]),
+                ..base()
+            }),
+        ] {
+            assert!(apply_dhcp_server_edit(&mut t, &edit).is_err());
+        }
+        assert_eq!(t.to_text().trim(), "", "a rejected edit writes nothing");
     }
 
     /// The global disable is independent of the per-port set.

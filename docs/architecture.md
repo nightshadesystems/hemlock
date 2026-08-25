@@ -72,7 +72,7 @@ daemons, the configuration model, and the image/installer pipeline.
 | `hemlock-syncd` | bin | The only ASIC owner: switch create, port bring-up, port state gRPC |
 | `hemlock-pmon` | bin | Manifest-driven environment monitoring + fan control |
 | `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring |
-| `hemlock-orch` | bin | Protocol engines: LACP, spanning tree, IGMP/MLD snooping, 802.1X (hostapd), DHCP snooping + DAI; packet I/O; the kernel-RIB → syncd FIB pipeline; FRR state queries |
+| `hemlock-orch` | bin | Protocol engines: LACP, spanning tree, IGMP/MLD snooping, 802.1X (hostapd), DHCP snooping + DAI + relay, LLDP; packet I/O; the kernel-RIB → syncd FIB pipeline; the sFlow exporter and the SNMP AgentX subagent; FRR, NTP and DHCP-lease state queries |
 | `hemlock-webd` | bin | Web console: serves the exported Next.js UI (`web/`) + JSON API over HTTP/HTTPS; config-driven via `set system http`/`https` |
 | `hemlock-config` | lib | Curly-brace config language: lexer, parser, tree |
 | `hemlockctl` | bin | Operator CLI |
@@ -143,6 +143,13 @@ weight, optional shaper) with per-queue binding and a port-level
 shaper, WRED profiles (`WredSpec`, including ECN marking) with
 per-queue binding, and two more queue stats (WRED drops, ECN marks).
 
+The services suite added the last ASIC surface: a hardware ingress
+sampler (`samplepacket` objects with per-port ingress binds, plus the
+`SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET` punt trap and a
+`SaiEvent::SampledPacket` carrying each sample's ingress port and its
+length on the wire) and an LLDP trap. Everything else the suite needed
+was CPU-side.
+
 The vendor backend also answers a **capability probe**
 (`SaiBackend::capabilities`, via `sai_query_attribute_capability`): which
 of LAG, STP, FDB flush/aging, L2MC, storm policers, mirroring,
@@ -161,7 +168,10 @@ fails cleanly with `% <feature> is not supported by this platform's SAI`
 — configuration is never silently dropped on the floor. Egress ACL
 bindings, rule `police`, port-security, CoPP overrides, egress rewrite
 maps, queue shapers, and WRED/ECN references each fail commit this way
-when unsupported, never silently no-op.
+when unsupported, never silently no-op. The services suite added
+`sflow` (both halves: the samplepacket object and the port attribute
+that binds it), so `services { sflow }` on a platform without a
+sampler fails the commit rather than sampling nothing.
 
 **Mock backend** (`mock-sai`, default feature): pure Rust, constructed from
 the platform port table. Links follow admin state and emit the same
@@ -246,8 +256,8 @@ match counts) alone. `clear acl counters` is baseline subtraction, not
 object churn.
 
 **CoPP** owns the CPU-bound protocol traps. The class table is compiled
-into syncd (bpdu, lacp, eapol, igmp, mld, arp, dhcp, ospf, bgp, vrrp,
-ip2me, acl-log, default — fixed membership, not user-definable): at
+into syncd (bpdu, lacp, lldp, eapol, igmp, mld, arp, dhcp, ospf, bgp,
+vrrp, ip2me, acl-log, default — fixed membership, not user-definable): at
 startup each class gets a pps policer and its own trap group with the
 member traps; the `default` class polices the switch's default trap
 group instead. The DHCP trap is a *copy* (hardware keeps forwarding;
@@ -261,6 +271,18 @@ secured port's learned set, a learn past the limit (or an injected
 `LearnLimitViolation`) records a violation and applies the action —
 `protect` freezes hardware learning, `shutdown` errdisables the port
 (recovered by `clear port-security`).
+
+**The sFlow sampler** (`sflow.rs`) is one shared samplepacket session
+bound to every enabled front-panel port, reconciled declaratively from
+`SetSflowSampling`: the rate is global in the config language, so a
+session per port would cost objects and buy nothing. A rate change
+rebuilds the session rather than mutating it; rate 0 tears the whole
+program down. Sampled frames come back on the punt path and stream to
+orch over `WatchSampledPackets` — the one packet path that rides gRPC,
+because the metadata (ingress port, wire length) only exists ASIC-side.
+The sample trap deliberately gets no CoPP policer: the sample rate is
+already the rate limit, and a second one would skew the statistical
+estimate every collector computes.
 
 **The QoS engine** (`qos.rs`) owns everything between the flat,
 declarative RPC surface (`SetQosMaps`, `SetPortQos`/`ClearPortQos`,
@@ -323,6 +345,11 @@ owner) should carry:
 - **IGMP/MLD snooping** (`snoop.rs`) — one generic engine instantiated
   per family: group membership with timers, fast-leave, querier election,
   dynamic mrouter learning from queries, and optional local querier.
+- **LLDP** (`lldp.rs`) — native 802.1AB, no `lldpd` in the image:
+  advertisements on every enabled front-panel port at the configured
+  interval, a TTL-aged neighbor table, and per-port frame counters.
+  On by default (`services { lldp { disable; } }` is the global off
+  switch, `lldp disable` the per-port one), like snooping.
 
 Each engine is a pure state machine spawned with mpsc channels (links and
 packets in; frames and state updates out), so engine tests wire two
@@ -365,6 +392,23 @@ never renders FRR config. Details:
   `GetNeighbors` snapshots — statics, connected, and FRR routes appear
   uniformly, with FIB (hardware) state — never from vtysh.
 
+**Render-and-reload appliers.** Four families are rendered into a
+package's own config file and reloaded, all to one pattern: a pure,
+deterministic render function pinned by golden files, plus a
+best-effort apply that is inert when the package is absent and is
+gated on a render diff so an unrelated commit never bounces the
+service. They are FRR (`frrapply.rs` → `/etc/frr/frr.conf` +
+`daemons`), the NTP client (`osapply.rs` → a
+`/etc/systemd/timesyncd.conf.d` drop-in), SNMP (`snmpapply.rs` →
+`/etc/snmp/snmpd.conf`) and the DHCP server (`dnsmasqapply.rs` →
+`/etc/dnsmasq.d/hemlock.conf`). `snmpd` and `dnsmasq` run only when
+their block exists; timesyncd stops when no server is configured.
+Two wrinkles are recorded in the appliers themselves: net-snmp
+persists derived USM keys that would shadow a changed passphrase, so
+a changed render drops that state first; and dnsmasq's DNS half is
+turned off outright (`port=0`), because a switch answering DNS on its
+management network is a surprise nobody asked for.
+
 **FRR (OSPFv2, BGP IPv4 unicast, VRRP).** FRR is the protocol stack
 (pinned Debian package in the image). mgmtd's FRR applier
 (`frrapply.rs`) renders `/etc/frr/frr.conf` + `daemons` from the
@@ -391,7 +435,7 @@ entries). The control socket is abstracted as an event stream, so
 engine tests run against a scripted hostapd-ctrl simulator.
 `clear dot1x interface <port>` is a REAUTHENTICATE poke at hostapd.
 
-**DHCP snooping + DAI (`snoopsec.rs`).** DHCP on snooped VLANs traps to
+**DHCP snooping + DAI + relay (`snoopsec.rs`).** DHCP on snooped VLANs traps to
 the CPU from untrusted ports and copies from trusted ports (binding
 learn), via syncd's `SetSnoopRedirects` internal-ACL program recomputed
 from config + the live VLAN membership view. The engine validates
@@ -403,6 +447,33 @@ toward the trusted side. DAI validates trapped ARP against the bindings
 + statics + the configured `validate` checks, re-injecting within the
 VLAN or dropping with a counted reason and a syslog line. The CoPP
 dhcp/arp classes bound the CPU load of both paths.
+
+**One DHCP packet path.** The relay (`set interfaces Vlan<id>
+dhcp-relay server <ipv4>`) is a capability of this same engine, not a
+daemon of its own — `isc-dhcp-relay` is not in the rootfs. A relayed
+request rides the same trap/validate/re-inject pipeline: the chaddr
+check runs *before* anything is forwarded, the SVI's address is
+stamped into giaddr, and the request goes out a UDP socket bound to
+that address (so the kernel routes and ARPs, and the server's reply
+comes back to the same socket). Replies are framed toward the client
+on the packet path, because a station with no address yet cannot
+receive a unicast. Relayed leases land in the same binding table, so
+DAI protects a relayed client with no extra configuration. Per-VLAN
+counters (to-server, to-client, dropped) ride the engine's existing
+state RPC.
+
+**The services suite's other orch residents.** The **sFlow exporter**
+(`sflow.rs`) turns syncd's sampled frames and periodic counter polls
+into byte-exact v5 datagrams — sequence numbers, sample pools, agent
+identity, MTU-budgeted packing and pacing — and sends them to the
+collectors; syncd owns the ASIC sampler, orch owns the export. The
+**SNMP AgentX subagent** (`snmpsub.rs`, over `agentx.rs`'s RFC 2741
+framing) registers `ifTable`/`ifXTable` on snmpd's master socket at a
+better priority than its built-in handlers and answers them from
+syncd's counters — kernel netdev counters on the hostifs do not
+reflect hardware forwarding, so plain snmpd interface data would
+simply be wrong. `ntpshow` and `dhcpserver` are query-only: they read
+`timedatectl` and dnsmasq's lease file the way `frrshow` reads vtysh.
 
 **Packet I/O decision**: engines exchange PDUs over Linux `AF_PACKET`
 sockets (`transport.rs`, via the `nix` crate — bound with `getifaddrs`
@@ -455,13 +526,16 @@ commit.
   because the RPC is declarative), named WRED/ECN profiles, and the
   per-port program (trust mode, default traffic class, port and queue
   shapers, per-queue scheduling and WRED) that rides the port and LAG
-  intents. Ordering inside the applier matters: profiles push before
+  intents — and the services suite: `services { lldp | ntp | snmp |
+  sflow | dhcp-server }` plus the per-port `lldp disable` / `sflow
+  disable` markers and the per-SVI `dhcp-relay server`. Ordering inside the applier matters: profiles push before
   the port programs that reference them, and profile removals come
   last, once no queue holds them. RADIUS shared
   secrets are the first secrets the config tree stores: they persist
   in the clear on-box like the rest of the tree, render into hostapd's
   config mode 0600, and display as `<hidden>` in `show configuration`
-  (the redaction convention new secret leaves follow). Cross-object validation
+  (the redaction convention new secret leaves follow — SNMP v3
+  passphrases are the second). Cross-object validation
   (e.g. "a LAG member's L2 config lives on the Port-Channel", mirror
   destination exclusivity) runs at load/commit before anything is pushed.
   An interface removed from the config reverts to defaults (admin up, no
@@ -486,7 +560,11 @@ unique command prefixes are accepted (`sh int status`).
 Config-mode commands (`interface <name>` → `description`, `shutdown`,
 `no shutdown`) edit the mgmtd *candidate* via the config tree; nothing
 touches the ASIC until `commit` (or `commit confirmed <secs>` for
-auto-rollback). `show interfaces status` renders the EOS-style summary
+auto-rollback). The services suite adds `show lldp [neighbors
+[detail]]`, `show ntp`, `show snmp`, `show sflow`, `show dhcp relay`
+and `show dhcp server [leases]`, plus `clear lldp counters` and
+`clear dhcp server lease <ip>`.
+`show interfaces status` renders the EOS-style summary
 (Status = connected/notconnect/disabled; Type comes from the manifest's
 per-port `media` field). Subcommand form (`hemlockctl show interfaces
 status`, `hemlockctl commit`, ...) drives the same daemons for scripting.
@@ -574,7 +652,11 @@ ONIE.
 
 Still out of scope: EVPN, OSPFv3, the BGP IPv6 address family, VRFs,
 multicast routing (PIM), policy routing, licensing, telemetry
-streaming. The seams they will land on already exist:
+streaming. The services suite drew its own line too, and every
+deferred spelling is rejected at parse with `% ... not supported`
+rather than silently ignored: PTP/1588, LLDP-MED TLVs, DHCP option-82,
+DHCPv6 (relay and server), SNMP traps/informs, SNMP write access, NTP
+server mode and authentication, and sFlow egress sampling. The seams they will land on already exist:
 
 - New routing families extend the `routing { ... }` intent extractors,
   the FRR render, and — where the ASIC is involved — the RIB pipeline's

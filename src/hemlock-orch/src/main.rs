@@ -9,6 +9,7 @@
 //! over gRPC.
 
 mod agentx;
+mod dhcpserver;
 mod dot1x;
 mod frrshow;
 mod lacp;
@@ -50,6 +51,7 @@ struct OrchService {
     lldp: lldp::Engine,
     snmp: snmpsub::Engine,
     sflow: sflow::Engine,
+    dhcp_server: dhcpserver::Engine,
     igmp: snoop::Engine,
     mld: snoop::Engine,
     rib: rib::Engine,
@@ -240,6 +242,109 @@ impl Orch for OrchService {
     ) -> Result<Response<pb::ClearLldpCountersResponse>, Status> {
         let cleared = self.lldp.clear_counters(&request.into_inner().port);
         Ok(Response::new(pb::ClearLldpCountersResponse { cleared }))
+    }
+
+    async fn set_dhcp_server_config(
+        &self,
+        request: Request<pb::SetDhcpServerConfigRequest>,
+    ) -> Result<Response<pb::SetDhcpServerConfigResponse>, Status> {
+        // A gRPC helper naturally speaks `Status`; its size is tonic's
+        // business, not this closure's.
+        #[allow(clippy::result_large_err)]
+        fn ipv4(what: &str, text: &str) -> Result<std::net::Ipv4Addr, Status> {
+            text.parse::<std::net::Ipv4Addr>()
+                .map_err(|_| Status::invalid_argument(format!("bad {what} {text:?}")))
+        }
+        let mut pools = Vec::new();
+        for pool in request.into_inner().pools {
+            let mut reservations = std::collections::BTreeMap::new();
+            for reservation in &pool.reservations {
+                reservations.insert(
+                    reservation.mac.clone(),
+                    ipv4("reservation address", &reservation.address)?,
+                );
+            }
+            let mut dns_servers = Vec::with_capacity(pool.dns_servers.len());
+            for server in &pool.dns_servers {
+                dns_servers.push(ipv4("dns-server", server)?);
+            }
+            pools.push(dhcpserver::Pool {
+                name: pool.name,
+                network: pool.network,
+                range_start: ipv4("range start", &pool.range_start)?,
+                range_end: ipv4("range end", &pool.range_end)?,
+                gateway: ipv4("default-gateway", &pool.gateway)?,
+                dns_servers,
+                lease_time: pool.lease_time,
+                domain_name: pool.domain_name,
+                reservations,
+            });
+        }
+        self.dhcp_server.set_config(dhcpserver::Config {
+            pools,
+            lease_file: String::new(),
+        });
+        Ok(Response::new(pb::SetDhcpServerConfigResponse {}))
+    }
+
+    async fn get_dhcp_server_state(
+        &self,
+        _request: Request<pb::GetDhcpServerStateRequest>,
+    ) -> Result<Response<pb::GetDhcpServerStateResponse>, Status> {
+        let snapshot = self.dhcp_server.snapshot();
+        Ok(Response::new(pb::GetDhcpServerStateResponse {
+            pools: snapshot
+                .pools
+                .iter()
+                .map(|pool| pb::DhcpPoolState {
+                    config: Some(pb::DhcpPoolConfig {
+                        name: pool.name.clone(),
+                        network: pool.network.clone(),
+                        range_start: pool.range_start.to_string(),
+                        range_end: pool.range_end.to_string(),
+                        gateway: pool.gateway.to_string(),
+                        dns_servers: pool.dns_servers.iter().map(|s| s.to_string()).collect(),
+                        lease_time: pool.lease_time,
+                        domain_name: pool.domain_name.clone(),
+                        reservations: pool
+                            .reservations
+                            .iter()
+                            .map(|(mac, address)| pb::DhcpReservationConfig {
+                                mac: mac.clone(),
+                                address: address.to_string(),
+                            })
+                            .collect(),
+                    }),
+                    in_use: snapshot.in_use.get(&pool.name).copied().unwrap_or(0),
+                    capacity: pool.capacity(),
+                })
+                .collect(),
+            leases: snapshot
+                .leases
+                .iter()
+                .map(|lease| pb::DhcpLeaseState {
+                    address: lease.address.to_string(),
+                    mac: lease.mac.clone(),
+                    hostname: lease.hostname.clone(),
+                    expires_at: lease.expires_at,
+                    reservation: lease.reservation,
+                    pool: lease.pool.clone(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn clear_dhcp_lease(
+        &self,
+        request: Request<pb::ClearDhcpLeaseRequest>,
+    ) -> Result<Response<pb::ClearDhcpLeaseResponse>, Status> {
+        let address = request.into_inner().address;
+        let address: std::net::Ipv4Addr = address
+            .parse()
+            .map_err(|_| Status::invalid_argument(format!("bad address {address:?}")))?;
+        Ok(Response::new(pb::ClearDhcpLeaseResponse {
+            cleared: self.dhcp_server.clear_lease(address),
+        }))
     }
 
     async fn set_sflow_config(
@@ -999,6 +1104,7 @@ async fn main() -> Result<()> {
     } = stp_io;
     let snmp_engine = snmpsub::Engine::new();
     let sflow_engine = sflow::Engine::new();
+    let dhcp_server_engine = dhcpserver::Engine::new();
     let (lldp_engine, lldp_io) = lldp::Engine::spawn(system_mac);
     let lldp::EngineIo {
         links: lldp_links,
@@ -1126,6 +1232,7 @@ async fn main() -> Result<()> {
         lldp: lldp_engine,
         snmp: snmp_engine,
         sflow: sflow_engine,
+        dhcp_server: dhcp_server_engine,
         igmp: igmp_engine,
         mld: mld_engine,
         rib: rib_engine,

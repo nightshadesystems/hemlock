@@ -1,6 +1,7 @@
 //! Parsing and dispatch for the services-suite operational commands:
 //! `show lldp [neighbors [detail]]`, `show ntp`, `show snmp`,
-//! `show sflow`, `show dhcp relay`, and `clear lldp counters`.
+//! `show sflow`, `show dhcp relay`, `show dhcp server [leases]`, and
+//! the `clear` verbs.
 
 use hemlock_common::ipc::IpcEndpoint;
 
@@ -146,5 +147,63 @@ pub async fn show_dhcp_relay(orch: &IpcEndpoint, args: &[&str]) -> Result<(), St
         return page_json("dhcp_relay", &state);
     }
     crate::pager::page(&render::dhcp_relay(&state));
+    Ok(())
+}
+
+/// `show dhcp server [leases] [| json]` (the dispatcher hands over the
+/// words after `server`).
+pub async fn show_dhcp_server(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    let leases = match words.split_first() {
+        None => false,
+        Some((word, rest)) => {
+            no_more(rest)?;
+            resolve(word, &["leases"])?;
+            true
+        }
+    };
+    let state = fetch::dhcp_server_state(orch).await.map_err(fmt_err)?;
+    if json {
+        return page_json(
+            if leases {
+                "dhcp_server_leases"
+            } else {
+                "dhcp_server"
+            },
+            &state,
+        );
+    }
+    let text = if leases {
+        render::dhcp_server_leases(&state)
+    } else {
+        render::dhcp_server(&state)
+    };
+    crate::pager::page(&text);
+    Ok(())
+}
+
+/// `clear dhcp server lease <ip>` (the dispatcher hands over the words
+/// after `server`).
+pub async fn clear_dhcp_lease(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    const USAGE: &str = "% Usage: clear dhcp server lease <ip>";
+    let Some(first) = args.first() else {
+        return Err(USAGE.into());
+    };
+    resolve(first, &["lease"])?;
+    let Some(address) = args.get(1) else {
+        return Err(USAGE.into());
+    };
+    no_more(&args[2..])?;
+    if address.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!("% bad address {address:?}"));
+    }
+    let cleared = fetch::clear_dhcp_lease(orch, (*address).to_string())
+        .await
+        .map_err(fmt_err)?;
+    if !cleared {
+        return Err(format!("% no lease for {address}"));
+    }
+    println!("lease {address} cleared");
     Ok(())
 }

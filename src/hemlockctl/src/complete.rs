@@ -31,6 +31,9 @@ pub struct State {
     /// WRED profile names cached from the mgmtd candidate, so a
     /// profile completes while it is being configured.
     pub wreds: Vec<String>,
+    /// DHCP pool and SNMP community names, cached the same way.
+    pub pools: Vec<String>,
+    pub communities: Vec<String>,
 }
 
 pub struct CliHelper {
@@ -57,6 +60,24 @@ const ACL: &str = "\0acl";
 /// offers the names cached from the mgmtd candidate but accepts any
 /// token.
 const WRED: &str = "\0wred";
+
+/// Sentinel meaning "a DHCP pool name goes here"; like [`ACL`], it
+/// offers the candidate's names and accepts any token.
+const POOL: &str = "\0pool";
+
+/// Sentinel meaning "an SNMP community name goes here".
+const COMMUNITY: &str = "\0community";
+
+/// The candidate-tree names each name-shaped sentinel offers. Grouped
+/// so the completion entry points keep one argument rather than one per
+/// family.
+#[derive(Debug, Default, Clone)]
+pub struct Names {
+    pub acls: Vec<String>,
+    pub wreds: Vec<String>,
+    pub pools: Vec<String>,
+    pub communities: Vec<String>,
+}
 
 /// The `show interfaces` subcommand words (the interface argument is
 /// optional and completes separately via [`PORT`]).
@@ -162,7 +183,8 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, ["show", "acl"]) => &["summary", ACL],
         (CliMode::Operational, ["show", "port-security" | "dot1x"]) => &["interface"],
         (CliMode::Operational, ["show", "port-security" | "dot1x", "interface"]) => &[PORT],
-        (CliMode::Operational, ["show", "dhcp"]) => &["snooping", "relay"],
+        (CliMode::Operational, ["show", "dhcp"]) => &["snooping", "relay", "server"],
+        (CliMode::Operational, ["show", "dhcp", "server"]) => &["leases"],
         (CliMode::Operational, ["show", "dhcp", "snooping"]) => &["binding", "statistics"],
         (CliMode::Operational, ["show", "arp"]) => &["inspection"],
         (CliMode::Operational, ["show", "arp", "inspection"]) => &["statistics"],
@@ -212,7 +234,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, ["clear", "acl", "counters"]) => &[ACL],
         (CliMode::Operational, ["clear", "port-security"]) => &["interface"],
         (CliMode::Operational, ["clear", "port-security", "interface"]) => &[PORT],
-        (CliMode::Operational, ["clear", "dhcp"]) => &["snooping"],
+        (CliMode::Operational, ["clear", "dhcp"]) => &["snooping", "server"],
+        (CliMode::Operational, ["clear", "dhcp", "server"]) => &["lease"],
+        (CliMode::Operational, ["clear", "dhcp", "server", "lease"]) => &[ANY],
         (CliMode::Operational, ["clear", "dhcp", "snooping"]) => &["binding"],
         (CliMode::Operational, ["clear", "dhcp", "snooping", "binding"]) => &[ANY],
         (CliMode::Operational, ["clear", "dot1x"]) => &["interface"],
@@ -240,7 +264,23 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "services",
             "qos",
         ],
-        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp", "ntp", "snmp", "sflow"],
+        (CliMode::Config, ["set" | "delete", "services"]) => {
+            &["lldp", "ntp", "snmp", "sflow", "dhcp-server"]
+        }
+        (CliMode::Config, ["set" | "delete", "services", "dhcp-server"]) => &["pool"],
+        (CliMode::Config, ["set" | "delete", "services", "dhcp-server", "pool"]) => &[POOL],
+        (CliMode::Config, ["set" | "delete", "services", "dhcp-server", "pool", POOL]) => &[
+            "network",
+            "range",
+            "default-gateway",
+            "dns-server",
+            "lease-time",
+            "domain-name",
+            "reservation",
+        ],
+        (CliMode::Config, ["set", "services", "dhcp-server", "pool", POOL, "reservation", ANY]) => {
+            &["address"]
+        }
         (CliMode::Config, ["set" | "delete", "services", "sflow"]) => {
             &["collector", "sample-rate", "polling-interval"]
         }
@@ -253,9 +293,10 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set" | "delete", "services", "snmp"]) => {
             &["community", "location", "contact", "user"]
         }
-        (CliMode::Config, ["set" | "delete", "services", "snmp", "community" | "user"]) => &[ANY],
-        (CliMode::Config, ["set", "services", "snmp", "community", ANY]) => &["source"],
-        (CliMode::Config, ["set", "services", "snmp", "community", ANY, "source"]) => &[ANY],
+        (CliMode::Config, ["set" | "delete", "services", "snmp", "community"]) => &[COMMUNITY],
+        (CliMode::Config, ["set" | "delete", "services", "snmp", "user"]) => &[ANY],
+        (CliMode::Config, ["set", "services", "snmp", "community", COMMUNITY]) => &["source"],
+        (CliMode::Config, ["set", "services", "snmp", "community", COMMUNITY, "source"]) => &[ANY],
         (CliMode::Config, ["set", "services", "snmp", "user", ANY]) => &["auth"],
         (CliMode::Config, ["set", "services", "snmp", "user", ANY, "auth"]) => &["sha"],
         (CliMode::Config, ["set", "services", "snmp", "user", ANY, "auth", "sha"]) => &[ANY],
@@ -711,20 +752,19 @@ fn resolve_word<'a>(input: &str, words: impl Iterator<Item = &'a str>) -> Option
 /// through [`candidates_with_names`].
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String]) -> Vec<String> {
-    expand(mode, tokens, partial, ports, &[], &[], false)
+    expand(mode, tokens, partial, ports, &Names::default(), false)
 }
 
-/// [`candidates`] with the candidate-tree ACL and WRED-profile names
-/// for their respective slots.
+/// [`candidates`] with the candidate-tree names for the name-shaped
+/// slots (ACLs, WRED profiles, DHCP pools, SNMP communities).
 pub fn candidates_with_names(
     mode: CliMode,
     tokens: &[&str],
     partial: &str,
     ports: &[String],
-    acls: &[String],
-    wreds: &[String],
+    names: &Names,
 ) -> Vec<String> {
-    expand(mode, tokens, partial, ports, acls, wreds, false)
+    expand(mode, tokens, partial, ports, names, false)
 }
 
 /// [`candidates`] for the EOS-style `?` contextual help: where an
@@ -736,18 +776,9 @@ pub fn help_candidates(
     tokens: &[&str],
     partial: &str,
     ports: &[String],
-    acls: &[String],
-    wreds: &[String],
+    names: &Names,
 ) -> Vec<String> {
-    expand(
-        mode,
-        tokens,
-        partial,
-        ports,
-        acls,
-        wreds,
-        partial.is_empty(),
-    )
+    expand(mode, tokens, partial, ports, names, partial.is_empty())
 }
 
 fn expand(
@@ -755,8 +786,7 @@ fn expand(
     tokens: &[&str],
     partial: &str,
     ports: &[String],
-    acls: &[String],
-    wreds: &[String],
+    names: &Names,
     placeholder_ports: bool,
 ) -> Vec<String> {
     let mut path: Vec<&str> = Vec::with_capacity(tokens.len());
@@ -786,6 +816,11 @@ fn expand(
             resolve_word(token, level.iter().copied().filter(|w| *w != ACL)).or(Some(ACL))
         } else if level.contains(&WRED) && !token.is_empty() {
             resolve_word(token, level.iter().copied().filter(|w| *w != WRED)).or(Some(WRED))
+        } else if level.contains(&POOL) && !token.is_empty() {
+            resolve_word(token, level.iter().copied().filter(|w| *w != POOL)).or(Some(POOL))
+        } else if level.contains(&COMMUNITY) && !token.is_empty() {
+            resolve_word(token, level.iter().copied().filter(|w| *w != COMMUNITY))
+                .or(Some(COMMUNITY))
         } else if level.contains(&ANY) && !token.is_empty() {
             Some(ANY)
         } else {
@@ -806,9 +841,13 @@ fn expand(
                     ports.to_vec()
                 }
             } else if *w == ACL {
-                acls.to_vec()
+                names.acls.to_vec()
             } else if *w == WRED {
-                wreds.to_vec()
+                names.wreds.to_vec()
+            } else if *w == POOL {
+                names.pools.to_vec()
+            } else if *w == COMMUNITY {
+                names.communities.to_vec()
             } else if *w == NUM || *w == ANY {
                 Vec::new() // free-form value; nothing to offer
             } else {
@@ -844,8 +883,12 @@ impl Completer for CliHelper {
             &tokens,
             partial,
             &state.ports,
-            &state.acls,
-            &state.wreds,
+            &Names {
+                acls: state.acls.clone(),
+                wreds: state.wreds.clone(),
+                pools: state.pools.clone(),
+                communities: state.communities.clone(),
+            },
         )
         .into_iter()
         .map(|w| Pair {
@@ -920,8 +963,10 @@ mod tests {
             &["set", "qos", "wred-profile"],
             "",
             &ports(),
-            &[],
-            &wreds,
+            &Names {
+                wreds: wreds.clone(),
+                ..Names::default()
+            },
         );
         assert_eq!(c, wreds);
         let c = candidates_with_names(
@@ -929,8 +974,10 @@ mod tests {
             &["set", "qos", "wred-profile", "BULK"],
             "",
             &ports(),
-            &[],
-            &wreds,
+            &Names {
+                wreds: wreds.clone(),
+                ..Names::default()
+            },
         );
         assert_eq!(
             c,
@@ -954,8 +1001,10 @@ mod tests {
             ],
             "B",
             &ports(),
-            &[],
-            &wreds,
+            &Names {
+                wreds: wreds.clone(),
+                ..Names::default()
+            },
         );
         assert_eq!(c, vec!["BULK".to_string()]);
 
@@ -1042,8 +1091,10 @@ mod tests {
             &["show", "acl"],
             "",
             &ports(),
-            &acls,
-            &[],
+            &Names {
+                acls: acls.clone(),
+                ..Names::default()
+            },
         );
         assert_eq!(
             c,
@@ -1058,8 +1109,10 @@ mod tests {
             &["show", "acl"],
             "E",
             &ports(),
-            &acls,
-            &[],
+            &Names {
+                acls: acls.clone(),
+                ..Names::default()
+            },
         );
         assert_eq!(c, vec!["EDGE-IN".to_string()]);
         // A binding's name slot completes too, and the direction follows
@@ -1069,8 +1122,10 @@ mod tests {
             &["set", "interfaces", "Eth0", "access-group"],
             "",
             &ports(),
-            &acls,
-            &[],
+            &Names {
+                acls: acls.clone(),
+                ..Names::default()
+            },
         );
         assert_eq!(c, vec!["EDGE-IN".to_string(), "MGMT6-IN".to_string()]);
         let c = candidates_with_names(
@@ -1078,8 +1133,10 @@ mod tests {
             &["set", "interfaces", "Eth0", "access-group", "EDGE-IN"],
             "",
             &ports(),
-            &acls,
-            &[],
+            &Names {
+                acls: acls.clone(),
+                ..Names::default()
+            },
         );
         assert_eq!(c, vec!["in".to_string(), "out".to_string()]);
         // The config-side rule tree keys off the family.
@@ -1109,7 +1166,14 @@ mod tests {
         // Operational security shows and clears.
         // The services suite shares `show dhcp` with this one.
         let c = candidates(CliMode::Operational, &["show", "dhcp"], "", &ports());
-        assert_eq!(c, vec!["snooping".to_string(), "relay".to_string()]);
+        assert_eq!(
+            c,
+            vec![
+                "snooping".to_string(),
+                "relay".to_string(),
+                "server".to_string()
+            ]
+        );
         let c = candidates(CliMode::Operational, &["clear", "dot1x"], "", &ports());
         assert_eq!(c, vec!["interface".to_string()]);
     }
@@ -1473,7 +1537,7 @@ mod tests {
         let c = candidates(CliMode::Config, &["set"], "serv", &ports());
         assert_eq!(c, vec!["services".to_string()]);
         let c = candidates(CliMode::Config, &["set", "services"], "", &ports());
-        assert_eq!(c, vec!["lldp", "ntp", "snmp", "sflow"]);
+        assert_eq!(c, vec!["lldp", "ntp", "snmp", "sflow", "dhcp-server"]);
         let c = candidates(CliMode::Config, &["set", "services", "sflow"], "", &ports());
         assert_eq!(c, vec!["collector", "sample-rate", "polling-interval"]);
         let c = candidates(
@@ -1545,6 +1609,59 @@ mod tests {
         assert_eq!(c, vec!["snmp"]);
         let c = candidates(CliMode::Operational, &["show"], "sf", &ports());
         assert_eq!(c, vec!["sflow"]);
+        // Pool and community names complete from the candidate cache.
+        let names = Names {
+            pools: vec!["GUEST".to_string(), "LAN-USERS".to_string()],
+            communities: vec!["netops".to_string(), "public".to_string()],
+            ..Names::default()
+        };
+        let c = candidates_with_names(
+            CliMode::Config,
+            &["set", "services", "dhcp-server", "pool"],
+            "",
+            &ports(),
+            &names,
+        );
+        assert_eq!(c, names.pools);
+        let c = candidates_with_names(
+            CliMode::Config,
+            &["set", "services", "dhcp-server", "pool", "LAN-USERS"],
+            "r",
+            &ports(),
+            &names,
+        );
+        assert_eq!(c, vec!["range".to_string(), "reservation".to_string()]);
+        let c = candidates_with_names(
+            CliMode::Config,
+            &["set", "services", "snmp", "community"],
+            "net",
+            &ports(),
+            &names,
+        );
+        assert_eq!(c, vec!["netops".to_string()]);
+        // A pool the candidate has never heard of is still accepted.
+        let c = candidates_with_names(
+            CliMode::Config,
+            &["set", "services", "dhcp-server", "pool", "BRAND-NEW"],
+            "net",
+            &ports(),
+            &names,
+        );
+        assert_eq!(c, vec!["network".to_string()]);
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "dhcp", "server"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["leases"]);
+        let c = candidates(
+            CliMode::Operational,
+            &["clear", "dhcp", "server"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["lease"]);
         // Both per-port service leaves offer only the off switch.
         let c = candidates(
             CliMode::Config,

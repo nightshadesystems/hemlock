@@ -2,7 +2,7 @@
 
 use crate::interfaces::table::{pad, Col, Text};
 
-use super::model::{DhcpRelayState, LldpState, NtpState, SflowState, SnmpState};
+use super::model::{DhcpRelayState, DhcpServerState, LldpState, NtpState, SflowState, SnmpState};
 
 /// The abbreviated interface form for tabular output
 /// ("Ethernet1" -> "Et1").
@@ -407,5 +407,101 @@ pub fn dhcp_relay(state: &DhcpRelayState) -> String {
             ],
         );
     }
+    out.finish()
+}
+
+// ------------------------------------------------- DHCP server
+
+/// `show dhcp server` — one row per pool, with its utilisation.
+pub fn dhcp_server(state: &DhcpServerState) -> String {
+    const COLS: [Col; 5] = [
+        Col::left(11),
+        Col::left(15),
+        Col::left(29),
+        Col::left(12),
+        Col::left(8),
+    ];
+    let mut out = Text::new();
+    out.row(
+        &COLS,
+        &["Pool", "Network", "Range", "Gateway", "Lease", "In Use"],
+    );
+    out.row(
+        &COLS,
+        &[
+            "---------",
+            "-------------",
+            "---------------------------",
+            "----------",
+            "------",
+            "------",
+        ],
+    );
+    for pool in &state.pools {
+        out.row(
+            &COLS,
+            &[
+                &pool.name,
+                &pool.network,
+                &pool.range,
+                &pool.gateway,
+                &pool.lease_time.to_string(),
+                &format!("{}/{}", pool.in_use, pool.capacity),
+            ],
+        );
+    }
+    out.finish()
+}
+
+/// A lease expiry as the wall-clock time it falls due, in UTC.
+///
+/// UTC rather than the local zone on purpose: the switch's clock is
+/// whatever NTP set it to, the image runs UTC, and a lease table that
+/// changed shape with `TZ` would be unreadable in a bug report.
+fn expiry_clock(expires_at: Option<u64>) -> String {
+    let Some(seconds) = expires_at else {
+        return "-".into();
+    };
+    match chrono::DateTime::from_timestamp(i64::try_from(seconds).unwrap_or(i64::MAX), 0) {
+        Some(time) => time.format("%H:%M:%S").to_string(),
+        None => "-".into(),
+    }
+}
+
+/// `show dhcp server leases` — every lease and reservation.
+pub fn dhcp_server_leases(state: &DhcpServerState) -> String {
+    const COLS: [Col; 4] = [Col::left(14), Col::left(19), Col::left(16), Col::left(13)];
+    let mut out = Text::new();
+    out.row(
+        &COLS,
+        &["IP Address", "MAC Address", "Hostname", "Expires", "Type"],
+    );
+    out.row(
+        &COLS,
+        &[
+            "------------",
+            "-----------------",
+            "--------------",
+            "-----------",
+            "-----------",
+        ],
+    );
+    for lease in &state.leases {
+        out.row(
+            &COLS,
+            &[
+                &lease.address,
+                &lease.mac,
+                if lease.hostname.is_empty() {
+                    "-"
+                } else {
+                    &lease.hostname
+                },
+                &expiry_clock(lease.expires_at),
+                &lease.kind,
+            ],
+        );
+    }
+    out.line(format!("Total leases: {}", state.leases.len()));
     out.finish()
 }
