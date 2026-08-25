@@ -81,6 +81,9 @@ pub struct Intents {
     /// LLDP (`services { lldp { ... } }`; per-port disables live on
     /// the port intents).
     pub lldp: LldpIntent,
+    /// NTP client (`services { ntp { ... } }`), rendered into
+    /// systemd-timesyncd.
+    pub ntp: NtpIntent,
     /// The four global QoS maps (`qos { map { ... } }`).
     pub qos_maps: QosMapsIntent,
     /// Named WRED/ECN profiles (`qos { wred-profile <name> { ... } }`).
@@ -446,6 +449,19 @@ pub struct LldpIntent {
     /// TTL multiplier; None = default (4).
     pub hold_multiplier: Option<u8>,
 }
+
+/// NTP client config (`services { ntp { ... } }`). No servers = the
+/// client is off (timesyncd stops).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NtpIntent {
+    /// Servers in config order, deduplicated: IPv4/IPv6 literals or
+    /// hostnames.
+    pub servers: Vec<String>,
+}
+
+/// The most NTP servers timesyncd is given (it walks the list in
+/// order, so a longer one only slows failover).
+pub const MAX_NTP_SERVERS: usize = 4;
 
 /// `switching { mac-table { ... } }`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -910,6 +926,9 @@ pub enum IntentError {
 
     #[error("services lldp: {0}")]
     BadLldp(String),
+
+    #[error("services ntp: {0}")]
+    BadNtp(String),
 
     #[error("{name}: {feature} is a physical-port setting")]
     PortServiceOnNonPort { name: String, feature: &'static str },
@@ -3738,6 +3757,7 @@ fn services(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError>
         }
         match name.as_str() {
             "lldp" => intents.lldp = lldp(children)?,
+            "ntp" => intents.ntp = ntp(children)?,
             other => {
                 return Err(IntentError::BadServices(format!(
                     "unrecognized block {other:?}"
@@ -3770,6 +3790,63 @@ fn lldp(items: &[Item]) -> Result<LldpIntent, IntentError> {
             None => None,
         },
     })
+}
+
+/// One NTP server address: an IP literal, or a syntactically valid
+/// hostname (resolution is timesyncd's problem, not the parser's).
+pub fn valid_ntp_server(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// `services { ntp { server <host>; ... } }`.
+fn ntp(items: &[Item]) -> Result<NtpIntent, IntentError> {
+    let bad = IntentError::BadNtp;
+    let mut servers: Vec<String> = Vec::new();
+    for item in items {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        // Deferred by this suite; named rather than silently ignored.
+        match name.as_str() {
+            "server" => {}
+            "listen" | "master" => {
+                return Err(bad("NTP server mode is not supported".into()));
+            }
+            "authentication" | "key" => {
+                return Err(bad("NTP authentication is not supported".into()));
+            }
+            other => return Err(bad(format!("unrecognized statement {other:?}"))),
+        }
+        let [host] = values.as_slice() else {
+            return Err(bad("expected `server <host>`".into()));
+        };
+        if !valid_ntp_server(host) {
+            return Err(bad(format!("bad server {host:?}")));
+        }
+        if !servers.iter().any(|existing| existing == host) {
+            servers.push(host.clone());
+        }
+    }
+    if servers.len() > MAX_NTP_SERVERS {
+        return Err(bad(format!(
+            "at most {MAX_NTP_SERVERS} servers ({} configured)",
+            servers.len()
+        )));
+    }
+    Ok(NtpIntent { servers })
 }
 
 /// `switching { mac-table { ... } mirror { ... } }`.
@@ -4248,6 +4325,8 @@ pub struct OsChanges {
     pub ssh: Option<SshIntent>,
     /// The full wanted web console state, present exactly when it changed.
     pub web: Option<WebIntent>,
+    /// The full wanted NTP client state, present exactly when it changed.
+    pub ntp: Option<NtpIntent>,
 }
 
 impl OsChanges {
@@ -4260,6 +4339,7 @@ impl OsChanges {
             && self.vrrp_macvlans.is_empty()
             && self.ssh.is_none()
             && self.web.is_none()
+            && self.ntp.is_none()
     }
 
     pub fn describe(&self) -> Vec<String> {
@@ -4281,6 +4361,13 @@ impl OsChanges {
             (false, true) => "web ui enabled (https)".to_string(),
             (false, false) => "web ui disabled".to_string(),
         });
+        let ntp = self.ntp.as_ref().map(|n| {
+            if n.servers.is_empty() {
+                "ntp disabled (no servers)".to_string()
+            } else {
+                format!("ntp servers: {}", n.servers.join(", "))
+            }
+        });
         self.ports
             .iter()
             .chain(&self.svis)
@@ -4291,6 +4378,7 @@ impl OsChanges {
             .chain(self.vrrp_macvlans.iter().map(VrrpMacvlanChange::describe))
             .chain(ssh)
             .chain(web)
+            .chain(ntp)
             .collect()
     }
 }
@@ -4504,6 +4592,9 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
     }
     if running.web != candidate.web {
         changes.web = Some(candidate.web.clone());
+    }
+    if running.ntp != candidate.ntp {
+        changes.ntp = Some(candidate.ntp.clone());
     }
     changes
 }
@@ -6580,6 +6671,10 @@ services {
         tx-interval 30;
         hold-multiplier 4;
     }
+    ntp {
+        server 10.42.0.5;
+        server pool.ntp.org;
+    }
 }
 interfaces {
     Ethernet3 {
@@ -6599,6 +6694,84 @@ interfaces {
             }
         );
         assert_eq!(lldp_state(&intents).disabled_ports, ["Ethernet3"]);
+        assert_eq!(intents.ntp.servers, ["10.42.0.5", "pool.ntp.org"]);
+    }
+
+    /// NTP: servers in order, deduplicated, capped at four, with the
+    /// deferred spellings rejected rather than ignored.
+    #[test]
+    fn ntp_validation() {
+        assert_eq!(intents_of("").ntp, NtpIntent::default());
+        let intents = intents_of(
+            "services { ntp { server 10.42.0.5
+server pool.ntp.org } }",
+        );
+        assert_eq!(intents.ntp.servers, ["10.42.0.5", "pool.ntp.org"]);
+        // IPv6 literals and trailing-dot FQDNs are servers too; a
+        // repeat of one already listed collapses.
+        let intents = intents_of(
+            "services { ntp { server 2001:db8::1
+server ntp.example.com.
+server 2001:db8::1 } }",
+        );
+        assert_eq!(intents.ntp.servers, ["2001:db8::1", "ntp.example.com."]);
+
+        for text in [
+            "services { ntp { server } }",
+            "services { ntp { server \"bad host\" } }",
+            "services { ntp { server -leading.example.com } }",
+            "services { ntp { server trailing-.example.com } }",
+            "services { ntp { server a..b } }",
+            "services { ntp { pool 10.0.0.1 } }",
+            "services { ntp { server 1.1.1.1
+server 2.2.2.2
+server 3.3.3.3
+server 4.4.4.4
+server 5.5.5.5 } }",
+        ] {
+            let tree = parse(text).unwrap();
+            assert!(
+                matches!(extract(&tree), Err(IntentError::BadNtp(_))),
+                "{text} should be rejected"
+            );
+        }
+        // The deferred halves of NTP name themselves.
+        let tree = parse("services { ntp { listen 10.0.0.1 } }").unwrap();
+        assert_eq!(
+            extract(&tree).unwrap_err().to_string(),
+            "services ntp: NTP server mode is not supported"
+        );
+        let tree = parse("services { ntp { key 1 } }").unwrap();
+        assert_eq!(
+            extract(&tree).unwrap_err().to_string(),
+            "services ntp: NTP authentication is not supported"
+        );
+    }
+
+    /// NTP is an OS-side family: it rides the `diff_os` delta like ssh
+    /// and the web console, and an emptied block is a real change (the
+    /// client stops).
+    #[test]
+    fn ntp_diffs_through_the_os_changes() {
+        let none = intents_of("");
+        let two = intents_of(
+            "services { ntp { server 10.42.0.5
+server pool.ntp.org } }",
+        );
+        assert_eq!(diff_os(&none, &none).ntp, None);
+        assert_eq!(
+            diff_os(&none, &two).ntp.unwrap().servers,
+            ["10.42.0.5", "pool.ntp.org"]
+        );
+        assert_eq!(diff_os(&two, &none).ntp, Some(NtpIntent::default()));
+        assert_eq!(
+            diff_os(&none, &two).describe(),
+            ["ntp servers: 10.42.0.5, pool.ntp.org"]
+        );
+        assert_eq!(
+            diff_os(&two, &none).describe(),
+            ["ntp disabled (no servers)"]
+        );
     }
 
     #[test]

@@ -56,3 +56,15 @@ fn lldp_neighbors() {
         include_str!("../../tests/golden/lldp_neighbors_detail.txt"),
     );
 }
+
+#[test]
+fn ntp() {
+    assert_golden(
+        &render::ntp(&fx::ntp_state()),
+        include_str!("../../tests/golden/ntp.txt"),
+    );
+    assert_golden(
+        &as_json("ntp", &fx::ntp_state()),
+        include_str!("../../tests/golden/ntp.json"),
+    );
+}

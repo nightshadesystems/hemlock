@@ -19,6 +19,8 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 # The DHCP-snooping binding store (persisted across restarts).
 serde = { workspace = true }
+# Ageing systemd timestamps (the NTP client's last-sync time).
+chrono = { workspace = true }
 
 # LACPDU transport over the member ports' hostif netdevs.
 [target.'cfg(target_os = "linux")'.dependencies]

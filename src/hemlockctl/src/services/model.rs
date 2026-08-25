@@ -72,3 +72,28 @@ impl LldpState {
             .collect()
     }
 }
+
+// ------------------------------------------------- NTP
+
+/// `show ntp`: the configured servers plus timesyncd's live sync.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct NtpState {
+    /// systemd-timesyncd is running (no servers = mgmtd stops it).
+    pub enabled: bool,
+    /// Servers in config order.
+    pub servers: Vec<String>,
+    pub synchronized: bool,
+    /// The server actually in use; empty while unsynchronized.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub server: String,
+    pub stratum: u32,
+    pub poll_interval_secs: u32,
+    /// Microseconds; the offset is signed (the local clock can lead).
+    pub offset_usecs: i64,
+    pub delay_usecs: u64,
+    pub jitter_usecs: u64,
+    /// Seconds since the last accepted reply; None = never, or the
+    /// timestamp was unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync_secs_ago: Option<u64>,
+}

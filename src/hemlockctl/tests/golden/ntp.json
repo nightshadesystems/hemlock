@@ -1,0 +1,17 @@
+{
+  "ntp": {
+    "delay_usecs": 1204,
+    "enabled": true,
+    "jitter_usecs": 88,
+    "last_sync_secs_ago": 252,
+    "offset_usecs": -412,
+    "poll_interval_secs": 512,
+    "server": "10.42.0.5",
+    "servers": [
+      "10.42.0.5",
+      "pool.ntp.org"
+    ],
+    "stratum": 3,
+    "synchronized": true
+  }
+}

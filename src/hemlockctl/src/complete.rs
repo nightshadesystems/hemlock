@@ -151,6 +151,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "dhcp",
             "qos",
             "lldp",
+            "ntp",
         ],
         (CliMode::Operational, ["show", "lldp"]) => &["neighbors"],
         (CliMode::Operational, ["show", "lldp", "neighbors"]) => &["detail"],
@@ -237,7 +238,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "services",
             "qos",
         ],
-        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp"],
+        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp", "ntp"],
+        (CliMode::Config, ["set" | "delete", "services", "ntp"]) => &["server"],
+        (CliMode::Config, ["set" | "delete", "services", "ntp", "server"]) => &[ANY],
         (CliMode::Config, ["set" | "delete", "services", "lldp"]) => {
             &["disable", "tx-interval", "hold-multiplier"]
         }
@@ -1437,7 +1440,9 @@ mod tests {
         let c = candidates(CliMode::Config, &["set"], "serv", &ports());
         assert_eq!(c, vec!["services".to_string()]);
         let c = candidates(CliMode::Config, &["set", "services"], "", &ports());
-        assert_eq!(c, vec!["lldp"]);
+        assert_eq!(c, vec!["lldp", "ntp"]);
+        let c = candidates(CliMode::Config, &["set", "services", "ntp"], "", &ports());
+        assert_eq!(c, vec!["server"]);
         let c = candidates(CliMode::Config, &["set", "services", "lldp"], "", &ports());
         assert_eq!(c, vec!["disable", "tx-interval", "hold-multiplier"]);
         let c = candidates(
@@ -1467,6 +1472,8 @@ mod tests {
         assert_eq!(c, vec!["detail"]);
         let c = candidates(CliMode::Operational, &["clear", "lldp"], "", &ports());
         assert_eq!(c, vec!["counters"]);
+        let c = candidates(CliMode::Operational, &["show"], "nt", &ports());
+        assert_eq!(c, vec!["ntp"]);
     }
 
     #[test]

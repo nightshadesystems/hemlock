@@ -2,7 +2,7 @@
 
 use crate::interfaces::table::{pad, Col, Text};
 
-use super::model::LldpState;
+use super::model::{LldpState, NtpState};
 
 /// The abbreviated interface form for tabular output
 /// ("Ethernet1" -> "Et1").
@@ -191,6 +191,64 @@ pub fn lldp_neighbors_detail(state: &LldpState) -> String {
     }
     if first {
         out.line("No LLDP neighbors.");
+    }
+    out.finish()
+}
+
+// ------------------------------------------------- NTP
+
+/// Microseconds as milliseconds with three decimals, the resolution
+/// timesyncd itself reports at ("-412us" -> "-0.412").
+fn millis(usecs: i64) -> String {
+    let sign = if usecs < 0 { "-" } else { "" };
+    let magnitude = usecs.unsigned_abs();
+    format!("{sign}{}.{:03}", magnitude / 1000, magnitude % 1000)
+}
+
+/// A short age: `4m12s`, `2h04m`, `3d05h`, `41s`.
+fn age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3_600 => format!("{}m{:02}s", s / 60, s % 60),
+        s if s < 86_400 => format!("{}h{:02}m", s / 3_600, (s % 3_600) / 60),
+        s => format!("{}d{:02}h", s / 86_400, (s % 86_400) / 3_600),
+    }
+}
+
+/// `show ntp` — the configured servers plus timesyncd's live sync.
+pub fn ntp(state: &NtpState) -> String {
+    let mut out = Text::new();
+    if state.servers.is_empty() {
+        out.line("NTP is disabled (no servers configured)");
+        return out.finish();
+    }
+    // Servers are configured but the unit is not running: say which of
+    // the two it is rather than printing a bare "disabled".
+    if state.enabled {
+        out.line("NTP is enabled (systemd-timesyncd)");
+    } else {
+        out.line("NTP is configured but systemd-timesyncd is not running");
+    }
+    out.line(format!("Servers: {}", state.servers.join(", ")));
+    out.blank();
+    if !state.synchronized {
+        out.line("Not synchronized");
+        return out.finish();
+    }
+    out.line(format!("Synchronized to {}", state.server));
+    out.line(format!(
+        "  Stratum {}, poll interval {}s",
+        state.stratum, state.poll_interval_secs
+    ));
+    out.line(format!(
+        "  Offset {} ms, delay {} ms, jitter {} ms",
+        millis(state.offset_usecs),
+        millis(i64::try_from(state.delay_usecs).unwrap_or(i64::MAX)),
+        millis(i64::try_from(state.jitter_usecs).unwrap_or(i64::MAX)),
+    ));
+    match state.last_sync_secs_ago {
+        Some(secs) => out.line(format!("  Last sync: {} ago", age(secs))),
+        None => out.line("  Last sync: unknown"),
     }
     out.finish()
 }

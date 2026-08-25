@@ -420,6 +420,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show qos interface <port>              one port's classification + queues");
             println!("  show qos interfaces                    per-port QoS summary");
             println!("  show lldp [neighbors [detail]]         LLDP settings and neighbors");
+            println!("  show ntp                               NTP client servers and sync");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -526,8 +527,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "dhcp",
         "qos",
         "lldp",
+        "ntp",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -606,6 +608,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "dhcp" => crate::security::cmd::show_dhcp(&endpoints.orch, &words[1..]).await,
             "qos" => crate::qos::cmd::show(&endpoints.syncd, &words[1..]).await,
             "lldp" => crate::services::cmd::show_lldp(&endpoints.orch, &words[1..]).await,
+            "ntp" => crate::services::cmd::show_ntp(&endpoints.orch, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -789,6 +792,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  delete switching [mac-table|mirror ...]");
             println!("  delete security [acl|copp|dot1x|dhcp-snooping|arp-inspection ...]");
             println!("  delete services [lldp [disable|tx-interval|hold-multiplier]]");
+            println!("                  [ntp [server [<host>]]]");
             println!("  delete qos [map [<table> [<key> <value>]] | wred-profile <name> [...]]");
             println!("  show                      show the candidate configuration");
             println!(
@@ -850,6 +854,30 @@ const COPP_CLASSES: &[&str] = &[
     "bpdu", "lacp", "lldp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
     "acl-log", "default",
 ];
+
+/// The most NTP servers the config accepts — checked at the prompt for
+/// immediate feedback; mgmtd re-validates.
+const MAX_NTP_SERVERS: usize = 4;
+
+/// NTP server syntax: an IP literal or a syntactically valid hostname
+/// (resolution is timesyncd's problem). Checked at the prompt;
+/// mgmtd re-validates.
+fn valid_ntp_server(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
 
 /// ACL name syntax (letter first, then letters/digits/_/-, max 32) —
 /// checked at the prompt for immediate feedback; mgmtd re-validates.
@@ -4958,14 +4986,15 @@ async fn config_services(
         .map_err(fmt_err);
     }
     let Some(first) = words.first() else {
-        return Err(format!("% Usage: {verb} services <lldp> ..."));
+        return Err(format!("% Usage: {verb} services <lldp|ntp> ..."));
     };
     // Deferred by this suite, rejected at parse rather than ignored.
     if resolve(first, &["ptp"]).is_ok() {
         return Err("% PTP/1588 is not supported".into());
     }
-    match resolve(first, &["lldp"])? {
+    match resolve(first, &["lldp", "ntp"])? {
         "lldp" => config_lldp(endpoints, &words[1..], delete).await,
+        "ntp" => config_ntp(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
 }
@@ -5058,6 +5087,105 @@ async fn config_lldp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
         }
         _ => unreachable!(),
     }
+}
+
+/// `set|delete services ntp server <host>` — repeatable, capped at
+/// four; the box is an NTP client only.
+async fn config_ntp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || format!("% Usage: {verb} services ntp server <ip|hostname>");
+    let delete_in_ntp = |edit: BlockEdit| async move {
+        edit_config(endpoints, move |tree| {
+            let services = tree.block_mut("services");
+            if let Some(block) = block_children_mut(services, "ntp") {
+                edit(block);
+                if block.is_empty() {
+                    ConfigTree::remove_block(services, "ntp", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "services");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if words.is_empty() {
+        return if delete {
+            delete_in_ntp(Box::new(|block| block.clear())).await
+        } else {
+            Err(usage())
+        };
+    }
+    // The deferred halves of NTP fail at the prompt, not silently.
+    for (word, message) in [
+        ("listen", "% NTP server mode is not supported"),
+        ("master", "% NTP server mode is not supported"),
+        ("authentication", "% NTP authentication is not supported"),
+        ("key", "% NTP authentication is not supported"),
+    ] {
+        if words[0] == word {
+            return Err(message.into());
+        }
+    }
+    resolve(words[0], &["server"])?;
+    // `delete services ntp server` with no host drops them all.
+    let Some(host) = words.get(1) else {
+        return if delete {
+            delete_in_ntp(Box::new(|block| ConfigTree::remove_leaf(block, "server"))).await
+        } else {
+            Err(usage())
+        };
+    };
+    if words.len() > 2 {
+        return Err(format!("% Invalid input: {:?}", words[2]));
+    }
+    if !valid_ntp_server(host) {
+        return Err(format!("% bad ntp server {host:?}"));
+    }
+    let host = (*host).to_string();
+    if delete {
+        return delete_in_ntp(Box::new(move |block| {
+            remove_leaf_matching(block, "server", &[&host]);
+        }))
+        .await;
+    }
+    // Cap at the intent layer's limit here too, so the prompt says no
+    // before the commit does.
+    let candidate = candidate_text(endpoints).await.map_err(fmt_err)?;
+    let existing = hemlock_config::parse(&candidate)
+        .ok()
+        .and_then(|tree| {
+            tree.block("services").map(|(_, items)| {
+                ConfigTree::blocks_named(items, "ntp")
+                    .next()
+                    .map(|(_, ntp)| {
+                        ntp.iter()
+                            .filter_map(|item| match item {
+                                hemlock_config::Item::Leaf { name, values } if name == "server" => {
+                                    values.first().cloned()
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+        })
+        .unwrap_or_default();
+    if !existing.contains(&host) && existing.len() >= MAX_NTP_SERVERS {
+        return Err(format!(
+            "% at most {MAX_NTP_SERVERS} ntp servers ({} configured)",
+            existing.len()
+        ));
+    }
+    edit_config(endpoints, move |tree| {
+        let services = tree.block_mut("services");
+        let block = ConfigTree::ensure_block(services, "ntp", &[]);
+        remove_leaf_matching(block, "server", &[&host]);
+        push_leaf(block, "server", vec![host]);
+    })
+    .await
+    .map_err(fmt_err)
 }
 
 /// `set|delete switching <mac-table|mirror> ...`.

@@ -100,6 +100,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/qos/ports/edit", post(qos_ports_edit))
         .route("/api/lldp", get(lldp))
         .route("/api/lldp/edit", post(lldp_edit))
+        .route("/api/ntp", get(ntp))
+        .route("/api/ntp/edit", post(ntp_edit))
         .route("/api/system", get(system))
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
@@ -959,6 +961,43 @@ async fn lldp_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::services_edit::apply_lldp_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/ntp` — orch's timesyncd view: configured servers plus
+/// the live sync posture.
+async fn ntp(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .get_ntp_state(pb::GetNtpStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "enabled": response.enabled,
+        "servers": response.servers,
+        "synchronized": response.synchronized,
+        "server": response.server,
+        "stratum": response.stratum,
+        "poll_interval_secs": response.poll_interval_secs,
+        "offset_usecs": response.offset_usecs,
+        "delay_usecs": response.delay_usecs,
+        "jitter_usecs": response.jitter_usecs,
+        "last_sync_secs_ago": response.last_sync_secs_ago,
+    })))
+}
+
+async fn ntp_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::services_edit::NtpEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::services_edit::apply_ntp_edit(tree, &edit)
     })
     .await
 }

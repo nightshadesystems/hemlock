@@ -1,7 +1,7 @@
 //! Test fixtures behind the services-suite golden outputs: the state
 //! the spec's seed configuration produces on a 52-port E1031.
 
-use super::model::{LldpNeighbor, LldpPort, LldpState};
+use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState};
 
 fn neighbor(
     port: &str,
@@ -96,5 +96,22 @@ pub fn lldp_state() -> LldpState {
             port("Ethernet3", false, (0, 0, 0, 0), Vec::new()),
             port("Ethernet49", true, (18822, 18822, 0, 0), vec![uplink]),
         ],
+    }
+}
+
+/// The NTP state the seed produces: two servers, synchronized to the
+/// first at stratum 3.
+pub fn ntp_state() -> NtpState {
+    NtpState {
+        enabled: true,
+        servers: vec!["10.42.0.5".into(), "pool.ntp.org".into()],
+        synchronized: true,
+        server: "10.42.0.5".into(),
+        stratum: 3,
+        poll_interval_secs: 512,
+        offset_usecs: -412,
+        delay_usecs: 1204,
+        jitter_usecs: 88,
+        last_sync_secs_ago: Some(4 * 60 + 12),
     }
 }

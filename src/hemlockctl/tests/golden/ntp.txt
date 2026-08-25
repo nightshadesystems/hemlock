@@ -1,0 +1,7 @@
+NTP is enabled (systemd-timesyncd)
+Servers: 10.42.0.5, pool.ntp.org
+
+Synchronized to 10.42.0.5
+  Stratum 3, poll interval 512s
+  Offset -0.412 ms, delay 1.204 ms, jitter 0.088 ms
+  Last sync: 4m12s ago

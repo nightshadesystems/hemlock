@@ -1,7 +1,8 @@
 //! OS-side apply for the non-ASIC intent families: management
 //! addressing (iproute2 on the manifest's os_device), static routes,
-//! the SSH service (systemd + an sshd_config drop-in), and the web
-//! console (hemlock-webd's systemd unit).
+//! the SSH service (systemd + an sshd_config drop-in), the web
+//! console (hemlock-webd's systemd unit), and the NTP client
+//! (systemd-timesyncd + a timesyncd.conf drop-in).
 //!
 //! Shell-outs to `ip` and `systemctl` follow the workspace's
 //! established access path (syncd's netdev sampling, sysinit's
@@ -18,8 +19,8 @@
 use tracing::warn;
 
 use crate::intents::{
-    ArpChange, Intents, NetdevChange, OsChanges, RouteChange, SshIntent, VrrpMacvlanChange,
-    WebIntent,
+    ArpChange, Intents, NetdevChange, NtpIntent, OsChanges, RouteChange, SshIntent,
+    VrrpMacvlanChange, WebIntent,
 };
 
 /// mgmtd's sshd drop-in (`10-hemlock-motd.conf` is the image's).
@@ -29,6 +30,11 @@ const SSH_UNIT: &str = "ssh";
 /// The web console daemon's unit. webd reads the running config itself
 /// (which listeners, TLS); mgmtd only decides whether it runs.
 const WEBD_UNIT: &str = "hemlock-webd";
+
+/// mgmtd's timesyncd drop-in and the unit it configures.
+const TIMESYNCD_DROPIN_DIR: &str = "/etc/systemd/timesyncd.conf.d";
+const TIMESYNCD_DROPIN: &str = "/etc/systemd/timesyncd.conf.d/20-hemlock.conf";
+const TIMESYNCD_UNIT: &str = "systemd-timesyncd";
 
 /// `authentication local`: PAM password logins against the on-box
 /// user database, pinned against other drop-ins overriding them.
@@ -100,6 +106,9 @@ impl OsApplier {
         }
         if let Some(web) = &changes.web {
             apply_web(web);
+        }
+        if let Some(ntp) = &changes.ntp {
+            apply_ntp(ntp);
         }
     }
 
@@ -186,6 +195,8 @@ impl OsApplier {
         apply_ssh(&intents.ssh);
         // Same for the web console (`system { http }` / `{ https }`).
         apply_web(&intents.web);
+        // And for the NTP client: no servers means timesyncd stops.
+        apply_ntp(&intents.ntp);
     }
 
     fn apply_management(&self, change: &NetdevChange) {
@@ -409,6 +420,60 @@ fn apply_web(web: &WebIntent) {
     });
 }
 
+/// Render the timesyncd drop-in for one NTP intent. `None` = no
+/// servers, so the client is off and the drop-in is removed.
+///
+/// `FallbackNTP=` is written empty on purpose: Debian ships a distro
+/// fallback pool, and a switch told to use one clock source must not
+/// quietly reach a different one.
+pub fn render_timesyncd(ntp: &NtpIntent) -> Option<String> {
+    if ntp.servers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "# Managed by hemlock-mgmtd; edit via the Hemlock config, not here.\n\
+         [Time]\n\
+         NTP={}\n\
+         FallbackNTP=\n",
+        ntp.servers.join(" ")
+    ))
+}
+
+/// Write (or remove) the drop-in and start (or stop) timesyncd.
+/// Idempotent: boot replay and commit-confirm expiry take the same
+/// path. timesyncd has no reload, so a changed server list restarts it.
+fn apply_ntp(ntp: &NtpIntent) {
+    match render_timesyncd(ntp) {
+        Some(dropin) => {
+            if let Err(err) = std::fs::create_dir_all(TIMESYNCD_DROPIN_DIR) {
+                warn!(%err, path = TIMESYNCD_DROPIN_DIR, "cannot create the timesyncd drop-in dir");
+            }
+            let changed =
+                std::fs::read_to_string(TIMESYNCD_DROPIN).ok().as_deref() != Some(dropin.as_str());
+            if let Err(err) = std::fs::write(TIMESYNCD_DROPIN, dropin) {
+                warn!(%err, path = TIMESYNCD_DROPIN, "cannot write the timesyncd drop-in");
+                return;
+            }
+            run("systemctl", &["enable", "--now", TIMESYNCD_UNIT]);
+            if changed {
+                run("systemctl", &["restart", TIMESYNCD_UNIT]);
+            }
+        }
+        None => {
+            remove_timesyncd_dropin();
+            run("systemctl", &["disable", "--now", TIMESYNCD_UNIT]);
+        }
+    }
+}
+
+fn remove_timesyncd_dropin() {
+    if let Err(err) = std::fs::remove_file(TIMESYNCD_DROPIN) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            warn!(%err, path = TIMESYNCD_DROPIN, "cannot remove the timesyncd drop-in");
+        }
+    }
+}
+
 fn remove_dropin() {
     if let Err(err) = std::fs::remove_file(SSHD_DROPIN) {
         if err.kind() != std::io::ErrorKind::NotFound {
@@ -430,5 +495,63 @@ fn run(program: &str, args: &[&str]) {
             "OS apply command failed"
         ),
         Err(err) => warn!(command = %command(), %err, "cannot run OS apply command"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::intents::extract;
+    use hemlock_config::parse;
+
+    fn ntp_of(text: &str) -> NtpIntent {
+        extract(&parse(text).unwrap()).unwrap().ntp
+    }
+
+    #[track_caller]
+    fn assert_golden(rendered: &str, golden: &str) {
+        let golden = golden.replace("\r\n", "\n");
+        if rendered != golden {
+            for (n, (got, want)) in rendered.lines().zip(golden.lines()).enumerate() {
+                assert_eq!(got, want, "first mismatch at line {}", n + 1);
+            }
+            assert_eq!(rendered, golden);
+        }
+    }
+
+    /// The spec seed's NTP block, and a full four-server list.
+    #[test]
+    fn renders_the_timesyncd_dropin() {
+        let seed = ntp_of(
+            "services { ntp { server 10.42.0.5
+server pool.ntp.org } }",
+        );
+        let rendered = render_timesyncd(&seed).unwrap();
+        assert_golden(
+            &rendered,
+            include_str!("../tests/golden/timesyncd_seed.conf"),
+        );
+        // Determinism: config order is the render order.
+        assert_eq!(render_timesyncd(&seed).unwrap(), rendered);
+
+        let four = ntp_of(
+            "services { ntp { server 2001:db8::123
+server ntp1.example.net
+server ntp2.example.net
+server 10.0.0.1 } }",
+        );
+        assert_golden(
+            &render_timesyncd(&four).unwrap(),
+            include_str!("../tests/golden/timesyncd_four_servers.conf"),
+        );
+    }
+
+    /// No servers = no drop-in: the client is off and the unit stops.
+    #[test]
+    fn no_servers_renders_nothing() {
+        assert!(render_timesyncd(&NtpIntent::default()).is_none());
+        assert!(render_timesyncd(&ntp_of("services { ntp { } }")).is_none());
+        assert!(render_timesyncd(&ntp_of("")).is_none());
     }
 }

@@ -65,6 +65,12 @@ service Orch {
   // `clear lldp counters`: baseline the per-port frame counters.
   rpc ClearLldpCounters(ClearLldpCountersRequest) returns (ClearLldpCountersResponse);
 
+  // --- NTP client (systemd-timesyncd) ----------------------------------
+  // Live sync state for `show ntp`. mgmtd renders the timesyncd
+  // drop-in; orch owns the `timedatectl` query surface, the way it
+  // owns vtysh for FRR.
+  rpc GetNtpState(GetNtpStateRequest) returns (GetNtpStateResponse);
+
   // --- DHCP snooping + dynamic ARP inspection --------------------------
   // Full desired snooping/DAI state (declarative). The engine drives
   // the CPU redirects into syncd, validates trapped packets, maintains
@@ -668,4 +674,28 @@ message ClearLldpCountersRequest {
 
 message ClearLldpCountersResponse {
   uint32 cleared = 1;
+}
+
+// --- NTP ----------------------------------------------------------------
+
+message GetNtpStateRequest {}
+
+message GetNtpStateResponse {
+  // systemd-timesyncd is running (mgmtd stops it when no server is
+  // configured).
+  bool enabled = 1;
+  // The servers timesyncd was given, in order.
+  repeated string servers = 2;
+  bool synchronized = 3;
+  // The server actually in use; "" while unsynchronized.
+  string server = 4;
+  uint32 stratum = 5;
+  uint32 poll_interval_secs = 6;
+  // Microseconds. The offset is signed (the local clock can lead).
+  int64 offset_usecs = 7;
+  uint64 delay_usecs = 8;
+  uint64 jitter_usecs = 9;
+  // Seconds since the last accepted reply; unset = never, or the
+  // timestamp was unreadable.
+  optional uint64 last_sync_secs_ago = 10;
 }

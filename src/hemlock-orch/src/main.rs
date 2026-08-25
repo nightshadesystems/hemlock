@@ -12,6 +12,7 @@ mod dot1x;
 mod frrshow;
 mod lacp;
 mod lldp;
+mod ntpshow;
 mod rib;
 mod snoop;
 mod snoopsec;
@@ -234,6 +235,13 @@ impl Orch for OrchService {
     ) -> Result<Response<pb::ClearLldpCountersResponse>, Status> {
         let cleared = self.lldp.clear_counters(&request.into_inner().port);
         Ok(Response::new(pb::ClearLldpCountersResponse { cleared }))
+    }
+
+    async fn get_ntp_state(
+        &self,
+        _request: Request<pb::GetNtpStateRequest>,
+    ) -> Result<Response<pb::GetNtpStateResponse>, Status> {
+        Ok(Response::new(ntpshow::ntp_state().await))
     }
 
     async fn set_stp_config(

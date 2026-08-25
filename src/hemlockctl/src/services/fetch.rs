@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 
-use super::model::{LldpNeighbor, LldpPort, LldpState};
+use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState};
 
 async fn orch_client(
     orch: &IpcEndpoint,
@@ -73,4 +73,25 @@ pub async fn clear_lldp_counters(orch: &IpcEndpoint) -> Result<u32> {
         .await?
         .into_inner()
         .cleared)
+}
+
+/// The NTP client's configured servers and live sync state.
+pub async fn ntp_state(orch: &IpcEndpoint) -> Result<NtpState> {
+    let response = orch_client(orch)
+        .await?
+        .get_ntp_state(pb::GetNtpStateRequest {})
+        .await?
+        .into_inner();
+    Ok(NtpState {
+        enabled: response.enabled,
+        servers: response.servers,
+        synchronized: response.synchronized,
+        server: response.server,
+        stratum: response.stratum,
+        poll_interval_secs: response.poll_interval_secs,
+        offset_usecs: response.offset_usecs,
+        delay_usecs: response.delay_usecs,
+        jitter_usecs: response.jitter_usecs,
+        last_sync_secs_ago: response.last_sync_secs_ago,
+    })
 }

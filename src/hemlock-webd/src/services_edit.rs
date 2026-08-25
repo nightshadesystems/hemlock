@@ -1,4 +1,4 @@
-//! Config edits for the services-suite pages: LLDP.
+//! Config edits for the services-suite pages: LLDP and NTP.
 //!
 //! Same discipline as `edit.rs`: the builders write exactly the leaves
 //! hemlockctl writes, based on the running config, and the result goes
@@ -16,6 +16,13 @@ fn block_children_mut<'a>(items: &'a mut [Item], name: &str) -> Option<&'a mut V
         } if n == name => Some(children),
         _ => None,
     })
+}
+
+fn push_leaf(items: &mut Vec<Item>, name: &str, values: Vec<String>) {
+    items.push(Item::Leaf {
+        name: name.to_string(),
+        values,
+    });
 }
 
 fn remove_block_if_empty(tree: &mut ConfigTree, name: &str) {
@@ -134,6 +141,72 @@ pub fn apply_lldp_edit(tree: &mut ConfigTree, edit: &LldpEdit) -> Result<(), Str
     Ok(())
 }
 
+// ------------------------------------------------------------------- NTP
+
+/// The most NTP servers the config accepts — the same cap the CLI and
+/// the intent extractor enforce.
+const MAX_NTP_SERVERS: usize = 4;
+
+/// NTP server syntax: an IP literal or a syntactically valid hostname
+/// (resolution is timesyncd's problem). mgmtd re-validates.
+fn valid_ntp_server(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct NtpEdit {
+    /// The whole wanted server list, in order; an empty list turns the
+    /// client off (mgmtd stops timesyncd).
+    #[serde(default)]
+    pub servers: Vec<String>,
+}
+
+pub fn apply_ntp_edit(tree: &mut ConfigTree, edit: &NtpEdit) -> Result<(), String> {
+    let mut wanted: Vec<&String> = Vec::new();
+    for server in &edit.servers {
+        if !valid_ntp_server(server) {
+            return Err(format!("bad ntp server {server:?}"));
+        }
+        // The page sends a list; a duplicate in it is a UI slip, not a
+        // second server.
+        if !wanted.contains(&server) {
+            wanted.push(server);
+        }
+    }
+    if wanted.len() > MAX_NTP_SERVERS {
+        return Err(format!(
+            "at most {MAX_NTP_SERVERS} ntp servers ({} given)",
+            wanted.len()
+        ));
+    }
+
+    let services = tree.block_mut("services");
+    if wanted.is_empty() {
+        ConfigTree::remove_block(services, "ntp", &[]);
+        remove_block_if_empty(tree, "services");
+        return Ok(());
+    }
+    let block = ConfigTree::ensure_block(services, "ntp", &[]);
+    ConfigTree::remove_leaf(block, "server");
+    for server in wanted {
+        push_leaf(block, "server", vec![server.clone()]);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -205,6 +278,62 @@ mod tests {
             ),
             Err("Vlan99: lldp is a physical-port setting".into())
         );
+    }
+
+    #[test]
+    fn ntp_edit_replaces_the_whole_server_list() {
+        let mut t = tree("");
+        apply_ntp_edit(
+            &mut t,
+            &NtpEdit {
+                servers: vec!["10.42.0.5".into(), "pool.ntp.org".into()],
+            },
+        )
+        .unwrap();
+        assert!(t.to_text().contains("server 10.42.0.5"));
+        assert!(t.to_text().contains("server pool.ntp.org"));
+        // A replacement list wins outright — no merge, no leftovers.
+        apply_ntp_edit(
+            &mut t,
+            &NtpEdit {
+                servers: vec!["2001:db8::1".into()],
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("server 2001:db8::1"));
+        assert!(!text.contains("10.42.0.5"));
+        // Emptying it removes the block, and `services` with it.
+        apply_ntp_edit(&mut t, &NtpEdit::default()).unwrap();
+        assert_eq!(t.to_text().trim(), "");
+    }
+
+    #[test]
+    fn ntp_edit_rejects_what_the_cli_rejects() {
+        let mut t = tree("");
+        assert!(apply_ntp_edit(
+            &mut t,
+            &NtpEdit {
+                servers: vec!["not a host".into()],
+            }
+        )
+        .is_err());
+        assert!(apply_ntp_edit(
+            &mut t,
+            &NtpEdit {
+                servers: (1..=5).map(|n| format!("10.0.0.{n}")).collect(),
+            }
+        )
+        .is_err());
+        // A duplicate collapses rather than eating a slot.
+        apply_ntp_edit(
+            &mut t,
+            &NtpEdit {
+                servers: vec!["10.0.0.1".into(), "10.0.0.1".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(t.to_text().matches("server 10.0.0.1").count(), 1);
     }
 
     /// The global disable is independent of the per-port set.

@@ -1,5 +1,6 @@
 //! Parsing and dispatch for the services-suite operational commands:
-//! `show lldp [neighbors [detail]]` and `clear lldp counters`.
+//! `show lldp [neighbors [detail]]`, `show ntp`, and
+//! `clear lldp counters`.
 
 use hemlock_common::ipc::IpcEndpoint;
 
@@ -70,5 +71,24 @@ pub async fn clear_lldp(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String>
     no_more(&args[1..])?;
     let cleared = fetch::clear_lldp_counters(orch).await.map_err(fmt_err)?;
     println!("lldp counters cleared on {cleared} port(s)");
+    Ok(())
+}
+
+/// `show ntp [| json]`.
+pub async fn show_ntp(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    // Deferred by this suite: the box is an NTP client only.
+    if let Some(first) = words.first() {
+        if resolve(first, &["associations", "server"]).is_ok() {
+            return Err("% NTP server mode is not supported".into());
+        }
+    }
+    no_more(&words)?;
+    let state = fetch::ntp_state(orch).await.map_err(fmt_err)?;
+    if json {
+        return page_json("ntp", &state);
+    }
+    crate::pager::page(&render::ntp(&state));
     Ok(())
 }

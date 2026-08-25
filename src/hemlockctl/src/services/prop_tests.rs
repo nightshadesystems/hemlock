@@ -1,11 +1,11 @@
 //! Property tests for the services suite: the LLDP TTL is always the
-//! interval times the multiplier (and never overflows the render), and
-//! no renderer panics or breaks its column layout whatever the engine
-//! reports. Deterministic xorshift generator, no external
+//! interval times the multiplier (and never overflows the render), the
+//! NTP renderer survives every sync posture, and no renderer panics or
+//! breaks its column layout whatever the engine reports. Deterministic xorshift generator, no external
 //! property-testing dependency (the interfaces family's convention).
 #![allow(clippy::unwrap_used)]
 
-use super::model::{LldpNeighbor, LldpPort, LldpState};
+use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState};
 use super::render;
 
 struct Rng(u64);
@@ -183,4 +183,110 @@ fn silent_switch_says_so() {
     );
     // The flat grid degrades to its headings.
     assert_eq!(render::lldp_neighbors(&state).lines().count(), 2);
+}
+
+/// The NTP block renders for every posture the engine can report:
+/// unconfigured, configured-but-stopped, running-but-unsynchronized,
+/// and synchronized — never panicking, never padding past end of line.
+#[test]
+fn ntp_renders_every_sync_posture() {
+    let mut rng = Rng(0x6e74_705f_7072_6f70);
+    let base = || NtpState {
+        servers: vec!["10.42.0.5".into(), "pool.ntp.org".into()],
+        server: "10.42.0.5".into(),
+        stratum: 3,
+        poll_interval_secs: 512,
+        ..NtpState::default()
+    };
+
+    // No servers: one line, and it never claims a sync.
+    let text = render::ntp(&NtpState::default());
+    assert_eq!(text, "NTP is disabled (no servers configured)\n");
+
+    // Configured but the unit is down — distinguishable from both.
+    let text = render::ntp(&base());
+    assert!(text.contains("systemd-timesyncd is not running"));
+    assert!(text.contains("Not synchronized"));
+
+    let text = render::ntp(&NtpState {
+        enabled: true,
+        ..base()
+    });
+    assert!(text.contains("NTP is enabled (systemd-timesyncd)"));
+    assert!(text.contains("Not synchronized"));
+    assert!(!text.contains("Stratum"));
+
+    // An unreadable last-sync timestamp says so rather than lying.
+    let text = render::ntp(&NtpState {
+        enabled: true,
+        synchronized: true,
+        last_sync_secs_ago: None,
+        ..base()
+    });
+    assert!(text.contains("Last sync: unknown"));
+
+    for _ in 0..2000 {
+        let state = NtpState {
+            enabled: rng.chance(),
+            synchronized: rng.chance(),
+            stratum: rng.u32(16),
+            poll_interval_secs: rng.u32(4096),
+            offset_usecs: i64::from(rng.u32(4_000_000)) - 2_000_000,
+            delay_usecs: u64::from(rng.u32(1_000_000)),
+            jitter_usecs: u64::from(rng.u32(1_000_000)),
+            last_sync_secs_ago: rng.chance().then(|| rng.u64() % 10_000_000),
+            ..base()
+        };
+        let text = render::ntp(&state);
+        for line in text.lines() {
+            assert_eq!(line.trim_end(), line, "trailing whitespace in {line:?}");
+        }
+        // The offset keeps its sign through the millisecond render.
+        if state.synchronized {
+            let negative = text.contains("Offset -");
+            assert_eq!(negative, state.offset_usecs < 0, "sign lost for {state:?}");
+        }
+    }
+}
+
+/// Microseconds render as milliseconds to three places, and ages read
+/// as the compact form the spec's sample uses.
+#[test]
+fn offsets_and_ages_render_compactly() {
+    let millis = |usecs: i64| {
+        let state = NtpState {
+            enabled: true,
+            synchronized: true,
+            servers: vec!["a".into()],
+            offset_usecs: usecs,
+            ..NtpState::default()
+        };
+        let text = render::ntp(&state);
+        let line = text.lines().find(|l| l.contains("Offset")).unwrap();
+        line.trim().to_string()
+    };
+    assert!(millis(-412).starts_with("Offset -0.412 ms"));
+    assert!(millis(1204).starts_with("Offset 1.204 ms"));
+    assert!(millis(0).starts_with("Offset 0.000 ms"));
+    assert!(millis(-2_000_000).starts_with("Offset -2000.000 ms"));
+
+    let age = |secs: u64| {
+        let state = NtpState {
+            enabled: true,
+            synchronized: true,
+            servers: vec!["a".into()],
+            last_sync_secs_ago: Some(secs),
+            ..NtpState::default()
+        };
+        let text = render::ntp(&state);
+        let line = text.lines().find(|l| l.contains("Last sync")).unwrap();
+        line.trim()
+            .trim_start_matches("Last sync: ")
+            .trim_end_matches(" ago")
+            .to_string()
+    };
+    assert_eq!(age(41), "41s");
+    assert_eq!(age(4 * 60 + 12), "4m12s");
+    assert_eq!(age(2 * 3600 + 4 * 60), "2h04m");
+    assert_eq!(age(3 * 86_400 + 5 * 3600), "3d05h");
 }
