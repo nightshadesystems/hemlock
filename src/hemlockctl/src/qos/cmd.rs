@@ -34,28 +34,10 @@ pub async fn show(syncd: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
     // Deferred by the QoS suite: buffer management and PFC.
-    for (word, message) in [
-        (
-            "priority-flow-control",
-            "priority-flow-control is not supported",
-        ),
-        ("buffer", "buffer-pool state is not supported"),
-    ] {
-        if resolve(first, &[word]).is_ok() {
-            return Err(format!("% {message}"));
-        }
+    if let Some(message) = crate::cli::qos_deferred(first, /* port = */ false) {
+        return Err(message);
     }
-    match resolve(
-        first,
-        &[
-            "maps",
-            "wred",
-            "interface",
-            "interfaces",
-            "priority-flow-control",
-            "buffer",
-        ],
-    )? {
+    match resolve(first, &["maps", "wred", "interface", "interfaces"])? {
         "maps" => {
             no_more(&words[1..])?;
             let state = fetch::maps(syncd).await.map_err(fmt_err)?;

@@ -969,6 +969,26 @@ async fn config_port_security(
     }
 }
 
+/// Spellings the QoS suite deliberately does not implement (Part 0's
+/// deferred list). Matched *exactly*, so they never make a supported
+/// prefix ambiguous; `port` adds the per-interface-only forms.
+pub(crate) fn qos_deferred(word: &str, port: bool) -> Option<String> {
+    let message = match word {
+        "pfc" | "priority-flow-control" => "priority-flow-control is not supported",
+        "priority-group" | "headroom" | "xoff" => {
+            "ingress priority-group buffer management is not supported"
+        }
+        "buffer" | "buffer-pool" => "buffer-pool configuration is not supported",
+        "map" if port => "per-port QoS maps are not supported (maps are global)",
+        "police" if port => {
+            "QoS policing lives in the ACL engine (set security acl <name> rule <n> police ...)"
+        }
+        "mc-queue" | "multicast-queue" if port => "multicast-queue scheduling is not supported",
+        _ => return None,
+    };
+    Some(format!("% {message}"))
+}
+
 /// The four global map tables and the key/value words each takes.
 const QOS_MAP_TABLES: &[(&str, &str, u8, &str, u8)] = &[
     ("dscp-to-tc", "dscp", 63, "tc", 7),
@@ -1071,13 +1091,10 @@ async fn config_qos(endpoints: &Endpoints, words: &[&str], delete: bool) -> Resu
     let Some(first) = words.first() else {
         return Err(format!("% Usage: {verb} qos <map|wred-profile> ..."));
     };
-    match resolve(
-        first,
-        &["map", "wred-profile", "priority-flow-control", "buffer"],
-    )? {
-        // Deferred by the QoS suite.
-        "priority-flow-control" => Err("% priority-flow-control is not supported".into()),
-        "buffer" => Err("% buffer-pool configuration is not supported".into()),
+    if let Some(message) = qos_deferred(first, /* port = */ false) {
+        return Err(message);
+    }
+    match resolve(first, &["map", "wred-profile"])? {
         "map" => config_qos_map(endpoints, &words[1..], delete).await,
         "wred-profile" => config_wred_profile(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
@@ -1306,18 +1323,10 @@ async fn config_port_qos(
         .await
         .map_err(fmt_err);
     }
-    match resolve(
-        words[0],
-        &[
-            "trust",
-            "default-tc",
-            "shape",
-            "queue",
-            "priority-flow-control",
-        ],
-    )? {
-        // Deferred by the QoS suite.
-        "priority-flow-control" => Err("% priority-flow-control is not supported".into()),
+    if let Some(message) = qos_deferred(words[0], /* port = */ true) {
+        return Err(message);
+    }
+    match resolve(words[0], &["trust", "default-tc", "shape", "queue"])? {
         "trust" => {
             if delete {
                 return edit_interface(endpoints, port, |eth| {
@@ -5315,6 +5324,95 @@ mod tests {
         prune_qos(&mut tree);
         assert!(tree.to_text().contains("wred-profile BULK"));
         assert!(!tree.to_text().contains("map"));
+    }
+
+    /// The `shape rate <rate>` tail shared by the port and queue forms:
+    /// prefixes resolve, rates canonicalize, and every rejection is a
+    /// `%` line the operator sees at the prompt.
+    #[test]
+    fn qos_shape_rate_usage_and_errors() {
+        let prefix = "set interfaces Ethernet1 qos";
+        assert_eq!(
+            qos_shape_rate(&["rate", "100m"], false, prefix).unwrap(),
+            Some("100m".into())
+        );
+        // A bare bps value canonicalizes to the suffixed config form.
+        assert_eq!(
+            qos_shape_rate(&["rate", "800000000"], false, prefix).unwrap(),
+            Some("800m".into())
+        );
+        // `r` uniquely prefixes `rate`.
+        assert_eq!(
+            qos_shape_rate(&["r", "1g"], false, prefix).unwrap(),
+            Some("1g".into())
+        );
+        // The delete form takes the keyword or nothing at all.
+        assert_eq!(qos_shape_rate(&[], true, prefix).unwrap(), None);
+        assert_eq!(qos_shape_rate(&["rate"], true, prefix).unwrap(), None);
+
+        assert_eq!(
+            qos_shape_rate(&[], false, prefix).unwrap_err(),
+            "% Usage: set interfaces Ethernet1 qos shape rate <rate>"
+        );
+        assert_eq!(
+            qos_shape_rate(&["rate"], false, prefix).unwrap_err(),
+            "% Usage: set interfaces Ethernet1 qos shape rate <rate>"
+        );
+        assert!(qos_shape_rate(&["rate", "32k"], false, prefix)
+            .unwrap_err()
+            .contains("below the 64k shaper granularity floor"));
+        assert!(qos_shape_rate(&["rate", "banana"], false, prefix)
+            .unwrap_err()
+            .starts_with("% bad rate"));
+        assert!(qos_shape_rate(&["rate", "100m", "extra"], false, prefix)
+            .unwrap_err()
+            .starts_with("% Invalid input"));
+        assert!(qos_shape_rate(&["bandwidth", "100m"], false, prefix)
+            .unwrap_err()
+            .starts_with("% Invalid input"));
+    }
+
+    /// Part 0's deferred list rejects at parse with a `% ... not
+    /// supported` line, and never shadows a supported keyword.
+    #[test]
+    fn qos_deferred_features_reject_at_parse() {
+        for word in ["pfc", "priority-flow-control", "headroom", "xoff", "buffer"] {
+            assert!(
+                qos_deferred(word, false).unwrap().starts_with("% "),
+                "{word} should reject"
+            );
+        }
+        assert_eq!(
+            qos_deferred("priority-group", true).unwrap(),
+            "% ingress priority-group buffer management is not supported"
+        );
+        assert_eq!(
+            qos_deferred("multicast-queue", true).unwrap(),
+            "% multicast-queue scheduling is not supported"
+        );
+        assert!(qos_deferred("police", true).unwrap().contains("ACL engine"));
+        // `map` is a supported global noun but a deferred per-port one.
+        assert!(qos_deferred("map", false).is_none());
+        assert!(qos_deferred("map", true)
+            .unwrap()
+            .contains("maps are global"));
+        // Nothing supported is caught, and prefixes never match — so a
+        // deferred spelling cannot make a real keyword ambiguous.
+        for word in [
+            "trust",
+            "default-tc",
+            "shape",
+            "queue",
+            "wred-profile",
+            "maps",
+        ] {
+            assert!(
+                qos_deferred(word, true).is_none(),
+                "{word} must stay usable"
+            );
+        }
+        assert!(qos_deferred("p", true).is_none());
+        assert!(qos_deferred("buf", false).is_none());
     }
 
     #[test]

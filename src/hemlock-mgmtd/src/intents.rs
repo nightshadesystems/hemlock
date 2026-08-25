@@ -2343,13 +2343,10 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
                 }
             }
             if let Some(profile) = &queue.wred_profile {
-                if !intents.wred_profiles.contains_key(profile) {
-                    return Err(IntentError::BadQueueQos {
-                        name: name.clone(),
-                        queue: index.to_string(),
-                        reason: format!("no such qos wred-profile {profile:?}"),
-                    });
-                }
+                // References are gathered for every profile, defined or
+                // not: an undefined one is reported once with the whole
+                // list, so deleting a bound profile names every queue
+                // holding it instead of one at a time.
                 wred_references
                     .entry(profile.clone())
                     .or_default()
@@ -2364,6 +2361,16 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
             if strict != expected {
                 return Err(IntentError::StrictQueueOrder);
             }
+        }
+    }
+    // A reference to a profile this config does not define — a typo,
+    // or a profile deleted while queues still bind it.
+    for (profile, references) in &wred_references {
+        if !intents.wred_profiles.contains_key(profile) {
+            return Err(IntentError::BadWredProfile {
+                name: profile.clone(),
+                reason: format!("not defined; referenced by {}", references.join(", ")),
+            });
         }
     }
     // A referenced profile needs both thresholds, in order.
@@ -6848,10 +6855,18 @@ interfaces {
     fn qos_wred_validation() {
         let bad = |text: &str| extract(&parse(text).unwrap()).unwrap_err();
 
-        // A dangling profile reference.
+        // A dangling profile reference names every queue holding it,
+        // so deleting a bound profile is one round trip, not N.
         assert_eq!(
             bad("interfaces { Ethernet1 { qos { queue 3 { wred-profile GONE } } } }").to_string(),
-            "Ethernet1 queue 3: no such qos wred-profile \"GONE\""
+            "qos wred-profile GONE: not defined; referenced by Ethernet1 (q3)"
+        );
+        assert_eq!(
+            bad("interfaces { Ethernet1 { qos { queue 3 { wred-profile BULK } } }
+Ethernet2 { qos { queue 5 { wred-profile BULK } } }
+Port-Channel1 { qos { queue 7 { wred-profile BULK } } } }")
+                .to_string(),
+            "qos wred-profile BULK: not defined; referenced by Ethernet1 (q3), Ethernet2 (q5), Port-Channel1 (q7)"
         );
         // Thresholds must be ordered...
         assert_eq!(
