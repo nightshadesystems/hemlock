@@ -620,6 +620,22 @@ pub trait SaiBackend: Send {
 
     fn set_port_admin_state(&mut self, port: PortId, up: bool) -> Result<(), SaiError>;
 
+    /// Pin the port's line rate (`SAI_PORT_ATTR_SPEED`, Mb/s). Only
+    /// meaningful with autoneg off; the caller orders the two.
+    fn set_port_speed(&mut self, port: PortId, speed_mbps: u32) -> Result<(), SaiError>;
+
+    /// Forced duplex (`SAI_PORT_ATTR_FULL_DUPLEX_MODE`); `false` = half.
+    fn set_port_duplex(&mut self, port: PortId, full: bool) -> Result<(), SaiError>;
+
+    /// Auto-negotiation (`SAI_PORT_ATTR_AUTO_NEG_MODE`). With it on the
+    /// ASIC advertises its supported modes and the forced speed/duplex
+    /// attributes are advisory.
+    fn set_port_autoneg(&mut self, port: PortId, on: bool) -> Result<(), SaiError>;
+
+    /// The port's L2 MTU (`SAI_PORT_ATTR_MTU`), frame bytes excluding
+    /// the FCS. The matching kernel hostif netdev MTU is mgmtd's job.
+    fn set_port_mtu(&mut self, port: PortId, mtu: u32) -> Result<(), SaiError>;
+
     /// Cumulative hardware counters for one port. Polled by syncd's stats
     /// engine; must be cheap enough for a 5s all-ports sweep.
     fn port_counters(&mut self, port: PortId) -> Result<PortCounters, SaiError>;

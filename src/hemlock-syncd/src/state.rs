@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
+use hemlock_common::link::Duplex;
 use hemlock_platform::PortDef;
 use hemlock_sai::{
     AclFamily, AclFields, AclPacketAction, AclStage, Oid, PolicerSpec, PolicerStats, PortId,
@@ -27,6 +28,45 @@ pub struct PortState {
     /// Errdisable cause (`bpduguard`, ...); the port is admin-down
     /// while set.
     pub errdisable_reason: Option<String>,
+    /// Operator-pinned link parameters; unset fields run at the
+    /// platform default from `def`.
+    pub link: LinkConfig,
+}
+
+impl PortState {
+    /// The rate to derive percent-relative rates from and to report:
+    /// the pinned speed when the operator forced one, otherwise the
+    /// platform's definition for the port.
+    pub fn speed_mbps(&self) -> u32 {
+        self.link.speed_mbps.unwrap_or(self.def.speed_mbps)
+    }
+
+    /// Auto-negotiation as programmed, falling back to the manifest's
+    /// declaration for the port.
+    pub fn autoneg(&self) -> bool {
+        self.link.autoneg.unwrap_or(self.def.autoneg)
+    }
+
+    /// The port's duplex for display. Nothing forced = full, which is
+    /// what every rate above 100M runs at anyway.
+    pub fn duplex(&self) -> Duplex {
+        self.link.duplex.unwrap_or(Duplex::Full)
+    }
+}
+
+/// Link parameters an operator pinned on a port. `None` everywhere is
+/// the boot state: the ASIC runs whatever config.bcm created and the
+/// hostif netdev keeps the KNET default MTU.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkConfig {
+    /// Pinned rate in Mb/s; None = not pinned.
+    pub speed_mbps: Option<u32>,
+    /// Forced duplex; None = not forced.
+    pub duplex: Option<Duplex>,
+    /// Auto-negotiation as programmed; None = platform default.
+    pub autoneg: Option<bool>,
+    /// L2 MTU as programmed; None = platform default.
+    pub mtu: Option<u32>,
 }
 
 /// One programmed storm-control level: the operator's percent (two

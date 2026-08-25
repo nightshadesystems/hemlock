@@ -355,6 +355,14 @@ message SetPortAttrsRequest {
   // Only fields that are present are applied.
   optional AdminState admin_state = 2;
   optional string description = 3;
+  // Pinned line rate in Mb/s; 0 = auto-negotiate. Validated against
+  // the port's platform-declared supported_modes.
+  optional uint32 speed_mbps = 4;
+  // "auto" | "full" | "half". Forcing either speed or duplex turns
+  // auto-negotiation off.
+  optional string duplex = 5;
+  // L2 MTU in bytes (68..9216).
+  optional uint32 mtu = 6;
 }
 
 message SetPortAttrsResponse {
@@ -485,6 +493,11 @@ message InterfaceState {
   uint32 access_vlan = 27;         // 0 = default VLAN (1)
   uint32 native_vlan = 28;         // 0 = default VLAN (1)
   repeated uint32 trunk_vlans = 29;
+  // What the operator pinned, as opposed to what the link negotiated:
+  // `speed_mbps`/`duplex` above report the live state (0 and "" while
+  // the link is down), these report the config. 0 / "" = not pinned.
+  uint32 forced_speed_mbps = 30;
+  string forced_duplex = 31;
 }
 
 message ClearCountersRequest {

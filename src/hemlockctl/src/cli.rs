@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use hemlock_common::ipc::IpcEndpoint;
+use hemlock_common::link;
 use hemlock_common::proto::v1 as pb;
 use hemlock_config::ConfigTree;
 use rustyline::error::ReadlineError;
@@ -681,6 +682,11 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces <port> shutdown | no-shutdown");
             println!("  set interfaces <port> address <ip/prefix>     puts the port in L3 mode");
             println!("  set interfaces Vlan<id> address <ip/prefix>   SVI (in-band management)");
+            println!(
+                "  set interfaces <port> speed <auto|rate>       rate in Mb/s, e.g. 1000 or 1G"
+            );
+            println!("  set interfaces <port> duplex <auto|full|half>");
+            println!("  set interfaces <port|Ma|Vlan<id>> mtu <68-9216>");
             println!("  set interfaces <port> switchport mode <access|trunk|dot1q-tunnel>");
             println!("  set interfaces <port> switchport access vlan <id>");
             println!("  set interfaces <port> switchport trunk vlans <list>   e.g. 10,20,30-32");
@@ -891,6 +897,154 @@ async fn config_access_group(
                     && values.get(1).map(String::as_str) == Some(direction.as_str()))
         });
         push_leaf(eth, "access-group", vec![name, direction]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// The speed/duplex modes the platform declares for `port`, from
+/// syncd's interface state. Empty when syncd cannot say (an SVI, a
+/// manifest without `supported_modes`, or an unreachable daemon) — the
+/// caller then skips the prompt-time check and lets the commit decide.
+async fn port_supported_modes(endpoints: &Endpoints, port: &str) -> Vec<String> {
+    let Ok(channel) = endpoints.syncd.connect().await else {
+        return Vec::new();
+    };
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    let Ok(response) = client
+        .get_interfaces(pb::GetInterfacesRequest {
+            names: vec![port.to_string()],
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    response
+        .into_inner()
+        .interfaces
+        .into_iter()
+        .find(|i| i.name == port)
+        .map(|i| i.supported_modes)
+        .unwrap_or_default()
+}
+
+/// `set interfaces <port> speed <auto|rate>` and
+/// `set interfaces <port> duplex <auto|full|half>`.
+///
+/// Both are checked against the port's platform-declared modes here for
+/// immediate feedback; syncd re-validates the resulting *pair* at
+/// commit, since that is where the port table lives.
+async fn config_link_mode(
+    endpoints: &Endpoints,
+    port: &str,
+    leaf: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if delete {
+        if let Some(extra) = words.first() {
+            return Err(format!("% Invalid input: {extra:?}"));
+        }
+        let leaf = leaf.to_string();
+        return edit_interface(endpoints, port, move |eth| {
+            ConfigTree::remove_leaf(eth, &leaf);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let choices = if leaf == "speed" {
+        "auto, or a rate such as 1000 or 1G"
+    } else {
+        "auto, full or half"
+    };
+    let Some(value) = words.first() else {
+        return Err(format!("% Usage: set interfaces {port} {leaf} <{choices}>"));
+    };
+    if let Some(extra) = words.get(1) {
+        return Err(format!("% Invalid input: {extra:?}"));
+    }
+
+    let modes = port_supported_modes(endpoints, port).await;
+    let stored = if value.eq_ignore_ascii_case("auto") {
+        if !modes.is_empty() && !link::supports_auto(&modes) {
+            return Err(format!(
+                "% {port} does not auto-negotiate (supported: {})",
+                modes.join(", ")
+            ));
+        }
+        "auto".to_string()
+    } else if leaf == "speed" {
+        let mbps =
+            link::parse_speed(value).ok_or_else(|| format!("% bad speed {value:?} ({choices})"))?;
+        let supported = link::supported_speeds(&modes);
+        if !supported.is_empty() && !supported.contains(&mbps) {
+            return Err(format!(
+                "% {port} does not support {}; it supports {}",
+                link::format_speed(mbps),
+                supported
+                    .iter()
+                    .map(|s| link::format_speed(*s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        mbps.to_string()
+    } else {
+        let duplex = link::Duplex::parse(value)
+            .ok_or_else(|| format!("% bad duplex {value:?} ({choices})"))?;
+        let supported = link::supported_duplexes(&modes);
+        if !supported.is_empty() && !supported.contains(&duplex) {
+            return Err(format!(
+                "% {port} does not support {}-duplex; it supports {}",
+                duplex.as_str(),
+                supported
+                    .iter()
+                    .map(|d| d.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        duplex.as_str().to_string()
+    };
+
+    let leaf = leaf.to_string();
+    edit_interface(endpoints, port, move |eth| {
+        ConfigTree::set_leaf(eth, &leaf, vec![stored]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set interfaces <port> mtu <68-9216>`.
+async fn config_mtu(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if let Some(extra) = words.get(usize::from(!delete)) {
+        return Err(format!("% Invalid input: {extra:?}"));
+    }
+    if delete {
+        return edit_interface(endpoints, port, |eth| {
+            ConfigTree::remove_leaf(eth, "mtu");
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(value) = words.first() else {
+        return Err(format!(
+            "% Usage: set interfaces {port} mtu <{}-{}>",
+            link::MIN_MTU,
+            link::MAX_MTU
+        ));
+    };
+    let bytes: u32 = value
+        .parse()
+        .map_err(|_| format!("% bad MTU {value:?} ({}..{})", link::MIN_MTU, link::MAX_MTU))?;
+    link::valid_mtu(bytes).map_err(|reason| format!("% {reason}"))?;
+    edit_interface(endpoints, port, move |eth| {
+        ConfigTree::set_leaf(eth, "mtu", vec![bytes.to_string()]);
     })
     .await
     .map_err(fmt_err)
@@ -2519,6 +2673,9 @@ async fn config_interfaces(
             "shutdown",
             "no-shutdown",
             "address",
+            "speed",
+            "duplex",
+            "mtu",
             "switchport",
             "channel-group",
             "lacp",
@@ -2544,7 +2701,7 @@ async fn config_interfaces(
         if subcommand == "qos" {
             return Err("% QoS is a front-panel concept; configure it on the physical port".into());
         }
-        if !matches!(subcommand, "address" | "vrrp") {
+        if !matches!(subcommand, "address" | "vrrp" | "mtu") {
             return Err(format!(
                 "% {subcommand} is not supported on VLAN interfaces"
             ));
@@ -2553,7 +2710,9 @@ async fn config_interfaces(
     if port.starts_with("Management")
         && matches!(
             subcommand,
-            "channel-group"
+            "speed"
+                | "duplex"
+                | "channel-group"
                 | "lacp"
                 | "spanning-tree"
                 | "storm-control"
@@ -2572,10 +2731,13 @@ async fn config_interfaces(
         ));
     }
     let is_lag = port.starts_with("Port-Channel");
+    if is_lag && subcommand == "mtu" {
+        return Err("% mtu follows the member ports; set it on those".into());
+    }
     if is_lag
         && matches!(
             subcommand,
-            "address" | "channel-group" | "vrrp" | "port-security" | "dot1x"
+            "address" | "speed" | "duplex" | "channel-group" | "vrrp" | "port-security" | "dot1x"
         )
     {
         return Err(format!(
@@ -2661,6 +2823,15 @@ async fn config_interfaces(
         }
         "vrrp" => {
             return config_vrrp(endpoints, &port, &rest[1..], delete).await;
+        }
+        _ => {}
+    }
+    match subcommand {
+        "speed" | "duplex" => {
+            return config_link_mode(endpoints, &port, subcommand, &rest[1..], delete).await;
+        }
+        "mtu" => {
+            return config_mtu(endpoints, &port, &rest[1..], delete).await;
         }
         _ => {}
     }

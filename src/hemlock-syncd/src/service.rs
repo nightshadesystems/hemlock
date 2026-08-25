@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use hemlock_common::link::{self, Duplex};
 use hemlock_common::proto::v1 as pb;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
@@ -13,25 +14,39 @@ use crate::actor::{FdbNotify, SaiHandle};
 use crate::ifstats::{utilization_pct, RawCounters, SharedEngine, Snapshot};
 use crate::netdev::NetdevSample;
 use crate::state::{
-    FdbStaticEntry, L3State, MirrorDir, MirrorState, PortState, StormState, SwitchportState,
-    VlanState,
+    FdbStaticEntry, L3State, LinkConfig, MirrorDir, MirrorState, PortState, StormState,
+    SwitchportState, VlanState,
 };
 
 /// Fallback L2 MTU for front-panel ports, matching the KNET default the
-/// platform loads (`linux-bcm-knet default_mtu=9100`). Used when a port's
-/// hostif netdev cannot be read; per-interface MTU intents arrive in a
-/// later phase.
-const PORT_MTU: u32 = 9100;
+/// platform loads (`linux-bcm-knet default_mtu=9100`). Used when a port
+/// carries no MTU intent and its hostif netdev cannot be read, and
+/// programmed back into the ASIC when an MTU intent is deleted.
+const PORT_MTU: u32 = link::DEFAULT_PORT_MTU;
 
-/// A port's live MTU: its hostif netdev is named after it, so the kernel
-/// has the truth (`ip link` parity). Fallback for mock backends and
-/// pre-hostif states.
-fn port_mtu(name: &str) -> u32 {
+/// Which halves of a port's link config a [`pb::SetPortAttrsRequest`]
+/// asked to change — an untouched half is never reprogrammed, so a
+/// description-only edit does not bounce the link.
+#[derive(Debug, Clone, Copy, Default)]
+struct LinkTouched {
+    /// Speed, duplex or negotiation.
+    link: bool,
+    mtu: bool,
+}
+
+/// An interface's live MTU: its hostif (port) or bridge (SVI) netdev is
+/// named after it, so the kernel has the truth (`ip link` parity).
+/// `default` covers mock backends and pre-netdev states.
+fn netdev_mtu(name: &str, default: u32) -> u32 {
     std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .filter(|&mtu| mtu > 0)
-        .unwrap_or(PORT_MTU)
+        .unwrap_or(default)
+}
+
+fn port_mtu(name: &str) -> u32 {
+    netdev_mtu(name, PORT_MTU)
 }
 
 /// Platform facts the interface RPCs need, resolved once at startup.
@@ -78,7 +93,7 @@ impl SyncdService {
             name: port.def.name.clone(),
             index: port.def.index,
             lanes: port.def.lanes.clone(),
-            speed_mbps: port.def.speed_mbps,
+            speed_mbps: port.speed_mbps(),
             admin_state: if port.admin_up {
                 pb::AdminState::Up
             } else {
@@ -122,6 +137,62 @@ impl SyncdService {
             late_collisions: c.late_collisions,
             deferred: c.deferred,
         }
+    }
+
+    /// Fold one request's link fields into the port's current config.
+    ///
+    /// `speed_mbps: 0` and `duplex: "auto"` mean "stop forcing" (the
+    /// spelling the config uses when the leaf is deleted), as does
+    /// `mtu: 0`. Forcing either speed or duplex turns auto-negotiation
+    /// off — a PHY cannot negotiate *to* a pin — and the resulting pair
+    /// must be one the platform declares for the port.
+    #[allow(clippy::result_large_err)] // tonic::Status is the RPC error
+    fn wanted_link(
+        port: &PortState,
+        req: &pb::SetPortAttrsRequest,
+    ) -> Result<(LinkConfig, LinkTouched), Status> {
+        let mut link = port.link.clone();
+        let mut touched = LinkTouched::default();
+
+        if let Some(mbps) = req.speed_mbps {
+            link.speed_mbps = (mbps != 0).then_some(mbps);
+            touched.link = true;
+        }
+        if let Some(word) = &req.duplex {
+            link.duplex = match word.as_str() {
+                "auto" | "" => None,
+                other => Some(Duplex::parse(other).ok_or_else(|| {
+                    Status::invalid_argument(format!("bad duplex {other:?} (auto, full or half)"))
+                })?),
+            };
+            touched.link = true;
+        }
+        if let Some(mtu) = req.mtu {
+            if mtu != 0 {
+                link::valid_mtu(mtu).map_err(Status::invalid_argument)?;
+            }
+            link.mtu = (mtu != 0).then_some(mtu);
+            touched.mtu = true;
+        }
+
+        if touched.link {
+            let forced = link.speed_mbps.is_some() || link.duplex.is_some();
+            // Nothing forced -> back to the manifest's declaration.
+            link.autoneg = forced.then_some(false);
+            if forced {
+                let speed = link.speed_mbps.unwrap_or(port.def.speed_mbps);
+                let duplex = link.duplex.unwrap_or(Duplex::Full);
+                if !link::mode_supported(&port.def.supported_modes, speed, duplex) {
+                    return Err(Status::invalid_argument(format!(
+                        "{}: {} is not supported (this port does: {})",
+                        port.def.name,
+                        link::format_mode(speed, duplex),
+                        port.def.supported_modes.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok((link, touched))
     }
 
     fn rates_to_proto(snap: &Snapshot, speed_mbps: u64) -> pb::RateStats {
@@ -193,7 +264,7 @@ impl SyncdService {
 
     fn port_to_iface(&self, port: &PortState, now: Instant) -> pb::InterfaceState {
         let speed = if port.oper_up {
-            u64::from(port.def.speed_mbps)
+            u64::from(port.speed_mbps())
         } else {
             // Down with nothing negotiated: `Unconfigured` in the CLI.
             0
@@ -215,13 +286,19 @@ impl SyncdService {
             mac: self.inventory.mac.clone().unwrap_or_default(),
             bia_mac: self.inventory.mac.clone().unwrap_or_default(),
             description: port.description.clone(),
-            mtu: port_mtu(&port.def.name),
+            mtu: port.link.mtu.unwrap_or_else(|| port_mtu(&port.def.name)),
             speed_mbps: speed,
-            duplex: "full".into(),
-            autoneg: port.def.autoneg,
+            duplex: port.duplex().as_str().into(),
+            autoneg: port.autoneg(),
             media: port.def.media.clone().unwrap_or_default(),
             phy_model: port.def.phy_model.clone().unwrap_or_default(),
             supported_modes: port.def.supported_modes.clone(),
+            forced_speed_mbps: port.link.speed_mbps.unwrap_or_default(),
+            forced_duplex: port
+                .link
+                .duplex
+                .map(|d| d.as_str().to_string())
+                .unwrap_or_default(),
             ip_addresses: port.l3.iter().map(|l3| l3.address.clone()).collect(),
             errdisable_reason: port.errdisable_reason.clone().unwrap_or_default(),
             ..pb::InterfaceState::default()
@@ -291,7 +368,9 @@ impl SyncdService {
             mac: self.inventory.mac.clone().unwrap_or_default(),
             bia_mac: self.inventory.mac.clone().unwrap_or_default(),
             description: name.to_string(),
-            mtu: PORT_MTU,
+            // The SVI's bridge netdev carries the MTU an `mtu` intent
+            // programmed; kernel default until one does.
+            mtu: netdev_mtu(&format!("Vlan{vlan}"), link::DEFAULT_MTU),
             ip_addresses: l3.iter().map(|l3| l3.address.clone()).collect(),
             ..pb::InterfaceState::default()
         }
@@ -1225,7 +1304,7 @@ impl pb::syncd_server::Syncd for SyncdService {
     ) -> Result<Response<pb::SetPortAttrsResponse>, Status> {
         let req = request.into_inner();
 
-        let (sai_id, admin_change) = {
+        let (sai_id, admin_change, link, link_touched) = {
             let table = self
                 .handle
                 .ports
@@ -1242,13 +1321,45 @@ impl pb::syncd_server::Syncd for SyncdService {
                 }
                 None => None,
             };
-            (port.sai_id, admin_change)
+            let (link, touched) = Self::wanted_link(port, &req)?;
+            (port.sai_id, admin_change, link, touched)
         };
 
         // Drive the ASIC outside the lock.
         if let Some(up) = admin_change {
             self.handle
                 .set_admin_state(sai_id, up)
+                .await
+                .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+        }
+        if link_touched.link {
+            // Autoneg first: pinning a rate while negotiation is still
+            // running lets the PHY re-negotiate over the pin.
+            let autoneg = link.autoneg.unwrap_or(false);
+            self.handle
+                .set_port_autoneg(sai_id, autoneg)
+                .await
+                .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+            if !autoneg {
+                if let Some(speed) = link.speed_mbps {
+                    self.handle
+                        .set_port_speed(sai_id, speed)
+                        .await
+                        .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+                }
+                if let Some(duplex) = link.duplex {
+                    self.handle
+                        .set_port_duplex(sai_id, duplex == Duplex::Full)
+                        .await
+                        .map_err(|e| Status::internal(format!("SAI: {e}")))?;
+                }
+            }
+        }
+        if link_touched.mtu {
+            // A deleted intent restores the boot-time KNET default
+            // rather than leaving the last pin in the ASIC.
+            self.handle
+                .set_port_mtu(sai_id, link.mtu.unwrap_or(PORT_MTU))
                 .await
                 .map_err(|e| Status::internal(format!("SAI: {e}")))?;
         }
@@ -1267,6 +1378,7 @@ impl pb::syncd_server::Syncd for SyncdService {
         if let Some(description) = req.description {
             port.description = description;
         }
+        port.link = link;
         Ok(Response::new(pb::SetPortAttrsResponse {
             port: Some(Self::to_proto(port)),
         }))
@@ -1359,10 +1471,7 @@ impl pb::syncd_server::Syncd for SyncdService {
                     .filter_map(|(n, _)| ports.get(n).map(|p| (n, p)))
                     .filter(|(_, p)| p.oper_up)
                     .collect();
-                let speed: u64 = bundled
-                    .iter()
-                    .map(|(_, p)| u64::from(p.def.speed_mbps))
-                    .sum();
+                let speed: u64 = bundled.iter().map(|(_, p)| u64::from(p.speed_mbps())).sum();
                 let mut state = pb::InterfaceState {
                     name,
                     kind: "port-channel".into(),
@@ -2246,7 +2355,7 @@ impl pb::syncd_server::Syncd for SyncdService {
                     let port = table
                         .get(name)
                         .ok_or_else(|| Status::not_found(format!("no port {name:?}")))?;
-                    (port.sai_id, port.def.speed_mbps)
+                    (port.sai_id, port.speed_mbps())
                 };
                 let kbps = match &level {
                     Some(level) => Some(Self::storm_kbps(speed, Self::level_hundredths(level)?)),
@@ -2284,7 +2393,7 @@ impl pb::syncd_server::Syncd for SyncdService {
             let port = table
                 .get(&req.name)
                 .ok_or_else(|| Status::not_found(format!("no port {:?}", req.name)))?;
-            (port.sai_id, port.def.speed_mbps)
+            (port.sai_id, port.speed_mbps())
         };
         let program = match &req.level {
             Some(level) => {
@@ -2404,7 +2513,7 @@ impl pb::syncd_server::Syncd for SyncdService {
                         .read()
                         .map_err(|_| Status::internal("port table poisoned"))?;
                     match table.get(member) {
-                        Some(port) => (port.sai_id, port.def.speed_mbps, port.oper_up),
+                        Some(port) => (port.sai_id, port.speed_mbps(), port.oper_up),
                         None => continue,
                     }
                 };
@@ -2844,7 +2953,7 @@ impl pb::syncd_server::Syncd for SyncdService {
                     let port = table
                         .get(name)
                         .ok_or_else(|| Status::not_found(format!("no port {name:?}")))?;
-                    (port.sai_id, port.def.speed_mbps)
+                    (port.sai_id, port.speed_mbps())
                 };
                 let hundredths = Self::level_hundredths(&state.level)?;
                 self.handle
@@ -6430,5 +6539,141 @@ lanes = [1, 2, 3, 4]
             err.message(),
             "control-plane policing is not supported by this platform's SAI"
         );
+    }
+
+    /// A service over the mock data plane, with the two-port test
+    /// platform whose ports declare `["1G/full", "auto"]`.
+    async fn mock_service() -> (SyncdService, Arc<SaiHandle>) {
+        let platform = test_platform();
+        let backend = Box::new(hemlock_sai::mock::MockSai::new(platform.ports.clone()));
+        let handle = Arc::new(SaiActor::spawn(backend, &platform).await.unwrap());
+        let service = SyncdService::new(
+            Arc::clone(&handle),
+            Engine::new(300),
+            Arc::default(),
+            Inventory {
+                platform_model: "Hemlock TestSwitch".into(),
+                management: None,
+                uc_queues: 2,
+                mc_queues: 1,
+                mac: Some("2c:dd:e9:12:00:01".into()),
+            },
+        );
+        (service, handle)
+    }
+
+    fn attrs(name: &str) -> pb::SetPortAttrsRequest {
+        pb::SetPortAttrsRequest {
+            name: name.into(),
+            ..pb::SetPortAttrsRequest::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pins_speed_duplex_and_mtu_within_the_platforms_modes() {
+        let (service, handle) = mock_service().await;
+
+        service
+            .set_port_attrs(Request::new(pb::SetPortAttrsRequest {
+                speed_mbps: Some(1000),
+                duplex: Some("full".into()),
+                mtu: Some(9216),
+                ..attrs("Ethernet1")
+            }))
+            .await
+            .unwrap();
+
+        let link = handle.ports.read().unwrap()["Ethernet1"].link.clone();
+        assert_eq!(link.speed_mbps, Some(1000));
+        assert_eq!(link.duplex, Some(Duplex::Full));
+        assert_eq!(link.mtu, Some(9216));
+        // A pin turns negotiation off; nothing else can honour it.
+        assert_eq!(link.autoneg, Some(false));
+
+        // Reverting sends the sentinels, and the port falls back to the
+        // manifest's declaration rather than keeping the pin.
+        service
+            .set_port_attrs(Request::new(pb::SetPortAttrsRequest {
+                speed_mbps: Some(0),
+                duplex: Some("auto".into()),
+                mtu: Some(0),
+                ..attrs("Ethernet1")
+            }))
+            .await
+            .unwrap();
+        let port = handle.ports.read().unwrap()["Ethernet1"].clone();
+        assert_eq!(port.link, crate::state::LinkConfig::default());
+        assert_eq!(port.speed_mbps(), 1000);
+        assert!(port.autoneg());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_modes_the_port_does_not_declare() {
+        let (service, handle) = mock_service().await;
+
+        // The test platform declares 1G/full and auto, nothing else.
+        let err = service
+            .set_port_attrs(Request::new(pb::SetPortAttrsRequest {
+                speed_mbps: Some(10_000),
+                ..attrs("Ethernet1")
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("10G/full is not supported"));
+        assert!(err.message().contains("1G/full, auto"));
+
+        // 1G is full-duplex only here, so half is refused even though
+        // the rate is fine.
+        let err = service
+            .set_port_attrs(Request::new(pb::SetPortAttrsRequest {
+                duplex: Some("half".into()),
+                ..attrs("Ethernet1")
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("1G/half is not supported"));
+
+        for bad in [
+            pb::SetPortAttrsRequest {
+                duplex: Some("quarter".into()),
+                ..attrs("Ethernet1")
+            },
+            pb::SetPortAttrsRequest {
+                mtu: Some(70_000),
+                ..attrs("Ethernet1")
+            },
+        ] {
+            let err = service.set_port_attrs(Request::new(bad)).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // Nothing partially applied.
+        assert_eq!(
+            handle.ports.read().unwrap()["Ethernet1"].link,
+            crate::state::LinkConfig::default()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_description_edit_leaves_the_link_alone() {
+        let (service, handle) = mock_service().await;
+        service
+            .set_port_attrs(Request::new(pb::SetPortAttrsRequest {
+                speed_mbps: Some(1000),
+                ..attrs("Ethernet1")
+            }))
+            .await
+            .unwrap();
+        service
+            .set_port_attrs(Request::new(pb::SetPortAttrsRequest {
+                description: Some("uplink".into()),
+                ..attrs("Ethernet1")
+            }))
+            .await
+            .unwrap();
+        let port = handle.ports.read().unwrap()["Ethernet1"].clone();
+        assert_eq!(port.description, "uplink");
+        assert_eq!(port.link.speed_mbps, Some(1000));
     }
 }

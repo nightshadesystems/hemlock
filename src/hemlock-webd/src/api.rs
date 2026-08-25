@@ -43,6 +43,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/interfaces/edit", post(interfaces_edit))
         .route("/api/vlans", get(vlans))
         .route("/api/vlans/edit", post(vlans_edit))
+        .route("/api/svis", get(svis))
+        .route("/api/svis/edit", post(svis_edit))
         .route("/api/lags", get(lags))
         .route("/api/lags/edit", post(lags_edit))
         .route("/api/spanning-tree", get(spanning_tree))
@@ -295,6 +297,15 @@ struct InterfaceJson {
     trunk_vlans: Vec<u32>,
     /// Physical media for display, e.g. "1000BASE-T", "SFP+".
     media: String,
+    duplex: String,
+    autoneg: bool,
+    /// What the operator pinned, as opposed to what negotiated: 0 and
+    /// "" mean nothing is forced.
+    forced_speed_mbps: u32,
+    forced_duplex: String,
+    /// Speed/duplex modes the platform declares for this port
+    /// (`["1G/full", "auto"]`) — the console offers exactly these.
+    supported_modes: Vec<String>,
 }
 
 fn interface_json(i: &pb::InterfaceState) -> InterfaceJson {
@@ -314,6 +325,11 @@ fn interface_json(i: &pb::InterfaceState) -> InterfaceJson {
         native_vlan: i.native_vlan,
         trunk_vlans: i.trunk_vlans.clone(),
         media: i.media.clone(),
+        duplex: i.duplex.clone(),
+        autoneg: i.autoneg,
+        forced_speed_mbps: i.forced_speed_mbps,
+        forced_duplex: i.forced_duplex.clone(),
+        supported_modes: i.supported_modes.clone(),
     }
 }
 
@@ -338,6 +354,7 @@ async fn interfaces(
 struct SviJson {
     name: String,
     address: Option<String>,
+    mtu: u32,
 }
 
 #[derive(Serialize)]
@@ -402,6 +419,7 @@ async fn vlans(
                         vlan.svi = Some(SviJson {
                             name: iface.name.clone(),
                             address: iface.ip_addresses.first().cloned(),
+                            mtu: iface.mtu,
                         });
                     }
                 }
@@ -475,6 +493,68 @@ async fn interfaces_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::edit::apply_interface_edit(tree, &edit)
+    })
+    .await
+}
+
+/// One routed VLAN interface, plus the VLAN it fronts.
+#[derive(Serialize)]
+struct SviRowJson {
+    /// The VLAN id; the interface is named `Vlan<id>`.
+    vlan: u32,
+    name: String,
+    /// The VLAN's display name, so the page need not join two calls.
+    vlan_name: String,
+    address: Option<String>,
+    mtu: u32,
+    admin_up: bool,
+    oper_up: bool,
+}
+
+/// The SVIs, plus every VLAN that could take one — the "New SVI"
+/// picker offers the VLANs that have no routed interface yet, and
+/// mgmtd refuses an SVI whose VLAN is undefined.
+async fn svis(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let response = fetch_interfaces(&state).await?;
+    let name_of = |id: u32| response.vlan_names.get(&id).cloned().unwrap_or_default();
+
+    let mut svis: Vec<SviRowJson> = response
+        .interfaces
+        .iter()
+        .filter(|i| i.kind == "vlan")
+        .filter_map(|i| {
+            let vlan: u32 = i.name.strip_prefix("Vlan")?.parse().ok()?;
+            Some(SviRowJson {
+                vlan,
+                name: i.name.clone(),
+                vlan_name: name_of(vlan),
+                address: i.ip_addresses.first().cloned(),
+                mtu: i.mtu,
+                admin_up: i.admin_state != pb::AdminState::Down as i32,
+                oper_up: i.oper_status == pb::OperStatus::Up as i32,
+            })
+        })
+        .collect();
+    svis.sort_by_key(|s| s.vlan);
+
+    let vlans: Vec<serde_json::Value> = response
+        .active_vlans
+        .iter()
+        .map(|&id| json!({ "id": id, "name": name_of(id) }))
+        .collect();
+    Ok(Json(json!({ "svis": svis, "vlans": vlans })))
+}
+
+async fn svis_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::edit::SviEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::edit::apply_svi_edit(tree, &edit)
     })
     .await
 }

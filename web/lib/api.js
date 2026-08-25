@@ -88,6 +88,49 @@ export function downloadText(filename, text) {
 export const formatSpeed = (mbps) =>
   !mbps ? '—' : mbps >= 1000 ? `${mbps / 1000} Gb/s` : `${mbps} Mb/s`;
 
+// --- Link parameters -------------------------------------------------
+// The platform declares each port's capabilities as `supported_modes`
+// tokens ("10M/half", "1G/full", "auto"); these mirror
+// hemlock_common::link so the pickers offer exactly what the port does.
+
+/// One mode token -> {mbps, duplex}. `auto` is a negotiation marker,
+/// not a forced pair, and yields null.
+export function parseMode(token) {
+  const [speed, duplex] = String(token).split('/');
+  if (!speed || (duplex !== 'full' && duplex !== 'half')) return null;
+  const match = /^(\d+)([GgMm])?$/.exec(speed.trim());
+  if (!match) return null;
+  const mbps = parseInt(match[1], 10) * (/[Gg]/.test(match[2] || '') ? 1000 : 1);
+  return mbps > 0 ? { mbps, duplex } : null;
+}
+
+/// A rate in manifest spelling: 10M, 1G, 10G.
+export const formatRate = (mbps) =>
+  mbps >= 1000 && mbps % 1000 === 0 ? `${mbps / 1000}G` : `${mbps}M`;
+
+/// The distinct forced rates the modes allow, ascending.
+export const supportedSpeeds = (modes) =>
+  [...new Set((modes || []).map(parseMode).filter(Boolean).map((m) => m.mbps))].sort(
+    (a, b) => a - b,
+  );
+
+/// The distinct duplexes the modes allow, full first.
+export const supportedDuplexes = (modes) =>
+  ['full', 'half'].filter((d) =>
+    (modes || []).map(parseMode).filter(Boolean).some((m) => m.duplex === d),
+  );
+
+export const supportsAuto = (modes) =>
+  (modes || []).some((m) => String(m).toLowerCase() === 'auto');
+
+/// The modes every interface in `ifaces` supports — a bulk edit must
+/// not offer a rate only some of the selection can reach.
+export function commonModes(ifaces) {
+  const lists = (ifaces || []).map((i) => i.supported_modes || []);
+  if (lists.length === 0) return [];
+  return lists.reduce((acc, list) => acc.filter((m) => list.includes(m)));
+}
+
 export const formatUptime = (secs) => {
   if (secs == null) return '—';
   const d = Math.floor(secs / 86400);

@@ -1,7 +1,10 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Shell from '@/components/Shell';
-import { api, formatSpeed, compareNames } from '@/lib/api';
+import {
+  api, formatSpeed, compareNames, commonModes, supportedSpeeds, supportedDuplexes,
+  supportsAuto, formatRate,
+} from '@/lib/api';
 import { Alert } from '@/components/ds/misc';
 import { Datagrid } from '@/components/ds/Datagrid';
 import { Button } from '@/components/ds/Button';
@@ -43,8 +46,19 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
   const [trunkVlans, setTrunkVlans] = useState([]);
   const [nativeVlan, setNativeVlan] = useState('');
   const [address, setAddress] = useState('');
+  const [speed, setSpeed] = useState(NO_CHANGE);
+  const [duplex, setDuplex] = useState(NO_CHANGE);
+  const [mtu, setMtu] = useState('');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  // Speed and duplex are front-panel concepts, and a bulk edit may only
+  // offer what every selected port can actually do.
+  const ethernet = targets.length > 0 && targets.every((t) => t.kind === 'ethernet');
+  const modes = ethernet ? commonModes(targets) : [];
+  const speeds = supportedSpeeds(modes);
+  const duplexes = supportedDuplexes(modes);
+  const canAuto = supportsAuto(modes);
 
   useEffect(() => {
     if (!open) return;
@@ -58,6 +72,11 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
       setTrunkVlans(target.trunk_vlans || []);
       setNativeVlan(target.native_vlan ? String(target.native_vlan) : '');
       setAddress((target.addresses && target.addresses[0]) || '');
+      // The forced_* fields are the config; speed_mbps/duplex are what
+      // the link negotiated, which reads 0 while a port is down.
+      setSpeed(target.forced_speed_mbps ? String(target.forced_speed_mbps) : 'auto');
+      setDuplex(target.forced_duplex || 'auto');
+      setMtu(target.mtu ? String(target.mtu) : '');
     } else {
       setDescription('');
       setAdmin(NO_CHANGE);
@@ -66,6 +85,9 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
       setTrunkVlans([]);
       setNativeVlan('');
       setAddress('');
+      setSpeed(NO_CHANGE);
+      setDuplex(NO_CHANGE);
+      setMtu('');
     }
   }, [open, single, target]);
 
@@ -98,7 +120,13 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
         }
         if (mode === 'trunk') {
           if (single || trunkVlans.length > 0) body.trunk_vlans = trunkVlans;
-          if (nativeVlan !== '') body.native_vlan = parseVlanField(nativeVlan, 'Native VLAN');
+          // 0 is the "no native VLAN" sentinel: leaving the field empty
+          // has to clear the leaf, which an omitted field cannot do.
+          if (nativeVlan !== '') {
+            body.native_vlan = parseVlanField(nativeVlan, 'Native VLAN');
+          } else if (single) {
+            body.native_vlan = 0;
+          }
         }
         if (mode === 'routed') {
           if (!address) throw new Error('A routed interface needs an address (ip/prefix).');
@@ -108,6 +136,24 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
         // Management interfaces are always routed; only the address moves.
         body.address = address;
       }
+
+      // Link parameters. `auto` and an empty MTU are the "stop forcing"
+      // spellings the API turns back into deleted leaves.
+      if (ethernet && speed !== NO_CHANGE) body.speed_mbps = speed === 'auto' ? 0 : parseInt(speed, 10);
+      if (ethernet && duplex !== NO_CHANGE) body.duplex = duplex;
+      const mtuNow = single ? (target.mtu ? String(target.mtu) : '') : NO_CHANGE;
+      if (mtu !== mtuNow) {
+        if (mtu === '') {
+          body.mtu = 0;
+        } else {
+          const bytes = parseInt(mtu, 10);
+          if (!Number.isInteger(bytes) || bytes < 68 || bytes > 9216) {
+            throw new Error('MTU must be 68..9216 bytes (empty restores the default).');
+          }
+          body.mtu = bytes;
+        }
+      }
+
       const result = await api('/api/interfaces/edit', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -131,6 +177,16 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
     value: v.id,
     label: v.name ? `${v.id} — ${v.name}` : String(v.id),
   }));
+  const speedOptions = [
+    ...(single ? [] : [{ value: NO_CHANGE, label: 'No Change' }]),
+    ...(canAuto ? [{ value: 'auto', label: 'Auto (negotiate)' }] : []),
+    ...speeds.map((mbps) => ({ value: String(mbps), label: formatRate(mbps) })),
+  ];
+  const duplexOptions = [
+    ...(single ? [] : [{ value: NO_CHANGE, label: 'No Change' }]),
+    ...(canAuto ? [{ value: 'auto', label: 'Auto (negotiate)' }] : []),
+    ...duplexes.map((d) => ({ value: d, label: d === 'full' ? 'Full' : 'Half' })),
+  ];
   // The default VLAN always exists even when not configured.
   const accessOptions = [
     ...(single ? [] : [{ value: '', label: 'Unchanged' }]),
@@ -162,7 +218,7 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
         {single && (
           <FormField label="Description" htmlFor="if-description">
             <Input id="if-description" value={description}
-              onChange={(e) => setDescription(e.target.value)} style={{ maxWidth: 'none' }} />
+              onChange={(e) => setDescription(e.target.value)} />
           </FormField>
         )}
         <FormField label="Admin State" htmlFor="if-admin">
@@ -223,6 +279,27 @@ function EditModal({ open, targets, vlans, onClose, onSaved }) {
             )}
           </>
         )}
+        {ethernet && speedOptions.length > 0 && (
+          <FormField label="Speed" htmlFor="if-speed"
+            helper={single
+              ? `${target.name} supports ${modes.join(', ')}`
+              : 'Only rates every selected port supports are listed.'}>
+            <Select id="if-speed" value={speed} onChange={(e) => setSpeed(e.target.value)}
+              options={speedOptions} />
+          </FormField>
+        )}
+        {ethernet && duplexOptions.length > 0 && (
+          <FormField label="Duplex" htmlFor="if-duplex"
+            helper="Forcing speed or duplex turns auto-negotiation off.">
+            <Select id="if-duplex" value={duplex} onChange={(e) => setDuplex(e.target.value)}
+              options={duplexOptions} />
+          </FormField>
+        )}
+        <FormField label="MTU" htmlFor="if-mtu"
+          helper={single ? '68..9216 bytes; empty restores the default' : '68..9216 bytes; empty leaves it unchanged'}>
+          <Input id="if-mtu" className="mono" value={mtu} placeholder={single ? 'default' : 'unchanged'}
+            onChange={(e) => setMtu(e.target.value)} style={{ maxWidth: 120 }} />
+        </FormField>
       </div>
     </Modal>
   );

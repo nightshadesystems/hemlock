@@ -91,6 +91,13 @@ pub struct MockSai {
     mirror_sessions: HashMap<Oid, PortId>,
     port_mirrors: HashMap<PortId, (Option<Oid>, Option<Oid>)>,
     tpids: HashMap<PortId, u16>,
+    /// Forced link parameters, as programmed: pinned speed, forced
+    /// duplex (true = full), autoneg state, and L2 MTU. Absent = the
+    /// port is running whatever config.bcm created it with.
+    forced_speeds: HashMap<PortId, u32>,
+    forced_duplex: HashMap<PortId, bool>,
+    autoneg: HashMap<PortId, bool>,
+    mtus: HashMap<PortId, u32>,
     /// LAGs (port-like ids) and their members:
     /// member oid -> (lag, port, collect/distribute gate).
     lags: std::collections::HashSet<PortId>,
@@ -173,6 +180,10 @@ impl MockSai {
             mirror_sessions: HashMap::new(),
             port_mirrors: HashMap::new(),
             tpids: HashMap::new(),
+            forced_speeds: HashMap::new(),
+            forced_duplex: HashMap::new(),
+            autoneg: HashMap::new(),
+            mtus: HashMap::new(),
             lags: std::collections::HashSet::new(),
             lag_members: HashMap::new(),
             stp_instances: std::collections::HashSet::new(),
@@ -234,6 +245,21 @@ impl MockSai {
     }
 
     /// A port's default traffic class (0 until set).
+    /// The forced link parameters programmed on a port: pinned speed
+    /// (Mb/s), forced duplex (true = full), autoneg, and L2 MTU. `None`
+    /// where nothing was pinned.
+    pub fn port_link_params(
+        &self,
+        port: PortId,
+    ) -> (Option<u32>, Option<bool>, Option<bool>, Option<u32>) {
+        (
+            self.forced_speeds.get(&port).copied(),
+            self.forced_duplex.get(&port).copied(),
+            self.autoneg.get(&port).copied(),
+            self.mtus.get(&port).copied(),
+        )
+    }
+
     pub fn port_default_tc(&self, port: PortId) -> u8 {
         self.port_default_tc.get(&port).copied().unwrap_or(0)
     }
@@ -942,6 +968,38 @@ impl SaiBackend for MockSai {
         } else {
             self.tpids.insert(port, tpid);
         }
+        Ok(())
+    }
+
+    fn set_port_speed(&mut self, port: PortId, speed_mbps: u32) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        self.forced_speeds.insert(port, speed_mbps);
+        // The reported port speed follows the pin, as the ASIC's would.
+        if let Some(p) = self.ports.iter_mut().find(|p| p.id == port) {
+            p.speed_mbps = speed_mbps;
+        }
+        Ok(())
+    }
+
+    fn set_port_duplex(&mut self, port: PortId, full: bool) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        self.forced_duplex.insert(port, full);
+        Ok(())
+    }
+
+    fn set_port_autoneg(&mut self, port: PortId, on: bool) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        self.autoneg.insert(port, on);
+        Ok(())
+    }
+
+    fn set_port_mtu(&mut self, port: PortId, mtu: u32) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        self.mtus.insert(port, mtu);
         Ok(())
     }
 

@@ -238,6 +238,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "shutdown",
             "no-shutdown",
             "address",
+            "speed",
+            "duplex",
+            "mtu",
             "switchport",
             "channel-group",
             "lacp",
@@ -274,6 +277,13 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set", "interfaces", PORT, "qos", "queue", NUM, "wred-profile"]) => {
             &[WRED]
         }
+        // Rates and duplexes are offered as the common set; the port's
+        // own supported_modes decide at `set` time (and syncd at commit).
+        (CliMode::Config, ["set", "interfaces", PORT, "speed"]) => {
+            &["auto", "10", "100", "1000", "10000"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "duplex"]) => &["auto", "full", "half"],
+        (CliMode::Config, ["set", "interfaces", PORT, "mtu"]) => &[NUM],
         (CliMode::Config, ["set", "interfaces", PORT, "access-group"]) => &[ACL],
         (CliMode::Config, ["set", "interfaces", PORT, "access-group", ACL]) => &["in", "out"],
         (CliMode::Config, ["delete", "interfaces", PORT, "access-group"]) => &["in", "out"],
@@ -1133,6 +1143,9 @@ mod tests {
                 "shutdown".to_string(),
                 "no-shutdown".to_string(),
                 "address".to_string(),
+                "speed".to_string(),
+                "duplex".to_string(),
+                "mtu".to_string(),
                 "switchport".to_string(),
                 "channel-group".to_string(),
                 "lacp".to_string(),

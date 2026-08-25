@@ -4,6 +4,7 @@
 pub mod error;
 pub mod image;
 pub mod ipc;
+pub mod link;
 pub mod logging;
 pub mod net;
 pub mod systemd;

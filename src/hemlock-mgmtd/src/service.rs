@@ -315,6 +315,9 @@ impl Engine {
                             }
                         }),
                         description: change.description.clone(),
+                        speed_mbps: change.speed_mbps,
+                        duplex: change.duplex.clone(),
+                        mtu: change.mtu,
                     })
                     .await
                     .with_context(|| format!("applying {}", change.describe()))?;
@@ -1327,8 +1330,19 @@ impl Engine {
                     }
                 }),
                 description: intent.description.clone(),
+                // Replay pins the config's own values; nothing to
+                // revert at boot, so the "stop forcing" sentinels are
+                // never sent here.
+                speed_mbps: intent.speed_mbps,
+                duplex: intent.duplex.map(|d| d.as_str().to_string()),
+                mtu: intent.mtu,
             };
-            if request.admin_state.is_some() || request.description.is_some() {
+            if request.admin_state.is_some()
+                || request.description.is_some()
+                || request.speed_mbps.is_some()
+                || request.duplex.is_some()
+                || request.mtu.is_some()
+            {
                 client
                     .set_port_attrs(request)
                     .await

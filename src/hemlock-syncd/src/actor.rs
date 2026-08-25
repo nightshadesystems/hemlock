@@ -151,6 +151,28 @@ pub enum SaiCmd {
         tpid: u16,
         reply: oneshot::Sender<Result<(), SaiError>>,
     },
+    /// Forced link parameters. Sent in order (autoneg, then speed,
+    /// then duplex) so a pin never races the negotiation it disables.
+    SetPortSpeed {
+        port: PortId,
+        speed_mbps: u32,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortDuplex {
+        port: PortId,
+        full: bool,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortAutoneg {
+        port: PortId,
+        on: bool,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortMtu {
+        port: PortId,
+        mtu: u32,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
     CreateLag {
         reply: oneshot::Sender<Result<PortId, SaiError>>,
     },
@@ -661,6 +683,30 @@ impl SaiHandle {
 
     pub async fn set_port_tpid(&self, port: PortId, tpid: u16) -> Result<(), SaiError> {
         self.call(|reply| SaiCmd::SetPortTpid { port, tpid, reply })
+            .await
+    }
+
+    pub async fn set_port_speed(&self, port: PortId, speed_mbps: u32) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortSpeed {
+            port,
+            speed_mbps,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_port_duplex(&self, port: PortId, full: bool) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortDuplex { port, full, reply })
+            .await
+    }
+
+    pub async fn set_port_autoneg(&self, port: PortId, on: bool) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortAutoneg { port, on, reply })
+            .await
+    }
+
+    pub async fn set_port_mtu(&self, port: PortId, mtu: u32) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortMtu { port, mtu, reply })
             .await
     }
 
@@ -1500,6 +1546,22 @@ impl SaiActor {
                         SaiCmd::SetPortTpid { port, tpid, reply } => {
                             let _ = reply.send(backend.set_port_tpid(port, tpid));
                         }
+                        SaiCmd::SetPortSpeed {
+                            port,
+                            speed_mbps,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_port_speed(port, speed_mbps));
+                        }
+                        SaiCmd::SetPortDuplex { port, full, reply } => {
+                            let _ = reply.send(backend.set_port_duplex(port, full));
+                        }
+                        SaiCmd::SetPortAutoneg { port, on, reply } => {
+                            let _ = reply.send(backend.set_port_autoneg(port, on));
+                        }
+                        SaiCmd::SetPortMtu { port, mtu, reply } => {
+                            let _ = reply.send(backend.set_port_mtu(port, mtu));
+                        }
                         SaiCmd::CreateLag { reply } => {
                             let _ = reply.send(backend.create_lag());
                         }
@@ -1666,6 +1728,7 @@ fn init_switch(
                 switchport: None,
                 storm: std::collections::BTreeMap::new(),
                 errdisable_reason: None,
+                link: Default::default(),
             },
         );
     }

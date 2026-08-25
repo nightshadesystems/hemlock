@@ -605,6 +605,24 @@ impl VendorSai {
         attr
     }
 
+    /// One `set_port_attribute` call with the switch-created guard and a
+    /// named error, the shape every scalar port attribute wants.
+    fn set_one_port_attr(
+        &mut self,
+        what: &'static str,
+        port: PortId,
+        attr: &ffi::sai_attribute_t,
+    ) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check(what, set(port.0, attr))
+        }
+    }
+
     /// Switch-scope objects needed by the L3 family, or a clear error
     /// when their resolution failed at create_switch.
     fn defaults(&self) -> Result<SwitchDefaults, SaiError> {
@@ -1632,6 +1650,30 @@ impl SaiBackend for VendorSai {
                 .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
             check("set_port_attribute(ADMIN_STATE)", set(port.0, &attr))
         }
+    }
+
+    fn set_port_speed(&mut self, port: PortId, speed_mbps: u32) -> Result<(), SaiError> {
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_SPEED);
+        attr.value.u32_ = speed_mbps;
+        self.set_one_port_attr("set_port_attribute(SPEED)", port, &attr)
+    }
+
+    fn set_port_duplex(&mut self, port: PortId, full: bool) -> Result<(), SaiError> {
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_FULL_DUPLEX_MODE);
+        attr.value.booldata = full;
+        self.set_one_port_attr("set_port_attribute(FULL_DUPLEX_MODE)", port, &attr)
+    }
+
+    fn set_port_autoneg(&mut self, port: PortId, on: bool) -> Result<(), SaiError> {
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_AUTO_NEG_MODE);
+        attr.value.booldata = on;
+        self.set_one_port_attr("set_port_attribute(AUTO_NEG_MODE)", port, &attr)
+    }
+
+    fn set_port_mtu(&mut self, port: PortId, mtu: u32) -> Result<(), SaiError> {
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_MTU);
+        attr.value.u32_ = mtu;
+        self.set_one_port_attr("set_port_attribute(MTU)", port, &attr)
     }
 
     fn port_counters(&mut self, port: PortId) -> Result<PortCounters, SaiError> {

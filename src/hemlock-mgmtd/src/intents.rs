@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hemlock_common::link::{self, Duplex};
 use hemlock_config::{ConfigTree, Item};
 
 /// Every intent family extracted from one config tree.
@@ -206,6 +207,8 @@ pub struct SviIntent {
     /// Interface address in CIDR form; gives the VLAN a router
     /// interface (ASIC) and a kernel address on its bridge netdev.
     pub address: Option<String>,
+    /// `mtu <bytes>` on the VLAN's bridge netdev. None = the default.
+    pub mtu: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -238,6 +241,13 @@ pub struct InterfaceIntent {
     pub arp_inspection_trust: bool,
     /// `qos { ... }`: classification, scheduling, shaping, WRED.
     pub qos: Option<PortQosIntent>,
+    /// `speed <mbps>`: pinned line rate. None = `speed auto` or no
+    /// leaf at all, which are the same thing to the ASIC.
+    pub speed_mbps: Option<u32>,
+    /// `duplex <full|half>`. None = `duplex auto` or no leaf.
+    pub duplex: Option<Duplex>,
+    /// `mtu <bytes>`. None = the platform default.
+    pub mtu: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -721,6 +731,8 @@ pub struct MgmtIntent {
     pub admin_up: Option<bool>,
     /// Primary address in CIDR form; puts the interface in L3 mode.
     pub address: Option<String>,
+    /// `mtu <bytes>` on the management netdev. None = leave it alone.
+    pub mtu: Option<u32>,
 }
 
 /// `system { ssh { ... } }` â€” SSH is on exactly when the block exists.
@@ -760,6 +772,9 @@ pub enum IntentError {
 
     #[error("interface {name}: bad address: {reason}")]
     BadAddress { name: String, reason: String },
+
+    #[error("interface {name}: {reason}")]
+    BadLinkParam { name: String, reason: String },
 
     #[error("interface {name}: switchport: {reason}")]
     BadSwitchport { name: String, reason: String },
@@ -1007,6 +1022,9 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         "trust",
                     ),
                     qos: port_qos(children, &ifname)?,
+                    speed_mbps: speed(children, &ifname)?,
+                    duplex: duplex(children, &ifname)?,
+                    mtu: mtu(children, &ifname)?,
                 };
                 if intent.dot1x && intent.port_security.is_some() {
                     return Err(IntentError::BadPortSecurity {
@@ -1052,6 +1070,13 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     return Err(IntentError::BadPortSecurity {
                         name: ifname,
                         reason: "port-security runs on physical ports only".into(),
+                    });
+                }
+                no_link_pinning(children, &ifname, "port-channel interfaces")?;
+                if ConfigTree::has_leaf(children, "mtu") {
+                    return Err(IntentError::BadLinkParam {
+                        name: ifname,
+                        reason: "mtu follows the member ports; set it on those".into(),
                     });
                 }
                 let intent = LagIntent {
@@ -1123,7 +1148,12 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         reason: "management ports take no ACL bindings".into(),
                     });
                 }
-                let intent = MgmtIntent { admin_up, address };
+                no_link_pinning(children, &ifname, "management ports")?;
+                let intent = MgmtIntent {
+                    admin_up,
+                    address,
+                    mtu: mtu(children, &ifname)?,
+                };
                 if intents.management.insert(ifname.clone(), intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
                 }
@@ -1162,7 +1192,11 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         "{ifname}: VLAN {id} is not defined (set vlans vlan {id})"
                     )));
                 }
-                let intent = SviIntent { address };
+                no_link_pinning(children, &ifname, "VLAN interfaces")?;
+                let intent = SviIntent {
+                    address,
+                    mtu: mtu(children, &ifname)?,
+                };
                 if intents.svis.insert(ifname.clone(), intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
                 }
@@ -2530,6 +2564,71 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
     Ok(())
 }
 
+/// `mtu <bytes>` on an interface block.
+fn mtu(children: &[Item], ifname: &str) -> Result<Option<u32>, IntentError> {
+    let Some(value) = ConfigTree::leaf_value(children, "mtu") else {
+        return Ok(None);
+    };
+    let bytes: u32 = value.parse().map_err(|_| IntentError::BadLinkParam {
+        name: ifname.to_string(),
+        reason: format!("bad MTU {value:?} ({}..{})", link::MIN_MTU, link::MAX_MTU),
+    })?;
+    link::valid_mtu(bytes).map_err(|reason| IntentError::BadLinkParam {
+        name: ifname.to_string(),
+        reason,
+    })?;
+    Ok(Some(bytes))
+}
+
+/// `speed <auto|mbps>`. `auto` and an absent leaf are the same intent
+/// â€” nothing is pinned â€” so both parse to `None`.
+fn speed(children: &[Item], ifname: &str) -> Result<Option<u32>, IntentError> {
+    let Some(value) = ConfigTree::leaf_value(children, "speed") else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    link::parse_speed(value)
+        .map(Some)
+        .ok_or_else(|| IntentError::BadLinkParam {
+            name: ifname.to_string(),
+            reason: format!("bad speed {value:?} (auto, or a rate in Mb/s such as 1000)"),
+        })
+}
+
+/// `duplex <auto|full|half>`, with `auto` collapsing to "not forced".
+/// Whether the pinned pair is one the *port* supports is syncd's call â€”
+/// it owns the platform port table.
+fn duplex(children: &[Item], ifname: &str) -> Result<Option<Duplex>, IntentError> {
+    let Some(value) = ConfigTree::leaf_value(children, "duplex") else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    Duplex::parse(value)
+        .map(Some)
+        .ok_or_else(|| IntentError::BadLinkParam {
+            name: ifname.to_string(),
+            reason: format!("bad duplex {value:?} (auto, full or half)"),
+        })
+}
+
+/// Reject `speed`/`duplex` on the interface kinds that have no PHY to
+/// negotiate with (SVIs, port-channels, the management NIC).
+fn no_link_pinning(children: &[Item], ifname: &str, what: &str) -> Result<(), IntentError> {
+    for leaf in ["speed", "duplex"] {
+        if ConfigTree::has_leaf(children, leaf) {
+            return Err(IntentError::BadLinkParam {
+                name: ifname.to_string(),
+                reason: format!("{leaf} is not supported on {what}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Admin state of an interface: the `shutdown` / `no shutdown` marker
 /// leaves, with the legacy `no-shutdown` and `admin-state
 /// enabled|disabled` forms still accepted for configs persisted before
@@ -3719,11 +3818,17 @@ fn mirror(items: &[Item]) -> Result<BTreeMap<u8, MirrorIntent>, IntentError> {
 }
 
 /// One change to push to syncd.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortChange {
     pub name: String,
     pub admin_up: Option<bool>,
     pub description: Option<String>,
+    /// Pinned line rate in Mb/s; `Some(0)` = stop pinning (negotiate).
+    pub speed_mbps: Option<u32>,
+    /// `"auto"`, `"full"` or `"half"`.
+    pub duplex: Option<String>,
+    /// L2 MTU in bytes; `Some(0)` = back to the platform default.
+    pub mtu: Option<u32>,
 }
 
 impl PortChange {
@@ -3737,6 +3842,21 @@ impl PortChange {
         }
         if let Some(desc) = &self.description {
             parts.push(format!("description {desc:?}"));
+        }
+        if let Some(speed) = self.speed_mbps {
+            parts.push(match speed {
+                0 => "speed auto".to_string(),
+                mbps => format!("speed {}", link::format_speed(mbps)),
+            });
+        }
+        if let Some(duplex) = &self.duplex {
+            parts.push(format!("duplex {duplex}"));
+        }
+        if let Some(mtu) = self.mtu {
+            parts.push(match mtu {
+                0 => "mtu default".to_string(),
+                bytes => format!("mtu {bytes}"),
+            });
         }
         format!("{}: {}", self.name, parts.join(", "))
     }
@@ -3772,11 +3892,21 @@ pub fn diff(
             (None, _) => None,
         };
 
-        if admin_up.is_some() || description.is_some() {
+        let (speed_mbps, duplex, mtu) = link_delta(wanted, current);
+
+        if admin_up.is_some()
+            || description.is_some()
+            || speed_mbps.is_some()
+            || duplex.is_some()
+            || mtu.is_some()
+        {
             changes.push(PortChange {
                 name: name.clone(),
                 admin_up,
                 description,
+                speed_mbps,
+                duplex,
+                mtu,
             });
         }
     }
@@ -3792,11 +3922,20 @@ pub fn diff(
             .as_ref()
             .filter(|d| !d.is_empty())
             .map(|_| String::new());
-        if admin_up.is_some() || description.is_some() {
+        let (speed_mbps, duplex, mtu) = link_delta(&InterfaceIntent::default(), Some(had));
+        if admin_up.is_some()
+            || description.is_some()
+            || speed_mbps.is_some()
+            || duplex.is_some()
+            || mtu.is_some()
+        {
             changes.push(PortChange {
                 name: name.clone(),
                 admin_up,
                 description,
+                speed_mbps,
+                duplex,
+                mtu,
             });
         }
     }
@@ -3804,9 +3943,34 @@ pub fn diff(
     changes
 }
 
+/// The speed/duplex/MTU fields of one port's [`PortChange`], each
+/// present only when it actually moved. A pin that goes away is sent as
+/// the "stop forcing" sentinel (`0` / `auto`) rather than omitted, so
+/// syncd reprograms the port instead of leaving the old pin in place.
+#[allow(clippy::type_complexity)]
+fn link_delta(
+    wanted: &InterfaceIntent,
+    current: Option<&InterfaceIntent>,
+) -> (Option<u32>, Option<String>, Option<u32>) {
+    let speed_now = current.and_then(|c| c.speed_mbps);
+    let duplex_now = current.and_then(|c| c.duplex);
+    let mtu_now = current.and_then(|c| c.mtu);
+
+    let speed_mbps =
+        (wanted.speed_mbps != speed_now).then(|| wanted.speed_mbps.unwrap_or_default());
+    let duplex = (wanted.duplex != duplex_now).then(|| {
+        wanted
+            .duplex
+            .map(|d| d.as_str().to_string())
+            .unwrap_or_else(|| "auto".to_string())
+    });
+    let mtu = (wanted.mtu != mtu_now).then(|| wanted.mtu.unwrap_or_default());
+    (speed_mbps, duplex, mtu)
+}
+
 /// One kernel-netdev change for the OS applier (a management interface,
 /// or the kernel side of a front-panel port's address).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetdevChange {
     pub name: String,
     pub admin_up: Option<bool>,
@@ -3815,6 +3979,9 @@ pub struct NetdevChange {
     /// add, since `ip addr replace` only replaces an identical local
     /// address.
     pub del_address: Option<String>,
+    /// Netdev MTU to program. A deleted `mtu` leaf sends the kind's
+    /// boot default rather than nothing, so the netdev actually reverts.
+    pub set_mtu: Option<u32>,
 }
 
 impl NetdevChange {
@@ -3830,6 +3997,9 @@ impl NetdevChange {
             (Some(new), _) => parts.push(format!("address {new}")),
             (None, Some(old)) => parts.push(format!("address {old} removed")),
             (None, None) => {}
+        }
+        if let Some(mtu) = self.set_mtu {
+            parts.push(format!("mtu {mtu}"));
         }
         format!("{}: {}", self.name, parts.join(", "))
     }
@@ -4024,6 +4194,12 @@ fn address_delta(
     }
 }
 
+/// The netdev MTU to program, or None when nothing moved. A deleted
+/// intent programs `default` explicitly â€” `ip link` has no "unset".
+fn mtu_delta(wanted: Option<u32>, current: Option<u32>, default: u32) -> Option<u32> {
+    (wanted != current).then(|| wanted.unwrap_or(default))
+}
+
 /// Diff the OS-side families, candidate against running.
 pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
     let mut changes = OsChanges::default();
@@ -4044,12 +4220,16 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
             current.and_then(|c| c.address.as_ref()),
         );
 
-        if admin_up.is_some() || set_address.is_some() || del_address.is_some() {
+        let set_mtu = mtu_delta(wanted.mtu, current.and_then(|c| c.mtu), link::DEFAULT_MTU);
+
+        if admin_up.is_some() || set_address.is_some() || del_address.is_some() || set_mtu.is_some()
+        {
             changes.management.push(NetdevChange {
                 name: name.clone(),
                 admin_up,
                 set_address,
                 del_address,
+                set_mtu,
             });
         }
     }
@@ -4059,12 +4239,14 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
         }
         let admin_up = matches!(had.admin_up, Some(false)).then_some(true);
         let del_address = had.address.clone();
-        if admin_up.is_some() || del_address.is_some() {
+        let set_mtu = mtu_delta(None, had.mtu, link::DEFAULT_MTU);
+        if admin_up.is_some() || del_address.is_some() || set_mtu.is_some() {
             changes.management.push(NetdevChange {
                 name: name.clone(),
                 admin_up,
                 set_address: None,
                 del_address,
+                set_mtu,
             });
         }
     }
@@ -4077,12 +4259,18 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
             wanted.address.as_ref(),
             current.and_then(|c| c.address.as_ref()),
         );
-        if set_address.is_some() || del_address.is_some() {
+        let set_mtu = mtu_delta(
+            wanted.mtu,
+            current.and_then(|c| c.mtu),
+            link::DEFAULT_PORT_MTU,
+        );
+        if set_address.is_some() || del_address.is_some() || set_mtu.is_some() {
             changes.ports.push(NetdevChange {
                 name: name.clone(),
                 admin_up: None,
                 set_address,
                 del_address,
+                set_mtu,
             });
         }
     }
@@ -4090,12 +4278,14 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
         if candidate.ports.contains_key(name) {
             continue;
         }
-        if let Some(old) = &had.address {
+        let set_mtu = mtu_delta(None, had.mtu, link::DEFAULT_PORT_MTU);
+        if had.address.is_some() || set_mtu.is_some() {
             changes.ports.push(NetdevChange {
                 name: name.clone(),
                 admin_up: None,
                 set_address: None,
-                del_address: Some(old.clone()),
+                del_address: had.address.clone(),
+                set_mtu,
             });
         }
     }
@@ -4107,12 +4297,14 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
             wanted.address.as_ref(),
             current.and_then(|c| c.address.as_ref()),
         );
-        if set_address.is_some() || del_address.is_some() {
+        let set_mtu = mtu_delta(wanted.mtu, current.and_then(|c| c.mtu), link::DEFAULT_MTU);
+        if set_address.is_some() || del_address.is_some() || set_mtu.is_some() {
             changes.svis.push(NetdevChange {
                 name: name.clone(),
                 admin_up: None,
                 set_address,
                 del_address,
+                set_mtu,
             });
         }
     }
@@ -4120,12 +4312,14 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
         if candidate.svis.contains_key(name) {
             continue;
         }
-        if let Some(old) = &had.address {
+        let set_mtu = mtu_delta(None, had.mtu, link::DEFAULT_MTU);
+        if had.address.is_some() || set_mtu.is_some() {
             changes.svis.push(NetdevChange {
                 name: name.clone(),
                 admin_up: None,
                 set_address: None,
-                del_address: Some(old.clone()),
+                del_address: had.address.clone(),
+                set_mtu,
             });
         }
     }
@@ -5132,7 +5326,8 @@ interfaces {
             intents.management["Management1"],
             MgmtIntent {
                 admin_up: Some(true),
-                address: Some("10.42.10.9/24".into())
+                address: Some("10.42.10.9/24".into()),
+                mtu: None,
             }
         );
     }
@@ -5224,6 +5419,7 @@ interfaces {
                 admin_up: None,
                 set_address: Some("10.42.10.10/24".into()),
                 del_address: Some("10.42.10.9/24".into()),
+                ..Default::default()
             }]
         );
         // Removal clears the address.
@@ -5235,6 +5431,7 @@ interfaces {
                 admin_up: None,
                 set_address: None,
                 del_address: Some("10.42.10.9/24".into()),
+                ..Default::default()
             }]
         );
         // No change, no delta.
@@ -5427,6 +5624,7 @@ interfaces {
                 name: "Ethernet0".into(),
                 admin_up: Some(true),
                 description: None,
+                ..Default::default()
             }]
         );
     }
@@ -5444,6 +5642,7 @@ interfaces {
                 name: "Ethernet5".into(),
                 admin_up: Some(true),
                 description: Some(String::new()),
+                ..Default::default()
             }]
         );
     }
@@ -5462,6 +5661,7 @@ interfaces {
                 admin_up: None,
                 set_address: Some("10.42.10.9/24".into()),
                 del_address: None,
+                ..Default::default()
             }]
         );
         assert_eq!(
@@ -5490,6 +5690,7 @@ interfaces {
                 admin_up: None,
                 set_address: None,
                 del_address: Some("10.42.10.9/24".into()),
+                ..Default::default()
             }]
         );
         assert_eq!(
@@ -5743,6 +5944,7 @@ interfaces { Vlan99 { address 10.42.10.9/24 } }",
                 admin_up: None,
                 set_address: Some("10.42.10.9/24".into()),
                 del_address: Some("10.0.0.5/24".into()),
+                ..Default::default()
             }]
         );
     }
@@ -6573,6 +6775,7 @@ switching {
                 admin_up: None,
                 set_address: Some("10.42.10.9/24".into()),
                 del_address: None,
+                ..Default::default()
             }]
         );
         // Port block removed entirely -> address torn down.
@@ -6584,6 +6787,7 @@ switching {
                 admin_up: None,
                 set_address: None,
                 del_address: Some("10.42.10.9/24".into()),
+                ..Default::default()
             }]
         );
     }
@@ -7245,5 +7449,145 @@ Port-Channel1 { qos { queue 7 { wred-profile BULK } } } }")
         let snoopsec = diff_snoopsec(&running, &candidate).unwrap();
         assert!(snoopsec.intent.arp_vlans.is_empty());
         assert!(snoopsec.dhcp_trusted.contains("Port-Channel1"));
+    }
+
+    #[test]
+    fn link_params_parse_on_the_kinds_that_have_a_phy() {
+        let intents = intents_of(
+            "interfaces { Ethernet1 { speed 1000
+duplex full
+mtu 9216 } }",
+        );
+        let eth = &intents.ports["Ethernet1"];
+        assert_eq!(eth.speed_mbps, Some(1000));
+        assert_eq!(eth.duplex, Some(Duplex::Full));
+        assert_eq!(eth.mtu, Some(9216));
+
+        // `auto` is the same intent as no leaf at all: nothing pinned.
+        let intents = intents_of(
+            "interfaces { Ethernet1 { speed auto
+duplex auto } }",
+        );
+        assert_eq!(intents.ports["Ethernet1"].speed_mbps, None);
+        assert_eq!(intents.ports["Ethernet1"].duplex, None);
+
+        // Unit suffixes are accepted alongside bare megabits.
+        let intents = intents_of("interfaces { Ethernet1 { speed 10G } }");
+        assert_eq!(intents.ports["Ethernet1"].speed_mbps, Some(10_000));
+    }
+
+    #[test]
+    fn mtu_lands_on_management_and_svis_but_pinning_does_not() {
+        let intents = intents_of("interfaces { Management1 { mtu 1500 } }");
+        assert_eq!(intents.management["Management1"].mtu, Some(1500));
+
+        let intents = intents_of(
+            "vlans { vlan 10 { } }
+interfaces { Vlan10 { mtu 9216 } }",
+        );
+        assert_eq!(intents.svis["Vlan10"].mtu, Some(9216));
+
+        // No PHY to negotiate with on an SVI, a port-channel, or the
+        // management NIC.
+        for text in [
+            "interfaces { Vlan1 { speed 1000 } }",
+            "interfaces { Vlan1 { duplex full } }",
+            "interfaces { Management1 { speed 1000 } }",
+            "interfaces { Port-Channel1 { duplex half } }",
+            // A port-channel's MTU follows its members.
+            "interfaces { Port-Channel1 { mtu 9216 } }",
+        ] {
+            assert!(
+                extract(&parse(text).unwrap()).is_err(),
+                "expected {text:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_link_params() {
+        for text in [
+            "interfaces { Ethernet1 { mtu 67 } }",
+            "interfaces { Ethernet1 { mtu 9217 } }",
+            "interfaces { Ethernet1 { mtu jumbo } }",
+            "interfaces { Ethernet1 { speed fast } }",
+            "interfaces { Ethernet1 { speed 0 } }",
+            "interfaces { Ethernet1 { duplex quarter } }",
+        ] {
+            assert!(
+                extract(&parse(text).unwrap()).is_err(),
+                "expected {text:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn link_diffs_send_sentinels_when_a_pin_goes_away() {
+        let running = intents_of(
+            "interfaces { Ethernet1 { speed 100
+duplex half
+mtu 9216 } }",
+        );
+        let candidate = intents_of("interfaces { Ethernet1 { speed 1000 } }");
+        assert_eq!(
+            diff(&running.ports, &candidate.ports),
+            vec![PortChange {
+                name: "Ethernet1".into(),
+                speed_mbps: Some(1000),
+                // Both the duplex force and the MTU were dropped, so
+                // syncd is told to stop forcing rather than left with
+                // the old pin.
+                duplex: Some("auto".into()),
+                mtu: Some(0),
+                ..Default::default()
+            }]
+        );
+
+        // Deleting the interface reverts every pin.
+        assert_eq!(
+            diff(&running.ports, &BTreeMap::new()),
+            vec![PortChange {
+                name: "Ethernet1".into(),
+                speed_mbps: Some(0),
+                duplex: Some("auto".into()),
+                mtu: Some(0),
+                ..Default::default()
+            }]
+        );
+
+        // No move, no delta.
+        assert!(diff(&running.ports, &running.ports).is_empty());
+    }
+
+    #[test]
+    fn netdev_mtu_reverts_to_the_kind_default() {
+        let running = intents_of(
+            "vlans { vlan 10 { } }
+interfaces { Vlan10 { address 10.0.10.1/24
+mtu 9216 } }",
+        );
+        let candidate = intents_of(
+            "vlans { vlan 10 { } }
+interfaces { Vlan10 { address 10.0.10.1/24 } }",
+        );
+        assert_eq!(
+            diff_os(&running, &candidate).svis,
+            vec![NetdevChange {
+                name: "Vlan10".into(),
+                set_mtu: Some(link::DEFAULT_MTU),
+                ..Default::default()
+            }]
+        );
+
+        // Front-panel ports revert to the KNET default instead.
+        let running = intents_of("interfaces { Ethernet1 { mtu 9216 } }");
+        assert_eq!(
+            diff_os(&running, &intents_of("")).ports,
+            vec![NetdevChange {
+                name: "Ethernet1".into(),
+                set_mtu: Some(link::DEFAULT_PORT_MTU),
+                ..Default::default()
+            }]
+        );
     }
 }

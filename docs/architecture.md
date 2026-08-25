@@ -208,6 +208,24 @@ and the paged `DumpFdb` RPC serve from the mirror rather than dumping the
 ASIC. syncd also re-derives storm-control policer rates on link-speed
 changes, since levels are configured as a percentage of link speed.
 
+**Link parameters** (`speed`, `duplex`, `mtu`) ride the same
+`SetPortAttrs` RPC as admin-state and description. syncd is the
+validator, because it owns the platform port table: a pin is accepted
+only when the resulting (rate, duplex) pair appears in that port's
+manifest `supported_modes`, and the same list is what hemlockctl checks
+at the prompt and what the web console's Speed and Duplex pickers offer
+(intersected across the selection, for a bulk edit). Forcing either half
+turns auto-negotiation off — a PHY cannot negotiate *to* a pin — so the
+apply order is autoneg, then speed, then duplex. Deleting a leaf sends a
+"stop forcing" sentinel (`0` / `auto`) rather than nothing, so the port
+actually reverts instead of keeping the last pin. MTU is two-sided: the
+ASIC attribute goes through syncd, and the matching kernel netdev MTU
+(hostif for a port, bridge for an SVI, the manifest's `os_device` for
+management) is set by mgmtd's OS applier; a deleted intent restores the
+kind's boot default (1500 for kernel netdevs, the KNET 9100 for
+front-panel ports). Port-channels take neither: their MTU follows the
+member ports.
+
 **The ACL engine** (`security.rs`) is the security suite's foundation:
 user ACLs *and* the enforcement other features need — dot1x
 unauthorized-port entries, DHCP-snooping/DAI CPU redirects — are all
@@ -425,7 +443,8 @@ commit.
   ring and promote the candidate. Each intent family is a pure function
   from config tree to typed intents plus an apply step, slotting into
   `intents.rs` without touching the lifecycle machinery. The families so
-  far: interface admin-state/description/addresses, VLANs (including
+  far: interface admin-state/description/addresses, link parameters
+  (`speed`, `duplex`, `mtu`), VLANs (including
   `state suspend`), switchport modes (access/trunk/dot1q-tunnel), static
   routes, system (hostname, users, http/https), the switching suite —
   LAGs + LACP, spanning tree, MAC table (aging + statics), IGMP/MLD

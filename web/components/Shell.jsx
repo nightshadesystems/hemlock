@@ -21,6 +21,7 @@ const SIDE_NAV = {
     items: [
       { id: '/switching/interfaces/', label: 'Interfaces', icon: 'network-settings' },
       { id: '/switching/vlans/', label: 'VLANs', icon: 'network-globe' },
+      { id: '/switching/svis/', label: 'SVIs', icon: 'network-switch' },
       { id: '/switching/lag/', label: 'Link Aggregation', icon: 'link' },
       { id: '/switching/spanning-tree/', label: 'Spanning Tree', icon: 'tree-view' },
       { id: '/switching/mac-table/', label: 'MAC Table', icon: 'view-list' },

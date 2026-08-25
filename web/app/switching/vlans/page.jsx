@@ -73,7 +73,7 @@ function VlanModal({ open, vlan, onClose, onSaved }) {
         </FormField>
         <FormField label="Name" htmlFor="vlan-name" helper="Optional; empty clears">
           <Input id="vlan-name" value={name} autoFocus={editing}
-            onChange={(e) => setName(e.target.value)} style={{ maxWidth: 'none' }} />
+            onChange={(e) => setName(e.target.value)} />
         </FormField>
       </div>
     </Modal>

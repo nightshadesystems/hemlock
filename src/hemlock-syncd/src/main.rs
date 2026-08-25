@@ -376,7 +376,7 @@ async fn reprogram_storm_rates(handle: &actor::SaiHandle, name: &str) {
                     port.sai_id,
                     *class,
                     state.level.clone(),
-                    u64::from(port.def.speed_mbps),
+                    u64::from(port.speed_mbps()),
                 )
             })
             .collect()

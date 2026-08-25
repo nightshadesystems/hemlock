@@ -130,29 +130,32 @@ impl OsApplier {
                 admin_up: intent.admin_up,
                 set_address: intent.address.clone(),
                 del_address: None,
+                set_mtu: intent.mtu,
             });
         }
         for (name, intent) in &intents.ports {
-            if intent.address.is_some() {
+            if intent.address.is_some() || intent.mtu.is_some() {
                 apply_netdev(
                     &NetdevChange {
                         name: name.clone(),
                         admin_up: None,
                         set_address: intent.address.clone(),
                         del_address: None,
+                        set_mtu: intent.mtu,
                     },
                     name,
                 );
             }
         }
         for (name, intent) in &intents.svis {
-            if intent.address.is_some() {
+            if intent.address.is_some() || intent.mtu.is_some() {
                 apply_netdev(
                     &NetdevChange {
                         name: name.clone(),
                         admin_up: None,
                         set_address: intent.address.clone(),
                         del_address: None,
+                        set_mtu: intent.mtu,
                     },
                     name,
                 );
@@ -273,6 +276,12 @@ impl OsApplier {
 }
 
 fn apply_netdev(change: &NetdevChange, dev: &str) {
+    // MTU before the address: a jumbo address wants the jumbo link
+    // already, and the kernel refuses an MTU below an existing one's
+    // needs on some tunnels.
+    if let Some(mtu) = change.set_mtu {
+        run("ip", &["link", "set", "dev", dev, "mtu", &mtu.to_string()]);
+    }
     if let Some(old) = &change.del_address {
         run("ip", &["addr", "del", old, "dev", dev]);
     }

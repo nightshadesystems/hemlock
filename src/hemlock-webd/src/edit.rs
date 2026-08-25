@@ -7,6 +7,7 @@
 //! Commit path — so validation, the rollback ring, and `show
 //! configuration` behave exactly as if the change came from the CLI.
 
+use hemlock_common::link;
 use hemlock_config::{ConfigTree, Item};
 use serde::Deserialize;
 
@@ -39,6 +40,16 @@ pub struct InterfaceEdit {
     pub native_vlan: Option<u16>,
     #[serde(default)]
     pub address: Option<String>,
+    /// Pinned line rate in Mb/s; `0` = auto-negotiate. Front-panel
+    /// ports only.
+    #[serde(default)]
+    pub speed_mbps: Option<u32>,
+    /// `"auto"`, `"full"` or `"half"`. Front-panel ports only.
+    #[serde(default)]
+    pub duplex: Option<String>,
+    /// L2 MTU in bytes; `0` = back to the platform default.
+    #[serde(default)]
+    pub mtu: Option<u32>,
 }
 
 fn valid_vlan(id: u16) -> Result<(), String> {
@@ -54,8 +65,17 @@ pub fn apply_interface_edit(tree: &mut ConfigTree, edit: &InterfaceEdit) -> Resu
         return Err("no interfaces selected".into());
     }
     for name in &edit.names {
-        if !(name.starts_with("Ethernet") || name.starts_with("Management")) {
+        let front_panel = name.starts_with("Ethernet");
+        if !(front_panel || name.starts_with("Management") || name.starts_with("Vlan")) {
             return Err(format!("{name}: not an editable interface"));
+        }
+        if !front_panel && (edit.speed_mbps.is_some() || edit.duplex.is_some()) {
+            return Err(format!(
+                "{name}: speed and duplex are front-panel port settings"
+            ));
+        }
+        if name.starts_with("Vlan") && edit.mode.is_some() {
+            return Err(format!("{name}: VLAN interfaces are always routed"));
         }
         if name.starts_with("Management")
             && matches!(
@@ -69,7 +89,8 @@ pub fn apply_interface_edit(tree: &mut ConfigTree, edit: &InterfaceEdit) -> Resu
     if let Some(id) = edit.access_vlan {
         valid_vlan(id)?;
     }
-    if let Some(id) = edit.native_vlan {
+    // 0 is the console's "no native VLAN" sentinel, not a VLAN id.
+    if let Some(id) = edit.native_vlan.filter(|id| *id != 0) {
         valid_vlan(id)?;
     }
     if let Some(vlans) = &edit.trunk_vlans {
@@ -80,6 +101,16 @@ pub fn apply_interface_edit(tree: &mut ConfigTree, edit: &InterfaceEdit) -> Resu
     if let Some(address) = &edit.address {
         if !address.is_empty() {
             hemlock_common::net::parse_cidr(address)?;
+        }
+    }
+    if let Some(mtu) = edit.mtu {
+        if mtu != 0 {
+            link::valid_mtu(mtu)?;
+        }
+    }
+    if let Some(duplex) = &edit.duplex {
+        if !matches!(duplex.as_str(), "auto" | "full" | "half") {
+            return Err(format!("bad duplex {duplex:?} (auto, full or half)"));
         }
     }
 
@@ -175,9 +206,15 @@ fn apply_one(eth: &mut Vec<Item>, edit: &InterfaceEdit) {
             }
         }
     }
+    // 0 is not a VLAN id; the console sends it to mean "no native
+    // VLAN", which an omitted field could not express.
     if let Some(id) = edit.native_vlan {
         if let Some(sp) = block_children_mut(eth, "switchport") {
-            ConfigTree::set_phrase(sp, "native", "vlan", vec![id.to_string()]);
+            if id == 0 {
+                ConfigTree::remove_leaf(sp, "native");
+            } else {
+                ConfigTree::set_phrase(sp, "native", "vlan", vec![id.to_string()]);
+            }
         }
     }
 
@@ -187,6 +224,31 @@ fn apply_one(eth: &mut Vec<Item>, edit: &InterfaceEdit) {
         } else {
             ConfigTree::remove_block(eth, "switchport", &[]);
             ConfigTree::set_leaf(eth, "address", vec![address.clone()]);
+        }
+    }
+
+    // Link parameters. The "stop forcing" spellings (`0` and `auto`)
+    // delete the leaf rather than writing a no-op one, so `show
+    // configuration` stays as short as the CLI would leave it.
+    if let Some(mbps) = edit.speed_mbps {
+        if mbps == 0 {
+            ConfigTree::remove_leaf(eth, "speed");
+        } else {
+            ConfigTree::set_leaf(eth, "speed", vec![mbps.to_string()]);
+        }
+    }
+    if let Some(duplex) = &edit.duplex {
+        if duplex == "auto" {
+            ConfigTree::remove_leaf(eth, "duplex");
+        } else {
+            ConfigTree::set_leaf(eth, "duplex", vec![duplex.clone()]);
+        }
+    }
+    if let Some(mtu) = edit.mtu {
+        if mtu == 0 {
+            ConfigTree::remove_leaf(eth, "mtu");
+        } else {
+            ConfigTree::set_leaf(eth, "mtu", vec![mtu.to_string()]);
         }
     }
 }
@@ -200,7 +262,7 @@ pub struct VlanEdit {
     pub delete: Vec<u16>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct VlanSet {
     pub id: u16,
     /// The VLAN's display name (config `description`); empty clears it.
@@ -246,6 +308,83 @@ pub fn apply_vlan_edit(tree: &mut ConfigTree, edit: &VlanEdit) -> Result<(), Str
         ConfigTree::remove_block(interfaces, &format!("Vlan{id}"), &[]);
     }
     remove_block_if_empty(tree, "vlans");
+    remove_block_if_empty(tree, "interfaces");
+    Ok(())
+}
+
+/// Create/update and delete SVIs (routed VLAN interfaces) in one
+/// request. An SVI is `interfaces { Vlan<id> { address ...; mtu ... } }`
+/// — there is no separate object to create, so writing an address is
+/// what brings one into being and clearing every leaf is what removes
+/// it. The VLAN itself must already exist; mgmtd rejects a dangling SVI
+/// at commit with that exact message.
+#[derive(Debug, Default, Deserialize)]
+pub struct SviEdit {
+    #[serde(default)]
+    pub set: Vec<SviSet>,
+    #[serde(default)]
+    pub delete: Vec<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SviSet {
+    /// The VLAN the interface fronts; the interface is named `Vlan<id>`.
+    pub vlan: u16,
+    /// Address in CIDR form; empty clears it. Absent leaves it alone.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// MTU in bytes; `0` restores the default. Absent leaves it alone.
+    #[serde(default)]
+    pub mtu: Option<u32>,
+}
+
+pub fn apply_svi_edit(tree: &mut ConfigTree, edit: &SviEdit) -> Result<(), String> {
+    if edit.set.is_empty() && edit.delete.is_empty() {
+        return Err("nothing to change".into());
+    }
+    for set in &edit.set {
+        valid_vlan(set.vlan)?;
+        if let Some(address) = &set.address {
+            if !address.is_empty() {
+                hemlock_common::net::parse_cidr(address)?;
+            }
+        }
+        if let Some(mtu) = set.mtu.filter(|m| *m != 0) {
+            link::valid_mtu(mtu)?;
+        }
+    }
+    for vlan in &edit.delete {
+        valid_vlan(*vlan)?;
+    }
+
+    for set in &edit.set {
+        let name = format!("Vlan{}", set.vlan);
+        let interfaces = tree.block_mut("interfaces");
+        let svi = ConfigTree::ensure_block(interfaces, &name, &[]);
+        if let Some(address) = &set.address {
+            if address.is_empty() {
+                ConfigTree::remove_leaf(svi, "address");
+            } else {
+                ConfigTree::set_leaf(svi, "address", vec![address.clone()]);
+            }
+        }
+        if let Some(mtu) = set.mtu {
+            if mtu == 0 {
+                ConfigTree::remove_leaf(svi, "mtu");
+            } else {
+                ConfigTree::set_leaf(svi, "mtu", vec![mtu.to_string()]);
+            }
+        }
+        // An `interfaces { Vlan10 { } }` husk would keep the SVI listed
+        // with nothing configured on it.
+        if svi.is_empty() {
+            ConfigTree::remove_block(tree.block_mut("interfaces"), &name, &[]);
+        }
+    }
+    for vlan in &edit.delete {
+        let interfaces = tree.block_mut("interfaces");
+        ConfigTree::remove_block(interfaces, &format!("Vlan{vlan}"), &[]);
+    }
     remove_block_if_empty(tree, "interfaces");
     Ok(())
 }
@@ -377,10 +516,36 @@ mod tests {
         let e = |edit: &InterfaceEdit| apply_interface_edit(&mut tree(""), edit).unwrap_err();
         assert!(e(&InterfaceEdit::default()).contains("no interfaces"));
         assert!(e(&InterfaceEdit {
-            names: vec!["Vlan10".into()],
+            names: vec!["Port-Channel1".into()],
             ..InterfaceEdit::default()
         })
         .contains("not an editable"));
+        // SVIs take an address and an MTU, but never a switchport mode
+        // or a link pin.
+        assert!(e(&InterfaceEdit {
+            names: vec!["Vlan10".into()],
+            mode: Some(Mode::Access),
+            ..InterfaceEdit::default()
+        })
+        .contains("always routed"));
+        assert!(e(&InterfaceEdit {
+            names: vec!["Vlan10".into()],
+            speed_mbps: Some(1000),
+            ..InterfaceEdit::default()
+        })
+        .contains("front-panel"));
+        assert!(e(&InterfaceEdit {
+            names: vec!["Ethernet1".into()],
+            mtu: Some(9999),
+            ..InterfaceEdit::default()
+        })
+        .contains("bad MTU"));
+        assert!(e(&InterfaceEdit {
+            names: vec!["Ethernet1".into()],
+            duplex: Some("quarter".into()),
+            ..InterfaceEdit::default()
+        })
+        .contains("bad duplex"));
         assert!(e(&InterfaceEdit {
             names: vec!["Management1".into()],
             mode: Some(Mode::Trunk),
@@ -461,9 +626,165 @@ mod tests {
         assert!(err(&VlanEdit {
             set: vec![VlanSet {
                 id: 0,
-                description: None
+                ..Default::default()
             }],
             delete: vec![]
+        })
+        .contains("bad VLAN id"));
+    }
+
+    #[test]
+    fn clearing_the_native_vlan_removes_it() {
+        let mut t = tree(
+            "interfaces { Ethernet1 { switchport { mode trunk
+trunk vlans 10, 20
+native vlan 54 } } }",
+        );
+        apply_interface_edit(
+            &mut t,
+            &InterfaceEdit {
+                names: vec!["Ethernet1".into()],
+                mode: Some(Mode::Trunk),
+                trunk_vlans: Some(vec![10, 20]),
+                // 0 is the console's "no native VLAN" — an omitted
+                // field would leave the old one in place.
+                native_vlan: Some(0),
+                ..InterfaceEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("trunk vlans 10, 20"));
+        assert!(!text.contains("native"));
+    }
+
+    #[test]
+    fn edits_link_parameters() {
+        let mut t = tree("");
+        apply_interface_edit(
+            &mut t,
+            &InterfaceEdit {
+                names: vec!["Ethernet1".into()],
+                speed_mbps: Some(100),
+                duplex: Some("half".into()),
+                mtu: Some(9216),
+                ..InterfaceEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("speed 100"));
+        assert!(text.contains("duplex half"));
+        assert!(text.contains("mtu 9216"));
+
+        // The "stop forcing" spellings delete the leaves outright.
+        apply_interface_edit(
+            &mut t,
+            &InterfaceEdit {
+                names: vec!["Ethernet1".into()],
+                speed_mbps: Some(0),
+                duplex: Some("auto".into()),
+                mtu: Some(0),
+                ..InterfaceEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(!text.contains("speed"));
+        assert!(!text.contains("duplex"));
+        assert!(!text.contains("mtu"));
+    }
+
+    #[test]
+    fn creates_and_removes_an_svi() {
+        let mut t = tree("vlans { vlan 10 { } }");
+        apply_svi_edit(
+            &mut t,
+            &SviEdit {
+                set: vec![SviSet {
+                    vlan: 10,
+                    address: Some("10.0.10.1/24".into()),
+                    mtu: Some(9216),
+                }],
+                delete: vec![],
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("Vlan10"));
+        assert!(text.contains("address 10.0.10.1/24"));
+        assert!(text.contains("mtu 9216"));
+
+        // Clearing every leaf takes the interface block with it, so the
+        // SVI stops being listed rather than lingering empty.
+        apply_svi_edit(
+            &mut t,
+            &SviEdit {
+                set: vec![SviSet {
+                    vlan: 10,
+                    address: Some(String::new()),
+                    mtu: Some(0),
+                }],
+                delete: vec![],
+            },
+        )
+        .unwrap();
+        assert!(!t.to_text().contains("Vlan10"));
+
+        // Delete removes the whole block in one step.
+        apply_svi_edit(
+            &mut t,
+            &SviEdit {
+                set: vec![SviSet {
+                    vlan: 20,
+                    address: Some("10.0.20.1/24".into()),
+                    mtu: None,
+                }],
+                delete: vec![],
+            },
+        )
+        .unwrap();
+        assert!(t.to_text().contains("Vlan20"));
+        apply_svi_edit(
+            &mut t,
+            &SviEdit {
+                set: vec![],
+                delete: vec![20],
+            },
+        )
+        .unwrap();
+        assert!(!t.to_text().contains("Vlan20"));
+    }
+
+    #[test]
+    fn rejects_bad_svi_edits() {
+        let err = |edit: &SviEdit| apply_svi_edit(&mut tree(""), edit).unwrap_err();
+        assert!(err(&SviEdit::default()).contains("nothing to change"));
+        assert!(err(&SviEdit {
+            set: vec![SviSet {
+                vlan: 10,
+                address: Some("10.0.10.1".into()),
+                mtu: None,
+            }],
+            delete: vec![],
+        })
+        .contains("prefix"));
+        assert!(err(&SviEdit {
+            set: vec![SviSet {
+                vlan: 10,
+                address: None,
+                mtu: Some(70_000),
+            }],
+            delete: vec![],
+        })
+        .contains("bad MTU"));
+        assert!(err(&SviEdit {
+            set: vec![SviSet {
+                vlan: 5000,
+                address: None,
+                mtu: None,
+            }],
+            delete: vec![],
         })
         .contains("bad VLAN id"));
     }
