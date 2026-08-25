@@ -135,7 +135,13 @@ state, and L2MC groups for snooping-constrained multicast. The security
 suite added ACL tables/entries/counters (with L4-port-range objects and
 per-entry policers), standalone policers, hostif trap groups + protocol
 traps, per-port FDB learn limits/learning mode (with
-`SaiEvent::LearnLimitViolation`), and port ACL binding.
+`SaiEvent::LearnLimitViolation`), and port ACL binding. The QoS suite
+added global qos-map objects with per-port bindings (`QosMapType`:
+DSCP/CoS classification and TC→DSCP/CoS rewrite), per-port default
+traffic class, scheduler profiles (`SchedulerSpec`: strict or DWRR
+weight, optional shaper) with per-queue binding and a port-level
+shaper, WRED profiles (`WredSpec`, including ECN marking) with
+per-queue binding, and two more queue stats (WRED drops, ECN marks).
 
 The vendor backend also answers a **capability probe**
 (`SaiBackend::capabilities`, via `sai_query_attribute_capability`): which
@@ -144,12 +150,18 @@ outer-TPID rewrite, ingress/egress ACL stages, per-ACL-entry policers,
 port learn limits, and trap groups (CoPP) this platform's SAI actually
 implements — the Helix4's ContentAware TCAM is small (IPv6 entries are
 double-wide) and `show acl summary` reports live utilization from the
-per-table `AVAILABLE_ACL_ENTRY` attribute. syncd runs
+per-table `AVAILABLE_ACL_ENTRY` attribute. The QoS suite grew the probe
+again: `buffer_bytes_total` (the shared packet buffer — Helix4 carries
+4 MB, and WRED thresholds validate against it), qos-map support per
+direction (`qos_map_ingress` / `qos_map_egress`), `wred` and `ecn`,
+`queue_shaper`, and `wred_queue_stats` (absent means the WRED-drop and
+ECN-marked counter columns render zero rather than lying). syncd runs
 the probe once at startup and every RPC that needs a missing capability
 fails cleanly with `% <feature> is not supported by this platform's SAI`
 — configuration is never silently dropped on the floor. Egress ACL
-bindings, rule `police`, port-security, and CoPP overrides each fail
-commit this way when unsupported, never silently no-op.
+bindings, rule `police`, port-security, CoPP overrides, egress rewrite
+maps, queue shapers, and WRED/ECN references each fail commit this way
+when unsupported, never silently no-op.
 
 **Mock backend** (`mock-sai`, default feature): pure Rust, constructed from
 the platform port table. Links follow admin state and emit the same
@@ -231,6 +243,42 @@ secured port's learned set, a learn past the limit (or an injected
 `LearnLimitViolation`) records a violation and applies the action —
 `protect` freezes hardware learning, `shutdown` errdisables the port
 (recovered by `clear port-security`).
+
+**The QoS engine** (`qos.rs`) owns everything between the flat,
+declarative RPC surface (`SetQosMaps`, `SetPortQos`/`ClearPortQos`,
+`EnsureWredProfile`/`RemoveWredProfile`, `GetQosState`) and the ASIC's
+object graph:
+
+- **Map objects.** A map table with entries gets exactly one SAI
+  object, *rewritten in place* when its values change — so a value-only
+  edit rebinds no port and disturbs no traffic. Ingress maps bind only
+  where a port's trust mode reads them (`trust dscp` → `DSCP_TO_TC`,
+  `trust cos` → `DOT1P_TO_TC`); the egress rewrite maps are global, so
+  they bind on every front-panel port whenever their table is
+  non-empty. An emptied table unbinds everywhere before its object is
+  freed.
+- **Scheduler profiles**, deduplicated and refcounted by value —
+  exactly the pattern the FIB uses for next-hop groups. Two ports
+  asking for the same queue shape share one SAI scheduler; the object
+  is freed when the last queue unbinds. A queue at the platform default
+  (DWRR, weight 1, unshaped) binds no profile at all, so a 52-port
+  switch at defaults costs the ASIC nothing.
+- **WRED objects**, refcounted by profile name: created on the first
+  queue binding, freed on the last unbind. An unreferenced profile is a
+  config-only draft — which is also why a platform without WRED fails
+  the *reference* rather than the definition. `RemoveWredProfile`
+  refuses a profile a queue still holds, naming the count.
+- **Port-Channel expansion.** A Port-Channel program expands to the
+  current member ports and follows membership churn, like a switchport
+  program or an ACL binding does.
+
+The Broadcom scheduler topology stays inside the vendor backend: Helix4
+hangs a scheduler-group tree off each port, but scheduler and WRED
+profiles bind on the *queue* object, so the only walk needed —
+port → `QOS_QUEUE_LIST` → the unicast entry with the matching index —
+lives in one documented function there. Hemlock's config language stays
+flat (`queue <0-7>` on a port), and nothing above syncd knows the tree
+exists.
 
 ## hemlock-pmon
 
@@ -381,9 +429,16 @@ commit.
   `state suspend`), switchport modes (access/trunk/dot1q-tunnel), static
   routes, system (hostname, users, http/https), the switching suite —
   LAGs + LACP, spanning tree, MAC table (aging + statics), IGMP/MLD
-  snooping, storm control, and mirror sessions — and the security suite:
+  snooping, storm control, and mirror sessions — the security suite:
   ACLs (with per-port/LAG bindings), CoPP class overrides, port
-  security, 802.1X, and DHCP snooping + ARP inspection. RADIUS shared
+  security, 802.1X, and DHCP snooping + ARP inspection — and the QoS
+  suite: the four global maps (`qos { map { ... } }`, pushed whole
+  because the RPC is declarative), named WRED/ECN profiles, and the
+  per-port program (trust mode, default traffic class, port and queue
+  shapers, per-queue scheduling and WRED) that rides the port and LAG
+  intents. Ordering inside the applier matters: profiles push before
+  the port programs that reference them, and profile removals come
+  last, once no queue holds them. RADIUS shared
   secrets are the first secrets the config tree stores: they persist
   in the clear on-box like the rest of the tree, render into hostapd's
   config mode 0600, and display as `<hidden>` in `show configuration`
@@ -391,7 +446,8 @@ commit.
   (e.g. "a LAG member's L2 config lives on the Port-Channel", mirror
   destination exclusivity) runs at load/commit before anything is pushed.
   An interface removed from the config reverts to defaults (admin up, no
-  description).
+  description) — and, for QoS, to the platform defaults: untrusted,
+  traffic class 0, no shapers, DWRR weight 1 on every queue, no WRED.
 - **Commit-confirm** — `commit --confirm N` arms a timer holding the
   pre-commit running text; `hemlockctl confirm` disarms it, expiry
   re-applies the old config automatically.

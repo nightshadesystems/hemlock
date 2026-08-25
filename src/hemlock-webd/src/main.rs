@@ -16,6 +16,7 @@ mod api;
 mod auth;
 mod edit;
 mod maint;
+mod qos_edit;
 mod routing_edit;
 mod security_edit;
 mod switching_edit;

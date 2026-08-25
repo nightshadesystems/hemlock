@@ -10,6 +10,7 @@ const TABS = [
   { label: 'Switching', href: '/switching/interfaces/', root: '/switching' },
   { label: 'Routing', href: '/routing/routes/', root: '/routing' },
   { label: 'Security', href: '/security/acls/', root: '/security' },
+  { label: 'QoS', href: '/qos/maps/', root: '/qos' },
   { label: 'System', href: '/system/general/', root: '/system' },
 ];
 
@@ -47,6 +48,14 @@ const SIDE_NAV = {
       { id: '/security/port-security/', label: 'Port Security', icon: 'lock' },
       { id: '/security/dot1x/', label: '802.1X', icon: 'key' },
       { id: '/security/snooping/', label: 'DHCP Snooping', icon: 'eye' },
+    ],
+  },
+  '/qos': {
+    label: 'QoS',
+    items: [
+      { id: '/qos/maps/', label: 'Maps', icon: 'map' },
+      { id: '/qos/wred/', label: 'WRED Profiles', icon: 'filter' },
+      { id: '/qos/interfaces/', label: 'Interfaces', icon: 'bar-chart' },
     ],
   },
   '/system': {

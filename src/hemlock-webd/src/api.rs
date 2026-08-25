@@ -90,6 +90,12 @@ pub fn router(state: SharedState) -> Router {
             "/api/snooping-sec/bindings/clear",
             post(snooping_sec_bindings_clear),
         )
+        .route("/api/qos/maps", get(qos_maps))
+        .route("/api/qos/maps/edit", post(qos_maps_edit))
+        .route("/api/qos/wred", get(qos_wred))
+        .route("/api/qos/wred/edit", post(qos_wred_edit))
+        .route("/api/qos/ports", get(qos_ports))
+        .route("/api/qos/ports/edit", post(qos_ports_edit))
         .route("/api/system", get(system))
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
@@ -1342,6 +1348,223 @@ async fn vrrp_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::routing_edit::apply_vrrp_edit(tree, &edit)
+    })
+    .await
+}
+
+// ------------------------------------------------------------ QoS suite
+
+/// One global map table as the Maps page renders it: the config
+/// keyword, its column labels, and the entries sorted by key.
+fn qos_map_table(
+    table: &str,
+    title: &str,
+    key_label: &str,
+    value_label: &str,
+    default_note: &str,
+    entries: &[pb::QosMapEntry],
+) -> serde_json::Value {
+    let mut rows: Vec<(u32, u32)> = entries.iter().map(|e| (e.key, e.value)).collect();
+    rows.sort();
+    json!({
+        "table": table,
+        "title": title,
+        "key_label": key_label,
+        "value_label": value_label,
+        "default_note": default_note,
+        "entries": rows.iter().map(|(key, value)| json!({
+            "key": key,
+            "value": value,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn qos_state(state: &AppState) -> Result<pb::GetQosStateResponse, ApiError> {
+    let mut client = syncd_client(state).await?;
+    Ok(client
+        .get_qos_state(pb::GetQosStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner())
+}
+
+/// `GET /api/qos/maps` — the four global map tables.
+async fn qos_maps(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let qos = qos_state(&state).await?;
+    let (ingress, egress) = qos_capabilities(&state).await?;
+    Ok(Json(json!({
+        "tables": [
+            qos_map_table(
+                "dscp-to-tc",
+                "DSCP to Traffic-Class",
+                "DSCP",
+                "TC",
+                "0",
+                &qos.dscp_to_tc,
+            ),
+            qos_map_table("cos-to-tc", "CoS to Traffic-Class", "CoS", "TC", "0", &qos.cos_to_tc),
+            qos_map_table(
+                "tc-to-dscp",
+                "Traffic-Class to DSCP rewrite",
+                "TC",
+                "DSCP",
+                "no rewrite",
+                &qos.tc_to_dscp,
+            ),
+            qos_map_table(
+                "tc-to-cos",
+                "Traffic-Class to CoS rewrite",
+                "TC",
+                "CoS",
+                "no rewrite",
+                &qos.tc_to_cos,
+            ),
+        ],
+        "qos_map_ingress": ingress,
+        "qos_map_egress": egress,
+    })))
+}
+
+/// The two qos-map capability bits, for gating the page's editors.
+async fn qos_capabilities(state: &AppState) -> Result<(bool, bool), ApiError> {
+    let mut client = syncd_client(state).await?;
+    let info = client
+        .get_switch_info(pb::GetSwitchInfoRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    let caps = info.capabilities.unwrap_or_default();
+    Ok((caps.qos_map_ingress, caps.qos_map_egress))
+}
+
+async fn qos_maps_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::qos_edit::MapEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::qos_edit::apply_map_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/qos/wred` — the named profiles with their queue
+/// references, plus the platform's buffer cap and capability posture
+/// (the threshold slider is bounded by both).
+async fn qos_wred(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let qos = qos_state(&state).await?;
+    let profiles: Vec<serde_json::Value> = qos
+        .wred_profiles
+        .iter()
+        .map(|profile| {
+            // A member carrying its Port-Channel's program is credited
+            // to the Port-Channel, so a reference is never listed twice.
+            let references: Vec<serde_json::Value> = qos
+                .ports
+                .iter()
+                .filter(|port| port.via_port_channel.is_empty())
+                .flat_map(|port| {
+                    port.queues
+                        .iter()
+                        .filter(|queue| queue.wred_profile == profile.name)
+                        .map(move |queue| json!({ "port": port.port, "queue": queue.queue }))
+                })
+                .collect();
+            json!({
+                "name": profile.name,
+                "min_threshold": profile.min_threshold_kb,
+                "max_threshold": profile.max_threshold_kb,
+                "drop_probability": profile.drop_probability,
+                "ecn": profile.ecn,
+                "references": references,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "profiles": profiles,
+        "buffer_kb": qos.buffer_kb,
+        "wred_supported": qos.wred_supported,
+        "ecn_supported": qos.ecn_supported,
+    })))
+}
+
+async fn qos_wred_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::qos_edit::WredEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::qos_edit::apply_wred_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/qos/ports` — per-port effective config with live per-queue
+/// counters, plus what the platform's SAI supports so the editors can
+/// gate the same way commit does.
+async fn qos_ports(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let qos = qos_state(&state).await?;
+    let ports: Vec<serde_json::Value> = qos
+        .ports
+        .iter()
+        .map(|port| {
+            json!({
+                "port": port.port,
+                "trust": port.trust,
+                "default_tc": port.default_tc,
+                "shape_bps": port.shape_bps,
+                "shaper": port.shape_bps.map(hemlock_common::net::display_shape_rate),
+                "configured": port.configured,
+                "via_port_channel": (!port.via_port_channel.is_empty())
+                    .then(|| port.via_port_channel.clone()),
+                "queues": port.queues.iter().map(|queue| json!({
+                    "queue": queue.queue,
+                    "mode": if queue.strict { "strict" } else { "dwrr" },
+                    // A strict queue takes no DWRR share.
+                    "weight": (!queue.strict).then_some(queue.weight),
+                    "shape_bps": queue.shape_bps,
+                    "shaper": queue.shape_bps.map(hemlock_common::net::display_shape_rate),
+                    "wred_profile": (!queue.wred_profile.is_empty())
+                        .then(|| queue.wred_profile.clone()),
+                    "ecn": queue.ecn,
+                    "tx_packets": queue.tx_packets,
+                    "tx_bytes": queue.tx_bytes,
+                    "dropped": queue.dropped,
+                    "wred_dropped": queue.wred_dropped,
+                    "ecn_marked": queue.ecn_marked,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ports": ports,
+        "default_ports": qos.default_ports,
+        "queue_count": qos.queue_count,
+        "buffer_kb": qos.buffer_kb,
+        "wred_supported": qos.wred_supported,
+        "ecn_supported": qos.ecn_supported,
+        "queue_shaper_supported": qos.queue_shaper_supported,
+        "wred_profiles": qos.wred_profiles.iter().map(|p| p.name.clone())
+            .collect::<Vec<_>>(),
+    })))
+}
+
+async fn qos_ports_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::qos_edit::PortQosEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::qos_edit::apply_port_qos_edit(tree, &edit)
     })
     .await
 }

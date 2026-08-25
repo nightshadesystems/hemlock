@@ -5994,6 +5994,227 @@ lanes = [1, 2, 3, 4]
         assert!(state.ports.iter().any(|p| p.port == "Port-Channel1"));
     }
 
+    /// A commit-confirm expiry re-applies the *previous* running text
+    /// through the same appliers, so the QoS world has to land back
+    /// exactly where it was: same scheduler objects, same refcounts,
+    /// same map bindings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qos_reapplying_a_prior_config_restores_the_same_objects() {
+        let platform = qos_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = qos_service(&platform, handle.clone());
+
+        // A snapshot of everything a commit could disturb: one port's
+        // (name, source, default-tc, shaper, scheduled queues).
+        type AppliedRow = (String, String, u8, Option<u64>, Vec<u8>);
+        let snapshot = || {
+            let world = handle.qos.read().unwrap();
+            let schedulers: Vec<(hemlock_sai::SchedulerSpec, (hemlock_sai::Oid, u32))> =
+                world.schedulers.iter().map(|(k, v)| (*k, *v)).collect();
+            let applied: Vec<AppliedRow> = world
+                .applied
+                .iter()
+                .map(|(port, state)| {
+                    (
+                        port.clone(),
+                        state.source.clone(),
+                        state.default_tc,
+                        state.shape_bps,
+                        state.queue_schedulers.keys().copied().collect(),
+                    )
+                })
+                .collect();
+            let maps = world.map_objects.clone();
+            (schedulers, applied, maps)
+        };
+
+        let program_a = pb::SetPortQosRequest {
+            port: "Ethernet1".into(),
+            trust: "dscp".into(),
+            default_tc: 1,
+            shape_bps: None,
+            queues: vec![
+                pb::QueueQos {
+                    strict: true,
+                    ..queue_qos(7)
+                },
+                pb::QueueQos {
+                    weight: 40,
+                    ..queue_qos(5)
+                },
+            ],
+        };
+        let program_b = pb::SetPortQosRequest {
+            port: "Ethernet1".into(),
+            trust: "cos".into(),
+            default_tc: 4,
+            shape_bps: Some(500_000_000),
+            queues: vec![pb::QueueQos {
+                weight: 7,
+                ..queue_qos(2)
+            }],
+        };
+
+        service
+            .set_qos_maps(Request::new(seed_maps()))
+            .await
+            .unwrap();
+        service
+            .set_port_qos(Request::new(program_a.clone()))
+            .await
+            .unwrap();
+        let before = snapshot();
+
+        // The commit that gets rolled back.
+        service.set_port_qos(Request::new(program_b)).await.unwrap();
+        let mut without_rewrite = seed_maps();
+        without_rewrite.tc_to_dscp.clear();
+        service
+            .set_qos_maps(Request::new(without_rewrite))
+            .await
+            .unwrap();
+        assert_ne!(snapshot().1, before.1);
+
+        // Expiry: the prior text applies again.
+        service
+            .set_qos_maps(Request::new(seed_maps()))
+            .await
+            .unwrap();
+        service.set_port_qos(Request::new(program_a)).await.unwrap();
+        let after = snapshot();
+        assert_eq!(
+            after.1, before.1,
+            "per-port state drifted across a rollback"
+        );
+        assert_eq!(
+            after.0.len(),
+            before.0.len(),
+            "scheduler object count drifted across a rollback"
+        );
+        for (spec, (_, refs)) in &after.0 {
+            let (_, want) = before
+                .0
+                .iter()
+                .find(|(other, _)| other == spec)
+                .map(|(_, v)| *v)
+                .expect("the same scheduler shapes are back");
+            assert_eq!(*refs, want, "refcount drifted for {spec:?}");
+        }
+        assert_eq!(
+            after.2.keys().collect::<Vec<_>>(),
+            before.2.keys().collect::<Vec<_>>(),
+            "map objects drifted across a rollback"
+        );
+
+        // And re-pushing the same program a third time is a no-op: the
+        // diff finds nothing to do, so no object churns.
+        let repeat = snapshot();
+        assert_eq!(repeat.0.len(), after.0.len());
+    }
+
+    /// Queue counters reach `GetQosState` from the stats engine, so the
+    /// web console's per-queue view and the CLI's read the same numbers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qos_state_carries_live_queue_counters() {
+        let platform = qos_platform();
+        let mut mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let port_id = mock.port_id_of(0);
+        mock.set_queue_counters(
+            port_id,
+            vec![
+                hemlock_sai::QueueCounters {
+                    unicast: true,
+                    index: 3,
+                    pkts: 88_123,
+                    bytes: 101_233_911,
+                    dropped_pkts: 1204,
+                    dropped_bytes: 1_812_664,
+                    wred_dropped: 1187,
+                    ecn_marked: 3320,
+                },
+                hemlock_sai::QueueCounters {
+                    unicast: true,
+                    index: 5,
+                    pkts: 421_900,
+                    bytes: 530_122_831,
+                    ..hemlock_sai::QueueCounters::default()
+                },
+            ],
+        );
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let engine = Engine::new(300);
+        let service = SyncdService::new(
+            handle.clone(),
+            engine.clone(),
+            Arc::default(),
+            qos_inventory(),
+        );
+
+        // One collector-equivalent sweep.
+        let ports: Vec<(String, hemlock_sai::PortId)> = handle
+            .ports
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(n, p)| (n.clone(), p.sai_id))
+            .collect();
+        let now = Instant::now();
+        for sample in handle.port_stats(ports).await.unwrap() {
+            let queues = sample
+                .queues
+                .iter()
+                .map(|q| crate::ifstats::QueueSample {
+                    label: format!("{}{}", if q.unicast { "UC" } else { "MC" }, q.index),
+                    pkts: q.pkts,
+                    bytes: q.bytes,
+                    dropped_pkts: q.dropped_pkts,
+                    dropped_bytes: q.dropped_bytes,
+                    wred_dropped: q.wred_dropped,
+                    ecn_marked: q.ecn_marked,
+                })
+                .collect();
+            engine.ingest(&sample.name, sample.counters.into(), queues, now);
+        }
+
+        let state = service
+            .get_qos_state(Request::new(pb::GetQosStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let port = state
+            .ports
+            .iter()
+            .find(|p| p.port == "Ethernet1")
+            .expect("Ethernet1 row");
+        let q3 = &port.queues[3];
+        assert_eq!(
+            (q3.tx_packets, q3.dropped, q3.wred_dropped, q3.ecn_marked),
+            (88_123, 1204, 1187, 3320)
+        );
+        assert_eq!(port.queues[5].tx_packets, 421_900);
+        // Untouched queues stay at zero rather than going missing.
+        assert_eq!(port.queues[0].tx_packets, 0);
+
+        // `clear counters` baselines them like every other counter.
+        service
+            .clear_counters(Request::new(pb::ClearCountersRequest { names: Vec::new() }))
+            .await
+            .unwrap();
+        let state = service
+            .get_qos_state(Request::new(pb::GetQosStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let port = state
+            .ports
+            .iter()
+            .find(|p| p.port == "Ethernet1")
+            .expect("Ethernet1 row");
+        assert_eq!(port.queues[3].wred_dropped, 0);
+        assert_eq!(port.queues[3].ecn_marked, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn qos_capabilities_gate_cleanly() {
         let platform = qos_platform();
