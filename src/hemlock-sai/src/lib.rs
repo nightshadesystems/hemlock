@@ -475,6 +475,8 @@ pub enum TrapKind {
     Ip2me,
     Stp,
     Lacp,
+    /// LLDP frames (01:80:c2:00:00:0e), punted to the native engine.
+    Lldp,
     Eapol,
     IgmpQuery,
     IgmpLeave,

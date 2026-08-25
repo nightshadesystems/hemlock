@@ -7,9 +7,9 @@
 //!
 //! One socket per port carries every protocol: received frames are
 //! dispatched by type (slow-protocols ethertype -> LACP, the STP
-//! multicast -> STP, IGMP/MLD -> the snooping engines, classified to a
-//! VLAN by the ingress port's untagged VLAN since hostif delivery
-//! strips tags).
+//! multicast -> STP, the LLDP ethertype -> LLDP, IGMP/MLD -> the
+//! snooping engines, classified to a VLAN by the ingress port's
+//! untagged VLAN since hostif delivery strips tags).
 //!
 //! The socket is created with `ETH_P_ALL` and bound through the
 //! interface's own `getifaddrs` link address (which carries the
@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, warn};
 
-use crate::{lacp, stp};
+use crate::{lacp, lldp, stp};
 
 type Sockets = Mutex<HashMap<String, Arc<OwnedFd>>>;
 type SnoopSinks = RwLock<Vec<(u16, mpsc::UnboundedSender<(String, u16, Vec<u8>)>)>>;
@@ -67,6 +67,25 @@ pub fn register_snoop(
             transmit(&port, frame).await;
         }
     });
+}
+
+type LldpSink = RwLock<Option<mpsc::UnboundedSender<(String, Vec<u8>)>>>;
+
+fn lldp_sink() -> &'static LldpSink {
+    static SINK: OnceLock<LldpSink> = OnceLock::new();
+    SINK.get_or_init(Default::default)
+}
+
+/// Attach the LLDP engine: trapped 0x88cc frames go to `packet_in`;
+/// its advertisements transmit like any other protocol frame.
+pub fn register_lldp(
+    packet_in: mpsc::UnboundedSender<(String, Vec<u8>)>,
+    packet_out: mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+) {
+    if let Ok(mut sink) = lldp_sink().write() {
+        *sink = Some(packet_in);
+    }
+    spawn_tx(packet_out);
 }
 
 type SnoopsecSink = RwLock<Option<mpsc::UnboundedSender<(String, u16, Vec<u8>)>>>;
@@ -139,6 +158,7 @@ async fn transmit(port: &str, frame: Vec<u8>) {
 pub async fn run(
     engine: lacp::Engine,
     stp_engine: stp::Engine,
+    lldp_engine: lldp::Engine,
     pdu_in: mpsc::UnboundedSender<(String, Vec<u8>)>,
     pdu_out: mpsc::UnboundedReceiver<(String, Vec<u8>)>,
     bpdu_in: mpsc::UnboundedSender<(String, Vec<u8>)>,
@@ -156,6 +176,11 @@ pub async fn run(
             .flat_map(|lag| lag.members.iter().map(|m| m.port.clone()))
             .collect();
         if let Some(snapshot) = stp_engine.snapshot() {
+            wanted.extend(snapshot.ports.into_iter().map(|p| p.port));
+        }
+        // LLDP runs on every front-panel port by default, so its port
+        // list is usually the widest of the three.
+        if let Some(snapshot) = lldp_engine.snapshot() {
             wanted.extend(snapshot.ports.into_iter().map(|p| p.port));
         }
         // Snooping listens wherever a PVID is known (every bridged port).
@@ -272,6 +297,12 @@ fn spawn_reader(
                         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
                         if ethertype == lacp::LACP_ETHERTYPE {
                             let _ = pdu_in.send((port.clone(), frame.to_vec()));
+                        } else if ethertype == lldp::LLDP_ETHERTYPE {
+                            if let Ok(sink) = lldp_sink().read() {
+                                if let Some(sink) = sink.as_ref() {
+                                    let _ = sink.send((port.clone(), frame.to_vec()));
+                                }
+                            }
                         } else if frame[..6] == stp::STP_DST {
                             let _ = bpdu_in.send((port.clone(), frame.to_vec()));
                         } else if snoop_relevant(ethertype, frame) {

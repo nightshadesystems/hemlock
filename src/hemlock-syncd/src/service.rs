@@ -5550,7 +5550,7 @@ lanes = [1, 2]
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(state.classes.len(), 13);
+        assert_eq!(state.classes.len(), crate::security::COPP_CLASSES.len());
         let bpdu = state.classes.iter().find(|c| c.class == "bpdu").unwrap();
         assert_eq!((bpdu.rate, bpdu.burst, bpdu.overridden), (512, 128, false));
         service

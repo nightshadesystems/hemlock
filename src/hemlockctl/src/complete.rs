@@ -150,7 +150,10 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "dot1x",
             "dhcp",
             "qos",
+            "lldp",
         ],
+        (CliMode::Operational, ["show", "lldp"]) => &["neighbors"],
+        (CliMode::Operational, ["show", "lldp", "neighbors"]) => &["detail"],
         (CliMode::Operational, ["show", "qos"]) => &["maps", "wred", "interface", "interfaces"],
         (CliMode::Operational, ["show", "qos", "interface"]) => &[PORT],
         (CliMode::Operational, ["show", "acl"]) => &["summary", ACL],
@@ -200,8 +203,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "port-security",
             "dhcp",
             "dot1x",
+            "lldp",
         ],
-        (CliMode::Operational, ["clear", "acl" | "copp"]) => &["counters"],
+        (CliMode::Operational, ["clear", "acl" | "copp" | "lldp"]) => &["counters"],
         (CliMode::Operational, ["clear", "acl", "counters"]) => &[ACL],
         (CliMode::Operational, ["clear", "port-security"]) => &["interface"],
         (CliMode::Operational, ["clear", "port-security", "interface"]) => &[PORT],
@@ -230,8 +234,14 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "protocols",
             "switching",
             "security",
+            "services",
             "qos",
         ],
+        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp"],
+        (CliMode::Config, ["set" | "delete", "services", "lldp"]) => {
+            &["disable", "tx-interval", "hold-multiplier"]
+        }
+        (CliMode::Config, ["set", "services", "lldp", "tx-interval" | "hold-multiplier"]) => &[NUM],
         (CliMode::Config, ["set" | "delete", "interfaces"]) => &[PORT],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT]) => &[
             "description",
@@ -254,7 +264,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "dhcp-snooping",
             "arp-inspection",
             "qos",
+            "lldp",
         ],
+        (CliMode::Config, ["set", "interfaces", PORT, "lldp"]) => &["disable"],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "qos"]) => {
             &["trust", "default-tc", "shape", "queue"]
         }
@@ -525,8 +537,8 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         ) => &["burst"],
         (CliMode::Config, ["set" | "delete", "security", "copp"]) => &["class"],
         (CliMode::Config, ["set" | "delete", "security", "copp", "class"]) => &[
-            "bpdu", "lacp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
-            "acl-log", "default",
+            "bpdu", "lacp", "lldp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp",
+            "ip2me", "acl-log", "default",
         ],
         (CliMode::Config, ["set" | "delete", "security", "copp", "class", _]) => &["rate", "burst"],
         (CliMode::Config, ["set" | "delete", "security", "dot1x"]) => {
@@ -1159,6 +1171,7 @@ mod tests {
                 "dhcp-snooping".to_string(),
                 "arp-inspection".to_string(),
                 "qos".to_string(),
+                "lldp".to_string(),
             ]
         );
         let c = candidates(
@@ -1198,6 +1211,7 @@ mod tests {
                 "protocols".to_string(),
                 "switching".to_string(),
                 "security".to_string(),
+                "services".to_string(),
                 "qos".to_string(),
             ]
         );
@@ -1414,6 +1428,45 @@ mod tests {
             &ports(),
         );
         assert_eq!(c, vec!["dot1q-tunnel"]);
+    }
+
+    /// The services suite: the `services { lldp }` block, its per-port
+    /// leaf, and the operational views.
+    #[test]
+    fn services_paths_complete() {
+        let c = candidates(CliMode::Config, &["set"], "serv", &ports());
+        assert_eq!(c, vec!["services".to_string()]);
+        let c = candidates(CliMode::Config, &["set", "services"], "", &ports());
+        assert_eq!(c, vec!["lldp"]);
+        let c = candidates(CliMode::Config, &["set", "services", "lldp"], "", &ports());
+        assert_eq!(c, vec!["disable", "tx-interval", "hold-multiplier"]);
+        let c = candidates(
+            CliMode::Config,
+            &["delete", "services", "lldp"],
+            "h",
+            &ports(),
+        );
+        assert_eq!(c, vec!["hold-multiplier"]);
+        // The per-port leaf is the off switch and nothing else.
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "lldp"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["disable"]);
+        // Operational views.
+        let c = candidates(CliMode::Operational, &["show", "lldp"], "", &ports());
+        assert_eq!(c, vec!["neighbors"]);
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "lldp", "neighbors"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["detail"]);
+        let c = candidates(CliMode::Operational, &["clear", "lldp"], "", &ports());
+        assert_eq!(c, vec!["counters"]);
     }
 
     #[test]

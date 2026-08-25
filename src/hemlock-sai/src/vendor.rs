@@ -1430,6 +1430,7 @@ impl VendorSai {
             TrapKind::Ip2me => trap::SAI_HOSTIF_TRAP_TYPE_IP2ME,
             TrapKind::Stp => trap::SAI_HOSTIF_TRAP_TYPE_STP,
             TrapKind::Lacp => trap::SAI_HOSTIF_TRAP_TYPE_LACP,
+            TrapKind::Lldp => trap::SAI_HOSTIF_TRAP_TYPE_LLDP,
             TrapKind::Eapol => trap::SAI_HOSTIF_TRAP_TYPE_EAPOL,
             TrapKind::IgmpQuery => trap::SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_QUERY,
             TrapKind::IgmpLeave => trap::SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_LEAVE,

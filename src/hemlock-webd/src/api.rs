@@ -98,6 +98,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/qos/wred/edit", post(qos_wred_edit))
         .route("/api/qos/ports", get(qos_ports))
         .route("/api/qos/ports/edit", post(qos_ports_edit))
+        .route("/api/lldp", get(lldp))
+        .route("/api/lldp/edit", post(lldp_edit))
         .route("/api/system", get(system))
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
@@ -899,6 +901,64 @@ async fn snooping_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::switching_edit::apply_snooping_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/lldp` — orch's LLDP view: settings, per-port counters and
+/// the aged neighbor table, plus the ports carrying `lldp disable` so
+/// the editor can show the whole grid.
+async fn lldp(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .get_lldp_state(pb::GetLldpStateRequest {
+            port: String::new(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "enabled": response.enabled,
+        "tx_interval": response.tx_interval,
+        "hold_multiplier": response.hold_multiplier,
+        "ttl": response.tx_interval.saturating_mul(response.hold_multiplier),
+        "chassis_id": response.chassis_id,
+        "system_name": response.system_name,
+        "system_description": response.system_description,
+        "management_address": response.management_address,
+        "ports": response.ports.iter().map(|port| json!({
+            "port": port.port,
+            "enabled": port.enabled,
+            "frames_tx": port.frames_tx,
+            "frames_rx": port.frames_rx,
+            "frames_discarded": port.frames_discarded,
+            "ageouts": port.ageouts,
+            "neighbors": port.neighbors.iter().map(|neighbor| json!({
+                "chassis_id": neighbor.chassis_id,
+                "chassis_id_subtype": neighbor.chassis_id_subtype,
+                "port_id": neighbor.port_id,
+                "port_id_subtype": neighbor.port_id_subtype,
+                "port_description": neighbor.port_description,
+                "system_name": neighbor.system_name,
+                "system_description": neighbor.system_description,
+                "management_address": neighbor.management_address,
+                "ttl": neighbor.ttl,
+                "age_secs": neighbor.age_secs,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn lldp_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::services_edit::LldpEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::services_edit::apply_lldp_edit(tree, &edit)
     })
     .await
 }

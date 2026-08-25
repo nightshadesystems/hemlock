@@ -56,6 +56,15 @@ service Orch {
   // `clear dot1x interface <port>`: force reauthentication.
   rpc Dot1xReauth(Dot1xReauthRequest) returns (Dot1xReauthResponse);
 
+  // --- LLDP (native engine over the ports' hostif netdevs) -------------
+  // Full desired LLDP state (declarative). orch runs the tx timers,
+  // ages the neighbor table, and serves both to `show lldp ...`.
+  rpc SetLldpConfig(SetLldpConfigRequest) returns (SetLldpConfigResponse);
+  // Per-port counters + the neighbor table for `show lldp [neighbors]`.
+  rpc GetLldpState(GetLldpStateRequest) returns (GetLldpStateResponse);
+  // `clear lldp counters`: baseline the per-port frame counters.
+  rpc ClearLldpCounters(ClearLldpCountersRequest) returns (ClearLldpCountersResponse);
+
   // --- DHCP snooping + dynamic ARP inspection --------------------------
   // Full desired snooping/DAI state (declarative). The engine drives
   // the CPU redirects into syncd, validates trapped packets, maintains
@@ -591,5 +600,72 @@ message ClearSnoopBindingRequest {
 }
 
 message ClearSnoopBindingResponse {
+  uint32 cleared = 1;
+}
+
+// --- LLDP ---------------------------------------------------------------
+
+message SetLldpConfigRequest {
+  // LLDP runs by default; this is the global off switch.
+  bool disabled = 1;
+  uint32 tx_interval = 2;      // 0 = default (30)
+  uint32 hold_multiplier = 3;  // 0 = default (4)
+  // Ports carrying `lldp disable`.
+  repeated string disabled_ports = 4;
+}
+
+message SetLldpConfigResponse {}
+
+message GetLldpStateRequest {
+  // Scope the neighbor list to one port; "" = every LLDP port.
+  string port = 1;
+}
+
+message LldpNeighborState {
+  // Colon-separated lowercase MAC, or whatever the chassis subtype
+  // carried.
+  string chassis_id = 1;
+  // "mac" | "interface-name" | "local" | "network-address" | ...
+  string chassis_id_subtype = 2;
+  string port_id = 3;
+  string port_id_subtype = 4;
+  string port_description = 5;
+  string system_name = 6;
+  string system_description = 7;
+  string management_address = 8;
+  // The TTL the neighbor advertised.
+  uint32 ttl = 9;
+  // Seconds since the last frame from this neighbor.
+  uint64 age_secs = 10;
+}
+
+message LldpPortState {
+  string port = 1;
+  bool enabled = 2;
+  uint64 frames_tx = 3;
+  uint64 frames_rx = 4;
+  uint64 frames_discarded = 5;
+  uint64 ageouts = 6;
+  repeated LldpNeighborState neighbors = 7;
+}
+
+message GetLldpStateResponse {
+  bool enabled = 1;
+  uint32 tx_interval = 2;
+  uint32 hold_multiplier = 3;
+  // Colon-separated lowercase switch base MAC.
+  string chassis_id = 4;
+  string system_name = 5;
+  string system_description = 6;
+  string management_address = 7;
+  repeated LldpPortState ports = 8;
+}
+
+message ClearLldpCountersRequest {
+  // Scope to one port; "" = every port.
+  string port = 1;
+}
+
+message ClearLldpCountersResponse {
   uint32 cleared = 1;
 }

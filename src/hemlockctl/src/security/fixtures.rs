@@ -134,6 +134,7 @@ pub fn copp_state() -> CoppState {
         classes: vec![
             class("bpdu", 512, 128, true, 182_331, 0),
             class("lacp", 1000, 256, false, 92_110, 0),
+            class("lldp", 512, 128, false, 37_640, 0),
             class("eapol", 256, 64, false, 412, 0),
             class("igmp", 1000, 256, false, 55_019, 12),
             class("mld", 1000, 256, false, 1044, 0),

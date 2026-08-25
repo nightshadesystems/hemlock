@@ -11,6 +11,7 @@
 mod dot1x;
 mod frrshow;
 mod lacp;
+mod lldp;
 mod rib;
 mod snoop;
 mod snoopsec;
@@ -42,6 +43,7 @@ struct Args {
 struct OrchService {
     engine: lacp::Engine,
     stp: stp::Engine,
+    lldp: lldp::Engine,
     igmp: snoop::Engine,
     mld: snoop::Engine,
     rib: rib::Engine,
@@ -145,6 +147,93 @@ impl Orch for OrchService {
         }
         self.engine.set_configs(system_priority, configs);
         Ok(Response::new(pb::SetLagConfigsResponse {}))
+    }
+
+    async fn set_lldp_config(
+        &self,
+        request: Request<pb::SetLldpConfigRequest>,
+    ) -> Result<Response<pb::SetLldpConfigResponse>, Status> {
+        let req = request.into_inner();
+        let tx_interval = match req.tx_interval {
+            0 => lldp::DEFAULT_TX_INTERVAL,
+            other => other,
+        };
+        if !(5..=300).contains(&tx_interval) {
+            return Err(Status::invalid_argument(format!(
+                "bad tx-interval {tx_interval}"
+            )));
+        }
+        let hold_multiplier = match req.hold_multiplier {
+            0 => lldp::DEFAULT_HOLD_MULTIPLIER,
+            other => u8::try_from(other)
+                .ok()
+                .filter(|n| (2..=10).contains(n))
+                .ok_or_else(|| Status::invalid_argument(format!("bad hold-multiplier {other}")))?,
+        };
+        self.lldp.set_config(lldp::Config {
+            disabled: req.disabled,
+            tx_interval: Duration::from_secs(u64::from(tx_interval)),
+            hold_multiplier,
+            disabled_ports: req.disabled_ports.into_iter().collect(),
+        });
+        Ok(Response::new(pb::SetLldpConfigResponse {}))
+    }
+
+    async fn get_lldp_state(
+        &self,
+        request: Request<pb::GetLldpStateRequest>,
+    ) -> Result<Response<pb::GetLldpStateResponse>, Status> {
+        let filter = request.into_inner().port;
+        let snapshot = self
+            .lldp
+            .snapshot()
+            .ok_or_else(|| Status::internal("lldp engine unavailable"))?;
+        Ok(Response::new(pb::GetLldpStateResponse {
+            enabled: snapshot.enabled,
+            tx_interval: snapshot.tx_interval_secs,
+            hold_multiplier: u32::from(snapshot.hold_multiplier),
+            chassis_id: snapshot.chassis_id,
+            system_name: snapshot.system_name,
+            system_description: snapshot.system_description,
+            management_address: snapshot.management_address,
+            ports: snapshot
+                .ports
+                .into_iter()
+                .filter(|port| filter.is_empty() || port.port == filter)
+                .map(|port| pb::LldpPortState {
+                    port: port.port,
+                    enabled: port.enabled,
+                    frames_tx: port.frames_tx,
+                    frames_rx: port.frames_rx,
+                    frames_discarded: port.frames_discarded,
+                    ageouts: port.ageouts,
+                    neighbors: port
+                        .neighbors
+                        .into_iter()
+                        .map(|entry| pb::LldpNeighborState {
+                            chassis_id: entry.neighbor.chassis_id,
+                            chassis_id_subtype: entry.neighbor.chassis_id_subtype,
+                            port_id: entry.neighbor.port_id,
+                            port_id_subtype: entry.neighbor.port_id_subtype,
+                            port_description: entry.neighbor.port_description,
+                            system_name: entry.neighbor.system_name,
+                            system_description: entry.neighbor.system_description,
+                            management_address: entry.neighbor.management_address,
+                            ttl: u32::from(entry.neighbor.ttl),
+                            age_secs: entry.age_secs,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn clear_lldp_counters(
+        &self,
+        request: Request<pb::ClearLldpCountersRequest>,
+    ) -> Result<Response<pb::ClearLldpCountersResponse>, Status> {
+        let cleared = self.lldp.clear_counters(&request.into_inner().port);
+        Ok(Response::new(pb::ClearLldpCountersResponse { cleared }))
     }
 
     async fn set_stp_config(
@@ -757,6 +846,12 @@ async fn main() -> Result<()> {
         states,
         errdisable,
     } = stp_io;
+    let (lldp_engine, lldp_io) = lldp::Engine::spawn(system_mac);
+    let lldp::EngineIo {
+        links: lldp_links,
+        frame_in: lldp_in,
+        frame_out: lldp_out,
+    } = lldp_io;
     let (igmp_engine, igmp_io) = snoop::Engine::spawn(snoop::Family::Igmp, system_mac);
     let (mld_engine, mld_io) = snoop::Engine::spawn(snoop::Family::Mld, system_mac);
     let (dot1x_engine, dot1x_io) = dot1x::Engine::spawn();
@@ -809,6 +904,11 @@ async fn main() -> Result<()> {
     transport::register_snoopsec(snoopsec_packets, snoopsec_out);
     #[cfg(not(target_os = "linux"))]
     drop((snoopsec_packets, snoopsec_out));
+    // LLDP rides the same sockets (ethertype 0x88cc).
+    #[cfg(target_os = "linux")]
+    transport::register_lldp(lldp_in, lldp_out);
+    #[cfg(not(target_os = "linux"))]
+    drop((lldp_in, lldp_out));
 
     // The RIB pipeline: kernel netlink (iproute2 dumps) -> engine ->
     // syncd FIB RPCs. The pusher reconciles on every engine change and
@@ -819,7 +919,7 @@ async fn main() -> Result<()> {
     tokio::spawn(rib::run_feed(rib_engine.clone()));
 
     // syncd port events -> the engines' link states.
-    tokio::spawn(watch_links(syncd.clone(), links, stp_links));
+    tokio::spawn(watch_links(syncd.clone(), links, stp_links, lldp_links));
     // The VLAN membership view (query transmission + VLAN
     // classification of snooped frames on tag-stripped netdevs), plus
     // the RIB engine's ASIC L3 interface set.
@@ -829,6 +929,7 @@ async fn main() -> Result<()> {
         mld_engine.clone(),
         rib_engine.clone(),
         snoopsec_engine.clone(),
+        lldp_engine.clone(),
     ));
     // Protocol frames <-> the ports' hostif netdevs (Linux only; on dev
     // hosts the engines still run, partnerless).
@@ -836,6 +937,7 @@ async fn main() -> Result<()> {
     tokio::spawn(transport::run(
         engine.clone(),
         stp_engine.clone(),
+        lldp_engine.clone(),
         pdu_in,
         pdu_out,
         bpdu_in,
@@ -847,10 +949,11 @@ async fn main() -> Result<()> {
         warn!("no netdev packet transport on this platform; LACP/STP/snooping run partnerless");
     }
 
-    info!(%listen, "hemlock-orch serving gRPC (lacp + stp + snooping engines up)");
+    info!(%listen, "hemlock-orch serving gRPC (lacp + stp + snooping + lldp engines up)");
     let service = OrchService {
         engine,
         stp: stp_engine,
+        lldp: lldp_engine,
         igmp: igmp_engine,
         mld: mld_engine,
         rib: rib_engine,
@@ -892,6 +995,16 @@ async fn resolve_system_mac(syncd: &IpcEndpoint) -> [u8; 6] {
     }
     warn!("cannot resolve the switch base MAC from syncd; using a locally administered id");
     [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
+}
+
+/// The switch's configured hostname, for the LLDP system-name TLV.
+fn hostname() -> String {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "hemlock".to_string())
 }
 
 fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -1173,6 +1286,7 @@ async fn watch_vlans(
     mld: snoop::Engine,
     rib: rib::Engine,
     snoopsec: snoopsec::Engine,
+    lldp_engine: lldp::Engine,
 ) {
     loop {
         if let Ok(channel) = syncd.connect().await {
@@ -1182,6 +1296,42 @@ async fn watch_vlans(
                 .await
             {
                 let response = response.into_inner();
+                // LLDP: every front-panel port is a candidate (the
+                // engine applies the global/per-port disables), and the
+                // advertised identity comes from the same view.
+                lldp_engine.set_ports(
+                    response
+                        .interfaces
+                        .iter()
+                        .filter(|i| i.kind == "ethernet")
+                        .map(|i| {
+                            (
+                                i.name.clone(),
+                                lldp::PortInfo {
+                                    mac: parse_mac(&i.mac).unwrap_or_default(),
+                                    description: i.description.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                );
+                lldp_engine.set_system(lldp::System {
+                    chassis_mac: response
+                        .interfaces
+                        .iter()
+                        .find(|i| i.kind == "ethernet" && !i.mac.is_empty())
+                        .and_then(|i| parse_mac(&i.mac))
+                        .unwrap_or_default(),
+                    name: hostname(),
+                    description: format!("Hemlock NOS version {}", hemlock_common::VERSION),
+                    management_address: response
+                        .interfaces
+                        .iter()
+                        .find(|i| i.kind == "management")
+                        .and_then(|i| i.ip_addresses.first())
+                        .map(|cidr| cidr.split('/').next().unwrap_or(cidr).to_string())
+                        .unwrap_or_default(),
+                });
                 // The RIB engine's ASIC L3 interface set: routed ports
                 // and SVIs, i.e. anything with an interface address.
                 let l3: std::collections::BTreeSet<String> = response
@@ -1436,9 +1586,10 @@ async fn watch_links(
     syncd: IpcEndpoint,
     links: tokio::sync::mpsc::UnboundedSender<lacp::LinkEvent>,
     stp_links: tokio::sync::mpsc::UnboundedSender<stp::LinkEvent>,
+    lldp_links: tokio::sync::mpsc::UnboundedSender<lldp::LinkEvent>,
 ) {
     loop {
-        match follow_links(&syncd, &links, &stp_links).await {
+        match follow_links(&syncd, &links, &stp_links, &lldp_links).await {
             Ok(()) => {}
             Err(e) => warn!(error = %e, "syncd link watch lost; reconnecting"),
         }
@@ -1450,6 +1601,7 @@ async fn follow_links(
     syncd: &IpcEndpoint,
     links: &tokio::sync::mpsc::UnboundedSender<lacp::LinkEvent>,
     stp_links: &tokio::sync::mpsc::UnboundedSender<stp::LinkEvent>,
+    lldp_links: &tokio::sync::mpsc::UnboundedSender<lldp::LinkEvent>,
 ) -> Result<()> {
     let channel = syncd.connect().await?;
     let mut client = pb::syncd_client::SyncdClient::new(channel);
@@ -1465,9 +1617,13 @@ async fn follow_links(
             up,
         });
         let _ = stp_links.send(stp::LinkEvent {
-            port: port.name,
+            port: port.name.clone(),
             up,
             speed_mbps: port.speed_mbps,
+        });
+        let _ = lldp_links.send(lldp::LinkEvent {
+            port: port.name,
+            up,
         });
     }
     let mut stream = client
@@ -1481,9 +1637,13 @@ async fn follow_links(
             up,
         });
         let _ = stp_links.send(stp::LinkEvent {
-            port: event.name,
+            port: event.name.clone(),
             up,
             speed_mbps: 0,
+        });
+        let _ = lldp_links.send(lldp::LinkEvent {
+            port: event.name,
+            up,
         });
     }
     Ok(())

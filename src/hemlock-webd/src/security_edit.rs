@@ -16,7 +16,7 @@ use serde::Deserialize;
 const ACL_FAMILIES: &[&str] = &["ipv4", "ipv6", "mac"];
 
 const COPP_CLASSES: &[&str] = &[
-    "bpdu", "lacp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
+    "bpdu", "lacp", "lldp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
     "acl-log", "default",
 ];
 

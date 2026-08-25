@@ -1,0 +1,10 @@
+LLDP is enabled
+Tx interval: 30s   Hold multiplier: 4 (TTL 120s)
+Chassis ID: 2c:dd:e9:4a:1b:00   System name: hemlock
+
+Port   State     Tx      Rx      Discarded  Ageouts  Neighbors
+-----  --------  ------  ------  ---------  -------  ---------
+Et1    enabled   18822   18790   0          1        1
+Et2    enabled   18821   18811   0          0        1
+Et3    disabled  0       0       0          0        0
+Et49   enabled   18822   18822   0          0        1

@@ -2,6 +2,7 @@ Class     Rate (pps)  Burst  Conforming     Dropped
 --------  ----------  -----  -------------  --------
 bpdu *    512         128    182331         0
 lacp      1000        256    92110          0
+lldp      512         128    37640          0
 eapol     256         64     412            0
 igmp      1000        256    55019          12
 mld       1000        256    1044           0

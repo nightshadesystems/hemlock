@@ -19,6 +19,7 @@ mod maint;
 mod qos_edit;
 mod routing_edit;
 mod security_edit;
+mod services_edit;
 mod switching_edit;
 mod tls;
 mod users;

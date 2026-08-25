@@ -78,6 +78,15 @@ pub const COPP_CLASSES: &[CoppClassDef] = &[
         traps: &[(TrapKind::Lacp, true)],
     },
     CoppClassDef {
+        // LLDP frames feed orch's native engine; a punt (not a copy),
+        // since a neighbor discovery frame has no business being
+        // forwarded on.
+        name: "lldp",
+        rate: 512,
+        burst: 128,
+        traps: &[(TrapKind::Lldp, true)],
+    },
+    CoppClassDef {
         name: "eapol",
         rate: 256,
         burst: 64,

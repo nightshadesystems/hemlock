@@ -1,0 +1,26 @@
+Interface Et1 detected 1 LLDP neighbor:
+
+  Neighbor b8:27:eb:41:0a:04 age 9 seconds
+  Chassis ID     : b8:27:eb:41:0a:04 (MAC address)
+  Port ID        : eth0 (interface name)
+  System Name    : access-ap-04
+  TTL            : 120 seconds
+
+Interface Et2 detected 1 LLDP neighbor:
+
+  Neighbor 00:1c:73:0c:aa:33 age 21 seconds
+  Chassis ID     : 00:1c:73:0c:aa:33 (MAC address)
+  Port ID        : LAN (interface name)
+  System Name    : printer-3rdfloor
+  TTL            : 120 seconds
+
+Interface Et49 detected 1 LLDP neighbor:
+
+  Neighbor 2c:dd:e9:77:00:0c age 12 seconds
+  Chassis ID     : 2c:dd:e9:77:00:0c (MAC address)
+  Port ID        : Ethernet12 (interface name)
+  Port Description : uplink to hemlock
+  System Name    : core-sw-01
+  System Description : Arista Networks EOS version 4.32.1F
+  Management Address : 10.42.0.12
+  TTL            : 120 seconds

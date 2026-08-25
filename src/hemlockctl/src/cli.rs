@@ -337,6 +337,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
                 "port-security",
                 "dhcp",
                 "dot1x",
+                "lldp",
             ];
             match words.get(1).map(|w| resolve(w, clear_topics)).transpose()? {
                 Some("arp") => {
@@ -361,6 +362,9 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
                 }
                 Some("dot1x") => {
                     crate::security::cmd::clear_dot1x(&endpoints.orch, &words[2..]).await?;
+                }
+                Some("lldp") => {
+                    crate::services::cmd::clear_lldp(&endpoints.orch, &words[2..]).await?;
                 }
                 _ => crate::switching::cmd::clear(&endpoints.syncd, &words[1..]).await?,
             }
@@ -415,6 +419,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show qos wred                          WRED/ECN profiles");
             println!("  show qos interface <port>              one port's classification + queues");
             println!("  show qos interfaces                    per-port QoS summary");
+            println!("  show lldp [neighbors [detail]]         LLDP settings and neighbors");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -424,6 +429,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  clear port-security [interface <port>] reset learned MACs / errdisable");
             println!("  clear dhcp snooping binding [<mac>]    drop dynamic snooping bindings");
             println!("  clear dot1x interface <port>           force 802.1X reauthentication");
+            println!("  clear lldp counters                    baseline LLDP frame counters");
             println!("  configure | conf                       enter configuration mode");
             println!("  upgrade <image.bin> [force] [reboot]   install an OS image (via mgmtd)");
             println!("  bash                                   drop to the Linux shell");
@@ -519,8 +525,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "dot1x",
         "dhcp",
         "qos",
+        "lldp",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -598,6 +605,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "dot1x" => crate::security::cmd::show_dot1x(&endpoints.orch, &words[1..]).await,
             "dhcp" => crate::security::cmd::show_dhcp(&endpoints.orch, &words[1..]).await,
             "qos" => crate::qos::cmd::show(&endpoints.syncd, &words[1..]).await,
+            "lldp" => crate::services::cmd::show_lldp(&endpoints.orch, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -744,7 +752,11 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces <port> access-group <name> <in|out>");
             println!("  set interfaces <port> port-security [maximum <1-1024>|violation <protect|shutdown>]");
             println!("  set interfaces <port> dot1x");
+            println!("  set interfaces <port> lldp disable            LLDP is on by default");
             println!("  set interfaces <port|Po> dhcp-snooping trust | arp-inspection trust");
+            println!(
+                "  set services lldp [disable | tx-interval <5-300> | hold-multiplier <2-10>]"
+            );
             println!("  set qos map dscp-to-tc dscp <0-63|list|range> tc <0-7>");
             println!("  set qos map cos-to-tc cos <0-7|list> tc <0-7>");
             println!("  set qos map tc-to-dscp tc <0-7> dscp <0-63>");
@@ -769,13 +781,14 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             );
             println!("                            channel-group|lacp|spanning-tree|storm-control|min-links|");
             println!("                            access-group|port-security|dot1x|dhcp-snooping|");
-            println!("                            arp-inspection|qos ...]");
+            println!("                            arp-inspection|lldp|qos ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
             println!("  delete routing [static [<prefix> [<next-hop>]] | arp [<ip>]]");
             println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
             println!("  delete switching [mac-table|mirror ...]");
             println!("  delete security [acl|copp|dot1x|dhcp-snooping|arp-inspection ...]");
+            println!("  delete services [lldp [disable|tx-interval|hold-multiplier]]");
             println!("  delete qos [map [<table> [<key> <value>]] | wred-profile <name> [...]]");
             println!("  show                      show the candidate configuration");
             println!(
@@ -801,7 +814,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
     let verb = if delete { "delete" } else { "set" };
     let Some(top) = words.first() else {
         return Err(format!(
-            "% Usage: {verb} <interfaces|system|routing|vlans|protocols|switching|security|qos> ..."
+            "% Usage: {verb} <interfaces|system|routing|vlans|protocols|switching|security|services|qos> ..."
         ));
     };
     match resolve(
@@ -814,6 +827,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
             "protocols",
             "switching",
             "security",
+            "services",
             "qos",
         ],
     )? {
@@ -824,6 +838,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
         "protocols" => config_protocols(endpoints, &words[1..], delete).await,
         "switching" => config_switching(endpoints, &words[1..], delete).await,
         "security" => config_security(endpoints, &words[1..], delete).await,
+        "services" => config_services(endpoints, &words[1..], delete).await,
         "qos" => config_qos(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
@@ -832,7 +847,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
 /// The compiled CoPP class names — completion and validation offer
 /// exactly these (the full table with default rates lives in syncd).
 const COPP_CLASSES: &[&str] = &[
-    "bpdu", "lacp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
+    "bpdu", "lacp", "lldp", "eapol", "igmp", "mld", "arp", "dhcp", "ospf", "bgp", "vrrp", "ip2me",
     "acl-log", "default",
 ];
 
@@ -2689,6 +2704,7 @@ async fn config_interfaces(
             "dhcp-snooping",
             "arp-inspection",
             "qos",
+            "lldp",
         ],
     )?;
     // SVIs carry an address (and, with the routing suite, VRRP groups)
@@ -2700,6 +2716,9 @@ async fn config_interfaces(
         }
         if subcommand == "qos" {
             return Err("% QoS is a front-panel concept; configure it on the physical port".into());
+        }
+        if subcommand == "lldp" {
+            return Err(format!("% {port}: lldp is a physical-port setting"));
         }
         if !matches!(subcommand, "address" | "vrrp" | "mtu") {
             return Err(format!(
@@ -2730,6 +2749,9 @@ async fn config_interfaces(
             "% {subcommand} is not supported on management ports"
         ));
     }
+    if port.starts_with("Management") && subcommand == "lldp" {
+        return Err(format!("% {port}: lldp is a physical-port setting"));
+    }
     let is_lag = port.starts_with("Port-Channel");
     if is_lag && subcommand == "mtu" {
         return Err("% mtu follows the member ports; set it on those".into());
@@ -2743,6 +2765,11 @@ async fn config_interfaces(
         return Err(format!(
             "% {subcommand} is not supported on port-channel interfaces"
         ));
+    }
+    // LLDP and sFlow run below a LAG: the members carry them, the
+    // Port-Channel interface has no wire of its own.
+    if is_lag && subcommand == "lldp" {
+        return Err(format!("% {port}: lldp is a physical-port setting"));
     }
     if !is_lag && subcommand == "min-links" {
         return Err("% min-links is only supported on port-channel interfaces".into());
@@ -2773,6 +2800,33 @@ async fn config_interfaces(
                     ConfigTree::remove_leaf(eth, "dot1x");
                 } else {
                     ConfigTree::set_leaf(eth, "dot1x", vec![]);
+                }
+            })
+            .await
+            .map_err(fmt_err);
+        }
+        "lldp" => {
+            // LLDP is on by default; `disable` is the only spelling.
+            match rest.get(1) {
+                Some(word) => {
+                    if resolve(word, &["med"]).is_ok() {
+                        return Err("% LLDP-MED TLVs are not supported".into());
+                    }
+                    resolve(word, &["disable"])?;
+                    if let Some(extra) = rest.get(2) {
+                        return Err(format!("% Invalid input: {extra:?}"));
+                    }
+                }
+                None if !delete => {
+                    return Err(format!("% Usage: set interfaces {port} lldp disable"));
+                }
+                None => {}
+            }
+            return edit_interface(endpoints, &port, move |eth| {
+                if delete {
+                    ConfigTree::remove_leaf(eth, "lldp");
+                } else {
+                    ConfigTree::set_leaf(eth, "lldp", vec!["disable".into()]);
                 }
             })
             .await
@@ -4884,6 +4938,123 @@ async fn config_snooping(
                 }
                 _ => unreachable!(),
             }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete services <lldp> ...` — the network-services families.
+async fn config_services(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            ConfigTree::remove_block(&mut tree.items, "services", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(format!("% Usage: {verb} services <lldp> ..."));
+    };
+    // Deferred by this suite, rejected at parse rather than ignored.
+    if resolve(first, &["ptp"]).is_ok() {
+        return Err("% PTP/1588 is not supported".into());
+    }
+    match resolve(first, &["lldp"])? {
+        "lldp" => config_lldp(endpoints, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete services lldp [disable | tx-interval <5-300> |
+/// hold-multiplier <2-10>]`. LLDP runs by default, so `disable` is the
+/// only on/off spelling.
+async fn config_lldp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} services lldp [disable | tx-interval <5-300> | hold-multiplier <2-10>]"
+        )
+    };
+    let edit_lldp = |edit: BlockEdit| async move {
+        edit_config(endpoints, move |tree| {
+            let services = tree.block_mut("services");
+            let block = ConfigTree::ensure_block(services, "lldp", &[]);
+            edit(block);
+        })
+        .await
+        .map_err(fmt_err)
+    };
+    let delete_in_lldp = |edit: BlockEdit| async move {
+        edit_config(endpoints, move |tree| {
+            let services = tree.block_mut("services");
+            if let Some(block) = block_children_mut(services, "lldp") {
+                edit(block);
+                if block.is_empty() {
+                    ConfigTree::remove_block(services, "lldp", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "services");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if words.is_empty() {
+        return if delete {
+            delete_in_lldp(Box::new(|block| block.clear())).await
+        } else {
+            Err(usage())
+        };
+    }
+    // LLDP-MED is explicitly out of scope.
+    if resolve(words[0], &["med"]).is_ok() {
+        return Err("% LLDP-MED TLVs are not supported".into());
+    }
+    match resolve(words[0], &["disable", "tx-interval", "hold-multiplier"])? {
+        "disable" => {
+            if words.len() > 1 {
+                return Err(format!("% Invalid input: {:?}", words[1]));
+            }
+            if delete {
+                delete_in_lldp(Box::new(|block| ConfigTree::remove_leaf(block, "disable"))).await
+            } else {
+                edit_lldp(Box::new(|block| {
+                    ConfigTree::set_leaf(block, "disable", vec![]);
+                }))
+                .await
+            }
+        }
+        leaf @ ("tx-interval" | "hold-multiplier") => {
+            let name = leaf.to_string();
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                return delete_in_lldp(Box::new(move |block| {
+                    ConfigTree::remove_leaf(block, &name);
+                }))
+                .await;
+            }
+            let Some(raw) = words.get(1) else {
+                return Err(usage());
+            };
+            if words.len() > 2 {
+                return Err(format!("% Invalid input: {:?}", words[2]));
+            }
+            let value = if leaf == "tx-interval" {
+                int_arg(raw, 5..=300u16, "tx-interval")?.to_string()
+            } else {
+                int_arg(raw, 2..=10u8, "hold-multiplier")?.to_string()
+            };
+            edit_lldp(Box::new(move |block| {
+                ConfigTree::set_leaf(block, &name, vec![value]);
+            }))
+            .await
         }
         _ => unreachable!(),
     }

@@ -1,0 +1,85 @@
+{
+  "lldp": {
+    "chassis_id": "2c:dd:e9:4a:1b:00",
+    "enabled": true,
+    "hold_multiplier": 4,
+    "management_address": "10.42.0.9",
+    "ports": [
+      {
+        "ageouts": 1,
+        "enabled": true,
+        "frames_discarded": 0,
+        "frames_rx": 18790,
+        "frames_tx": 18822,
+        "neighbors": [
+          {
+            "age_secs": 9,
+            "chassis_id": "b8:27:eb:41:0a:04",
+            "chassis_id_subtype": "mac",
+            "port": "Ethernet1",
+            "port_id": "eth0",
+            "port_id_subtype": "interface-name",
+            "system_name": "access-ap-04",
+            "ttl": 120
+          }
+        ],
+        "port": "Ethernet1"
+      },
+      {
+        "ageouts": 0,
+        "enabled": true,
+        "frames_discarded": 0,
+        "frames_rx": 18811,
+        "frames_tx": 18821,
+        "neighbors": [
+          {
+            "age_secs": 21,
+            "chassis_id": "00:1c:73:0c:aa:33",
+            "chassis_id_subtype": "mac",
+            "port": "Ethernet2",
+            "port_id": "LAN",
+            "port_id_subtype": "interface-name",
+            "system_name": "printer-3rdfloor",
+            "ttl": 120
+          }
+        ],
+        "port": "Ethernet2"
+      },
+      {
+        "ageouts": 0,
+        "enabled": false,
+        "frames_discarded": 0,
+        "frames_rx": 0,
+        "frames_tx": 0,
+        "neighbors": [],
+        "port": "Ethernet3"
+      },
+      {
+        "ageouts": 0,
+        "enabled": true,
+        "frames_discarded": 0,
+        "frames_rx": 18822,
+        "frames_tx": 18822,
+        "neighbors": [
+          {
+            "age_secs": 12,
+            "chassis_id": "2c:dd:e9:77:00:0c",
+            "chassis_id_subtype": "mac",
+            "management_address": "10.42.0.12",
+            "port": "Ethernet49",
+            "port_description": "uplink to hemlock",
+            "port_id": "Ethernet12",
+            "port_id_subtype": "interface-name",
+            "system_description": "Arista Networks EOS version 4.32.1F",
+            "system_name": "core-sw-01",
+            "ttl": 120
+          }
+        ],
+        "port": "Ethernet49"
+      }
+    ],
+    "system_description": "Hemlock NOS version 0.1.0",
+    "system_name": "hemlock",
+    "tx_interval": 30
+  }
+}

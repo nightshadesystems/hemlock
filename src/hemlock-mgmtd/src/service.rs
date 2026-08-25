@@ -615,6 +615,15 @@ impl Engine {
                 .context("pushing STP config to orch")?;
         }
 
+        // LLDP: the whole wanted state to the orch engine, which owns
+        // the advertisement timers and the neighbor table.
+        let lldp_change = intents::diff_lldp(&running_intents, &wanted_intents);
+        if let Some(lldp) = &lldp_change {
+            self.push_lldp_config(lldp)
+                .await
+                .context("pushing lldp config to orch")?;
+        }
+
         // Snooping: the full family state to the orch engines (which
         // drive the L2MC programming back into syncd).
         if let Some(snooping) = &igmp_change {
@@ -698,6 +707,9 @@ impl Engine {
         }
         if mld_change.is_some() {
             described.push("mld-snooping configuration updated".into());
+        }
+        if lldp_change.is_some() {
+            described.push("lldp configuration updated".into());
         }
         described.extend(mac_changes.describe());
         described.extend(storm_changes.iter().map(intents::StormChange::describe));
@@ -845,6 +857,21 @@ impl Engine {
             })
             .await
             .context("SetSnoopingConfig")?;
+        Ok(())
+    }
+
+    /// Push the whole wanted LLDP state to orch.
+    async fn push_lldp_config(&self, wanted: &intents::LldpState) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_lldp_config(pb::SetLldpConfigRequest {
+                disabled: wanted.global.disabled,
+                tx_interval: u32::from(wanted.global.tx_interval.unwrap_or(0)),
+                hold_multiplier: u32::from(wanted.global.hold_multiplier.unwrap_or(0)),
+                disabled_ports: wanted.disabled_ports.clone(),
+            })
+            .await
+            .context("SetLldpConfig")?;
         Ok(())
     }
 
@@ -1230,6 +1257,9 @@ fn needs_syncd_replay(running: &Intents) -> bool {
         || !intents::port_security_state(running).is_empty()
         || intents::dot1x_state(running) != intents::Dot1xState::default()
         || intents::snoopsec_state(running) != intents::SnoopSecState::default()
+        // The services families are orch-owned and can be entirely
+        // global (LLDP timers touch no interface at all).
+        || intents::lldp_state(running) != intents::LldpState::default()
 }
 
 fn qos_maps_request(maps: &intents::QosMapsIntent) -> pb::SetQosMapsRequest {
@@ -1406,6 +1436,17 @@ impl Engine {
             self.push_stp_config(&stp_state)
                 .await
                 .context("replaying STP config to orch")?;
+            applied += 1;
+        }
+
+        // LLDP replays to orch whenever the running config says
+        // anything about it (an all-defaults config needs no push:
+        // that is what the engine already runs).
+        let lldp_state = intents::lldp_state(&running);
+        if lldp_state != intents::LldpState::default() {
+            self.push_lldp_config(&lldp_state)
+                .await
+                .context("replaying lldp config to orch")?;
             applied += 1;
         }
 
@@ -1858,6 +1899,8 @@ queue 7 { priority strict } } }
 ",
             "qos { map { dscp-to-tc { dscp 46 tc 5 } } }
 ",
+            "services { lldp { tx-interval 15 } }
+",
         );
         let running = intents_of(text);
         assert!(needs_syncd_replay(&running));
@@ -1876,5 +1919,19 @@ queue 7 { priority strict } } }
         );
         assert_ne!(running.qos_maps, intents::QosMapsIntent::default());
         assert!(!intents::port_qos_state(&running).is_empty());
+        assert_ne!(intents::lldp_state(&running), intents::LldpState::default());
+    }
+
+    /// LLDP is orch-owned and entirely global-capable, so it gates the
+    /// replay on its own — a restart must not silently revert the
+    /// timers to the engine defaults.
+    #[test]
+    fn services_only_configs_still_replay() {
+        assert!(needs_syncd_replay(&intents_of(
+            "services { lldp { disable } }"
+        )));
+        assert!(needs_syncd_replay(&intents_of(
+            "interfaces { Ethernet3 { lldp disable } }"
+        )));
     }
 }

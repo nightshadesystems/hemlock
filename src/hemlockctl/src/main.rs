@@ -17,6 +17,7 @@ mod platform;
 mod qos;
 mod routing;
 mod security;
+mod services;
 mod show;
 mod switching;
 mod upgrade;

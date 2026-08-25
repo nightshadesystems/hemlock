@@ -18,6 +18,14 @@
         "rate": 1000
       },
       {
+        "burst": 128,
+        "class": "lldp",
+        "conforming": 37640,
+        "dropped": 0,
+        "overridden": false,
+        "rate": 512
+      },
+      {
         "burst": 64,
         "class": "eapol",
         "conforming": 412,

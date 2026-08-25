@@ -78,6 +78,9 @@ pub struct Intents {
     /// dhcp-snooping ... arp-inspection ... }`; per-port trust flags
     /// live on the port intents).
     pub snoop_sec: SnoopSecIntent,
+    /// LLDP (`services { lldp { ... } }`; per-port disables live on
+    /// the port intents).
+    pub lldp: LldpIntent,
     /// The four global QoS maps (`qos { map { ... } }`).
     pub qos_maps: QosMapsIntent,
     /// Named WRED/ECN profiles (`qos { wred-profile <name> { ... } }`).
@@ -241,6 +244,8 @@ pub struct InterfaceIntent {
     pub arp_inspection_trust: bool,
     /// `qos { ... }`: classification, scheduling, shaping, WRED.
     pub qos: Option<PortQosIntent>,
+    /// `lldp disable`: LLDP runs on every port by default.
+    pub lldp_disabled: bool,
     /// `speed <mbps>`: pinned line rate. None = `speed auto` or no
     /// leaf at all, which are the same thing to the ASIC.
     pub speed_mbps: Option<u32>,
@@ -429,6 +434,17 @@ pub struct SnoopVlanIntent {
     pub querier_address: Option<String>,
     /// Static mrouter ports, sorted.
     pub mrouters: Vec<String>,
+}
+
+/// Global LLDP config (`services { lldp { ... } }`). LLDP runs by
+/// default; `disable` is the off switch, exactly like snooping.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LldpIntent {
+    pub disabled: bool,
+    /// Seconds between advertisements; None = default (30).
+    pub tx_interval: Option<u16>,
+    /// TTL multiplier; None = default (4).
+    pub hold_multiplier: Option<u8>,
 }
 
 /// `switching { mac-table { ... } }`.
@@ -889,6 +905,15 @@ pub enum IntentError {
     #[error("security arp-inspection: {0}")]
     BadArpInspection(String),
 
+    #[error("services: {0}")]
+    BadServices(String),
+
+    #[error("services lldp: {0}")]
+    BadLldp(String),
+
+    #[error("{name}: {feature} is a physical-port setting")]
+    PortServiceOnNonPort { name: String, feature: &'static str },
+
     #[error("qos: {0}")]
     BadQos(String),
 
@@ -924,6 +949,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
     protocols(tree, &mut intents)?;
     switching(tree, &mut intents)?;
     security(tree, &mut intents)?;
+    services(tree, &mut intents)?;
     qos(tree, &mut intents)?;
     let Some((_, items)) = tree.block("interfaces") else {
         finish_validation(&mut intents)?;
@@ -1022,6 +1048,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         "trust",
                     ),
                     qos: port_qos(children, &ifname)?,
+                    lldp_disabled: port_lldp(children, &ifname)?,
                     speed_mbps: speed(children, &ifname)?,
                     duplex: duplex(children, &ifname)?,
                     mtu: mtu(children, &ifname)?,
@@ -1063,6 +1090,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         "{ifname}: dot1x runs on physical ports only"
                     )));
                 }
+                no_port_services(children, &ifname)?;
                 if ConfigTree::blocks_named(children, "port-security")
                     .next()
                     .is_some()
@@ -1142,6 +1170,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         "{ifname}: dot1x is not supported on Management"
                     )));
                 }
+                no_port_services(children, &ifname)?;
                 if ConfigTree::has_leaf(children, "access-group") {
                     return Err(IntentError::BadAccessGroup {
                         name: ifname,
@@ -1193,6 +1222,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     )));
                 }
                 no_link_pinning(children, &ifname, "VLAN interfaces")?;
+                no_port_services(children, &ifname)?;
                 let intent = SviIntent {
                     address,
                     mtu: mtu(children, &ifname)?,
@@ -2633,6 +2663,34 @@ fn no_link_pinning(children: &[Item], ifname: &str, what: &str) -> Result<(), In
 /// leaves, with the legacy `no-shutdown` and `admin-state
 /// enabled|disabled` forms still accepted for configs persisted before
 /// the format changes.
+/// `lldp disable` on one physical port. LLDP is on by default, so the
+/// only spelling is the off switch.
+fn port_lldp(children: &[Item], ifname: &str) -> Result<bool, IntentError> {
+    match ConfigTree::leaf_values(children, "lldp") {
+        None => Ok(false),
+        Some([word]) if word == "disable" => Ok(true),
+        Some(_) => Err(IntentError::BadLldp(format!(
+            "{ifname}: expected `lldp disable`"
+        ))),
+    }
+}
+
+/// The per-port service leaves are physical-port settings: SVIs,
+/// Port-Channels and management ports carry none of them. (LLDP and
+/// sFlow run below a LAG, so a Port-Channel *member* is fine — it is
+/// the Port-Channel interface itself that has no wire.)
+fn no_port_services(children: &[Item], ifname: &str) -> Result<(), IntentError> {
+    for feature in ["lldp"] {
+        if ConfigTree::has_leaf(children, feature) {
+            return Err(IntentError::PortServiceOnNonPort {
+                name: ifname.to_string(),
+                feature,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn admin_state(children: &[Item], name: &str) -> Result<Option<bool>, IntentError> {
     let shutdown = ConfigTree::has_leaf(children, "shutdown");
     let no_shutdown = ConfigTree::has_phrase(children, "no", "shutdown")
@@ -3656,6 +3714,64 @@ fn snooping(items: &[Item], family: &'static str) -> Result<SnoopingIntent, Inte
     Ok(intent)
 }
 
+/// `services { lldp { ... } }` — the network-services families.
+fn services(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
+    let Some((_, items)) = tree.block("services") else {
+        return Ok(());
+    };
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadServices(format!(
+                "unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        if !keys.is_empty() {
+            return Err(IntentError::BadServices(format!(
+                "unrecognized block {name:?}"
+            )));
+        }
+        match name.as_str() {
+            "lldp" => intents.lldp = lldp(children)?,
+            other => {
+                return Err(IntentError::BadServices(format!(
+                    "unrecognized block {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `services { lldp { disable; tx-interval <s>; hold-multiplier <n> } }`.
+fn lldp(items: &[Item]) -> Result<LldpIntent, IntentError> {
+    let bad = IntentError::BadLldp;
+    for item in items {
+        let Item::Leaf { name, .. } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        if !matches!(name.as_str(), "disable" | "tx-interval" | "hold-multiplier") {
+            return Err(bad(format!("unrecognized statement {name:?}")));
+        }
+    }
+    Ok(LldpIntent {
+        disabled: ConfigTree::has_leaf(items, "disable"),
+        tx_interval: match ConfigTree::leaf_value(items, "tx-interval") {
+            Some(value) => Some(parse_int(value, 5u16..=300, "tx-interval").map_err(bad)?),
+            None => None,
+        },
+        hold_multiplier: match ConfigTree::leaf_value(items, "hold-multiplier") {
+            Some(value) => Some(parse_int(value, 2u8..=10, "hold-multiplier").map_err(bad)?),
+            None => None,
+        },
+    })
+}
+
 /// `switching { mac-table { ... } mirror { ... } }`.
 fn switching(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
     let Some((_, items)) = tree.block("switching") else {
@@ -4651,6 +4767,36 @@ pub fn diff_snooping(
     candidate: &SnoopingIntent,
 ) -> Option<SnoopingIntent> {
     (running != candidate).then(|| candidate.clone())
+}
+
+/// The full wanted LLDP state: the global block plus the ports that
+/// carry `lldp disable`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LldpState {
+    pub global: LldpIntent,
+    /// Physical ports with LLDP turned off, sorted.
+    pub disabled_ports: Vec<String>,
+}
+
+/// Assemble the LLDP state from one intent set.
+pub fn lldp_state(intents: &Intents) -> LldpState {
+    LldpState {
+        global: intents.lldp.clone(),
+        disabled_ports: intents
+            .ports
+            .iter()
+            .filter(|(_, port)| port.lldp_disabled)
+            .map(|(name, _)| name.clone())
+            .collect(),
+    }
+}
+
+/// LLDP delta: the full wanted state exactly when it changed (orch
+/// consumes whole states, not edits).
+pub fn diff_lldp(running: &Intents, candidate: &Intents) -> Option<LldpState> {
+    let now = lldp_state(running);
+    let want = lldp_state(candidate);
+    (now != want).then_some(want)
 }
 
 /// The default MAC-table aging time (seconds).
@@ -6420,6 +6566,138 @@ switching {
             extract(&tree),
             Err(IntentError::BadStormControl { .. })
         ));
+    }
+
+    /// LLDP: defaults on, `disable` as the off switch, timers in
+    /// range, and every rejection in the spec.
+    /// The services suite's seed block (its LLDP half), round-tripped
+    /// through the serializer and re-extracted.
+    #[test]
+    fn services_seed_round_trips_and_extracts() {
+        let text = r#"
+services {
+    lldp {
+        tx-interval 30;
+        hold-multiplier 4;
+    }
+}
+interfaces {
+    Ethernet3 {
+        lldp disable;
+    }
+}
+"#;
+        let tree = parse(text).unwrap();
+        assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+        let intents = extract(&tree).unwrap();
+        assert_eq!(
+            intents.lldp,
+            LldpIntent {
+                disabled: false,
+                tx_interval: Some(30),
+                hold_multiplier: Some(4),
+            }
+        );
+        assert_eq!(lldp_state(&intents).disabled_ports, ["Ethernet3"]);
+    }
+
+    #[test]
+    fn lldp_validation() {
+        // Absent block = defaults, LLDP running.
+        assert_eq!(intents_of("").lldp, LldpIntent::default());
+        assert!(!intents_of("").lldp.disabled);
+
+        let intents = intents_of(
+            "services { lldp { tx-interval 45
+hold-multiplier 3 } }",
+        );
+        assert_eq!(
+            intents.lldp,
+            LldpIntent {
+                disabled: false,
+                tx_interval: Some(45),
+                hold_multiplier: Some(3),
+            }
+        );
+        assert!(intents_of("services { lldp { disable } }").lldp.disabled);
+
+        for text in [
+            "services { lldp { tx-interval 4 } }",
+            "services { lldp { tx-interval 301 } }",
+            "services { lldp { hold-multiplier 1 } }",
+            "services { lldp { hold-multiplier 11 } }",
+            "services { lldp { tx-interval banana } }",
+        ] {
+            let tree = parse(text).unwrap();
+            assert!(
+                matches!(extract(&tree), Err(IntentError::BadLldp(_))),
+                "{text} should be rejected"
+            );
+        }
+        // Unknown statements inside the block and unknown services.
+        let tree = parse("services { lldp { med } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadLldp(_))));
+        let tree = parse("services { ptp { } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadServices(_))));
+
+        // Per-port: `lldp disable` on physical ports only, Po members
+        // included (LLDP runs below the LAG).
+        let intents = intents_of(
+            "interfaces { Ethernet3 { lldp disable }
+Ethernet4 { channel-group 1 mode active
+lldp disable } }",
+        );
+        assert!(intents.ports["Ethernet3"].lldp_disabled);
+        assert!(intents.ports["Ethernet4"].lldp_disabled);
+        assert!(!intents_of("interfaces { Ethernet1 { } }").ports["Ethernet1"].lldp_disabled);
+        let tree = parse("interfaces { Ethernet1 { lldp enable } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadLldp(_))));
+        for name in ["Vlan99", "Port-Channel1", "Management1"] {
+            let tree = parse(&format!(
+                "vlans {{ vlan 99 {{ }} }}
+interfaces {{ {name} {{ lldp disable }} }}"
+            ))
+            .unwrap();
+            assert!(
+                matches!(
+                    extract(&tree),
+                    Err(IntentError::PortServiceOnNonPort {
+                        feature: "lldp",
+                        ..
+                    })
+                ),
+                "{name} should reject a per-port lldp leaf"
+            );
+        }
+        assert_eq!(
+            IntentError::PortServiceOnNonPort {
+                name: "Vlan99".into(),
+                feature: "lldp",
+            }
+            .to_string(),
+            "Vlan99: lldp is a physical-port setting"
+        );
+    }
+
+    /// The LLDP state is the global block plus the disabled ports, and
+    /// it diffs as one whole (orch consumes whole states).
+    #[test]
+    fn lldp_state_and_diff() {
+        let running = intents_of("");
+        assert_eq!(lldp_state(&running), LldpState::default());
+        assert_eq!(diff_lldp(&running, &running), None);
+
+        let candidate = intents_of(
+            "services { lldp { tx-interval 15 } }
+interfaces { Ethernet3 { lldp disable }
+Ethernet1 { } }",
+        );
+        let change = diff_lldp(&running, &candidate).unwrap();
+        assert_eq!(change.global.tx_interval, Some(15));
+        assert_eq!(change.disabled_ports, ["Ethernet3"]);
+        // Removing the whole block reverts to the engine defaults.
+        let change = diff_lldp(&candidate, &running).unwrap();
+        assert_eq!(change, LldpState::default());
     }
 
     #[test]

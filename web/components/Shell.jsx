@@ -11,6 +11,7 @@ const TABS = [
   { label: 'Routing', href: '/routing/routes/', root: '/routing' },
   { label: 'Security', href: '/security/acls/', root: '/security' },
   { label: 'QoS', href: '/qos/maps/', root: '/qos' },
+  { label: 'Services', href: '/services/lldp/', root: '/services' },
   { label: 'System', href: '/system/general/', root: '/system' },
 ];
 
@@ -57,6 +58,12 @@ const SIDE_NAV = {
       { id: '/qos/maps/', label: 'Maps', icon: 'map' },
       { id: '/qos/wred/', label: 'WRED Profiles', icon: 'filter' },
       { id: '/qos/interfaces/', label: 'Interfaces', icon: 'bar-chart' },
+    ],
+  },
+  '/services': {
+    label: 'Services',
+    items: [
+      { id: '/services/lldp/', label: 'LLDP', icon: 'nodes' },
     ],
   },
   '/system': {
