@@ -13,8 +13,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use hemlock_platform::Platform;
 use hemlock_sai::{
     AclAction, AclFamily, AclFields, AclStage, FdbAction, FdbEventKind, IpPrefix, Oid, PolicerSpec,
-    PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities,
-    SaiError, SaiEvent, StormClass, StpPortState, SwitchInfo, TrapKind,
+    PolicerStats, PortCounters, PortId, QosMapType, QueueCounters, RouteTarget, SaiBackend,
+    SaiCapabilities, SaiError, SaiEvent, SchedulerSpec, StormClass, StpPortState, SwitchInfo,
+    TrapKind, WredSpec,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -340,6 +341,69 @@ pub enum SaiCmd {
         policer: Option<Oid>,
         reply: oneshot::Sender<Result<(), SaiError>>,
     },
+    CreateQosMap {
+        kind: QosMapType,
+        entries: Vec<(u8, u8)>,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    SetQosMap {
+        map: Oid,
+        entries: Vec<(u8, u8)>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemoveQosMap {
+        map: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortQosMapBinding {
+        port: PortId,
+        kind: QosMapType,
+        map: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortDefaultTc {
+        port: PortId,
+        tc: u8,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateScheduler {
+        spec: SchedulerSpec,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveScheduler {
+        scheduler: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    BindQueueScheduler {
+        port: PortId,
+        queue: u32,
+        scheduler: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortShaper {
+        port: PortId,
+        rate_bps: Option<u64>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    CreateWred {
+        spec: WredSpec,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    SetWred {
+        wred: Oid,
+        spec: WredSpec,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    RemoveWred {
+        wred: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    BindQueueWred {
+        port: PortId,
+        queue: u32,
+        wred: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
     SetPortLearnLimit {
         port: PortId,
         limit: Option<u32>,
@@ -410,6 +474,9 @@ pub struct SaiHandle {
     pub acls: crate::state::SharedAcls,
     pub copp: crate::state::SharedCopp,
     pub port_security: crate::state::SharedPortSecurity,
+    /// The QoS world: global maps, WRED profiles, per-port programs and
+    /// the deduplicated scheduler objects behind them.
+    pub qos: crate::state::SharedQos,
     cmd_tx: mpsc::Sender<SaiCmd>,
     pub events: broadcast::Sender<OperEvent>,
     pub fdb_events: broadcast::Sender<FdbNotify>,
@@ -955,6 +1022,118 @@ impl SaiHandle {
             .await
     }
 
+    pub async fn create_qos_map(
+        &self,
+        kind: QosMapType,
+        entries: Vec<(u8, u8)>,
+    ) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateQosMap {
+            kind,
+            entries,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_qos_map(&self, map: Oid, entries: Vec<(u8, u8)>) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetQosMap {
+            map,
+            entries,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_qos_map(&self, map: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveQosMap { map, reply }).await
+    }
+
+    pub async fn set_port_qos_map_binding(
+        &self,
+        port: PortId,
+        kind: QosMapType,
+        map: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortQosMapBinding {
+            port,
+            kind,
+            map,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_port_default_tc(&self, port: PortId, tc: u8) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortDefaultTc { port, tc, reply })
+            .await
+    }
+
+    pub async fn create_scheduler(&self, spec: SchedulerSpec) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateScheduler { spec, reply })
+            .await
+    }
+
+    pub async fn remove_scheduler(&self, scheduler: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveScheduler { scheduler, reply })
+            .await
+    }
+
+    pub async fn bind_queue_scheduler(
+        &self,
+        port: PortId,
+        queue: u32,
+        scheduler: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::BindQueueScheduler {
+            port,
+            queue,
+            scheduler,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_port_shaper(
+        &self,
+        port: PortId,
+        rate_bps: Option<u64>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortShaper {
+            port,
+            rate_bps,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn create_wred(&self, spec: WredSpec) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateWred { spec, reply }).await
+    }
+
+    pub async fn set_wred(&self, wred: Oid, spec: WredSpec) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetWred { wred, spec, reply })
+            .await
+    }
+
+    pub async fn remove_wred(&self, wred: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveWred { wred, reply }).await
+    }
+
+    pub async fn bind_queue_wred(
+        &self,
+        port: PortId,
+        queue: u32,
+        wred: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::BindQueueWred {
+            port,
+            queue,
+            wred,
+            reply,
+        })
+        .await
+    }
+
     pub async fn set_port_learn_limit(
         &self,
         port: PortId,
@@ -1167,6 +1346,73 @@ impl SaiActor {
                         SaiCmd::SetDefaultTrapGroupPolicer { policer, reply } => {
                             let _ = reply.send(backend.set_default_trap_group_policer(policer));
                         }
+                        SaiCmd::CreateQosMap {
+                            kind,
+                            entries,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.create_qos_map(kind, &entries));
+                        }
+                        SaiCmd::SetQosMap {
+                            map,
+                            entries,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_qos_map(map, &entries));
+                        }
+                        SaiCmd::RemoveQosMap { map, reply } => {
+                            let _ = reply.send(backend.remove_qos_map(map));
+                        }
+                        SaiCmd::SetPortQosMapBinding {
+                            port,
+                            kind,
+                            map,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_port_qos_map_binding(port, kind, map));
+                        }
+                        SaiCmd::SetPortDefaultTc { port, tc, reply } => {
+                            let _ = reply.send(backend.set_port_default_tc(port, tc));
+                        }
+                        SaiCmd::CreateScheduler { spec, reply } => {
+                            let _ = reply.send(backend.create_scheduler(spec));
+                        }
+                        SaiCmd::RemoveScheduler { scheduler, reply } => {
+                            let _ = reply.send(backend.remove_scheduler(scheduler));
+                        }
+                        SaiCmd::BindQueueScheduler {
+                            port,
+                            queue,
+                            scheduler,
+                            reply,
+                        } => {
+                            let _ =
+                                reply.send(backend.bind_queue_scheduler(port, queue, scheduler));
+                        }
+                        SaiCmd::SetPortShaper {
+                            port,
+                            rate_bps,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_port_shaper(port, rate_bps));
+                        }
+                        SaiCmd::CreateWred { spec, reply } => {
+                            let _ = reply.send(backend.create_wred(spec));
+                        }
+                        SaiCmd::SetWred { wred, spec, reply } => {
+                            let _ = reply.send(backend.set_wred(wred, spec));
+                        }
+                        SaiCmd::RemoveWred { wred, reply } => {
+                            let _ = reply.send(backend.remove_wred(wred));
+                        }
+                        SaiCmd::BindQueueWred {
+                            port,
+                            queue,
+                            wred,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.bind_queue_wred(port, queue, wred));
+                        }
                         SaiCmd::SetPortLearnLimit { port, limit, reply } => {
                             let _ = reply.send(backend.set_port_learn_limit(port, limit));
                         }
@@ -1361,6 +1607,7 @@ impl SaiActor {
             acls: crate::state::SharedAcls::default(),
             copp: crate::state::SharedCopp::default(),
             port_security: crate::state::SharedPortSecurity::default(),
+            qos: crate::state::SharedQos::default(),
             cmd_tx,
             events,
             fdb_events,

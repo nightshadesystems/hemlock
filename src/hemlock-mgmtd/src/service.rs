@@ -149,6 +149,64 @@ impl Engine {
                 }
             }
         }
+        // QoS capability gates: probed once so a commit needing an
+        // absent map direction, WRED/ECN, or a queue shaper fails with
+        // the platform error before anything applies. The WRED
+        // thresholds validate against the probed packet buffer here too
+        // — nothing below mgmtd knows the board's buffer size.
+        let qos_ports = intents::port_qos_state(&wanted);
+        let needs_qos_caps = !wanted.qos_maps.is_empty() || !qos_ports.is_empty();
+        if needs_qos_caps {
+            if let Ok(mut client) = self.syncd_client().await {
+                if let Ok(info) = client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
+                    let caps = info.into_inner().capabilities.unwrap_or_default();
+                    let classification = !wanted.qos_maps.dscp_to_tc.is_empty()
+                        || !wanted.qos_maps.cos_to_tc.is_empty()
+                        || qos_ports
+                            .values()
+                            .any(|qos| qos.trust != intents::QosTrust::Untrusted);
+                    if classification && !caps.qos_map_ingress {
+                        anyhow::bail!(
+                            "QoS classification maps are not supported by this platform's SAI"
+                        );
+                    }
+                    let rewrite = !wanted.qos_maps.tc_to_dscp.is_empty()
+                        || !wanted.qos_maps.tc_to_cos.is_empty();
+                    if rewrite && !caps.qos_map_egress {
+                        anyhow::bail!("QoS rewrite maps are not supported by this platform's SAI");
+                    }
+                    let queues = || qos_ports.values().flat_map(|qos| qos.queues.values());
+                    if queues().any(|queue| queue.shape.is_some()) && !caps.queue_shaper {
+                        anyhow::bail!("per-queue shapers are not supported by this platform's SAI");
+                    }
+                    let referenced: std::collections::BTreeSet<&String> = queues()
+                        .filter_map(|queue| queue.wred_profile.as_ref())
+                        .collect();
+                    if !referenced.is_empty() && !caps.wred {
+                        anyhow::bail!("WRED is not supported by this platform's SAI");
+                    }
+                    let ecn_wanted = referenced
+                        .iter()
+                        .filter_map(|name| wanted.wred_profiles.get(*name))
+                        .any(|profile| profile.ecn);
+                    if ecn_wanted && !caps.ecn {
+                        anyhow::bail!("ECN marking is not supported by this platform's SAI");
+                    }
+                    let buffer_kb = caps.buffer_bytes_total / 1024;
+                    if buffer_kb > 0 {
+                        for (name, profile) in &wanted.wred_profiles {
+                            let max = profile.max_threshold.unwrap_or(0);
+                            if u64::from(max) > buffer_kb {
+                                anyhow::bail!(
+                                    "qos wred-profile {name}: max-threshold {max} KB exceeds this platform's {buffer_kb} KB packet buffer"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let port_references = !wanted.ports.is_empty()
             || !wanted.mac_table.statics.is_empty()
             || !wanted.mirror.is_empty()
@@ -159,18 +217,39 @@ impl Engine {
             return Ok(());
         }
         let mut client = self.syncd_client().await?;
-        let ports = client
+        let known_ports = client
             .list_ports(pb::ListPortsRequest {})
             .await
             .context("listing ports from syncd")?
             .into_inner()
             .ports;
-        let known: std::collections::HashSet<_> = ports.into_iter().map(|p| p.name).collect();
+        let known: std::collections::HashSet<_> =
+            known_ports.iter().map(|p| p.name.clone()).collect();
         for name in wanted.ports.keys() {
             if !known.contains(name) {
                 anyhow::bail!("unknown interface {name:?}");
             }
         }
+        // A port shaper above the port's line rate is dead config; the
+        // port table is the only place its speed is known.
+        let port_speeds: std::collections::HashMap<String, u32> = known_ports
+            .iter()
+            .map(|port| (port.name.clone(), port.speed_mbps))
+            .collect();
+        for (name, qos) in &qos_ports {
+            let Some(rate) = qos.shape else { continue };
+            let Some(speed) = port_speeds.get(name) else {
+                continue;
+            };
+            let line_rate = u64::from(*speed) * 1_000_000;
+            if line_rate > 0 && rate > line_rate {
+                anyhow::bail!(
+                    "interface {name}: qos: shaper {} exceeds the port's {speed} Mbps line rate",
+                    hemlock_common::net::format_shape_rate(rate)
+                );
+            }
+        }
+
         // L2 references may also name a configured port-channel.
         let lags: std::collections::HashSet<String> = intents::lag_state(&wanted)
             .keys()
@@ -469,6 +548,58 @@ impl Engine {
                 .context("pushing dhcp-snooping/arp-inspection config to orch")?;
         }
 
+        // The QoS suite: profiles push before the port programs that
+        // reference them, the global maps before the ports whose trust
+        // mode reads them, and profile removals last (a profile is only
+        // free once no queue binds it).
+        let qos_map_change = intents::diff_qos_maps(&running_intents, &wanted_intents);
+        let wred_changes = intents::diff_wred_profiles(&running_intents, &wanted_intents);
+        let port_qos_changes = intents::diff_port_qos(&running_intents, &wanted_intents);
+        if qos_map_change.is_some() || !wred_changes.is_empty() || !port_qos_changes.is_empty() {
+            let mut client = self.syncd_client().await?;
+            for change in wred_changes.iter().filter(|c| c.ensure.is_some()) {
+                let profile = change.ensure.as_ref().expect("filtered on is_some");
+                client
+                    .ensure_wred_profile(pb::EnsureWredProfileRequest {
+                        profile: Some(wred_profile_request(&change.name, profile)),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+            if let Some(maps) = &qos_map_change {
+                client
+                    .set_qos_maps(qos_maps_request(maps))
+                    .await
+                    .context("applying qos maps")?;
+            }
+            for change in &port_qos_changes {
+                match &change.set {
+                    Some(qos) => {
+                        client
+                            .set_port_qos(port_qos_request(&change.port, qos))
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                    None => {
+                        client
+                            .clear_port_qos(pb::ClearPortQosRequest {
+                                port: change.port.clone(),
+                            })
+                            .await
+                            .with_context(|| format!("applying {}", change.describe()))?;
+                    }
+                }
+            }
+            for change in wred_changes.iter().filter(|c| c.ensure.is_none()) {
+                client
+                    .remove_wred_profile(pb::RemoveWredProfileRequest {
+                        name: change.name.clone(),
+                    })
+                    .await
+                    .with_context(|| format!("applying {}", change.describe()))?;
+            }
+        }
+
         // Spanning tree: MST instances in syncd, then the full state to
         // the orch engine (which drives the port states back into
         // syncd).
@@ -579,6 +710,19 @@ impl Engine {
             psec_changes
                 .iter()
                 .map(intents::PortSecurityChange::describe),
+        );
+        if qos_map_change.is_some() {
+            described.push("qos maps updated".into());
+        }
+        described.extend(
+            wred_changes
+                .iter()
+                .map(intents::WredProfileChange::describe),
+        );
+        described.extend(
+            port_qos_changes
+                .iter()
+                .map(intents::PortQosChange::describe),
         );
         if dot1x_change.is_some() {
             described.push("dot1x configuration updated".into());
@@ -1055,6 +1199,56 @@ fn acl_request(name: &str, acl: &intents::AclIntent) -> pb::EnsureAclRequest {
                     .map(|(_, mask)| mask.clone())
                     .unwrap_or_default(),
                 ethertype: rule.ethertype.map(u32::from),
+            })
+            .collect(),
+    }
+}
+
+/// A global-map intent as the syncd request (all four tables at once).
+fn qos_maps_request(maps: &intents::QosMapsIntent) -> pb::SetQosMapsRequest {
+    let table = |entries: &std::collections::BTreeMap<u8, u8>| -> Vec<pb::QosMapEntry> {
+        entries
+            .iter()
+            .map(|(key, value)| pb::QosMapEntry {
+                key: u32::from(*key),
+                value: u32::from(*value),
+            })
+            .collect()
+    };
+    pb::SetQosMapsRequest {
+        dscp_to_tc: table(&maps.dscp_to_tc),
+        cos_to_tc: table(&maps.cos_to_tc),
+        tc_to_dscp: table(&maps.tc_to_dscp),
+        tc_to_cos: table(&maps.tc_to_cos),
+    }
+}
+
+fn wred_profile_request(name: &str, profile: &intents::WredProfileIntent) -> pb::WredProfile {
+    pb::WredProfile {
+        name: name.to_string(),
+        min_threshold_kb: profile.min_threshold.unwrap_or(0),
+        max_threshold_kb: profile.max_threshold.unwrap_or(0),
+        drop_probability: profile.drop_probability,
+        ecn: profile.ecn,
+    }
+}
+
+/// One port's whole QoS program as the syncd request.
+fn port_qos_request(name: &str, qos: &intents::PortQosIntent) -> pb::SetPortQosRequest {
+    pb::SetPortQosRequest {
+        port: name.to_string(),
+        trust: qos.trust.word().to_string(),
+        default_tc: u32::from(qos.default_tc),
+        shape_bps: qos.shape,
+        queues: qos
+            .queues
+            .iter()
+            .map(|(index, queue)| pb::QueueQos {
+                queue: u32::from(*index),
+                strict: queue.strict,
+                weight: queue.weight.map(u32::from).unwrap_or(0),
+                shape_bps: queue.shape,
+                wred_profile: queue.wred_profile.clone().unwrap_or_default(),
             })
             .collect(),
     }

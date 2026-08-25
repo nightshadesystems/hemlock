@@ -257,6 +257,26 @@ pub struct SaiCapabilities {
     pub port_learn_limit: bool,
     /// Hostif trap groups with attachable policers (CoPP).
     pub copp: bool,
+
+    // --- QoS suite ---------------------------------------------------
+    /// The shared packet buffer in bytes (0 = the SAI would not say).
+    /// Helix4 carries 4 MB; WRED thresholds validate against this.
+    pub buffer_bytes_total: u64,
+    /// Ingress qos-map bindings (DSCP/CoS -> traffic class).
+    pub qos_map_ingress: bool,
+    /// Egress qos-map bindings (traffic class -> DSCP/CoS rewrite).
+    pub qos_map_egress: bool,
+    /// Per-queue WRED profiles.
+    pub wred: bool,
+    /// ECN marking inside a WRED profile (mark instead of drop for ECT
+    /// traffic).
+    pub ecn: bool,
+    /// Per-queue egress shapers (the port shaper rides the port's own
+    /// scheduler profile and always exists where schedulers do).
+    pub queue_shaper: bool,
+    /// WRED-drop and ECN-marked queue stats; absent means those two
+    /// counter columns render zero.
+    pub wred_queue_stats: bool,
 }
 
 impl SaiCapabilities {
@@ -280,8 +300,83 @@ impl SaiCapabilities {
             acl_entry_policer: true,
             port_learn_limit: true,
             copp: true,
+            // Helix4's shared packet buffer.
+            buffer_bytes_total: 4 * 1024 * 1024,
+            qos_map_ingress: true,
+            qos_map_egress: true,
+            wred: true,
+            ecn: true,
+            queue_shaper: true,
+            wred_queue_stats: true,
         }
     }
+}
+
+/// Which global QoS map table an object holds. Hemlock exposes four of
+/// SAI's map types: two ingress classification maps and two egress
+/// rewrite maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum QosMapType {
+    /// DSCP -> traffic class (`SAI_QOS_MAP_TYPE_DSCP_TO_TC`).
+    DscpToTc,
+    /// 802.1p CoS -> traffic class (`SAI_QOS_MAP_TYPE_DOT1P_TO_TC`).
+    Dot1pToTc,
+    /// Traffic class -> DSCP rewrite
+    /// (`SAI_QOS_MAP_TYPE_TC_AND_COLOR_TO_DSCP`).
+    TcToDscp,
+    /// Traffic class -> CoS rewrite
+    /// (`SAI_QOS_MAP_TYPE_TC_AND_COLOR_TO_DOT1P`).
+    TcToDot1p,
+}
+
+impl QosMapType {
+    /// True for the two ingress classification maps.
+    pub fn ingress(self) -> bool {
+        matches!(self, QosMapType::DscpToTc | QosMapType::Dot1pToTc)
+    }
+}
+
+/// One egress queue's (or one port's) scheduling program. syncd dedups
+/// and refcounts the SAI scheduler objects these describe, so two ports
+/// with the same queue shape share one profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SchedulerSpec {
+    /// Strict priority; `weight` is then ignored.
+    pub strict: bool,
+    /// DWRR weight (1..=127).
+    pub weight: u8,
+    /// Shaper ceiling in bits/sec; None = unshaped.
+    pub max_rate_bps: Option<u64>,
+}
+
+impl SchedulerSpec {
+    /// The platform default every queue starts at: DWRR, weight 1,
+    /// unshaped.
+    pub fn default_queue() -> Self {
+        Self {
+            strict: false,
+            weight: 1,
+            max_rate_bps: None,
+        }
+    }
+
+    /// True when this is the default program, i.e. no scheduler object
+    /// is needed at all.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default_queue()
+    }
+}
+
+/// One WRED/ECN profile. Thresholds are in bytes at this layer (the
+/// config language takes KB).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WredSpec {
+    pub min_threshold_bytes: u32,
+    pub max_threshold_bytes: u32,
+    /// Drop (or ECN-mark) probability in percent at `max_threshold`.
+    pub drop_probability: u8,
+    /// Mark instead of drop for ECT traffic.
+    pub ecn: bool,
 }
 
 /// Storm-control traffic class.
@@ -501,6 +596,10 @@ pub struct QueueCounters {
     pub bytes: u64,
     pub dropped_pkts: u64,
     pub dropped_bytes: u64,
+    /// WRED-dropped and ECN-marked packets. Stay 0 where
+    /// [`SaiCapabilities::wred_queue_stats`] is false.
+    pub wred_dropped: u64,
+    pub ecn_marked: u64,
 }
 
 /// The safe wrapper trait over a SAI implementation.
@@ -871,6 +970,72 @@ pub trait SaiBackend: Send {
     /// trap group — the CoPP `default` class, policing every trap not
     /// steered into a named class group.
     fn set_default_trap_group_policer(&mut self, policer: Option<Oid>) -> Result<(), SaiError>;
+
+    // --- QoS: global maps and port classification --------------------------
+
+    /// Create a global QoS map object holding `entries` (`key ->
+    /// value`, both already range-checked by the layer above).
+    fn create_qos_map(&mut self, kind: QosMapType, entries: &[(u8, u8)]) -> Result<Oid, SaiError>;
+
+    /// Replace a map object's whole value list in place, so ports bound
+    /// to it need no rebinding.
+    fn set_qos_map(&mut self, map: Oid, entries: &[(u8, u8)]) -> Result<(), SaiError>;
+
+    /// Remove a map object; no port may still bind it.
+    fn remove_qos_map(&mut self, map: Oid) -> Result<(), SaiError>;
+
+    /// Bind (or, with None, unbind) a map on a port for one map type.
+    fn set_port_qos_map_binding(
+        &mut self,
+        port: PortId,
+        kind: QosMapType,
+        map: Option<Oid>,
+    ) -> Result<(), SaiError>;
+
+    /// The traffic class untrusted (or unmapped) traffic lands in.
+    fn set_port_default_tc(&mut self, port: PortId, tc: u8) -> Result<(), SaiError>;
+
+    // --- QoS: scheduling, shaping, WRED ------------------------------------
+
+    /// Create a scheduler profile. syncd owns the dedup/refcounting, so
+    /// the backend just makes the object.
+    fn create_scheduler(&mut self, spec: SchedulerSpec) -> Result<Oid, SaiError>;
+
+    /// Remove a scheduler profile; nothing may still bind it.
+    fn remove_scheduler(&mut self, scheduler: Oid) -> Result<(), SaiError>;
+
+    /// Bind (or, with None, unbind) a scheduler profile on one of a
+    /// port's egress queues. The backend walks the vendor's
+    /// scheduler-group tree to find the queue object.
+    fn bind_queue_scheduler(
+        &mut self,
+        port: PortId,
+        queue: u32,
+        scheduler: Option<Oid>,
+    ) -> Result<(), SaiError>;
+
+    /// The port-level shaper in bits/sec; None removes it. The backend
+    /// owns the port scheduler profile's lifecycle.
+    fn set_port_shaper(&mut self, port: PortId, rate_bps: Option<u64>) -> Result<(), SaiError>;
+
+    /// Create a WRED profile object.
+    fn create_wred(&mut self, spec: WredSpec) -> Result<Oid, SaiError>;
+
+    /// Update a WRED profile in place, so queues bound to it need no
+    /// rebinding.
+    fn set_wred(&mut self, wred: Oid, spec: WredSpec) -> Result<(), SaiError>;
+
+    /// Remove a WRED profile; no queue may still bind it.
+    fn remove_wred(&mut self, wred: Oid) -> Result<(), SaiError>;
+
+    /// Bind (or, with None, unbind) a WRED profile on one of a port's
+    /// egress queues.
+    fn bind_queue_wred(
+        &mut self,
+        port: PortId,
+        queue: u32,
+        wred: Option<Oid>,
+    ) -> Result<(), SaiError>;
 
     // --- Port security -----------------------------------------------------
 

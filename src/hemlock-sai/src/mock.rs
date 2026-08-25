@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 
 use crate::{
     AclAction, AclFamily, AclFields, AclStage, FdbAction, IpPrefix, Oid, PolicerSpec, PolicerStats,
-    PortCounters, PortId, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities, SaiError,
-    SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo, TrapKind,
+    PortCounters, PortId, QosMapType, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities,
+    SaiError, SaiEvent, SaiPort, SchedulerSpec, StormClass, StpPortState, SwitchInfo, TrapKind,
+    WredSpec,
 };
 
 /// Synthetic OIDs: obviously fake, stable, and readable in logs.
@@ -43,6 +44,9 @@ const MOCK_ACL_COUNTER_OID_BASE: u64 = 0x2100_0000_0001_2000;
 const MOCK_POLICER_OID_BASE: u64 = 0x2100_0000_0001_3000;
 const MOCK_TRAP_GROUP_OID_BASE: u64 = 0x2100_0000_0001_4000;
 const MOCK_TRAP_OID_BASE: u64 = 0x2100_0000_0001_5000;
+const MOCK_QOS_MAP_OID_BASE: u64 = 0x2100_0000_0001_6000;
+const MOCK_SCHEDULER_OID_BASE: u64 = 0x2100_0000_0001_7000;
+const MOCK_WRED_OID_BASE: u64 = 0x2100_0000_0001_8000;
 
 /// The mock TCAM's entry capacity per stage — Helix4-shaped numbers so
 /// `show acl summary` has something honest to report (IPv6 entries
@@ -122,6 +126,22 @@ pub struct MockSai {
     learn_limits: HashMap<PortId, u32>,
     learning_off: std::collections::HashSet<PortId>,
     default_trap_group_policer: Option<Oid>,
+    /// QoS model: global map objects, their per-port bindings, and each
+    /// port's default traffic class.
+    qos_maps: HashMap<Oid, (QosMapType, Vec<(u8, u8)>)>,
+    port_qos_maps: HashMap<(PortId, QosMapType), Oid>,
+    port_default_tc: HashMap<PortId, u8>,
+    /// Egress scheduling model: scheduler profile objects, their
+    /// per-(port, queue) bindings, and the port-level shaper rate.
+    schedulers: HashMap<Oid, SchedulerSpec>,
+    queue_schedulers: HashMap<(PortId, u32), Oid>,
+    port_shapers: HashMap<PortId, u64>,
+    /// WRED profile objects and their per-(port, queue) bindings.
+    wreds: HashMap<Oid, WredSpec>,
+    queue_wreds: HashMap<(PortId, u32), Oid>,
+    /// Injected per-queue counters (the mock forwards nothing, so
+    /// queue stats are whatever a test asked for).
+    queue_counters: HashMap<PortId, Vec<QueueCounters>>,
     synthetic_counters: bool,
     next_oid: u64,
 }
@@ -177,9 +197,70 @@ impl MockSai {
             learn_limits: HashMap::new(),
             learning_off: std::collections::HashSet::new(),
             default_trap_group_policer: None,
+            qos_maps: HashMap::new(),
+            port_qos_maps: HashMap::new(),
+            port_default_tc: HashMap::new(),
+            schedulers: HashMap::new(),
+            queue_schedulers: HashMap::new(),
+            port_shapers: HashMap::new(),
+            wreds: HashMap::new(),
+            queue_wreds: HashMap::new(),
+            queue_counters: HashMap::new(),
             synthetic_counters: false,
             next_oid: 0,
         }
+    }
+
+    /// The synthetic port id of the `index`-th platform port-table
+    /// entry, so tests can address a port before `create_switch`.
+    pub fn port_id_of(&self, index: usize) -> PortId {
+        PortId(MOCK_PORT_OID_BASE + index as u64)
+    }
+
+    /// Inject the per-queue stat counters a port reports (the mock
+    /// forwards nothing, so they are 0 until a test says otherwise).
+    pub fn set_queue_counters(&mut self, port: PortId, queues: Vec<QueueCounters>) {
+        self.queue_counters.insert(port, queues);
+    }
+
+    /// A created QoS map object's type and value list.
+    pub fn qos_map(&self, map: Oid) -> Option<(QosMapType, Vec<(u8, u8)>)> {
+        self.qos_maps.get(&map).cloned()
+    }
+
+    /// The map object bound on a port for one map type.
+    pub fn port_qos_map(&self, port: PortId, kind: QosMapType) -> Option<Oid> {
+        self.port_qos_maps.get(&(port, kind)).copied()
+    }
+
+    /// A port's default traffic class (0 until set).
+    pub fn port_default_tc(&self, port: PortId) -> u8 {
+        self.port_default_tc.get(&port).copied().unwrap_or(0)
+    }
+
+    /// A created scheduler profile's program.
+    pub fn scheduler(&self, scheduler: Oid) -> Option<SchedulerSpec> {
+        self.schedulers.get(&scheduler).copied()
+    }
+
+    /// The scheduler profile bound on one of a port's queues.
+    pub fn queue_scheduler(&self, port: PortId, queue: u32) -> Option<Oid> {
+        self.queue_schedulers.get(&(port, queue)).copied()
+    }
+
+    /// A port's shaper rate in bits/sec, when one is set.
+    pub fn port_shaper(&self, port: PortId) -> Option<u64> {
+        self.port_shapers.get(&port).copied()
+    }
+
+    /// A created WRED profile's program.
+    pub fn wred(&self, wred: Oid) -> Option<WredSpec> {
+        self.wreds.get(&wred).copied()
+    }
+
+    /// The WRED profile bound on one of a port's queues.
+    pub fn queue_wred(&self, port: PortId, queue: u32) -> Option<Oid> {
+        self.queue_wreds.get(&(port, queue)).copied()
     }
 
     /// Override the capability posture (tests: prove that commits
@@ -300,6 +381,25 @@ impl MockSai {
             AclStage::Egress => MOCK_ACL_EGRESS_CAPACITY,
         }
     }
+
+    /// The capability posture on qos maps, per direction — a mock
+    /// configured without them refuses the calls like a vendor blob
+    /// missing the attribute would.
+    fn require_qos_map(&self, kind: QosMapType) -> Result<(), SaiError> {
+        let supported = if kind.ingress() {
+            self.capabilities.qos_map_ingress
+        } else {
+            self.capabilities.qos_map_egress
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(SaiError::Other(format!(
+                "{} QoS maps are not supported",
+                if kind.ingress() { "ingress" } else { "egress" }
+            )))
+        }
+    }
 }
 
 impl SaiBackend for MockSai {
@@ -373,7 +473,7 @@ impl SaiBackend for MockSai {
             return Err(SaiError::NoSwitch);
         }
         self.port_mut(id)?;
-        Ok(Vec::new())
+        Ok(self.queue_counters.get(&id).cloned().unwrap_or_default())
     }
 
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>> {
@@ -1351,6 +1451,185 @@ impl SaiBackend for MockSai {
             }
         }
         self.default_trap_group_policer = policer;
+        Ok(())
+    }
+
+    fn create_qos_map(&mut self, kind: QosMapType, entries: &[(u8, u8)]) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        self.require_qos_map(kind)?;
+        let oid = self.alloc(MOCK_QOS_MAP_OID_BASE);
+        self.qos_maps.insert(oid, (kind, entries.to_vec()));
+        Ok(oid)
+    }
+
+    fn set_qos_map(&mut self, map: Oid, entries: &[(u8, u8)]) -> Result<(), SaiError> {
+        self.require_switch()?;
+        let Some((_, values)) = self.qos_maps.get_mut(&map) else {
+            return Err(SaiError::Other(format!("no such QoS map {map}")));
+        };
+        *values = entries.to_vec();
+        Ok(())
+    }
+
+    fn remove_qos_map(&mut self, map: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.port_qos_maps.values().any(|bound| *bound == map) {
+            return Err(SaiError::Other(format!("QoS map {map} is still bound")));
+        }
+        if self.qos_maps.remove(&map).is_none() {
+            return Err(SaiError::Other(format!("no such QoS map {map}")));
+        }
+        Ok(())
+    }
+
+    fn set_port_qos_map_binding(
+        &mut self,
+        port: PortId,
+        kind: QosMapType,
+        map: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port_like(port)?;
+        self.require_qos_map(kind)?;
+        match map {
+            Some(map) => {
+                match self.qos_maps.get(&map) {
+                    Some((map_kind, _)) if *map_kind == kind => {}
+                    Some(_) => {
+                        return Err(SaiError::Other(format!(
+                            "QoS map {map} is not a {kind:?} map"
+                        )))
+                    }
+                    None => return Err(SaiError::Other(format!("no such QoS map {map}"))),
+                }
+                self.port_qos_maps.insert((port, kind), map);
+            }
+            None => {
+                self.port_qos_maps.remove(&(port, kind));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_port_default_tc(&mut self, port: PortId, tc: u8) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port_like(port)?;
+        self.port_default_tc.insert(port, tc);
+        Ok(())
+    }
+
+    fn create_scheduler(&mut self, spec: SchedulerSpec) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if spec.max_rate_bps.is_some() && !self.capabilities.queue_shaper {
+            return Err(SaiError::Other("egress shapers are not supported".into()));
+        }
+        let oid = self.alloc(MOCK_SCHEDULER_OID_BASE);
+        self.schedulers.insert(oid, spec);
+        Ok(oid)
+    }
+
+    fn remove_scheduler(&mut self, scheduler: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.queue_schedulers.values().any(|s| *s == scheduler) {
+            return Err(SaiError::Other(format!(
+                "scheduler {scheduler} is still bound"
+            )));
+        }
+        if self.schedulers.remove(&scheduler).is_none() {
+            return Err(SaiError::Other(format!("no such scheduler {scheduler}")));
+        }
+        Ok(())
+    }
+
+    fn bind_queue_scheduler(
+        &mut self,
+        port: PortId,
+        queue: u32,
+        scheduler: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port_like(port)?;
+        match scheduler {
+            Some(scheduler) => {
+                if !self.schedulers.contains_key(&scheduler) {
+                    return Err(SaiError::Other(format!("no such scheduler {scheduler}")));
+                }
+                self.queue_schedulers.insert((port, queue), scheduler);
+            }
+            None => {
+                self.queue_schedulers.remove(&(port, queue));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_port_shaper(&mut self, port: PortId, rate_bps: Option<u64>) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port_like(port)?;
+        match rate_bps {
+            Some(rate) => self.port_shapers.insert(port, rate),
+            None => self.port_shapers.remove(&port),
+        };
+        Ok(())
+    }
+
+    fn create_wred(&mut self, spec: WredSpec) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if !self.capabilities.wred {
+            return Err(SaiError::Other("WRED is not supported".into()));
+        }
+        if spec.ecn && !self.capabilities.ecn {
+            return Err(SaiError::Other("ECN marking is not supported".into()));
+        }
+        let oid = self.alloc(MOCK_WRED_OID_BASE);
+        self.wreds.insert(oid, spec);
+        Ok(oid)
+    }
+
+    fn set_wred(&mut self, wred: Oid, spec: WredSpec) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if spec.ecn && !self.capabilities.ecn {
+            return Err(SaiError::Other("ECN marking is not supported".into()));
+        }
+        let Some(slot) = self.wreds.get_mut(&wred) else {
+            return Err(SaiError::Other(format!("no such WRED profile {wred}")));
+        };
+        *slot = spec;
+        Ok(())
+    }
+
+    fn remove_wred(&mut self, wred: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.queue_wreds.values().any(|w| *w == wred) {
+            return Err(SaiError::Other(format!(
+                "WRED profile {wred} is still bound"
+            )));
+        }
+        if self.wreds.remove(&wred).is_none() {
+            return Err(SaiError::Other(format!("no such WRED profile {wred}")));
+        }
+        Ok(())
+    }
+
+    fn bind_queue_wred(
+        &mut self,
+        port: PortId,
+        queue: u32,
+        wred: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port_like(port)?;
+        match wred {
+            Some(wred) => {
+                if !self.wreds.contains_key(&wred) {
+                    return Err(SaiError::Other(format!("no such WRED profile {wred}")));
+                }
+                self.queue_wreds.insert((port, queue), wred);
+            }
+            None => {
+                self.queue_wreds.remove(&(port, queue));
+            }
+        }
         Ok(())
     }
 

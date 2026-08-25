@@ -18,9 +18,9 @@ use std::collections::HashMap;
 
 use crate::{
     ffi, AclAction, AclFamily, AclFields, AclPacketAction, AclStage, FdbAction, FdbEventKind,
-    IpPrefix, Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QueueCounters, RouteTarget,
-    SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, StormClass, StpPortState, SwitchInfo,
-    SwitchInit, TrapKind,
+    IpPrefix, Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QosMapType, QueueCounters,
+    RouteTarget, SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, SchedulerSpec,
+    StormClass, StpPortState, SwitchInfo, SwitchInit, TrapKind, WredSpec,
 };
 
 /// SAI profile key/value store handed to the vendor library. Static because
@@ -206,6 +206,10 @@ pub struct VendorSai {
     /// Soft-probed like MY_MAC: a vendor blob refusing the ACL api
     /// leaves this null and the ACL capabilities off.
     acl_api: *mut ffi::sai_acl_api_t,
+    /// QoS suite api tables, soft-probed the same way.
+    qos_map_api: *mut ffi::sai_qos_map_api_t,
+    scheduler_api: *mut ffi::sai_scheduler_api_t,
+    wred_api: *mut ffi::sai_wred_api_t,
     /// `sai_query_attribute_capability`, when the library exports it
     /// (optional in the SAI spec; absent = assume supported and let the
     /// call fail with a real status).
@@ -219,6 +223,14 @@ pub struct VendorSai {
     >,
     /// Storm-control policers this backend created, per (port, class).
     storm_policers: HashMap<(u64, StormClass), ffi::sai_object_id_t>,
+    /// QoS map objects this backend created, by type: SAI's map type is
+    /// create-only, and a later value-list rewrite needs it to lay the
+    /// entries out.
+    qos_map_kinds: HashMap<u64, QosMapType>,
+    /// Port-level shaper profiles this backend created, per port: the
+    /// port shaper has no object of its own in SAI, it is a scheduler
+    /// profile hung on the port.
+    port_shaper_profiles: HashMap<u64, ffi::sai_object_id_t>,
     /// ACL tables this backend created, and each entry's ACL-range
     /// objects (L4 port ranges live in their own SAI objects; they are
     /// removed with the entry).
@@ -233,6 +245,9 @@ pub struct VendorSai {
     /// stp-port objects this backend created, per (stp, port).
     stp_ports: HashMap<(u64, u64), ffi::sai_object_id_t>,
     switch_oid: Option<ffi::sai_object_id_t>,
+    /// The first port the switch created, for capability probes that
+    /// need a live port object (queue stat support).
+    first_port: Option<ffi::sai_object_id_t>,
     defaults: Option<SwitchDefaults>,
     events_rx: Option<mpsc::UnboundedReceiver<SaiEvent>>,
     src_mac: Option<[u8; 6]>,
@@ -412,6 +427,20 @@ impl VendorSai {
             if api_query(ffi::_sai_api_t::SAI_API_ACL, &mut acl_api) != 0 {
                 acl_api = std::ptr::null_mut();
             }
+            // The QoS families are optional too: an absent table turns
+            // the matching capabilities off rather than failing boot.
+            let mut qos_map_api: *mut c_void = std::ptr::null_mut();
+            if api_query(ffi::_sai_api_t::SAI_API_QOS_MAP, &mut qos_map_api) != 0 {
+                qos_map_api = std::ptr::null_mut();
+            }
+            let mut scheduler_api: *mut c_void = std::ptr::null_mut();
+            if api_query(ffi::_sai_api_t::SAI_API_SCHEDULER, &mut scheduler_api) != 0 {
+                scheduler_api = std::ptr::null_mut();
+            }
+            let mut wred_api: *mut c_void = std::ptr::null_mut();
+            if api_query(ffi::_sai_api_t::SAI_API_WRED, &mut wred_api) != 0 {
+                wred_api = std::ptr::null_mut();
+            }
             (
                 switch_api as *mut ffi::sai_switch_api_t,
                 port_api as *mut ffi::sai_port_api_t,
@@ -433,6 +462,9 @@ impl VendorSai {
                 next_hop_group_api as *mut ffi::sai_next_hop_group_api_t,
                 my_mac_api as *mut ffi::sai_my_mac_api_t,
                 acl_api as *mut ffi::sai_acl_api_t,
+                qos_map_api as *mut ffi::sai_qos_map_api_t,
+                scheduler_api as *mut ffi::sai_scheduler_api_t,
+                wred_api as *mut ffi::sai_wred_api_t,
             )
         };
         let (
@@ -456,6 +488,9 @@ impl VendorSai {
             next_hop_group_api,
             my_mac_api,
             acl_api,
+            qos_map_api,
+            scheduler_api,
+            wred_api,
         ) = apis;
         // SAFETY: symbol lookup only; the fn pointer is copied out and
         // the library stays mapped for our whole lifetime.
@@ -493,14 +528,20 @@ impl VendorSai {
             next_hop_group_api,
             my_mac_api,
             acl_api,
+            qos_map_api,
+            scheduler_api,
+            wred_api,
             query_capability,
             storm_policers: HashMap::new(),
+            qos_map_kinds: HashMap::new(),
+            port_shaper_profiles: HashMap::new(),
             acl_tables: HashMap::new(),
             acl_entry_ranges: HashMap::new(),
             user_traps: std::collections::HashSet::new(),
             stp_ports: HashMap::new(),
             lags: std::collections::HashSet::new(),
             switch_oid: None,
+            first_port: None,
             defaults: None,
             events_rx: Some(rx),
             src_mac: init.src_mac,
@@ -1033,6 +1074,45 @@ impl VendorSai {
         }
     }
 
+    /// Whether the ASIC serves the WRED-drop / ECN-marked queue stats:
+    /// read them once on the first port's first queue. A refused read
+    /// means those two counter columns render zero forever after.
+    fn probe_wred_queue_stats(&self) -> bool {
+        // SAFETY per block: valid api tables; buffers outlive the calls.
+        unsafe {
+            let Some(get_port_attr) = (*self.port_api).get_port_attribute else {
+                return false;
+            };
+            let Some(get_queue_stats) = (*self.queue_api).get_queue_stats else {
+                return false;
+            };
+            let Some(port) = self.first_port else {
+                return false;
+            };
+            let mut oids = [0 as ffi::sai_object_id_t; 1];
+            let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_QUEUE_LIST);
+            attr.value.objlist.count = 1;
+            attr.value.objlist.list = oids.as_mut_ptr();
+            // A count-too-small answer still fills the first slot.
+            let status = get_port_attr(port, 1, &mut attr);
+            if oids[0] == 0 && status != 0 {
+                return false;
+            }
+            const STAT_IDS: [ffi::sai_stat_id_t; 2] = [
+                ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_WRED_DROPPED_PACKETS as ffi::sai_stat_id_t,
+                ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_WRED_ECN_MARKED_PACKETS
+                    as ffi::sai_stat_id_t,
+            ];
+            let mut stats = [0u64; 2];
+            get_queue_stats(
+                oids[0],
+                STAT_IDS.len() as u32,
+                STAT_IDS.as_ptr(),
+                stats.as_mut_ptr(),
+            ) == 0
+        }
+    }
+
     fn fdb_entry(&self, vlan: Option<Oid>, mac: [u8; 6]) -> Result<ffi::sai_fdb_entry_t, SaiError> {
         Ok(ffi::sai_fdb_entry_t {
             switch_id: self.switch_oid()?,
@@ -1070,6 +1150,236 @@ impl VendorSai {
                 set(port.0, &a),
             )
         }
+    }
+
+    /// The QoS-map api table, or a clear error when the vendor blob
+    /// refused to serve it (the capability probe then reads
+    /// unsupported, so a commit never reaches this).
+    fn qos_map_api(&self) -> Result<*mut ffi::sai_qos_map_api_t, SaiError> {
+        if self.qos_map_api.is_null() {
+            return Err(SaiError::Other("SAI serves no QoS map api table".into()));
+        }
+        Ok(self.qos_map_api)
+    }
+
+    fn sai_qos_map_type(kind: QosMapType) -> u32 {
+        use ffi::_sai_qos_map_type_t as t;
+        match kind {
+            QosMapType::DscpToTc => t::SAI_QOS_MAP_TYPE_DSCP_TO_TC,
+            QosMapType::Dot1pToTc => t::SAI_QOS_MAP_TYPE_DOT1P_TO_TC,
+            QosMapType::TcToDscp => t::SAI_QOS_MAP_TYPE_TC_AND_COLOR_TO_DSCP,
+            QosMapType::TcToDot1p => t::SAI_QOS_MAP_TYPE_TC_AND_COLOR_TO_DOT1P,
+        }
+    }
+
+    /// The port attribute a map type binds through.
+    fn qos_map_port_attr(kind: QosMapType) -> u32 {
+        use ffi::_sai_port_attr_t as attr;
+        match kind {
+            QosMapType::DscpToTc => attr::SAI_PORT_ATTR_QOS_DSCP_TO_TC_MAP,
+            QosMapType::Dot1pToTc => attr::SAI_PORT_ATTR_QOS_DOT1P_TO_TC_MAP,
+            QosMapType::TcToDscp => attr::SAI_PORT_ATTR_QOS_TC_AND_COLOR_TO_DSCP_MAP,
+            QosMapType::TcToDot1p => attr::SAI_PORT_ATTR_QOS_TC_AND_COLOR_TO_DOT1P_MAP,
+        }
+    }
+
+    /// Hemlock's `(key, value)` pairs as SAI map entries. Which fields
+    /// carry the key and the value differ per map type; unused ones
+    /// stay 0, and the egress rewrite maps key on (tc, GREEN) because
+    /// SAI's TC->DSCP and TC->Dot1p maps are colour-qualified.
+    fn qos_map_entries(kind: QosMapType, entries: &[(u8, u8)]) -> Vec<ffi::sai_qos_map_t> {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                // SAFETY: sai_qos_map_t is POD; every field is written
+                // or deliberately left zero.
+                let mut entry: ffi::sai_qos_map_t = unsafe { std::mem::zeroed() };
+                match kind {
+                    QosMapType::DscpToTc => {
+                        entry.key.dscp = *key;
+                        entry.value.tc = *value;
+                    }
+                    QosMapType::Dot1pToTc => {
+                        entry.key.dot1p = *key;
+                        entry.value.tc = *value;
+                    }
+                    QosMapType::TcToDscp => {
+                        entry.key.tc = *key;
+                        entry.key.color = ffi::_sai_packet_color_t::SAI_PACKET_COLOR_GREEN;
+                        entry.value.dscp = *value;
+                    }
+                    QosMapType::TcToDot1p => {
+                        entry.key.tc = *key;
+                        entry.key.color = ffi::_sai_packet_color_t::SAI_PACKET_COLOR_GREEN;
+                        entry.value.dot1p = *value;
+                    }
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// The SAI queue object for one of a port's unicast egress queues.
+    ///
+    /// # The Broadcom scheduler topology
+    ///
+    /// Helix4 hangs a three-level scheduler-group tree off every port:
+    /// a root group per port, one child group per traffic class, and
+    /// the queue objects at the leaves. Hemlock's config language is
+    /// flat (`queue <0-7>` on a port), so the whole tree stays an
+    /// implementation detail of this backend.
+    ///
+    /// Scheduler profiles and WRED profiles bind on the *queue* object
+    /// (`SAI_QUEUE_ATTR_SCHEDULER_PROFILE_ID` /
+    /// `SAI_QUEUE_ATTR_WRED_PROFILE_ID`), not on the intermediate
+    /// groups, so the only walk needed is port -> `QOS_QUEUE_LIST` ->
+    /// the entry whose `INDEX` matches and whose `TYPE` is unicast (or
+    /// the type-agnostic `ALL`). Ports report multicast queues in the
+    /// same list, hence the type filter.
+    fn queue_oid(&self, port: PortId, index: u32) -> Result<ffi::sai_object_id_t, SaiError> {
+        // SAFETY per block below: valid api tables; buffers outlive the calls.
+        let get_port_attr = unsafe {
+            (*self.port_api)
+                .get_port_attribute
+                .ok_or(SaiError::Other("port api lacks get_port_attribute".into()))?
+        };
+        let get_queue_attr = unsafe {
+            (*self.queue_api)
+                .get_queue_attribute
+                .ok_or(SaiError::Other(
+                    "queue api lacks get_queue_attribute".into(),
+                ))?
+        };
+        let count = {
+            let mut attr =
+                Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_NUMBER_OF_QUEUES);
+            // SAFETY: single-attr get.
+            unsafe {
+                check(
+                    "get(QOS_NUMBER_OF_QUEUES)",
+                    get_port_attr(port.0, 1, &mut attr),
+                )?;
+                attr.value.u32_
+            }
+        };
+        let mut oids: Vec<ffi::sai_object_id_t> = vec![0; count as usize];
+        {
+            let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_QUEUE_LIST);
+            attr.value.objlist.count = count;
+            attr.value.objlist.list = oids.as_mut_ptr();
+            // SAFETY: list buffer sized to `count`, alive across the call.
+            unsafe {
+                check("get(QOS_QUEUE_LIST)", get_port_attr(port.0, 1, &mut attr))?;
+                oids.truncate(attr.value.objlist.count as usize);
+            }
+        }
+        for oid in oids {
+            let type_attr = Self::zeroed_attr(ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_TYPE);
+            let index_attr = Self::zeroed_attr(ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_INDEX);
+            let mut attrs = [type_attr, index_attr];
+            // SAFETY: attr array valid across the call; union reads
+            // match the attr ids just fetched.
+            let (kind, queue_index) = unsafe {
+                check(
+                    "get_queue_attribute",
+                    get_queue_attr(oid, attrs.len() as u32, attrs.as_mut_ptr()),
+                )?;
+                (attrs[0].value.s32, u32::from(attrs[1].value.u8_))
+            };
+            let unicast = kind != ffi::_sai_queue_type_t::SAI_QUEUE_TYPE_MULTICAST as i32;
+            if unicast && queue_index == index {
+                return Ok(oid);
+            }
+        }
+        Err(SaiError::Other(format!(
+            "port {port} has no unicast egress queue {index}"
+        )))
+    }
+
+    fn scheduler_api(&self) -> Result<*mut ffi::sai_scheduler_api_t, SaiError> {
+        if self.scheduler_api.is_null() {
+            return Err(SaiError::Other("SAI serves no scheduler api table".into()));
+        }
+        Ok(self.scheduler_api)
+    }
+
+    fn wred_api(&self) -> Result<*mut ffi::sai_wred_api_t, SaiError> {
+        if self.wred_api.is_null() {
+            return Err(SaiError::Other("SAI serves no WRED api table".into()));
+        }
+        Ok(self.wred_api)
+    }
+
+    /// The attribute set of one scheduler profile. SAI meters bytes,
+    /// Hemlock's config language bits, so shaper rates divide by 8.
+    fn scheduler_attrs(spec: SchedulerSpec) -> Vec<ffi::sai_attribute_t> {
+        use ffi::_sai_scheduler_attr_t as attr;
+        let mut type_attr = Self::zeroed_attr(attr::SAI_SCHEDULER_ATTR_SCHEDULING_TYPE);
+        type_attr.value.s32 = if spec.strict {
+            ffi::_sai_scheduling_type_t::SAI_SCHEDULING_TYPE_STRICT
+        } else {
+            ffi::_sai_scheduling_type_t::SAI_SCHEDULING_TYPE_DWRR
+        } as i32;
+        let mut attrs = vec![type_attr];
+        if !spec.strict {
+            let mut weight_attr = Self::zeroed_attr(attr::SAI_SCHEDULER_ATTR_SCHEDULING_WEIGHT);
+            weight_attr.value.u8_ = spec.weight;
+            attrs.push(weight_attr);
+        }
+        let mut meter_attr = Self::zeroed_attr(attr::SAI_SCHEDULER_ATTR_METER_TYPE);
+        meter_attr.value.s32 = ffi::_sai_meter_type_t::SAI_METER_TYPE_BYTES as i32;
+        attrs.push(meter_attr);
+        let mut rate_attr = Self::zeroed_attr(attr::SAI_SCHEDULER_ATTR_MAX_BANDWIDTH_RATE);
+        // 0 = no limit, which is exactly the unshaped case.
+        rate_attr.value.u64_ = spec.max_rate_bps.unwrap_or(0) / 8;
+        attrs.push(rate_attr);
+        attrs
+    }
+
+    /// The attribute set of one WRED profile. Hemlock exposes a single
+    /// curve, so it is programmed on all three colours; ECN marking
+    /// swaps drops for marks across the board.
+    fn wred_attrs(spec: WredSpec) -> Vec<ffi::sai_attribute_t> {
+        use ffi::_sai_wred_attr_t as attr;
+        let mut attrs = Vec::new();
+        for (enable, min, max, probability) in [
+            (
+                attr::SAI_WRED_ATTR_GREEN_ENABLE,
+                attr::SAI_WRED_ATTR_GREEN_MIN_THRESHOLD,
+                attr::SAI_WRED_ATTR_GREEN_MAX_THRESHOLD,
+                attr::SAI_WRED_ATTR_GREEN_DROP_PROBABILITY,
+            ),
+            (
+                attr::SAI_WRED_ATTR_YELLOW_ENABLE,
+                attr::SAI_WRED_ATTR_YELLOW_MIN_THRESHOLD,
+                attr::SAI_WRED_ATTR_YELLOW_MAX_THRESHOLD,
+                attr::SAI_WRED_ATTR_YELLOW_DROP_PROBABILITY,
+            ),
+            (
+                attr::SAI_WRED_ATTR_RED_ENABLE,
+                attr::SAI_WRED_ATTR_RED_MIN_THRESHOLD,
+                attr::SAI_WRED_ATTR_RED_MAX_THRESHOLD,
+                attr::SAI_WRED_ATTR_RED_DROP_PROBABILITY,
+            ),
+        ] {
+            let mut enable_attr = Self::zeroed_attr(enable);
+            enable_attr.value.booldata = true;
+            let mut min_attr = Self::zeroed_attr(min);
+            min_attr.value.u32_ = spec.min_threshold_bytes;
+            let mut max_attr = Self::zeroed_attr(max);
+            max_attr.value.u32_ = spec.max_threshold_bytes;
+            let mut probability_attr = Self::zeroed_attr(probability);
+            probability_attr.value.u32_ = u32::from(spec.drop_probability);
+            attrs.extend([enable_attr, min_attr, max_attr, probability_attr]);
+        }
+        let mut ecn_attr = Self::zeroed_attr(attr::SAI_WRED_ATTR_ECN_MARK_MODE);
+        ecn_attr.value.s32 = if spec.ecn {
+            ffi::_sai_ecn_mark_mode_t::SAI_ECN_MARK_MODE_ALL
+        } else {
+            ffi::_sai_ecn_mark_mode_t::SAI_ECN_MARK_MODE_NONE
+        } as i32;
+        attrs.push(ecn_attr);
+        attrs
     }
 
     /// The ACL api table, or a clear error when the vendor blob refused
@@ -1307,6 +1617,7 @@ impl SaiBackend for VendorSai {
                 });
             }
         }
+        self.first_port = ports.first().map(|p| p.id.0);
         Ok(ports)
     }
 
@@ -1507,6 +1818,13 @@ impl SaiBackend for VendorSai {
             ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_DROPPED_PACKETS as ffi::sai_stat_id_t,
             ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_DROPPED_BYTES as ffi::sai_stat_id_t,
         ];
+        // The WRED pair is optional (probed once into
+        // `wred_queue_stats`); a refused read leaves both columns 0
+        // rather than failing the whole sweep.
+        const WRED_STAT_IDS: [ffi::sai_stat_id_t; 2] = [
+            ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_WRED_DROPPED_PACKETS as ffi::sai_stat_id_t,
+            ffi::_sai_queue_stat_t::SAI_QUEUE_STAT_WRED_ECN_MARKED_PACKETS as ffi::sai_stat_id_t,
+        ];
 
         let mut queues = Vec::with_capacity(queue_oids.len());
         for oid in queue_oids {
@@ -1514,6 +1832,7 @@ impl SaiBackend for VendorSai {
             let index_attr = Self::zeroed_attr(ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_INDEX);
             let mut attrs = [type_attr, index_attr];
             let mut stats = [0u64; STAT_IDS.len()];
+            let mut wred_stats = [0u64; WRED_STAT_IDS.len()];
             // SAFETY: attr array + stat buffers valid across the calls;
             // union reads match the attr ids just fetched.
             unsafe {
@@ -1530,6 +1849,15 @@ impl SaiBackend for VendorSai {
                         stats.as_mut_ptr(),
                     ),
                 )?;
+                if get_queue_stats(
+                    oid,
+                    WRED_STAT_IDS.len() as u32,
+                    WRED_STAT_IDS.as_ptr(),
+                    wred_stats.as_mut_ptr(),
+                ) != 0
+                {
+                    wred_stats = [0; WRED_STAT_IDS.len()];
+                }
                 queues.push(QueueCounters {
                     unicast: attrs[0].value.s32
                         != ffi::_sai_queue_type_t::SAI_QUEUE_TYPE_MULTICAST as i32,
@@ -1538,6 +1866,8 @@ impl SaiBackend for VendorSai {
                     bytes: stats[1],
                     dropped_pkts: stats[2],
                     dropped_bytes: stats[3],
+                    wred_dropped: wred_stats[0],
+                    ecn_marked: wred_stats[1],
                 });
             }
         }
@@ -2201,6 +2531,70 @@ impl SaiBackend for VendorSai {
         // SAFETY: valid hostif api table (fn-pointer presence read).
         let copp = policer_fns && unsafe { (*self.hostif_api).create_hostif_trap_group.is_some() };
 
+        // --- QoS suite -----------------------------------------------
+        // The shared packet buffer, for the WRED threshold cap. Helix4
+        // carries 4 MB; a switch that will not answer reports 0 and the
+        // cap check is skipped rather than guessed.
+        let mut buffer_bytes_total = 0u64;
+        // SAFETY: valid switch api table; attr outlives the call.
+        unsafe {
+            if let Some(get) = (*self.switch_api).get_switch_attribute {
+                let mut attr =
+                    Self::zeroed_attr(ffi::_sai_switch_attr_t::SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE);
+                if get(self.switch_oid()?, 1, &mut attr) == 0 {
+                    // SAI reports the pool in KB.
+                    buffer_bytes_total = u64::from(attr.value.u32_) * 1024;
+                }
+            }
+        }
+        // qos maps: the api table may have been refused outright; each
+        // direction then probes its port binding attribute.
+        // SAFETY: null check before the fn-pointer presence read.
+        let qos_map_fns =
+            !self.qos_map_api.is_null() && unsafe { (*self.qos_map_api).create_qos_map.is_some() };
+        let qos_map_ingress = qos_map_fns
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_PORT,
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_DSCP_TO_TC_MAP,
+                true,
+            );
+        let qos_map_egress = qos_map_fns
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_PORT,
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_TC_AND_COLOR_TO_DSCP_MAP,
+                true,
+            );
+        let wred = self.attr_supported(
+            object::SAI_OBJECT_TYPE_WRED,
+            ffi::_sai_wred_attr_t::SAI_WRED_ATTR_GREEN_ENABLE,
+            false,
+        ) && self.attr_supported(
+            object::SAI_OBJECT_TYPE_QUEUE,
+            ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_WRED_PROFILE_ID,
+            true,
+        );
+        let ecn = wred
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_WRED,
+                ffi::_sai_wred_attr_t::SAI_WRED_ATTR_ECN_MARK_MODE,
+                false,
+            );
+        // Queue shapers ride a per-queue scheduler profile; the port
+        // shaper rides the port's own, which exists wherever schedulers
+        // do, so only the queue binding needs a probe.
+        let queue_shaper = self.attr_supported(
+            object::SAI_OBJECT_TYPE_QUEUE,
+            ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_SCHEDULER_PROFILE_ID,
+            true,
+        ) && self.attr_supported(
+            object::SAI_OBJECT_TYPE_SCHEDULER,
+            ffi::_sai_scheduler_attr_t::SAI_SCHEDULER_ATTR_MAX_BANDWIDTH_RATE,
+            false,
+        );
+        // The WRED-drop / ECN-marked queue stats are read once at boot
+        // on the first port; a refused read turns the two columns off.
+        let wred_queue_stats = wred && self.probe_wred_queue_stats();
+
         Ok(SaiCapabilities {
             lag: self.attr_supported(
                 object::SAI_OBJECT_TYPE_LAG,
@@ -2244,6 +2638,13 @@ impl SaiBackend for VendorSai {
             acl_entry_policer,
             port_learn_limit,
             copp,
+            buffer_bytes_total,
+            qos_map_ingress,
+            qos_map_egress,
+            wred,
+            ecn,
+            queue_shaper,
+            wred_queue_stats,
         })
     }
 
@@ -3704,6 +4105,311 @@ impl SaiBackend for VendorSai {
             check(
                 "set_hostif_trap_group_attribute(POLICER)",
                 set(defaults.trap_group, &attr),
+            )
+        }
+    }
+
+    fn create_qos_map(&mut self, kind: QosMapType, entries: &[(u8, u8)]) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let api = self.qos_map_api()?;
+        // SAFETY: valid qos-map api table.
+        let create = unsafe {
+            (*api)
+                .create_qos_map
+                .ok_or(SaiError::Other("qos map api lacks create_qos_map".into()))?
+        };
+        let mut list = Self::qos_map_entries(kind, entries);
+        let mut type_attr = Self::zeroed_attr(ffi::_sai_qos_map_attr_t::SAI_QOS_MAP_ATTR_TYPE);
+        type_attr.value.s32 = Self::sai_qos_map_type(kind) as i32;
+        let mut list_attr =
+            Self::zeroed_attr(ffi::_sai_qos_map_attr_t::SAI_QOS_MAP_ATTR_MAP_TO_VALUE_LIST);
+        list_attr.value.qosmap.count = list.len() as u32;
+        list_attr.value.qosmap.list = list.as_mut_ptr();
+        let attrs = [type_attr, list_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array and the entry list outlive the call.
+        unsafe {
+            check(
+                "create_qos_map",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        self.qos_map_kinds.insert(oid, kind);
+        Ok(Oid(oid))
+    }
+
+    fn set_qos_map(&mut self, map: Oid, entries: &[(u8, u8)]) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let api = self.qos_map_api()?;
+        // SAFETY: valid qos-map api table.
+        let set = unsafe {
+            (*api).set_qos_map_attribute.ok_or(SaiError::Other(
+                "qos map api lacks set_qos_map_attribute".into(),
+            ))?
+        };
+        // The map's type is create-only, so the entry layout comes from
+        // what this backend created it as.
+        let kind = *self
+            .qos_map_kinds
+            .get(&map.0)
+            .ok_or_else(|| SaiError::Other(format!("no such QoS map {map}")))?;
+        let mut list = Self::qos_map_entries(kind, entries);
+        let mut attr =
+            Self::zeroed_attr(ffi::_sai_qos_map_attr_t::SAI_QOS_MAP_ATTR_MAP_TO_VALUE_LIST);
+        attr.value.qosmap.count = list.len() as u32;
+        attr.value.qosmap.list = list.as_mut_ptr();
+        // SAFETY: attr and the entry list outlive the call.
+        unsafe {
+            check(
+                "set_qos_map_attribute(MAP_TO_VALUE_LIST)",
+                set(map.0, &attr),
+            )
+        }
+    }
+
+    fn remove_qos_map(&mut self, map: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let api = self.qos_map_api()?;
+        // SAFETY: valid qos-map api table.
+        unsafe {
+            let remove = (*api)
+                .remove_qos_map
+                .ok_or(SaiError::Other("qos map api lacks remove_qos_map".into()))?;
+            check("remove_qos_map", remove(map.0))?;
+        }
+        self.qos_map_kinds.remove(&map.0);
+        Ok(())
+    }
+
+    fn set_port_qos_map_binding(
+        &mut self,
+        port: PortId,
+        kind: QosMapType,
+        map: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let mut attr = Self::zeroed_attr(Self::qos_map_port_attr(kind));
+        attr.value.oid = map.map(|m| m.0).unwrap_or(0);
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check("set_port_attribute(QOS map)", set(port.0, &attr))
+        }
+    }
+
+    fn set_port_default_tc(&mut self, port: PortId, tc: u8) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let mut attr = Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_DEFAULT_TC);
+        attr.value.u8_ = tc;
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check("set_port_attribute(QOS_DEFAULT_TC)", set(port.0, &attr))
+        }
+    }
+
+    fn create_scheduler(&mut self, spec: SchedulerSpec) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let api = self.scheduler_api()?;
+        // SAFETY: valid scheduler api table.
+        let create = unsafe {
+            (*api).create_scheduler.ok_or(SaiError::Other(
+                "scheduler api lacks create_scheduler".into(),
+            ))?
+        };
+        let attrs = Self::scheduler_attrs(spec);
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_scheduler",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_scheduler(&mut self, scheduler: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let api = self.scheduler_api()?;
+        // SAFETY: valid scheduler api table.
+        unsafe {
+            let remove = (*api).remove_scheduler.ok_or(SaiError::Other(
+                "scheduler api lacks remove_scheduler".into(),
+            ))?;
+            check("remove_scheduler", remove(scheduler.0))
+        }
+    }
+
+    fn bind_queue_scheduler(
+        &mut self,
+        port: PortId,
+        queue: u32,
+        scheduler: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let queue_oid = self.queue_oid(port, queue)?;
+        let mut attr =
+            Self::zeroed_attr(ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_SCHEDULER_PROFILE_ID);
+        attr.value.oid = scheduler.map(|s| s.0).unwrap_or(0);
+        // SAFETY: valid queue api table; attr outlives the call.
+        unsafe {
+            let set = (*self.queue_api)
+                .set_queue_attribute
+                .ok_or(SaiError::Other(
+                    "queue api lacks set_queue_attribute".into(),
+                ))?;
+            check(
+                "set_queue_attribute(SCHEDULER_PROFILE_ID)",
+                set(queue_oid, &attr),
+            )
+        }
+    }
+
+    fn set_port_shaper(&mut self, port: PortId, rate_bps: Option<u64>) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // The port shaper is a scheduler profile hung on the port, so
+        // this owns that object's lifecycle: create on first set,
+        // update in place while it lives, drop it when the shaper goes.
+        let existing = self.port_shaper_profiles.get(&port.0).copied();
+        match (rate_bps, existing) {
+            (Some(rate), Some(profile)) => {
+                let mut attr = Self::zeroed_attr(
+                    ffi::_sai_scheduler_attr_t::SAI_SCHEDULER_ATTR_MAX_BANDWIDTH_RATE,
+                );
+                attr.value.u64_ = rate / 8;
+                let api = self.scheduler_api()?;
+                // SAFETY: valid scheduler api table; attr outlives the call.
+                unsafe {
+                    let set = (*api).set_scheduler_attribute.ok_or(SaiError::Other(
+                        "scheduler api lacks set_scheduler_attribute".into(),
+                    ))?;
+                    check(
+                        "set_scheduler_attribute(MAX_BANDWIDTH_RATE)",
+                        set(profile, &attr),
+                    )?;
+                }
+            }
+            (Some(rate), None) => {
+                let profile = self.create_scheduler(SchedulerSpec {
+                    strict: false,
+                    weight: 1,
+                    max_rate_bps: Some(rate),
+                })?;
+                let mut attr = Self::zeroed_attr(
+                    ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_SCHEDULER_PROFILE_ID,
+                );
+                attr.value.oid = profile.0;
+                // SAFETY: valid port api table; attr outlives the call.
+                unsafe {
+                    let set = (*self.port_api)
+                        .set_port_attribute
+                        .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+                    check(
+                        "set_port_attribute(QOS_SCHEDULER_PROFILE_ID)",
+                        set(port.0, &attr),
+                    )?;
+                }
+                self.port_shaper_profiles.insert(port.0, profile.0);
+            }
+            (None, Some(profile)) => {
+                let mut attr = Self::zeroed_attr(
+                    ffi::_sai_port_attr_t::SAI_PORT_ATTR_QOS_SCHEDULER_PROFILE_ID,
+                );
+                attr.value.oid = 0;
+                // SAFETY: valid port api table; attr outlives the call.
+                unsafe {
+                    let set = (*self.port_api)
+                        .set_port_attribute
+                        .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+                    check(
+                        "set_port_attribute(QOS_SCHEDULER_PROFILE_ID)",
+                        set(port.0, &attr),
+                    )?;
+                }
+                self.port_shaper_profiles.remove(&port.0);
+                self.remove_scheduler(Oid(profile))?;
+            }
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    fn create_wred(&mut self, spec: WredSpec) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        let api = self.wred_api()?;
+        // SAFETY: valid WRED api table.
+        let create = unsafe {
+            (*api)
+                .create_wred
+                .ok_or(SaiError::Other("wred api lacks create_wred".into()))?
+        };
+        let attrs = Self::wred_attrs(spec);
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_wred",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn set_wred(&mut self, wred: Oid, spec: WredSpec) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let api = self.wred_api()?;
+        // SAFETY: valid WRED api table.
+        let set = unsafe {
+            (*api)
+                .set_wred_attribute
+                .ok_or(SaiError::Other("wred api lacks set_wred_attribute".into()))?
+        };
+        // WRED attributes are all CREATE_AND_SET, so the profile
+        // updates in place and bound queues keep their binding.
+        for attr in Self::wred_attrs(spec) {
+            // SAFETY: attr outlives the call.
+            unsafe { check("set_wred_attribute", set(wred.0, &attr))? };
+        }
+        Ok(())
+    }
+
+    fn remove_wred(&mut self, wred: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let api = self.wred_api()?;
+        // SAFETY: valid WRED api table.
+        unsafe {
+            let remove = (*api)
+                .remove_wred
+                .ok_or(SaiError::Other("wred api lacks remove_wred".into()))?;
+            check("remove_wred", remove(wred.0))
+        }
+    }
+
+    fn bind_queue_wred(
+        &mut self,
+        port: PortId,
+        queue: u32,
+        wred: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        let queue_oid = self.queue_oid(port, queue)?;
+        let mut attr = Self::zeroed_attr(ffi::_sai_queue_attr_t::SAI_QUEUE_ATTR_WRED_PROFILE_ID);
+        attr.value.oid = wred.map(|w| w.0).unwrap_or(0);
+        // SAFETY: valid queue api table; attr outlives the call.
+        unsafe {
+            let set = (*self.queue_api)
+                .set_queue_attribute
+                .ok_or(SaiError::Other(
+                    "queue api lacks set_queue_attribute".into(),
+                ))?;
+            check(
+                "set_queue_attribute(WRED_PROFILE_ID)",
+                set(queue_oid, &attr),
             )
         }
     }

@@ -173,6 +173,28 @@ service Syncd {
   // re-injected by orch), on trusted ports copies (binding learn); ARP
   // on inspected VLANs' untrusted ports traps for DAI validation.
   rpc SetSnoopRedirects(SetSnoopRedirectsRequest) returns (SetSnoopRedirectsResponse);
+
+  // --- QoS --------------------------------------------------------------
+  // The four global maps, declarative: syncd diffs them against what it
+  // holds, rewrites the SAI map objects in place, and rebinds only the
+  // ports whose trust mode (or rewrite need) changed.
+  rpc SetQosMaps(SetQosMapsRequest) returns (SetQosMapsResponse);
+  // One port's whole QoS program: trust mode, default traffic class,
+  // port shaper, and the per-queue scheduler/shaper/WRED set. A
+  // Port-Channel program expands to the member ports (and follows
+  // membership churn), exactly like a switchport program does.
+  rpc SetPortQos(SetPortQosRequest) returns (SetPortQosResponse);
+  // Back to the platform defaults (untrusted, TC 0, no shapers, DWRR
+  // weight 1 on every queue, no WRED).
+  rpc ClearPortQos(ClearPortQosRequest) returns (ClearPortQosResponse);
+  // Named WRED/ECN profiles. Pushed before the port programs that
+  // reference them; a removal is refused while a queue still binds it.
+  rpc EnsureWredProfile(EnsureWredProfileRequest) returns (EnsureWredProfileResponse);
+  rpc RemoveWredProfile(RemoveWredProfileRequest) returns (RemoveWredProfileResponse);
+  // Everything the `show qos ...` family and the web console need:
+  // the global maps, the profiles, and per-port effective config with
+  // live per-queue counters.
+  rpc GetQosState(GetQosStateRequest) returns (GetQosStateResponse);
 }
 
 message GetSwitchInfoRequest {}
@@ -213,6 +235,19 @@ message SwitchCapabilities {
   bool port_learn_limit = 16;
   // Hostif trap groups with policers (CoPP).
   bool copp = 17;
+  // The shared packet buffer in bytes (0 = the SAI would not say);
+  // WRED thresholds validate against it.
+  uint64 buffer_bytes_total = 18;
+  // qos-map bindings, per direction (classification / rewrite).
+  bool qos_map_ingress = 19;
+  bool qos_map_egress = 20;
+  // Per-queue WRED profiles, and ECN marking inside one.
+  bool wred = 21;
+  bool ecn = 22;
+  // Per-queue egress shapers.
+  bool queue_shaper = 23;
+  // WRED-drop / ECN-marked queue stats; absent renders those columns 0.
+  bool wred_queue_stats = 24;
 }
 
 message EnsureNeighborRequest {
@@ -386,6 +421,10 @@ message QueueCounters {
   uint64 bytes = 3;
   uint64 dropped_pkts = 4;
   uint64 dropped_bytes = 5;
+  // WRED-dropped and ECN-marked packets; 0 where the stat probe says
+  // the platform does not serve them.
+  uint64 wred_dropped_pkts = 6;
+  uint64 ecn_marked_pkts = 7;
 }
 
 // RMON frame-size distribution: the seven EOS bins
@@ -1027,3 +1066,130 @@ message SetSnoopRedirectsRequest {
 }
 
 message SetSnoopRedirectsResponse {}
+
+// --- QoS -------------------------------------------------------------
+
+// One `key -> value` mapping in a global QoS map (DSCP/CoS/TC values).
+message QosMapEntry {
+  uint32 key = 1;
+  uint32 value = 2;
+}
+
+message SetQosMapsRequest {
+  repeated QosMapEntry dscp_to_tc = 1;
+  repeated QosMapEntry cos_to_tc = 2;
+  repeated QosMapEntry tc_to_dscp = 3;
+  repeated QosMapEntry tc_to_cos = 4;
+}
+
+message SetQosMapsResponse {}
+
+// One egress queue's program. Absent from a request = platform default
+// (DWRR weight 1, no shaper, no WRED).
+message QueueQos {
+  uint32 queue = 1;
+  // Strict priority; mutually exclusive with `weight` upstream.
+  bool strict = 2;
+  // DWRR weight 1..127; 0 = the default (1).
+  uint32 weight = 3;
+  optional uint64 shape_bps = 4;
+  // WRED profile name; "" = none.
+  string wred_profile = 5;
+}
+
+message SetPortQosRequest {
+  // A port or Port-Channel display name.
+  string port = 1;
+  // "untrusted" | "dscp" | "cos".
+  string trust = 2;
+  uint32 default_tc = 3;
+  // Port shaper in bits/sec; absent = none.
+  optional uint64 shape_bps = 4;
+  repeated QueueQos queues = 5;
+}
+
+message SetPortQosResponse {}
+
+message ClearPortQosRequest {
+  string port = 1;
+}
+
+message ClearPortQosResponse {}
+
+message WredProfile {
+  string name = 1;
+  // Thresholds in KB (1..4096, capped at the platform buffer).
+  uint32 min_threshold_kb = 2;
+  uint32 max_threshold_kb = 3;
+  // Drop probability in percent at max_threshold.
+  uint32 drop_probability = 4;
+  // Mark instead of drop for ECT traffic.
+  bool ecn = 5;
+}
+
+message EnsureWredProfileRequest {
+  WredProfile profile = 1;
+}
+
+message EnsureWredProfileResponse {}
+
+message RemoveWredProfileRequest {
+  string name = 1;
+}
+
+message RemoveWredProfileResponse {}
+
+message GetQosStateRequest {}
+
+// One queue's effective program plus its live counters (baselined by
+// `clear counters` like every other interface counter).
+message QueueQosState {
+  uint32 queue = 1;
+  bool strict = 2;
+  uint32 weight = 3;
+  optional uint64 shape_bps = 4;
+  string wred_profile = 5;
+  // The bound profile's ECN flag, so a renderer needs no second lookup.
+  bool ecn = 6;
+  uint64 tx_packets = 7;
+  uint64 tx_bytes = 8;
+  uint64 dropped = 9;
+  uint64 wred_dropped = 10;
+  uint64 ecn_marked = 11;
+}
+
+// One port's effective QoS. Port-Channel rows summarize the config;
+// member rows carry the same effective values.
+message PortQosState {
+  string port = 1;
+  // "untrusted" | "dscp" | "cos".
+  string trust = 2;
+  uint32 default_tc = 3;
+  optional uint64 shape_bps = 4;
+  repeated QueueQosState queues = 5;
+  // False for a port running entirely at the defaults.
+  bool configured = 6;
+  // Set on a physical port whose program comes from its Port-Channel.
+  string via_port_channel = 7;
+}
+
+message GetQosStateResponse {
+  repeated QosMapEntry dscp_to_tc = 1;
+  repeated QosMapEntry cos_to_tc = 2;
+  repeated QosMapEntry tc_to_dscp = 3;
+  repeated QosMapEntry tc_to_cos = 4;
+  repeated WredProfile wred_profiles = 5;
+  repeated PortQosState ports = 6;
+  // Ports running entirely at the defaults (the trailing `... N ports
+  // with default QoS configuration` line).
+  uint32 default_ports = 7;
+  // The platform buffer in KB, for the WRED threshold cap; 0 = unknown.
+  uint32 buffer_kb = 8;
+  // Capability posture, so the web editors can gate their controls the
+  // way commit does.
+  bool wred_supported = 9;
+  bool ecn_supported = 10;
+  bool queue_shaper_supported = 11;
+  // Queues per front-panel port, from the platform definition.
+  uint32 queue_count = 12;
+}

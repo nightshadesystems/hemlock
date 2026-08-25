@@ -84,6 +84,7 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
         mode: CliMode::Operational,
         ports: Vec::new(),
         acls: Vec::new(),
+        wreds: Vec::new(),
     }));
     let mut rl: rustyline::Editor<CliHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::new()?;
@@ -128,11 +129,12 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
                         })
                         .await
                     {
-                        let names = hemlock_config::parse(&response.into_inner().text)
-                            .map(|tree| candidate_acl_names(&tree))
-                            .unwrap_or_default();
+                        let tree = hemlock_config::parse(&response.into_inner().text).ok();
+                        let acls = tree.as_ref().map(candidate_acl_names).unwrap_or_default();
+                        let wreds = tree.as_ref().map(candidate_wred_names).unwrap_or_default();
                         if let Ok(mut state) = state.lock() {
-                            state.acls = names;
+                            state.acls = acls;
+                            state.wreds = wreds;
                         }
                     }
                 }
@@ -178,11 +180,17 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
             } else {
                 ""
             };
-            let (cli_mode, ports, acls) = match helper_state.lock() {
-                Ok(state) => (state.mode, state.ports.clone(), state.acls.clone()),
-                Err(_) => (CliMode::Operational, Vec::new(), Vec::new()),
+            let (cli_mode, ports, acls, wreds) = match helper_state.lock() {
+                Ok(state) => (
+                    state.mode,
+                    state.ports.clone(),
+                    state.acls.clone(),
+                    state.wreds.clone(),
+                ),
+                Err(_) => (CliMode::Operational, Vec::new(), Vec::new(), Vec::new()),
             };
-            let options = complete::help_candidates(cli_mode, &tokens, partial, &ports, &acls);
+            let options =
+                complete::help_candidates(cli_mode, &tokens, partial, &ports, &acls, &wreds);
             if options.is_empty() {
                 println!("  <cr>");
             } else {
@@ -725,17 +733,38 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces <port> port-security [maximum <1-1024>|violation <protect|shutdown>]");
             println!("  set interfaces <port> dot1x");
             println!("  set interfaces <port|Po> dhcp-snooping trust | arp-inspection trust");
+            println!("  set qos map dscp-to-tc dscp <0-63|list|range> tc <0-7>");
+            println!("  set qos map cos-to-tc cos <0-7|list> tc <0-7>");
+            println!("  set qos map tc-to-dscp tc <0-7> dscp <0-63>");
+            println!("  set qos map tc-to-cos tc <0-7> cos <0-7>");
+            println!(
+                "  set qos wred-profile <name> [min-threshold <1-4096>|max-threshold <1-4096>|"
+            );
+            println!(
+                "                              drop-probability <1-100>|ecn]      thresholds in KB"
+            );
+            println!("  set interfaces <port|Po> qos trust <dscp|cos|untrusted>");
+            println!("  set interfaces <port|Po> qos default-tc <0-7>");
+            println!(
+                "  set interfaces <port|Po> qos shape rate <rate>       port shaper, k/m/g bps"
+            );
+            println!(
+                "  set interfaces <port|Po> qos queue <0-7> [priority strict | weight <1-127>"
+            );
+            println!("                                            | shape rate <rate> | wred-profile <name>]");
             println!(
                 "  delete interfaces <port> [description|shutdown|no-shutdown|address|switchport|"
             );
             println!("                            channel-group|lacp|spanning-tree|storm-control|min-links|");
-            println!("                            access-group|port-security|dot1x|dhcp-snooping|arp-inspection ...]");
+            println!("                            access-group|port-security|dot1x|dhcp-snooping|");
+            println!("                            arp-inspection|qos ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
             println!("  delete routing [static [<prefix> [<next-hop>]] | arp [<ip>]]");
             println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
             println!("  delete switching [mac-table|mirror ...]");
             println!("  delete security [acl|copp|dot1x|dhcp-snooping|arp-inspection ...]");
+            println!("  delete qos [map [<table> [<key> <value>]] | wred-profile <name> [...]]");
             println!("  show                      show the candidate configuration");
             println!(
                 "  commit [confirmed <s>]    apply the candidate (auto-rollback unless confirmed)"
@@ -760,7 +789,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
     let verb = if delete { "delete" } else { "set" };
     let Some(top) = words.first() else {
         return Err(format!(
-            "% Usage: {verb} <interfaces|system|routing|vlans|protocols|switching|security> ..."
+            "% Usage: {verb} <interfaces|system|routing|vlans|protocols|switching|security|qos> ..."
         ));
     };
     match resolve(
@@ -773,6 +802,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
             "protocols",
             "switching",
             "security",
+            "qos",
         ],
     )? {
         "interfaces" => config_interfaces(endpoints, &words[1..], delete).await,
@@ -782,6 +812,7 @@ async fn config_edit(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
         "protocols" => config_protocols(endpoints, &words[1..], delete).await,
         "switching" => config_switching(endpoints, &words[1..], delete).await,
         "security" => config_security(endpoints, &words[1..], delete).await,
+        "qos" => config_qos(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
 }
@@ -924,6 +955,595 @@ async fn config_port_security(
             edit_interface(endpoints, port, move |eth| {
                 let ps = ConfigTree::ensure_block(eth, "port-security", &[]);
                 ConfigTree::set_leaf(ps, "violation", vec![action]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// The four global map tables and the key/value words each takes.
+const QOS_MAP_TABLES: &[(&str, &str, u8, &str, u8)] = &[
+    ("dscp-to-tc", "dscp", 63, "tc", 7),
+    ("cos-to-tc", "cos", 7, "tc", 7),
+    ("tc-to-dscp", "tc", 7, "dscp", 63),
+    ("tc-to-cos", "tc", 7, "cos", 7),
+];
+
+/// WRED profile name syntax (letter first, then letters/digits/_/-, max
+/// 32) — checked at the prompt for immediate feedback; mgmtd
+/// re-validates.
+fn valid_wred_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The WRED profile names a config tree defines (`qos { wred-profile
+/// <name> ... }`), sorted — the completer's profile-name cache.
+fn candidate_wred_names(tree: &hemlock_config::ConfigTree) -> Vec<String> {
+    let Some((_, items)) = tree.block("qos") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = hemlock_config::ConfigTree::blocks_named(items, "wred-profile")
+        .filter_map(|(keys, _)| keys.first().cloned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Replace (or insert) one map entry — a per-value phrase leaf, so
+/// `delete qos map dscp-to-tc dscp 46` drops exactly one mapping.
+fn set_map_entry(
+    items: &mut Vec<hemlock_config::Item>,
+    key_word: &str,
+    key: u8,
+    value_word: &str,
+    value: u8,
+) {
+    let key_text = key.to_string();
+    for item in items.iter_mut() {
+        if let hemlock_config::Item::Leaf { name, values } = item {
+            if name == key_word && values.first().map(String::as_str) == Some(key_text.as_str()) {
+                *values = vec![key_text, value_word.to_string(), value.to_string()];
+                return;
+            }
+        }
+    }
+    items.push(hemlock_config::Item::Leaf {
+        name: key_word.to_string(),
+        values: vec![key_text, value_word.to_string(), value.to_string()],
+    });
+}
+
+/// Drop the map entries for `keys` (empty = the whole table).
+fn remove_map_entries(items: &mut Vec<hemlock_config::Item>, key_word: &str, keys: &[u8]) {
+    let wanted: Vec<String> = keys.iter().map(u8::to_string).collect();
+    items.retain(|item| {
+        !matches!(item, hemlock_config::Item::Leaf { name, values }
+            if name == key_word
+                && (wanted.is_empty()
+                    || values
+                        .first()
+                        .is_some_and(|v| wanted.iter().any(|w| w == v))))
+    });
+}
+
+/// Remove an emptied `qos { <sub> { ... } }` chain bottom-up.
+fn prune_qos(tree: &mut hemlock_config::ConfigTree) {
+    let qos = tree.block_mut("qos");
+    // Only the map tables collapse when emptied; a `wred-profile <name>
+    // { }` with no leaves is still a defined profile.
+    for item in qos.iter_mut() {
+        if let hemlock_config::Item::Block { name, children, .. } = item {
+            if name == "map" {
+                children.retain(
+                    |child| !matches!(child, hemlock_config::Item::Block { children, .. } if children.is_empty()),
+                );
+            }
+        }
+    }
+    qos.retain(|item| {
+        !matches!(item, hemlock_config::Item::Block { name, children, .. }
+            if name == "map" && children.is_empty())
+    });
+    remove_block_if_empty(tree, "qos");
+}
+
+/// `set|delete qos <map|wred-profile> ...`.
+async fn config_qos(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            ConfigTree::remove_block(&mut tree.items, "qos", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(first) = words.first() else {
+        return Err(format!("% Usage: {verb} qos <map|wred-profile> ..."));
+    };
+    match resolve(
+        first,
+        &["map", "wred-profile", "priority-flow-control", "buffer"],
+    )? {
+        // Deferred by the QoS suite.
+        "priority-flow-control" => Err("% priority-flow-control is not supported".into()),
+        "buffer" => Err("% buffer-pool configuration is not supported".into()),
+        "map" => config_qos_map(endpoints, &words[1..], delete).await,
+        "wred-profile" => config_wred_profile(endpoints, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// `set|delete qos map <table> <key> <value-word> <value>`.
+async fn config_qos_map(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    if delete && words.is_empty() {
+        return edit_config(endpoints, |tree| {
+            let qos = tree.block_mut("qos");
+            ConfigTree::remove_block(qos, "map", &[]);
+            prune_qos(tree);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let table_words: Vec<&str> = QOS_MAP_TABLES.iter().map(|(name, ..)| *name).collect();
+    let Some(table_word) = words.first() else {
+        return Err(format!(
+            "% Usage: {verb} qos map <{}> ...",
+            table_words.join("|")
+        ));
+    };
+    let table = resolve(table_word, &table_words)?;
+    let (_, key_word, key_max, value_word, value_max) = *QOS_MAP_TABLES
+        .iter()
+        .find(|(name, ..)| *name == table)
+        .expect("resolved from the same table");
+    let usage = format!(
+        "% Usage: {verb} qos map {table} {key_word} <0-{key_max}> {value_word} <0-{value_max}>"
+    );
+
+    // `delete qos map <table>` drops the whole table.
+    if delete && words.len() == 1 {
+        let table = table.to_string();
+        return edit_config(endpoints, move |tree| {
+            let qos = tree.block_mut("qos");
+            let map = ConfigTree::ensure_block(qos, "map", &[]);
+            ConfigTree::remove_block(map, &table, &[]);
+            prune_qos(tree);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+
+    let Some(key_keyword) = words.get(1) else {
+        return Err(usage);
+    };
+    resolve(key_keyword, &[key_word])?;
+    let Some(key_text) = words.get(2) else {
+        return Err(usage);
+    };
+    // Lists and ranges expand to per-value leaves, matching how VLAN
+    // sets expand elsewhere.
+    let keys = hemlock_common::net::parse_value_list(key_text, key_max, key_word)
+        .map_err(|e| format!("% {e}"))?;
+
+    if delete {
+        if let Some(extra) = words.get(3) {
+            return Err(format!("% Invalid input: {extra:?}"));
+        }
+        let table = table.to_string();
+        let key_word = key_word.to_string();
+        return edit_config(endpoints, move |tree| {
+            let qos = tree.block_mut("qos");
+            let map = ConfigTree::ensure_block(qos, "map", &[]);
+            let entries = ConfigTree::ensure_block(map, &table, &[]);
+            remove_map_entries(entries, &key_word, &keys);
+            prune_qos(tree);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+
+    let Some(value_keyword) = words.get(3) else {
+        return Err(usage);
+    };
+    resolve(value_keyword, &[value_word])?;
+    let Some(value_text) = words.get(4) else {
+        return Err(usage);
+    };
+    let value = int_arg::<u8>(value_text, 0..=value_max, value_word)?;
+    if let Some(extra) = words.get(5) {
+        return Err(format!("% Invalid input: {extra:?}"));
+    }
+    let table = table.to_string();
+    let key_word = key_word.to_string();
+    let value_word = value_word.to_string();
+    edit_config(endpoints, move |tree| {
+        let qos = tree.block_mut("qos");
+        let map = ConfigTree::ensure_block(qos, "map", &[]);
+        let entries = ConfigTree::ensure_block(map, &table, &[]);
+        for key in keys {
+            set_map_entry(entries, &key_word, key, &value_word, value);
+        }
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete qos wred-profile <name> [min-threshold|max-threshold|
+/// drop-probability|ecn]`.
+async fn config_wred_profile(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let Some(name) = words.first() else {
+        return Err(format!(
+            "% Usage: {verb} qos wred-profile <name> [min-threshold <1-4096>|max-threshold <1-4096>|drop-probability <1-100>|ecn]"
+        ));
+    };
+    if !valid_wred_name(name) {
+        return Err(format!(
+            "% bad WRED profile name {name:?} (letter first, then letters/digits/_/-, max 32)"
+        ));
+    }
+    let name = name.to_string();
+    let rest = &words[1..];
+
+    if rest.is_empty() {
+        let name = name.clone();
+        return edit_config(endpoints, move |tree| {
+            let qos = tree.block_mut("qos");
+            if delete {
+                ConfigTree::remove_block(qos, "wred-profile", &[&name]);
+                prune_qos(tree);
+            } else {
+                ConfigTree::ensure_block(qos, "wred-profile", &[&name]);
+            }
+        })
+        .await
+        .map_err(fmt_err);
+    }
+
+    let knob = resolve(
+        rest[0],
+        &[
+            "min-threshold",
+            "max-threshold",
+            "drop-probability",
+            "ecn",
+            "weight",
+        ],
+    )?;
+    // Deferred by the QoS suite: one curve per profile.
+    if knob == "weight" {
+        return Err("% per-profile WRED weight is not supported".into());
+    }
+    if knob == "ecn" {
+        if let Some(extra) = rest.get(1) {
+            return Err(format!("% Invalid input: {extra:?}"));
+        }
+        let name = name.clone();
+        return edit_config(endpoints, move |tree| {
+            let qos = tree.block_mut("qos");
+            let profile = ConfigTree::ensure_block(qos, "wred-profile", &[&name]);
+            if delete {
+                ConfigTree::remove_leaf(profile, "ecn");
+            } else {
+                ConfigTree::set_leaf(profile, "ecn", vec![]);
+            }
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    if delete {
+        if let Some(extra) = rest.get(1) {
+            return Err(format!("% Invalid input: {extra:?}"));
+        }
+        let knob = knob.to_string();
+        let name = name.clone();
+        return edit_config(endpoints, move |tree| {
+            let qos = tree.block_mut("qos");
+            let profile = ConfigTree::ensure_block(qos, "wred-profile", &[&name]);
+            ConfigTree::remove_leaf(profile, &knob);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let range = if knob == "drop-probability" {
+        1..=100u32
+    } else {
+        1..=4096u32
+    };
+    let Some(value) = rest.get(1) else {
+        return Err(format!(
+            "% Usage: set qos wred-profile {name} {knob} <{}-{}>",
+            range.start(),
+            range.end()
+        ));
+    };
+    let value = int_arg::<u32>(value, range, knob)?.to_string();
+    if let Some(extra) = rest.get(2) {
+        return Err(format!("% Invalid input: {extra:?}"));
+    }
+    let knob = knob.to_string();
+    edit_config(endpoints, move |tree| {
+        let qos = tree.block_mut("qos");
+        let profile = ConfigTree::ensure_block(qos, "wred-profile", &[&name]);
+        ConfigTree::set_leaf(profile, &knob, vec![value]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete interfaces <port> qos [trust|default-tc|shape rate|
+/// queue <0-7> ...]`.
+async fn config_port_qos(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    if words.is_empty() {
+        return edit_interface(endpoints, port, move |eth| {
+            if delete {
+                ConfigTree::remove_block(eth, "qos", &[]);
+            } else {
+                ConfigTree::ensure_block(eth, "qos", &[]);
+            }
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    match resolve(
+        words[0],
+        &[
+            "trust",
+            "default-tc",
+            "shape",
+            "queue",
+            "priority-flow-control",
+        ],
+    )? {
+        // Deferred by the QoS suite.
+        "priority-flow-control" => Err("% priority-flow-control is not supported".into()),
+        "trust" => {
+            if delete {
+                return edit_interface(endpoints, port, |eth| {
+                    if let Some(qos) = block_children_mut(eth, "qos") {
+                        ConfigTree::remove_leaf(qos, "trust");
+                    }
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(mode) = words.get(1) else {
+                return Err(format!(
+                    "% Usage: set interfaces {port} qos trust <dscp|cos|untrusted>"
+                ));
+            };
+            let mode = resolve(mode, &["dscp", "cos", "untrusted"])?.to_string();
+            if let Some(extra) = words.get(2) {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            edit_interface(endpoints, port, move |eth| {
+                let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                ConfigTree::set_leaf(qos, "trust", vec![mode]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "default-tc" => {
+            if delete {
+                return edit_interface(endpoints, port, |eth| {
+                    if let Some(qos) = block_children_mut(eth, "qos") {
+                        ConfigTree::remove_leaf(qos, "default-tc");
+                    }
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = words.get(1) else {
+                return Err(format!(
+                    "% Usage: set interfaces {port} qos default-tc <0-7>"
+                ));
+            };
+            let value = int_arg::<u8>(value, 0..=7, "default-tc")?.to_string();
+            if let Some(extra) = words.get(2) {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            edit_interface(endpoints, port, move |eth| {
+                let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                ConfigTree::set_leaf(qos, "default-tc", vec![value]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "shape" => {
+            let rate = qos_shape_rate(&words[1..], delete, &format!("set interfaces {port} qos"))?;
+            edit_interface(endpoints, port, move |eth| {
+                let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                match rate {
+                    Some(rate) => ConfigTree::set_phrase(qos, "shape", "rate", vec![rate]),
+                    None => ConfigTree::remove_leaf(qos, "shape"),
+                }
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "queue" => config_port_qos_queue(endpoints, port, &words[1..], delete).await,
+        _ => unreachable!(),
+    }
+}
+
+/// The `shape rate <rate>` tail shared by the port and queue forms.
+/// `Ok(None)` = the delete form.
+fn qos_shape_rate(words: &[&str], delete: bool, prefix: &str) -> Result<Option<String>, String> {
+    if delete {
+        if let Some(word) = words.first() {
+            resolve(word, &["rate"])?;
+        }
+        if let Some(extra) = words.get(1) {
+            return Err(format!("% Invalid input: {extra:?}"));
+        }
+        return Ok(None);
+    }
+    let Some(keyword) = words.first() else {
+        return Err(format!("% Usage: {prefix} shape rate <rate>"));
+    };
+    resolve(keyword, &["rate"])?;
+    let Some(rate) = words.get(1) else {
+        return Err(format!("% Usage: {prefix} shape rate <rate>"));
+    };
+    let parsed = hemlock_common::net::parse_shape_rate(rate).map_err(|e| format!("% {e}"))?;
+    if let Some(extra) = words.get(2) {
+        return Err(format!("% Invalid input: {extra:?}"));
+    }
+    Ok(Some(hemlock_common::net::format_shape_rate(parsed)))
+}
+
+/// `set|delete interfaces <port> qos queue <0-7> [priority strict|
+/// weight <1-127>|shape rate <rate>|wred-profile <name>]`.
+async fn config_port_qos_queue(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let Some(index_text) = words.first() else {
+        return Err(format!(
+            "% Usage: {verb} interfaces {port} qos queue <0-7> [priority strict|weight <1-127>|shape rate <rate>|wred-profile <name>]"
+        ));
+    };
+    let index = int_arg::<u8>(index_text, 0..=7, "queue")?.to_string();
+    let rest = &words[1..];
+
+    if rest.is_empty() {
+        let index = index.clone();
+        return edit_interface(endpoints, port, move |eth| {
+            let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+            if delete {
+                ConfigTree::remove_block(qos, "queue", &[&index]);
+            } else {
+                ConfigTree::ensure_block(qos, "queue", &[&index]);
+            }
+        })
+        .await
+        .map_err(fmt_err);
+    }
+
+    let knob = resolve(
+        rest[0],
+        &["priority", "weight", "shape", "wred-profile", "bandwidth"],
+    )?;
+    // Deferred by the QoS suite: DWRR weights, not percentages.
+    if knob == "bandwidth" {
+        return Err("% queue bandwidth percentages are not supported (use weight)".into());
+    }
+    let prefix = format!("{verb} interfaces {port} qos queue {index}");
+    match knob {
+        "priority" => {
+            if !delete {
+                let Some(word) = rest.get(1) else {
+                    return Err(format!("% Usage: {prefix} priority strict"));
+                };
+                resolve(word, &["strict"])?;
+            }
+            if let Some(extra) = rest.get(2) {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            edit_interface(endpoints, port, move |eth| {
+                let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                let queue = ConfigTree::ensure_block(qos, "queue", &[&index]);
+                if delete {
+                    ConfigTree::remove_leaf(queue, "priority");
+                } else {
+                    // Strict priority and a DWRR weight are mutually
+                    // exclusive, so setting one clears the other.
+                    ConfigTree::remove_leaf(queue, "weight");
+                    ConfigTree::set_leaf(queue, "priority", vec!["strict".into()]);
+                }
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "weight" => {
+            if delete {
+                if let Some(extra) = rest.get(1) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_interface(endpoints, port, move |eth| {
+                    let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                    let queue = ConfigTree::ensure_block(qos, "queue", &[&index]);
+                    ConfigTree::remove_leaf(queue, "weight");
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = rest.get(1) else {
+                return Err(format!("% Usage: {prefix} weight <1-127>"));
+            };
+            let value = int_arg::<u8>(value, 1..=127, "weight")?.to_string();
+            if let Some(extra) = rest.get(2) {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            edit_interface(endpoints, port, move |eth| {
+                let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                let queue = ConfigTree::ensure_block(qos, "queue", &[&index]);
+                ConfigTree::remove_leaf(queue, "priority");
+                ConfigTree::set_leaf(queue, "weight", vec![value]);
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "shape" => {
+            let rate = qos_shape_rate(&rest[1..], delete, &prefix)?;
+            edit_interface(endpoints, port, move |eth| {
+                let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                let queue = ConfigTree::ensure_block(qos, "queue", &[&index]);
+                match rate {
+                    Some(rate) => ConfigTree::set_phrase(queue, "shape", "rate", vec![rate]),
+                    None => ConfigTree::remove_leaf(queue, "shape"),
+                }
+            })
+            .await
+            .map_err(fmt_err)
+        }
+        "wred-profile" => {
+            if delete {
+                if let Some(extra) = rest.get(1) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_interface(endpoints, port, move |eth| {
+                    let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                    let queue = ConfigTree::ensure_block(qos, "queue", &[&index]);
+                    ConfigTree::remove_leaf(queue, "wred-profile");
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(name) = rest.get(1) else {
+                return Err(format!("% Usage: {prefix} wred-profile <name>"));
+            };
+            if !valid_wred_name(name) {
+                return Err(format!(
+                    "% bad WRED profile name {name:?} (letter first, then letters/digits/_/-, max 32)"
+                ));
+            }
+            let name = name.to_string();
+            if let Some(extra) = rest.get(2) {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            edit_interface(endpoints, port, move |eth| {
+                let qos = ConfigTree::ensure_block(eth, "qos", &[]);
+                let queue = ConfigTree::ensure_block(qos, "queue", &[&index]);
+                ConfigTree::set_leaf(queue, "wred-profile", vec![name]);
             })
             .await
             .map_err(fmt_err)
@@ -1896,6 +2516,7 @@ async fn config_interfaces(
             "dot1x",
             "dhcp-snooping",
             "arp-inspection",
+            "qos",
         ],
     )?;
     // SVIs carry an address (and, with the routing suite, VRRP groups)
@@ -1904,6 +2525,9 @@ async fn config_interfaces(
         // Deferred by the security suite: ACLs bind to ports only.
         if subcommand == "access-group" {
             return Err("% VLAN ACLs are not supported (port bindings only)".into());
+        }
+        if subcommand == "qos" {
+            return Err("% QoS is a front-panel concept; configure it on the physical port".into());
         }
         if !matches!(subcommand, "address" | "vrrp") {
             return Err(format!(
@@ -1925,6 +2549,7 @@ async fn config_interfaces(
                 | "dot1x"
                 | "dhcp-snooping"
                 | "arp-inspection"
+                | "qos"
         )
     {
         return Err(format!(
@@ -1951,6 +2576,9 @@ async fn config_interfaces(
         }
         "port-security" => {
             return config_port_security(endpoints, &port, &rest[1..], delete).await;
+        }
+        "qos" => {
+            return config_port_qos(endpoints, &port, &rest[1..], delete).await;
         }
         "dot1x" => {
             if let Some(extra) = rest.get(1) {
@@ -4612,6 +5240,75 @@ mod tests {
             vec!["EDGE-IN", "IOT-MAC", "MGMT6-IN"]
         );
         assert!(candidate_acl_names(&hemlock_config::ConfigTree::default()).is_empty());
+    }
+
+    #[test]
+    fn wred_names_validate_at_the_prompt() {
+        assert!(valid_wred_name("BULK"));
+        assert!(valid_wred_name("a"));
+        assert!(valid_wred_name("A2345678901234567890123456789012")); // 32
+        assert!(!valid_wred_name("A23456789012345678901234567890123")); // 33
+        assert!(!valid_wred_name("9BAD"));
+        assert!(!valid_wred_name(""));
+        assert!(!valid_wred_name("has space"));
+    }
+
+    #[test]
+    fn candidate_wred_names_come_from_the_qos_block() {
+        let tree = hemlock_config::parse(
+            "qos { wred-profile VOICE { } wred-profile BULK { } map { dscp-to-tc { } } }",
+        )
+        .unwrap();
+        assert_eq!(candidate_wred_names(&tree), vec!["BULK", "VOICE"]);
+        assert!(candidate_wred_names(&hemlock_config::ConfigTree::default()).is_empty());
+    }
+
+    /// Map entries are per-value phrase leaves, so a list expands and a
+    /// single value deletes on its own.
+    #[test]
+    fn qos_map_entries_are_per_value_leaves() {
+        let mut items: Vec<hemlock_config::Item> = Vec::new();
+        for dscp in [40, 41, 42, 48] {
+            set_map_entry(&mut items, "dscp", dscp, "tc", 5);
+        }
+        assert_eq!(items.len(), 4);
+        // A later set for the same value replaces it.
+        set_map_entry(&mut items, "dscp", 42, "tc", 3);
+        assert_eq!(items.len(), 4);
+        let entry = items
+            .iter()
+            .find(|item| {
+                matches!(item, hemlock_config::Item::Leaf { values, .. }
+                    if values.first().map(String::as_str) == Some("42"))
+            })
+            .unwrap();
+        assert_eq!(
+            entry,
+            &hemlock_config::Item::Leaf {
+                name: "dscp".into(),
+                values: vec!["42".into(), "tc".into(), "3".into()],
+            }
+        );
+        // One value out, then the whole table.
+        remove_map_entries(&mut items, "dscp", &[41]);
+        assert_eq!(items.len(), 3);
+        remove_map_entries(&mut items, "dscp", &[]);
+        assert!(items.is_empty());
+    }
+
+    /// The `qos { map { <table> { } } }` scaffolding collapses when its
+    /// last entry goes; a named profile block does not.
+    #[test]
+    fn prune_qos_collapses_emptied_map_tables() {
+        let mut tree =
+            hemlock_config::parse("qos { map { dscp-to-tc { } cos-to-tc { } } }").unwrap();
+        prune_qos(&mut tree);
+        assert_eq!(tree.to_text().trim(), "");
+
+        let mut tree = hemlock_config::parse("qos { map { } wred-profile BULK { } }").unwrap();
+        prune_qos(&mut tree);
+        assert!(tree.to_text().contains("wred-profile BULK"));
+        assert!(!tree.to_text().contains("map"));
     }
 
     #[test]

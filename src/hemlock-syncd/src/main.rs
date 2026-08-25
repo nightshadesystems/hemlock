@@ -12,6 +12,7 @@
 mod actor;
 mod ifstats;
 mod netdev;
+mod qos;
 mod security;
 mod service;
 mod state;
@@ -328,6 +329,8 @@ async fn collect_stats(
                             bytes: q.bytes,
                             dropped_pkts: q.dropped_pkts,
                             dropped_bytes: q.dropped_bytes,
+                            wred_dropped: q.wred_dropped,
+                            ecn_marked: q.ecn_marked,
                         })
                         .collect();
                     engine.ingest(&sample.name, sample.counters.into(), queues, now);

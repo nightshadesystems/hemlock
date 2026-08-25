@@ -77,6 +77,10 @@ pub struct Intents {
     /// dhcp-snooping ... arp-inspection ... }`; per-port trust flags
     /// live on the port intents).
     pub snoop_sec: SnoopSecIntent,
+    /// The four global QoS maps (`qos { map { ... } }`).
+    pub qos_maps: QosMapsIntent,
+    /// Named WRED/ECN profiles (`qos { wred-profile <name> { ... } }`).
+    pub wred_profiles: BTreeMap<String, WredProfileIntent>,
     /// Non-fatal commit notes (empty port-channels, MTU hints).
     pub warnings: Vec<String>,
 }
@@ -232,6 +236,8 @@ pub struct InterfaceIntent {
     /// `dhcp-snooping trust` / `arp-inspection trust` markers.
     pub dhcp_snooping_trust: bool,
     pub arp_inspection_trust: bool,
+    /// `qos { ... }`: classification, scheduling, shaping, WRED.
+    pub qos: Option<PortQosIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -317,6 +323,8 @@ pub struct LagIntent {
     /// `dhcp-snooping trust` / `arp-inspection trust` markers.
     pub dhcp_snooping_trust: bool,
     pub arp_inspection_trust: bool,
+    /// `qos { ... }`: applies to every member port.
+    pub qos: Option<PortQosIntent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,6 +531,11 @@ pub struct CoppClassIntent {
     pub burst: Option<u32>,
 }
 
+/// Egress unicast queues per front-panel port. The Helix4 exposes
+/// eight; the config grammar and the strict-priority contiguity rule
+/// both key off it.
+pub const QOS_QUEUE_COUNT: u8 = 8;
+
 /// The compiled CoPP class names (`security copp class <name>`); the
 /// full table with default rates lives in syncd.
 pub const COPP_CLASS_NAMES: &[&str] = &[
@@ -619,6 +632,87 @@ impl Default for PortSecurityIntent {
             shutdown: false,
         }
     }
+}
+
+/// The four global QoS map tables. Empty tables mean the defaults:
+/// unmapped DSCP/CoS values land in TC 0, and a TC with no rewrite entry
+/// leaves the packet's markings alone.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QosMapsIntent {
+    /// DSCP (0..63) -> traffic class (0..7).
+    pub dscp_to_tc: BTreeMap<u8, u8>,
+    /// 802.1p CoS (0..7) -> traffic class.
+    pub cos_to_tc: BTreeMap<u8, u8>,
+    /// Traffic class -> DSCP rewrite.
+    pub tc_to_dscp: BTreeMap<u8, u8>,
+    /// Traffic class -> CoS rewrite.
+    pub tc_to_cos: BTreeMap<u8, u8>,
+}
+
+impl QosMapsIntent {
+    pub fn is_empty(&self) -> bool {
+        self.dscp_to_tc.is_empty()
+            && self.cos_to_tc.is_empty()
+            && self.tc_to_dscp.is_empty()
+            && self.tc_to_cos.is_empty()
+    }
+}
+
+/// One named WRED/ECN profile. Both thresholds are required by commit
+/// once a queue references the profile.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WredProfileIntent {
+    /// KB.
+    pub min_threshold: Option<u32>,
+    pub max_threshold: Option<u32>,
+    /// Percent at max-threshold; default 10.
+    pub drop_probability: u32,
+    /// Mark instead of drop for ECT traffic.
+    pub ecn: bool,
+}
+
+/// A port's ingress classification mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QosTrust {
+    /// Everything lands in the port's default traffic class.
+    #[default]
+    Untrusted,
+    Dscp,
+    Cos,
+}
+
+impl QosTrust {
+    pub fn word(self) -> &'static str {
+        match self {
+            QosTrust::Untrusted => "untrusted",
+            QosTrust::Dscp => "dscp",
+            QosTrust::Cos => "cos",
+        }
+    }
+}
+
+/// A port's whole QoS program (`interfaces { <name> { qos { ... } } }`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PortQosIntent {
+    pub trust: QosTrust,
+    pub default_tc: u8,
+    /// Port shaper in bits/sec.
+    pub shape: Option<u64>,
+    /// Queues carrying non-default config, keyed by queue index.
+    pub queues: BTreeMap<u8, QueueQosIntent>,
+}
+
+/// One egress queue's config. Absent = the platform default (DWRR
+/// weight 1, unshaped, no WRED).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueueQosIntent {
+    /// `priority strict`.
+    pub strict: bool,
+    /// DWRR weight 1..127; None = the default 1.
+    pub weight: Option<u8>,
+    /// Queue shaper in bits/sec.
+    pub shape: Option<u64>,
+    pub wred_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -779,6 +873,28 @@ pub enum IntentError {
 
     #[error("security arp-inspection: {0}")]
     BadArpInspection(String),
+
+    #[error("qos: {0}")]
+    BadQos(String),
+
+    #[error("qos map {table}: {reason}")]
+    BadQosMap { table: String, reason: String },
+
+    #[error("qos wred-profile {name}: {reason}")]
+    BadWredProfile { name: String, reason: String },
+
+    #[error("interface {name}: qos: {reason}")]
+    BadPortQos { name: String, reason: String },
+
+    #[error("{name} queue {queue}: {reason}")]
+    BadQueueQos {
+        name: String,
+        queue: String,
+        reason: String,
+    },
+
+    #[error("strict queues must be the highest-numbered queues")]
+    StrictQueueOrder,
 }
 
 /// Extract every intent family from a config tree.
@@ -793,6 +909,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
     protocols(tree, &mut intents)?;
     switching(tree, &mut intents)?;
     security(tree, &mut intents)?;
+    qos(tree, &mut intents)?;
     let Some((_, items)) = tree.block("interfaces") else {
         finish_validation(&mut intents)?;
         return Ok(intents);
@@ -889,6 +1006,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         "arp-inspection",
                         "trust",
                     ),
+                    qos: port_qos(children, &ifname)?,
                 };
                 if intent.dot1x && intent.port_security.is_some() {
                     return Err(IntentError::BadPortSecurity {
@@ -953,12 +1071,19 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         "arp-inspection",
                         "trust",
                     ),
+                    qos: port_qos(children, &ifname)?,
                 };
                 if intents.lags.insert(group, intent).is_some() {
                     return Err(IntentError::Duplicate { name: ifname });
                 }
             }
             Kind::Management => {
+                if ConfigTree::blocks_named(children, "qos").next().is_some() {
+                    return Err(IntentError::BadPortQos {
+                        name: ifname,
+                        reason: "QoS is a front-panel concept (not supported on Management)".into(),
+                    });
+                }
                 for (block, what) in [
                     ("switchport", "switchports"),
                     ("spanning-tree", "spanning-tree ports"),
@@ -1020,6 +1145,14 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     return Err(IntentError::BadSwitchport {
                         name: ifname,
                         reason: "VLAN interfaces are not switchports".into(),
+                    });
+                }
+                if ConfigTree::blocks_named(children, "qos").next().is_some() {
+                    return Err(IntentError::BadPortQos {
+                        name: ifname,
+                        reason:
+                            "QoS is a front-panel concept; classification happens at the physical port"
+                                .into(),
                     });
                 }
                 // An SVI needs its VLAN to exist (the default VLAN 1
@@ -1085,6 +1218,271 @@ fn vrrp_groups(children: &[Item], ifname: &str) -> Result<Vec<(u8, VrrpIntent)>,
         groups.push((group, vrrp));
     }
     Ok(groups)
+}
+
+/// `qos { map { ... } wred-profile <name> { ... } }`.
+fn qos(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
+    let Some((_, items)) = tree.block("qos") else {
+        return Ok(());
+    };
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadQos(format!(
+                "unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        match (name.as_str(), keys.as_slice()) {
+            ("map", []) => qos_maps(children, intents)?,
+            ("wred-profile", [profile]) => {
+                let intent = wred_profile(profile, children)?;
+                if intents
+                    .wred_profiles
+                    .insert(profile.clone(), intent)
+                    .is_some()
+                {
+                    return Err(IntentError::BadWredProfile {
+                        name: profile.clone(),
+                        reason: "duplicate profile".into(),
+                    });
+                }
+            }
+            ("wred-profile", _) => {
+                return Err(IntentError::BadQos(
+                    "wred-profile block needs exactly one name key".into(),
+                ));
+            }
+            (other, _) => {
+                return Err(IntentError::BadQos(format!("unrecognized block {other:?}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// WRED/ECN profile name syntax: letter first, then letters/digits/`_`/
+/// `-`, at most 32 characters — same shape as an ACL name.
+pub fn valid_wred_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    name.len() <= 32 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn wred_profile(name: &str, children: &[Item]) -> Result<WredProfileIntent, IntentError> {
+    let bad = |reason: String| IntentError::BadWredProfile {
+        name: name.to_string(),
+        reason,
+    };
+    if !valid_wred_name(name) {
+        return Err(bad(
+            "bad name (letter first, then letters/digits/_/-, max 32)".into(),
+        ));
+    }
+    let mut profile = WredProfileIntent {
+        drop_probability: 10,
+        ..WredProfileIntent::default()
+    };
+    for item in children {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match (name.as_str(), values.as_slice()) {
+            ("min-threshold", [value]) => {
+                profile.min_threshold =
+                    Some(parse_int::<u32>(value, 1..=4096, "min-threshold").map_err(&bad)?);
+            }
+            ("max-threshold", [value]) => {
+                profile.max_threshold =
+                    Some(parse_int::<u32>(value, 1..=4096, "max-threshold").map_err(&bad)?);
+            }
+            ("drop-probability", [value]) => {
+                profile.drop_probability =
+                    parse_int::<u32>(value, 1..=100, "drop-probability").map_err(&bad)?;
+            }
+            ("ecn", []) => profile.ecn = true,
+            _ => return Err(bad(format!("unrecognized statement {name:?}"))),
+        }
+    }
+    Ok(profile)
+}
+
+/// The four `map { <table> { ... } }` blocks. Each entry is a per-value
+/// phrase leaf (`dscp 46 tc 5;`), so one mapping deletes on its own.
+fn qos_maps(items: &[Item], intents: &mut Intents) -> Result<(), IntentError> {
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(IntentError::BadQos(format!(
+                "map: unrecognized statement {:?}",
+                item.name()
+            )));
+        };
+        if !keys.is_empty() {
+            return Err(IntentError::BadQos(format!(
+                "map: unrecognized block {name:?}"
+            )));
+        }
+        // (key word, key max, value word, value max, destination)
+        let (key_word, key_max, value_word, value_max) = match name.as_str() {
+            "dscp-to-tc" => ("dscp", 63u8, "tc", 7u8),
+            "cos-to-tc" => ("cos", 7, "tc", 7),
+            "tc-to-dscp" => ("tc", 7, "dscp", 63),
+            "tc-to-cos" => ("tc", 7, "cos", 7),
+            other => {
+                return Err(IntentError::BadQos(format!(
+                    "map: unrecognized table {other:?}"
+                )));
+            }
+        };
+        let bad = |reason: String| IntentError::BadQosMap {
+            table: name.clone(),
+            reason,
+        };
+        let mut table = BTreeMap::new();
+        for entry in children {
+            let Item::Leaf { name: leaf, values } = entry else {
+                return Err(bad(format!("unrecognized block {:?}", entry.name())));
+            };
+            let [key, keyword, value] = values.as_slice() else {
+                return Err(bad(format!(
+                    "expected `{key_word} <value> {value_word} <value>`"
+                )));
+            };
+            if leaf != key_word || keyword != value_word {
+                return Err(bad(format!(
+                    "expected `{key_word} <value> {value_word} <value>`"
+                )));
+            }
+            let key = parse_int::<u8>(key, 0..=key_max, key_word).map_err(&bad)?;
+            let value = parse_int::<u8>(value, 0..=value_max, value_word).map_err(&bad)?;
+            if table.insert(key, value).is_some() {
+                return Err(bad(format!("duplicate {key_word} {key}")));
+            }
+        }
+        let slot = match name.as_str() {
+            "dscp-to-tc" => &mut intents.qos_maps.dscp_to_tc,
+            "cos-to-tc" => &mut intents.qos_maps.cos_to_tc,
+            "tc-to-dscp" => &mut intents.qos_maps.tc_to_dscp,
+            _ => &mut intents.qos_maps.tc_to_cos,
+        };
+        if !slot.is_empty() {
+            return Err(IntentError::BadQos(format!("duplicate map block {name:?}")));
+        }
+        *slot = table;
+    }
+    Ok(())
+}
+
+/// One interface's `qos { ... }` block.
+fn port_qos(children: &[Item], ifname: &str) -> Result<Option<PortQosIntent>, IntentError> {
+    let mut blocks = ConfigTree::blocks_named(children, "qos");
+    let Some((keys, body)) = blocks.next() else {
+        return Ok(None);
+    };
+    if blocks.next().is_some() || !keys.is_empty() {
+        return Err(IntentError::BadPortQos {
+            name: ifname.to_string(),
+            reason: "duplicate qos block".into(),
+        });
+    }
+    let bad = |reason: String| IntentError::BadPortQos {
+        name: ifname.to_string(),
+        reason,
+    };
+    let mut qos = PortQosIntent::default();
+    for item in body {
+        match item {
+            Item::Leaf { name, values } => match (name.as_str(), values.as_slice()) {
+                ("trust", [word]) => {
+                    qos.trust = match word.as_str() {
+                        "untrusted" => QosTrust::Untrusted,
+                        "dscp" => QosTrust::Dscp,
+                        "cos" => QosTrust::Cos,
+                        other => {
+                            return Err(bad(format!("bad trust {other:?} (dscp|cos|untrusted)")));
+                        }
+                    };
+                }
+                ("default-tc", [value]) => {
+                    qos.default_tc = parse_int::<u8>(value, 0..=7, "default-tc").map_err(&bad)?;
+                }
+                ("shape", [keyword, rate]) if keyword == "rate" => {
+                    qos.shape = Some(hemlock_common::net::parse_shape_rate(rate).map_err(&bad)?);
+                }
+                _ => return Err(bad(format!("unrecognized statement {name:?}"))),
+            },
+            Item::Block {
+                name,
+                keys,
+                children,
+            } => {
+                if name != "queue" {
+                    return Err(bad(format!("unrecognized block {name:?}")));
+                }
+                let [index_text] = keys.as_slice() else {
+                    return Err(bad("queue block needs exactly one index key".into()));
+                };
+                let queue_bad = |reason: String| IntentError::BadQueueQos {
+                    name: ifname.to_string(),
+                    queue: index_text.clone(),
+                    reason,
+                };
+                let index = parse_int::<u8>(index_text, 0..=7, "queue").map_err(&queue_bad)?;
+                let queue = queue_qos(children, &queue_bad)?;
+                if qos.queues.insert(index, queue).is_some() {
+                    return Err(queue_bad("duplicate queue block".into()));
+                }
+            }
+        }
+    }
+    // A queue left entirely at the defaults carries no config, so an
+    // empty `queue <n> { }` diffs to nothing.
+    qos.queues
+        .retain(|_, queue| *queue != QueueQosIntent::default());
+    Ok(Some(qos))
+}
+
+/// One `queue <0-7> { ... }` body.
+fn queue_qos(
+    children: &[Item],
+    bad: &dyn Fn(String) -> IntentError,
+) -> Result<QueueQosIntent, IntentError> {
+    let mut queue = QueueQosIntent::default();
+    for item in children {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match (name.as_str(), values.as_slice()) {
+            ("priority", [word]) if word == "strict" => queue.strict = true,
+            ("priority", [other]) => {
+                return Err(bad(format!("bad priority {other:?} (strict)")));
+            }
+            ("weight", [value]) => {
+                queue.weight = Some(parse_int::<u8>(value, 1..=127, "weight").map_err(bad)?);
+            }
+            ("shape", [keyword, rate]) if keyword == "rate" => {
+                queue.shape = Some(hemlock_common::net::parse_shape_rate(rate).map_err(bad)?);
+            }
+            ("wred-profile", [name]) => queue.wred_profile = Some(name.clone()),
+            _ => return Err(bad(format!("unrecognized statement {name:?}"))),
+        }
+    }
+    if queue.strict && queue.weight.is_some() {
+        return Err(bad("strict and weight are mutually exclusive".into()));
+    }
+    Ok(queue)
 }
 
 /// Cross-family semantic checks that need the whole tree extracted:
@@ -1893,6 +2291,102 @@ fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
                     cg.group
                 )));
             }
+        }
+    }
+
+    // QoS: strict/weight exclusivity and contiguity, shaper ordering,
+    // WRED profile references, and the front-panel-only rule.
+    let mut qos_targets: Vec<(String, &PortQosIntent)> = Vec::new();
+    for (name, port) in &intents.ports {
+        if let Some(qos) = &port.qos {
+            if let Some(cg) = &port.channel_group {
+                return Err(IntentError::MemberConfigConflict {
+                    member: name.clone(),
+                    group: cg.group,
+                });
+            }
+            qos_targets.push((name.clone(), qos));
+        }
+    }
+    for (group, lag) in &intents.lags {
+        if let Some(qos) = &lag.qos {
+            qos_targets.push((format!("Port-Channel{group}"), qos));
+        }
+    }
+    let mut wred_references: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, qos) in &qos_targets {
+        let mut strict: BTreeSet<u8> = BTreeSet::new();
+        for (index, queue) in &qos.queues {
+            if queue.strict && queue.weight.is_some() {
+                return Err(IntentError::BadQueueQos {
+                    name: name.clone(),
+                    queue: index.to_string(),
+                    reason: "strict and weight are mutually exclusive".into(),
+                });
+            }
+            if queue.strict {
+                strict.insert(*index);
+            }
+            // A queue shaper below the port shaper is the only useful
+            // ordering: the other way round is silently dead config.
+            if let (Some(queue_rate), Some(port_rate)) = (queue.shape, qos.shape) {
+                if queue_rate > port_rate {
+                    return Err(IntentError::BadQueueQos {
+                        name: name.clone(),
+                        queue: index.to_string(),
+                        reason: format!(
+                            "shaper {} exceeds the port shaper {}",
+                            hemlock_common::net::format_shape_rate(queue_rate),
+                            hemlock_common::net::format_shape_rate(port_rate)
+                        ),
+                    });
+                }
+            }
+            if let Some(profile) = &queue.wred_profile {
+                if !intents.wred_profiles.contains_key(profile) {
+                    return Err(IntentError::BadQueueQos {
+                        name: name.clone(),
+                        queue: index.to_string(),
+                        reason: format!("no such qos wred-profile {profile:?}"),
+                    });
+                }
+                wred_references
+                    .entry(profile.clone())
+                    .or_default()
+                    .push(format!("{name} (q{index})"));
+            }
+        }
+        // The Helix4 scheduler tree can only express strict priority on
+        // the top queues, so the strict set must run 7, 7-6, 7-6-5, ...
+        if !strict.is_empty() {
+            let top = QOS_QUEUE_COUNT - 1;
+            let expected: BTreeSet<u8> = (top + 1 - strict.len() as u8..=top).collect();
+            if strict != expected {
+                return Err(IntentError::StrictQueueOrder);
+            }
+        }
+    }
+    // A referenced profile needs both thresholds, in order.
+    for (name, profile) in &intents.wred_profiles {
+        let referenced = wred_references.contains_key(name);
+        let bad = |reason: String| IntentError::BadWredProfile {
+            name: name.clone(),
+            reason,
+        };
+        match (profile.min_threshold, profile.max_threshold) {
+            (Some(min), Some(max)) if min >= max => {
+                return Err(bad(format!(
+                    "min-threshold {min} must be below max-threshold {max}"
+                )));
+            }
+            (Some(_), Some(_)) => {}
+            _ if referenced => {
+                return Err(bad(
+                    "min-threshold and max-threshold are required when the profile is referenced"
+                        .into(),
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -4447,6 +4941,134 @@ pub fn diff_snoopsec(running: &Intents, candidate: &Intents) -> Option<SnoopSecS
     (snoopsec_state(running) != wanted).then_some(wanted)
 }
 
+/// The whole global-map state when it changed, else None. The push is
+/// declarative (all four tables at once), so one Option carries it.
+pub fn diff_qos_maps(running: &Intents, candidate: &Intents) -> Option<QosMapsIntent> {
+    (running.qos_maps != candidate.qos_maps).then(|| candidate.qos_maps.clone())
+}
+
+pub struct WredProfileChange {
+    pub name: String,
+    /// The wanted profile; None = remove.
+    pub ensure: Option<WredProfileIntent>,
+}
+
+impl WredProfileChange {
+    pub fn describe(&self) -> String {
+        match &self.ensure {
+            Some(profile) => format!(
+                "qos wred-profile {}: min {} max {} drop {}%{}",
+                self.name,
+                profile
+                    .min_threshold
+                    .map(|kb| format!("{kb}KB"))
+                    .unwrap_or_else(|| "unset".into()),
+                profile
+                    .max_threshold
+                    .map(|kb| format!("{kb}KB"))
+                    .unwrap_or_else(|| "unset".into()),
+                profile.drop_probability,
+                if profile.ecn { " ecn" } else { "" },
+            ),
+            None => format!("qos wred-profile {} removed", self.name),
+        }
+    }
+}
+
+/// Diff the WRED profiles, candidate against running.
+pub fn diff_wred_profiles(running: &Intents, candidate: &Intents) -> Vec<WredProfileChange> {
+    let mut changes = Vec::new();
+    for (name, profile) in &candidate.wred_profiles {
+        if running.wred_profiles.get(name) != Some(profile) {
+            changes.push(WredProfileChange {
+                name: name.clone(),
+                ensure: Some(profile.clone()),
+            });
+        }
+    }
+    for name in running.wred_profiles.keys() {
+        if !candidate.wred_profiles.contains_key(name) {
+            changes.push(WredProfileChange {
+                name: name.clone(),
+                ensure: None,
+            });
+        }
+    }
+    changes
+}
+
+/// The per-port QoS programs of a config, keyed by the display name the
+/// operator configured (a port or a Port-Channel).
+pub fn port_qos_state(intents: &Intents) -> BTreeMap<String, PortQosIntent> {
+    let mut state: BTreeMap<String, PortQosIntent> = intents
+        .ports
+        .iter()
+        .filter_map(|(name, port)| port.qos.clone().map(|qos| (name.clone(), qos)))
+        .collect();
+    for (group, lag) in &intents.lags {
+        if let Some(qos) = &lag.qos {
+            state.insert(format!("Port-Channel{group}"), qos.clone());
+        }
+    }
+    state
+}
+
+pub struct PortQosChange {
+    pub port: String,
+    /// The wanted program; None = back to the platform defaults.
+    pub set: Option<PortQosIntent>,
+}
+
+impl PortQosChange {
+    pub fn describe(&self) -> String {
+        match &self.set {
+            Some(qos) => {
+                let mut text = format!(
+                    "qos on {}: trust {} default-tc {}",
+                    self.port,
+                    qos.trust.word(),
+                    qos.default_tc
+                );
+                if let Some(rate) = qos.shape {
+                    text.push_str(&format!(
+                        " shaper {}",
+                        hemlock_common::net::format_shape_rate(rate)
+                    ));
+                }
+                if !qos.queues.is_empty() {
+                    text.push_str(&format!(" ({} queue(s) configured)", qos.queues.len()));
+                }
+                text
+            }
+            None => format!("qos removed from {}", self.port),
+        }
+    }
+}
+
+/// Diff the per-port QoS programs, candidate against running.
+pub fn diff_port_qos(running: &Intents, candidate: &Intents) -> Vec<PortQosChange> {
+    let running = port_qos_state(running);
+    let wanted = port_qos_state(candidate);
+    let mut changes = Vec::new();
+    for (port, qos) in &wanted {
+        if running.get(port) != Some(qos) {
+            changes.push(PortQosChange {
+                port: port.clone(),
+                set: Some(qos.clone()),
+            });
+        }
+    }
+    for port in running.keys() {
+        if !wanted.contains_key(port) {
+            changes.push(PortQosChange {
+                port: port.clone(),
+                set: None,
+            });
+        }
+    }
+    changes
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -6066,6 +6688,269 @@ interfaces {
     }
 }
 "#
+    }
+
+    /// The Part 1.1 seed: the golden fixture for the QoS family.
+    fn qos_seed() -> &'static str {
+        r#"
+qos {
+    map {
+        dscp-to-tc {
+            dscp 46 tc 5
+            dscp 26 tc 3
+            dscp 8 tc 1
+        }
+        cos-to-tc {
+            cos 5 tc 5
+            cos 3 tc 3
+        }
+        tc-to-dscp {
+            tc 5 dscp 46
+            tc 3 dscp 26
+        }
+        tc-to-cos {
+            tc 5 cos 5
+            tc 3 cos 3
+        }
+    }
+    wred-profile BULK {
+        min-threshold 64
+        max-threshold 256
+        drop-probability 10
+        ecn
+    }
+}
+interfaces {
+    Ethernet1 {
+        qos {
+            trust dscp
+            default-tc 1
+            queue 7 {
+                priority strict
+            }
+            queue 5 {
+                weight 40
+                shape rate 100m
+            }
+            queue 3 {
+                weight 30
+                wred-profile BULK
+            }
+        }
+    }
+    Port-Channel1 {
+        qos {
+            trust dscp
+            shape rate 800m
+        }
+    }
+}
+"#
+    }
+
+    #[test]
+    fn qos_seed_round_trips_and_extracts() {
+        let tree = parse(qos_seed()).unwrap();
+        assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+        let intents = extract(&tree).unwrap();
+
+        // Global maps.
+        assert_eq!(
+            intents.qos_maps.dscp_to_tc,
+            BTreeMap::from([(46, 5), (26, 3), (8, 1)])
+        );
+        assert_eq!(intents.qos_maps.cos_to_tc, BTreeMap::from([(5, 5), (3, 3)]));
+        assert_eq!(
+            intents.qos_maps.tc_to_dscp,
+            BTreeMap::from([(5, 46), (3, 26)])
+        );
+        assert_eq!(intents.qos_maps.tc_to_cos, BTreeMap::from([(5, 5), (3, 3)]));
+
+        // The WRED profile.
+        assert_eq!(
+            intents.wred_profiles["BULK"],
+            WredProfileIntent {
+                min_threshold: Some(64),
+                max_threshold: Some(256),
+                drop_probability: 10,
+                ecn: true,
+            }
+        );
+
+        // Per-port classification, scheduling, shaping.
+        let qos = intents.ports["Ethernet1"].qos.as_ref().unwrap();
+        assert_eq!(qos.trust, QosTrust::Dscp);
+        assert_eq!(qos.default_tc, 1);
+        assert_eq!(qos.shape, None);
+        assert_eq!(
+            qos.queues.keys().copied().collect::<Vec<_>>(),
+            vec![3, 5, 7]
+        );
+        assert!(qos.queues[&7].strict);
+        assert_eq!(qos.queues[&5].weight, Some(40));
+        assert_eq!(qos.queues[&5].shape, Some(100_000_000));
+        assert_eq!(qos.queues[&3].wred_profile.as_deref(), Some("BULK"));
+
+        // A Port-Channel program applies to every member.
+        let po = intents.lags[&1].qos.as_ref().unwrap();
+        assert_eq!(po.trust, QosTrust::Dscp);
+        assert_eq!(po.shape, Some(800_000_000));
+        assert_eq!(
+            port_qos_state(&intents).keys().collect::<Vec<_>>(),
+            vec!["Ethernet1", "Port-Channel1"]
+        );
+    }
+
+    #[test]
+    fn qos_queue_validation() {
+        let bad = |text: &str| extract(&parse(text).unwrap()).unwrap_err();
+
+        // Strict and weight on the same queue.
+        assert_eq!(
+            bad("interfaces { Ethernet1 { qos { queue 5 { priority strict\nweight 40 } } } }")
+                .to_string(),
+            "Ethernet1 queue 5: strict and weight are mutually exclusive"
+        );
+        // Strict queues must be the top ones.
+        assert_eq!(
+            bad("interfaces { Ethernet1 { qos { queue 5 { priority strict } } } }").to_string(),
+            "strict queues must be the highest-numbered queues"
+        );
+        assert_eq!(
+            bad("interfaces { Ethernet1 { qos { queue 7 { priority strict }\nqueue 5 { priority strict } } } }")
+                .to_string(),
+            "strict queues must be the highest-numbered queues"
+        );
+        // ... and a contiguous run from the top is fine.
+        extract(
+            &parse(
+                "interfaces { Ethernet1 { qos { queue 7 { priority strict }\nqueue 6 { priority strict } } } }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        // A queue shaper above the port shaper is dead config.
+        assert_eq!(
+            bad(
+                "interfaces { Ethernet1 { qos { shape rate 100m\nqueue 3 { shape rate 200m } } } }"
+            )
+            .to_string(),
+            "Ethernet1 queue 3: shaper 200m exceeds the port shaper 100m"
+        );
+        // Rates below the shaper granularity floor.
+        assert!(bad("interfaces { Ethernet1 { qos { shape rate 32k } } }")
+            .to_string()
+            .contains("below the 64k shaper granularity floor"));
+    }
+
+    #[test]
+    fn qos_wred_validation() {
+        let bad = |text: &str| extract(&parse(text).unwrap()).unwrap_err();
+
+        // A dangling profile reference.
+        assert_eq!(
+            bad("interfaces { Ethernet1 { qos { queue 3 { wred-profile GONE } } } }").to_string(),
+            "Ethernet1 queue 3: no such qos wred-profile \"GONE\""
+        );
+        // Thresholds must be ordered...
+        assert_eq!(
+            bad("qos { wred-profile BULK { min-threshold 256\nmax-threshold 64 } }").to_string(),
+            "qos wred-profile BULK: min-threshold 256 must be below max-threshold 64"
+        );
+        // ... and both are required once a queue references it.
+        assert_eq!(
+            bad("qos { wred-profile BULK { min-threshold 64 } }\ninterfaces { Ethernet1 { qos { queue 3 { wred-profile BULK } } } }")
+                .to_string(),
+            "qos wred-profile BULK: min-threshold and max-threshold are required when the profile is referenced"
+        );
+        // An unreferenced half-configured profile is only a draft.
+        extract(&parse("qos { wred-profile BULK { min-threshold 64 } }").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn qos_is_a_front_panel_concept() {
+        let bad = |text: &str| extract(&parse(text).unwrap()).unwrap_err();
+
+        // LAG members configure on the Port-Channel.
+        assert_eq!(
+            bad("interfaces { Ethernet49 { channel-group 1 mode active\nqos { trust dscp } } }")
+                .to_string(),
+            "Ethernet49: member of Port-Channel1; configure the Port-Channel"
+        );
+        // SVIs and Management carry no QoS.
+        assert!(
+            bad("vlans { vlan 10 { } }\ninterfaces { Vlan10 { qos { trust dscp } } }")
+                .to_string()
+                .contains("QoS is a front-panel concept")
+        );
+        assert!(bad("interfaces { Management1 { qos { trust dscp } } }")
+            .to_string()
+            .contains("not supported on Management"));
+    }
+
+    #[test]
+    fn qos_map_validation() {
+        let bad = |text: &str| extract(&parse(text).unwrap()).unwrap_err();
+        assert!(bad("qos { map { dscp-to-tc { dscp 64 tc 5 } } }")
+            .to_string()
+            .starts_with("qos map dscp-to-tc:"));
+        assert!(bad("qos { map { dscp-to-tc { dscp 46 tc 9 } } }")
+            .to_string()
+            .contains("bad tc"));
+        assert!(
+            bad("qos { map { dscp-to-tc { dscp 46 tc 5 }\ndscp-to-tc { dscp 8 tc 1 } } }")
+                .to_string()
+                .contains("duplicate map block")
+        );
+        assert!(bad("qos { map { banana { dscp 46 tc 5 } } }")
+            .to_string()
+            .contains("unrecognized table"));
+        // The value words are fixed per table.
+        assert!(bad("qos { map { tc-to-dscp { dscp 46 tc 5 } } }")
+            .to_string()
+            .contains("expected `tc <value> dscp <value>`"));
+    }
+
+    #[test]
+    fn qos_diffs_report_minimal_deltas() {
+        let running = intents_of(qos_seed());
+        // No change at all.
+        assert!(diff_qos_maps(&running, &running).is_none());
+        assert!(diff_wred_profiles(&running, &running).is_empty());
+        assert!(diff_port_qos(&running, &running).is_empty());
+
+        // One map value edited: the whole (declarative) map state ships.
+        let edited = intents_of(&qos_seed().replace("dscp 46 tc 5", "dscp 46 tc 6"));
+        let maps = diff_qos_maps(&running, &edited).unwrap();
+        assert_eq!(maps.dscp_to_tc[&46], 6);
+        assert!(diff_port_qos(&running, &edited).is_empty());
+
+        // A profile threshold change is one ensure; a removed profile
+        // is one remove.
+        let edited = intents_of(&qos_seed().replace("max-threshold 256", "max-threshold 512"));
+        let changes = diff_wred_profiles(&running, &edited);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, "BULK");
+        assert_eq!(changes[0].ensure.as_ref().unwrap().max_threshold, Some(512));
+
+        // Dropping the port's qos block clears the port.
+        let cleared = intents_of(&qos_seed().replace(
+            "        qos {\n            trust dscp\n            default-tc 1\n",
+            "        qos {\n",
+        ));
+        let changes = diff_port_qos(&running, &cleared);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].port, "Ethernet1");
+        let set = changes[0].set.as_ref().unwrap();
+        assert_eq!(set.trust, QosTrust::Untrusted);
+        assert_eq!(set.default_tc, 0);
+
+        // Removing the block entirely reverts to the platform defaults.
+        let none = intents_of("qos { }\ninterfaces { Ethernet1 { } }");
+        let changes = diff_port_qos(&running, &none);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|change| change.set.is_none()));
     }
 
     #[test]

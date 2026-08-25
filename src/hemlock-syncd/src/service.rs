@@ -55,7 +55,7 @@ pub struct SyncdService {
     pub(crate) handle: Arc<SaiHandle>,
     engine: SharedEngine,
     netdevs: SharedNetdevs,
-    inventory: Inventory,
+    pub(crate) inventory: Inventory,
 }
 
 impl SyncdService {
@@ -138,6 +138,15 @@ impl SyncdService {
 
     /// Queue rows padded/ordered per the platform declaration: UC0..N-1
     /// then MC0..M-1, zeros where the sweep produced nothing.
+    /// One interface's live per-queue samples, baselined against the
+    /// last `clear counters` (empty when nothing has been swept yet).
+    pub(crate) fn queue_samples(&self, name: &str) -> Vec<crate::ifstats::QueueSample> {
+        self.engine
+            .snapshot(name, Instant::now())
+            .map(|snap| snap.queues)
+            .unwrap_or_default()
+    }
+
     fn queue_rows(&self, snap: &Snapshot) -> Vec<pb::QueueCounters> {
         let labels = (0..self.inventory.uc_queues)
             .map(|i| format!("UC{i}"))
@@ -151,6 +160,8 @@ impl SyncdService {
                     bytes: sample.map(|q| q.bytes).unwrap_or(0),
                     dropped_pkts: sample.map(|q| q.dropped_pkts).unwrap_or(0),
                     dropped_bytes: sample.map(|q| q.dropped_bytes).unwrap_or(0),
+                    wred_dropped_pkts: sample.map(|q| q.wred_dropped).unwrap_or(0),
+                    ecn_marked_pkts: sample.map(|q| q.ecn_marked).unwrap_or(0),
                 }
             })
             .collect()
@@ -821,7 +832,7 @@ impl SyncdService {
     }
 
     /// A physical port's or a port-channel's port-like SAI id.
-    fn port_like_sai_id(&self, name: &str) -> Result<hemlock_sai::PortId, Status> {
+    pub(crate) fn port_like_sai_id(&self, name: &str) -> Result<hemlock_sai::PortId, Status> {
         if let Some(group) = lag_group_of(name) {
             let lags = self
                 .handle
@@ -1183,6 +1194,13 @@ impl pb::syncd_server::Syncd for SyncdService {
                 acl_entry_policer: caps.acl_entry_policer,
                 port_learn_limit: caps.port_learn_limit,
                 copp: caps.copp,
+                buffer_bytes_total: caps.buffer_bytes_total,
+                qos_map_ingress: caps.qos_map_ingress,
+                qos_map_egress: caps.qos_map_egress,
+                wred: caps.wred,
+                ecn: caps.ecn,
+                queue_shaper: caps.queue_shaper,
+                wred_queue_stats: caps.wred_queue_stats,
             }),
         }))
     }
@@ -2850,6 +2868,8 @@ impl pb::syncd_server::Syncd for SyncdService {
         let current: Vec<String> = wanted.keys().cloned().collect();
         self.refresh_lag_acls(group, &stale_for_acls, &current)
             .await?;
+        self.refresh_lag_qos(group, &stale_for_acls, &current)
+            .await?;
         Ok(Response::new(pb::SetLagMembersResponse {}))
     }
 
@@ -3741,6 +3761,56 @@ impl pb::syncd_server::Syncd for SyncdService {
     ) -> Result<Response<pb::SetSnoopRedirectsResponse>, Status> {
         self.set_snoop_redirects_impl(request.into_inner()).await?;
         Ok(Response::new(pb::SetSnoopRedirectsResponse {}))
+    }
+
+    // --- QoS ---------------------------------------------------------
+
+    async fn set_qos_maps(
+        &self,
+        request: Request<pb::SetQosMapsRequest>,
+    ) -> Result<Response<pb::SetQosMapsResponse>, Status> {
+        self.set_qos_maps_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::SetQosMapsResponse {}))
+    }
+
+    async fn set_port_qos(
+        &self,
+        request: Request<pb::SetPortQosRequest>,
+    ) -> Result<Response<pb::SetPortQosResponse>, Status> {
+        self.set_port_qos_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::SetPortQosResponse {}))
+    }
+
+    async fn clear_port_qos(
+        &self,
+        request: Request<pb::ClearPortQosRequest>,
+    ) -> Result<Response<pb::ClearPortQosResponse>, Status> {
+        self.clear_port_qos_impl(&request.into_inner().port).await?;
+        Ok(Response::new(pb::ClearPortQosResponse {}))
+    }
+
+    async fn ensure_wred_profile(
+        &self,
+        request: Request<pb::EnsureWredProfileRequest>,
+    ) -> Result<Response<pb::EnsureWredProfileResponse>, Status> {
+        self.ensure_wred_profile_impl(request.into_inner()).await?;
+        Ok(Response::new(pb::EnsureWredProfileResponse {}))
+    }
+
+    async fn remove_wred_profile(
+        &self,
+        request: Request<pb::RemoveWredProfileRequest>,
+    ) -> Result<Response<pb::RemoveWredProfileResponse>, Status> {
+        self.remove_wred_profile_impl(&request.into_inner().name)
+            .await?;
+        Ok(Response::new(pb::RemoveWredProfileResponse {}))
+    }
+
+    async fn get_qos_state(
+        &self,
+        _request: Request<pb::GetQosStateRequest>,
+    ) -> Result<Response<pb::GetQosStateResponse>, Status> {
+        Ok(Response::new(self.qos_state_impl().await?))
     }
 }
 
@@ -5541,6 +5611,507 @@ lanes = [1, 2]
             .unwrap()
             .into_inner();
         assert!(state.ports.is_empty());
+    }
+
+    /// A 4-port board with the Helix4's eight unicast egress queues,
+    /// for the QoS suite (the shared `test_platform` has two).
+    fn qos_platform() -> Platform {
+        let toml = r#"
+schema_version = 1
+
+[platform]
+id = "test-qos"
+onie_machine = "x86_64-test_qos-r0"
+vendor = "Hemlock"
+model = "TestSwitch"
+asic_family = "broadcom-xgs"
+asic = "helix4"
+
+[sai]
+package = "libsaibcm"
+version_pin = "0"
+libsai_path = "/usr/lib/libsai.so.1"
+config_bcm = "config.bcm"
+
+[ports]
+uc_queues = 8
+mc_queues = 1
+
+[[ports.group]]
+prefix = "Ethernet"
+name_start = 1
+index_start = 1
+speed_mbps = 1000
+autoneg = true
+media = "1000BASE-T"
+phy_model = "HLK-PHY-TEST"
+supported_modes = ["1G/full", "auto"]
+lanes = [1, 2, 3, 4]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("platform.toml"), toml).unwrap();
+        Platform::load(dir.path()).unwrap()
+    }
+
+    fn qos_inventory() -> Inventory {
+        Inventory {
+            uc_queues: 8,
+            mc_queues: 1,
+            ..Inventory::default()
+        }
+    }
+
+    fn qos_service(platform: &Platform, handle: Arc<crate::actor::SaiHandle>) -> SyncdService {
+        SyncdService::new(
+            handle,
+            Engine::new(300),
+            Arc::default(),
+            Inventory {
+                platform_model: platform.manifest.platform.model.clone(),
+                ..qos_inventory()
+            },
+        )
+    }
+
+    fn map_entry(key: u32, value: u32) -> pb::QosMapEntry {
+        pb::QosMapEntry { key, value }
+    }
+
+    /// The Part 1.1 seed's maps.
+    fn seed_maps() -> pb::SetQosMapsRequest {
+        pb::SetQosMapsRequest {
+            dscp_to_tc: vec![map_entry(8, 1), map_entry(26, 3), map_entry(46, 5)],
+            cos_to_tc: vec![map_entry(3, 3), map_entry(5, 5)],
+            tc_to_dscp: vec![map_entry(3, 26), map_entry(5, 46)],
+            tc_to_cos: vec![map_entry(3, 3), map_entry(5, 5)],
+        }
+    }
+
+    fn queue_qos(queue: u32) -> pb::QueueQos {
+        pb::QueueQos {
+            queue,
+            strict: false,
+            weight: 0,
+            shape_bps: None,
+            wred_profile: String::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qos_maps_and_classification_over_mock_sai() {
+        let platform = qos_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = qos_service(&platform, handle.clone());
+
+        service
+            .set_qos_maps(Request::new(seed_maps()))
+            .await
+            .unwrap();
+        // Four tables with entries -> four map objects. The rewrite
+        // maps are global, so every port binds them; nothing binds a
+        // classification map until a port trusts something.
+        {
+            let world = handle.qos.read().unwrap();
+            assert_eq!(world.map_objects.len(), 4);
+            assert_eq!(world.applied.len(), 4);
+            for applied in world.applied.values() {
+                assert_eq!(
+                    applied.bound_maps,
+                    std::collections::BTreeSet::from([
+                        hemlock_sai::QosMapType::TcToDscp,
+                        hemlock_sai::QosMapType::TcToDot1p,
+                    ])
+                );
+            }
+        }
+
+        service
+            .set_port_qos(Request::new(pb::SetPortQosRequest {
+                port: "Ethernet1".into(),
+                trust: "dscp".into(),
+                default_tc: 1,
+                shape_bps: None,
+                queues: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.qos.read().unwrap();
+            let applied = &world.applied["Ethernet1"];
+            assert!(applied
+                .bound_maps
+                .contains(&hemlock_sai::QosMapType::DscpToTc));
+            assert_eq!(applied.default_tc, 1);
+            // Trusting DSCP binds no CoS map.
+            assert!(!applied
+                .bound_maps
+                .contains(&hemlock_sai::QosMapType::Dot1pToTc));
+            assert!(!world.applied["Ethernet2"]
+                .bound_maps
+                .contains(&hemlock_sai::QosMapType::DscpToTc));
+        }
+
+        // A value-only edit rewrites the object in place: the binding
+        // set is untouched and no port is rebound.
+        let mut edited = seed_maps();
+        edited.dscp_to_tc = vec![map_entry(8, 1), map_entry(26, 3), map_entry(46, 6)];
+        let objects_before = handle.qos.read().unwrap().map_objects.clone();
+        service.set_qos_maps(Request::new(edited)).await.unwrap();
+        {
+            let world = handle.qos.read().unwrap();
+            assert_eq!(world.map_objects, objects_before);
+            assert_eq!(world.maps.dscp_to_tc[&46], 6);
+        }
+
+        // Emptying a table frees its object and unbinds the ports.
+        let mut without_rewrite = seed_maps();
+        without_rewrite.tc_to_dscp.clear();
+        without_rewrite.tc_to_cos.clear();
+        service
+            .set_qos_maps(Request::new(without_rewrite))
+            .await
+            .unwrap();
+        {
+            let world = handle.qos.read().unwrap();
+            assert_eq!(world.map_objects.len(), 2);
+            for applied in world.applied.values() {
+                assert!(!applied
+                    .bound_maps
+                    .contains(&hemlock_sai::QosMapType::TcToDscp));
+            }
+        }
+
+        // ClearPortQos puts the port back to the platform defaults.
+        service
+            .clear_port_qos(Request::new(pb::ClearPortQosRequest {
+                port: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(!handle.qos.read().unwrap().applied.contains_key("Ethernet1"));
+
+        let state = service
+            .get_qos_state(Request::new(pb::GetQosStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.ports.len(), 4);
+        assert_eq!(state.default_ports, 4);
+        assert_eq!(state.queue_count, 8);
+        assert_eq!(state.dscp_to_tc.len(), 3);
+        assert!(state.tc_to_dscp.is_empty());
+        let port = &state.ports[0];
+        assert_eq!(port.trust, "untrusted");
+        assert_eq!(port.queues.len(), 8);
+        assert!(port.queues.iter().all(|q| q.weight == 1 && !q.strict));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qos_scheduler_and_wred_objects_are_deduplicated() {
+        let platform = qos_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = qos_service(&platform, handle.clone());
+
+        service
+            .ensure_wred_profile(Request::new(pb::EnsureWredProfileRequest {
+                profile: Some(pb::WredProfile {
+                    name: "BULK".into(),
+                    min_threshold_kb: 64,
+                    max_threshold_kb: 256,
+                    drop_probability: 10,
+                    ecn: true,
+                }),
+            }))
+            .await
+            .unwrap();
+        // A profile nothing references costs the ASIC no object.
+        assert!(handle.qos.read().unwrap().wred_profiles["BULK"]
+            .oid
+            .is_none());
+
+        let program = |port: &str| pb::SetPortQosRequest {
+            port: port.into(),
+            trust: "dscp".into(),
+            default_tc: 0,
+            shape_bps: None,
+            queues: vec![
+                pb::QueueQos {
+                    strict: true,
+                    ..queue_qos(7)
+                },
+                pb::QueueQos {
+                    weight: 40,
+                    ..queue_qos(5)
+                },
+                pb::QueueQos {
+                    weight: 30,
+                    wred_profile: "BULK".into(),
+                    ..queue_qos(3)
+                },
+            ],
+        };
+        service
+            .set_port_qos(Request::new(program("Ethernet1")))
+            .await
+            .unwrap();
+        service
+            .set_port_qos(Request::new(program("Ethernet2")))
+            .await
+            .unwrap();
+
+        // Two ports, the same three queue shapes: three scheduler
+        // objects between them, each refcounted twice.
+        {
+            let world = handle.qos.read().unwrap();
+            assert_eq!(world.schedulers.len(), 3);
+            assert!(world.schedulers.values().all(|(_, refs)| *refs == 2));
+            // ... and one WRED object with two queue references.
+            assert_eq!(world.wred_profiles["BULK"].refs, 2);
+            assert!(world.wred_profiles["BULK"].oid.is_some());
+            // Queues left at the default bind nothing at all.
+            assert_eq!(world.applied["Ethernet1"].queue_schedulers.len(), 3);
+        }
+
+        // The last unbind frees the objects.
+        service
+            .clear_port_qos(Request::new(pb::ClearPortQosRequest {
+                port: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.qos.read().unwrap();
+            assert_eq!(world.schedulers.len(), 3);
+            assert!(world.schedulers.values().all(|(_, refs)| *refs == 1));
+            assert_eq!(world.wred_profiles["BULK"].refs, 1);
+        }
+        // A profile still bound cannot be removed.
+        let err = service
+            .remove_wred_profile(Request::new(pb::RemoveWredProfileRequest {
+                name: "BULK".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("still bound"));
+
+        service
+            .clear_port_qos(Request::new(pb::ClearPortQosRequest {
+                port: "Ethernet2".into(),
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.qos.read().unwrap();
+            assert!(world.schedulers.is_empty());
+            assert_eq!(world.wred_profiles["BULK"].refs, 0);
+            assert!(world.wred_profiles["BULK"].oid.is_none());
+            assert!(world.applied.is_empty());
+        }
+        service
+            .remove_wred_profile(Request::new(pb::RemoveWredProfileRequest {
+                name: "BULK".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(handle.qos.read().unwrap().wred_profiles.is_empty());
+    }
+
+    /// A Port-Channel QoS program expands to its members and follows
+    /// membership churn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qos_port_channel_program_expands_to_members() {
+        let platform = qos_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = qos_service(&platform, handle.clone());
+
+        service
+            .create_lag(Request::new(pb::CreateLagRequest {
+                group: 1,
+                description: String::new(),
+                admin_up: true,
+            }))
+            .await
+            .unwrap();
+        service
+            .set_lag_members(Request::new(pb::SetLagMembersRequest {
+                group: 1,
+                members: vec![pb::LagMemberSpec {
+                    port: "Ethernet1".into(),
+                    enabled: true,
+                }],
+            }))
+            .await
+            .unwrap();
+        service
+            .set_port_qos(Request::new(pb::SetPortQosRequest {
+                port: "Port-Channel1".into(),
+                trust: "dscp".into(),
+                default_tc: 2,
+                shape_bps: Some(800_000_000),
+                queues: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.qos.read().unwrap();
+            let applied = &world.applied["Ethernet1"];
+            assert_eq!(applied.source, "Port-Channel1");
+            assert_eq!(applied.default_tc, 2);
+            assert_eq!(applied.shape_bps, Some(800_000_000));
+        }
+
+        // Membership churn: the new member picks the program up, the
+        // old one falls back to the defaults.
+        service
+            .set_lag_members(Request::new(pb::SetLagMembersRequest {
+                group: 1,
+                members: vec![pb::LagMemberSpec {
+                    port: "Ethernet2".into(),
+                    enabled: true,
+                }],
+            }))
+            .await
+            .unwrap();
+        {
+            let world = handle.qos.read().unwrap();
+            assert!(!world.applied.contains_key("Ethernet1"));
+            assert_eq!(world.applied["Ethernet2"].source, "Port-Channel1");
+        }
+
+        // The member row carries the Port-Channel's effective values.
+        let state = service
+            .get_qos_state(Request::new(pb::GetQosStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let member = state.ports.iter().find(|p| p.port == "Ethernet2").unwrap();
+        assert_eq!(member.via_port_channel, "Port-Channel1");
+        assert_eq!(member.default_tc, 2);
+        assert!(state.ports.iter().any(|p| p.port == "Port-Channel1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qos_capabilities_gate_cleanly() {
+        let platform = qos_platform();
+        let mut mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        mock.set_capabilities(hemlock_sai::SaiCapabilities {
+            qos_map_egress: false,
+            wred: false,
+            queue_shaper: false,
+            wred_queue_stats: false,
+            buffer_bytes_total: 4 * 1024 * 1024,
+            ..hemlock_sai::SaiCapabilities::all()
+        });
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = qos_service(&platform, handle.clone());
+
+        // No egress rewrite maps.
+        let err = service
+            .set_qos_maps(Request::new(seed_maps()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "egress rewrite QoS maps are not supported by this platform's SAI"
+        );
+        // Classification-only maps still land.
+        let mut ingress_only = seed_maps();
+        ingress_only.tc_to_dscp.clear();
+        ingress_only.tc_to_cos.clear();
+        service
+            .set_qos_maps(Request::new(ingress_only))
+            .await
+            .unwrap();
+
+        // No per-queue shapers.
+        let err = service
+            .set_port_qos(Request::new(pb::SetPortQosRequest {
+                port: "Ethernet1".into(),
+                trust: "dscp".into(),
+                default_tc: 0,
+                shape_bps: None,
+                queues: vec![pb::QueueQos {
+                    shape_bps: Some(100_000_000),
+                    ..queue_qos(5)
+                }],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "per-queue shapers are not supported by this platform's SAI"
+        );
+
+        // A WRED profile definition is fine; the reference is what
+        // fails, and it fails at the SAI object create.
+        service
+            .ensure_wred_profile(Request::new(pb::EnsureWredProfileRequest {
+                profile: Some(pb::WredProfile {
+                    name: "BULK".into(),
+                    min_threshold_kb: 64,
+                    max_threshold_kb: 256,
+                    drop_probability: 10,
+                    ecn: false,
+                }),
+            }))
+            .await
+            .unwrap();
+        let err = service
+            .set_port_qos(Request::new(pb::SetPortQosRequest {
+                port: "Ethernet1".into(),
+                trust: "dscp".into(),
+                default_tc: 0,
+                shape_bps: None,
+                queues: vec![pb::QueueQos {
+                    weight: 30,
+                    wred_profile: "BULK".into(),
+                    ..queue_qos(3)
+                }],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "WRED is not supported by this platform's SAI"
+        );
+
+        // Thresholds validate against the probed packet buffer.
+        let err = service
+            .ensure_wred_profile(Request::new(pb::EnsureWredProfileRequest {
+                profile: Some(pb::WredProfile {
+                    name: "HUGE".into(),
+                    min_threshold_kb: 64,
+                    max_threshold_kb: 8192,
+                    drop_probability: 10,
+                    ecn: false,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "qos wred-profile HUGE: max-threshold 8192 KB exceeds this platform's 4096 KB packet buffer"
+        );
+
+        // The stat probe is off, so the two counter columns read zero.
+        let state = service
+            .get_qos_state(Request::new(pb::GetQosStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!state.wred_supported);
+        assert!(!state.queue_shaper_supported);
+        assert_eq!(state.buffer_kb, 4096);
+        assert!(state
+            .ports
+            .iter()
+            .flat_map(|p| &p.queues)
+            .all(|q| { q.wred_dropped == 0 && q.ecn_marked == 0 }));
     }
 
     #[tokio::test(flavor = "multi_thread")]

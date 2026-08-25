@@ -118,6 +118,10 @@ pub struct QueueSample {
     pub bytes: u64,
     pub dropped_pkts: u64,
     pub dropped_bytes: u64,
+    /// WRED-dropped and ECN-marked packets; 0 where the platform does
+    /// not serve those stats.
+    pub wred_dropped: u64,
+    pub ecn_marked: u64,
 }
 
 /// EWMA rate state. The smoothing constant follows the load interval:
@@ -298,6 +302,8 @@ impl Engine {
                     bytes: q.bytes.saturating_sub(base.bytes),
                     dropped_pkts: q.dropped_pkts.saturating_sub(base.dropped_pkts),
                     dropped_bytes: q.dropped_bytes.saturating_sub(base.dropped_bytes),
+                    wred_dropped: q.wred_dropped.saturating_sub(base.wred_dropped),
+                    ecn_marked: q.ecn_marked.saturating_sub(base.ecn_marked),
                 }
             })
             .collect();

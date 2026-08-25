@@ -226,6 +226,113 @@ pub fn parse_storm_level(text: &str) -> Result<String, String> {
     Ok(format!("{whole_n}.{hundredths:02}"))
 }
 
+/// The smallest shaper step the Helix4 egress metering block resolves.
+/// Rates below it would silently round to nothing, so they are errors.
+pub const SHAPE_RATE_FLOOR_BPS: u64 = 64_000;
+
+/// A QoS shaper rate: bits/sec with an optional `k`/`m`/`g` suffix
+/// (`100m` = 100,000,000). Unlike a policer rate there is no `pps`
+/// form — shapers meter bandwidth.
+pub fn parse_shape_rate(text: &str) -> Result<u64, String> {
+    let bad = || format!("bad rate {text:?} (<bps>[k|m|g])");
+    let lower = text.to_ascii_lowercase();
+    let (digits, unit) = split_unit(&lower);
+    if digits.is_empty() {
+        return Err(bad());
+    }
+    let value: u64 = digits.parse().map_err(|_| bad())?;
+    let rate = match unit {
+        "" => value,
+        "k" => value.checked_mul(1_000).ok_or_else(bad)?,
+        "m" => value.checked_mul(1_000_000).ok_or_else(bad)?,
+        "g" => value.checked_mul(1_000_000_000).ok_or_else(bad)?,
+        _ => return Err(bad()),
+    };
+    if rate < SHAPE_RATE_FLOOR_BPS {
+        return Err(format!(
+            "rate {text:?} is below the 64k shaper granularity floor"
+        ));
+    }
+    Ok(rate)
+}
+
+/// A shaper rate back to its suffixed config form (`100000000` ->
+/// `100m`).
+pub fn format_shape_rate(rate: u64) -> String {
+    format_scaled(rate)
+}
+
+/// A shaper rate for display (`100000000` -> `100 Mbps`).
+pub fn display_shape_rate(rate: u64) -> String {
+    for (factor, unit) in [
+        (1_000_000_000, "Gbps"),
+        (1_000_000, "Mbps"),
+        (1_000, "Kbps"),
+    ] {
+        if rate >= factor && rate % factor == 0 {
+            return format!("{} {unit}", rate / factor);
+        }
+    }
+    format!("{rate} bps")
+}
+
+/// A comma/range value list (`40-46,48`) expanded to its individual
+/// values, deduplicated and sorted. `max` bounds every value; ranges
+/// run low..=high with low < high.
+pub fn parse_value_list(text: &str, max: u8, what: &str) -> Result<Vec<u8>, String> {
+    let bad = || format!("bad {what} {text:?} (0..{max}, list and ranges allowed)");
+    if text.is_empty() {
+        return Err(bad());
+    }
+    let mut values = std::collections::BTreeSet::new();
+    for part in text.split(',') {
+        let (low, high) = match part.split_once('-') {
+            None => {
+                let value: u8 = part.parse().map_err(|_| bad())?;
+                (value, value)
+            }
+            Some((low, high)) => {
+                let low: u8 = low.parse().map_err(|_| bad())?;
+                let high: u8 = high.parse().map_err(|_| bad())?;
+                if low >= high {
+                    return Err(format!("bad {what} range {part:?} (low must be < high)"));
+                }
+                (low, high)
+            }
+        };
+        if high > max {
+            return Err(bad());
+        }
+        values.extend(low..=high);
+    }
+    Ok(values.into_iter().collect())
+}
+
+/// The inverse of [`parse_value_list`]: a sorted value set rendered
+/// back to its most compact list form (`[40,41,42,48]` -> `40-42,48`).
+pub fn format_value_list(values: &[u8]) -> String {
+    let mut sorted: Vec<u8> = values.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut parts: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < sorted.len() {
+        let start = sorted[index];
+        let mut end = start;
+        while index + 1 < sorted.len() && sorted[index + 1] == end + 1 {
+            index += 1;
+            end = sorted[index];
+        }
+        parts.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        });
+        index += 1;
+    }
+    parts.join(",")
+}
+
 /// The network address of `addr/len` (host bits cleared).
 pub fn network(addr: IpAddr, len: u8) -> IpAddr {
     match addr {
@@ -258,6 +365,64 @@ mod tests {
         assert!(parse_cidr("2001:db8::1/129").is_err());
         assert!(parse_cidr("banana/24").is_err());
         assert!(parse_cidr("10.0.0.1/x").is_err());
+    }
+
+    #[test]
+    fn parses_and_formats_shaper_rates() {
+        assert_eq!(parse_shape_rate("64000").unwrap(), 64_000);
+        assert_eq!(parse_shape_rate("100m").unwrap(), 100_000_000);
+        assert_eq!(parse_shape_rate("800M").unwrap(), 800_000_000);
+        assert_eq!(parse_shape_rate("1g").unwrap(), 1_000_000_000);
+        // Below the shaper's granularity floor, and the malformed forms.
+        assert!(parse_shape_rate("32k")
+            .unwrap_err()
+            .contains("64k shaper granularity floor"));
+        assert!(parse_shape_rate("0").is_err());
+        assert!(parse_shape_rate("").is_err());
+        assert!(parse_shape_rate("100pps").is_err());
+        assert!(parse_shape_rate("banana").is_err());
+
+        // The config form round-trips; the display form is for shows.
+        for text in ["64k", "100m", "800m", "1g", "2500k"] {
+            let rate = parse_shape_rate(text).unwrap();
+            assert_eq!(format_shape_rate(rate), text);
+            assert_eq!(parse_shape_rate(&format_shape_rate(rate)).unwrap(), rate);
+        }
+        assert_eq!(display_shape_rate(100_000_000), "100 Mbps");
+        assert_eq!(display_shape_rate(800_000_000), "800 Mbps");
+        assert_eq!(display_shape_rate(1_000_000_000), "1 Gbps");
+        assert_eq!(display_shape_rate(64_000), "64 Kbps");
+    }
+
+    #[test]
+    fn value_lists_expand_and_round_trip() {
+        assert_eq!(parse_value_list("46", 63, "dscp").unwrap(), vec![46]);
+        assert_eq!(
+            parse_value_list("40-46,48", 63, "dscp").unwrap(),
+            vec![40, 41, 42, 43, 44, 45, 46, 48]
+        );
+        // Duplicates collapse and the result is sorted.
+        assert_eq!(
+            parse_value_list("5,3,5,1-2", 7, "cos").unwrap(),
+            vec![1, 2, 3, 5]
+        );
+        assert!(parse_value_list("64", 63, "dscp").is_err());
+        assert!(parse_value_list("8", 7, "cos").is_err());
+        assert!(parse_value_list("46-40", 63, "dscp").is_err());
+        assert!(parse_value_list("", 63, "dscp").is_err());
+        assert!(parse_value_list("a", 63, "dscp").is_err());
+
+        // Expansion and compaction are inverses over every subset of a
+        // small domain.
+        for bits in 0u32..256 {
+            let values: Vec<u8> = (0..8u8).filter(|i| bits & (1 << i) != 0).collect();
+            let text = format_value_list(&values);
+            if values.is_empty() {
+                assert_eq!(text, "");
+                continue;
+            }
+            assert_eq!(parse_value_list(&text, 7, "cos").unwrap(), values);
+        }
     }
 
     #[test]

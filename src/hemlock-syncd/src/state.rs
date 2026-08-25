@@ -1,12 +1,12 @@
 //! Shared port state between the SAI actor and the gRPC service.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use hemlock_platform::PortDef;
 use hemlock_sai::{
     AclFamily, AclFields, AclPacketAction, AclStage, Oid, PolicerSpec, PolicerStats, PortId,
-    StormClass,
+    QosMapType, SchedulerSpec, StormClass, WredSpec,
 };
 
 /// One front-panel port: manifest definition + live ASIC state + the
@@ -396,6 +396,160 @@ pub struct PortSecurityState {
 
 /// Port-security state keyed by port name.
 pub type SharedPortSecurity = Arc<RwLock<BTreeMap<String, PortSecurityState>>>;
+
+/// The QoS world: the four global maps and their SAI objects, the named
+/// WRED profiles, the per-port programs mgmtd pushed, and what is
+/// actually programmed on each physical port.
+///
+/// # Object dedup
+///
+/// Scheduler and WRED objects are shared, refcounted resources exactly
+/// like the FIB's next-hop groups: two ports asking for the same queue
+/// shape get one SAI scheduler between them, and the object is freed
+/// when the last queue unbinds. Keying is by value (a [`SchedulerSpec`]
+/// / a profile name), so an edit that leaves a queue's shape unchanged
+/// touches no hardware.
+#[derive(Debug, Default)]
+pub struct QosWorld {
+    /// The global maps as pushed by `SetQosMaps`.
+    pub maps: QosMaps,
+    /// The SAI map object behind each non-empty map table.
+    pub map_objects: BTreeMap<QosMapType, Oid>,
+    /// Named WRED profiles, keyed by name.
+    pub wred_profiles: BTreeMap<String, WredProfileState>,
+    /// Per-port programs as pushed, keyed by the display name mgmtd
+    /// used — a physical port or a Port-Channel.
+    pub programs: BTreeMap<String, PortQosProgram>,
+    /// What each *physical* port currently has programmed (a
+    /// Port-Channel program expands to its members).
+    pub applied: BTreeMap<String, AppliedPortQos>,
+    /// Deduplicated scheduler profiles: spec -> (object, refcount).
+    pub schedulers: BTreeMap<SchedulerSpec, (Oid, u32)>,
+}
+
+/// The four global QoS map tables (`value -> value`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QosMaps {
+    pub dscp_to_tc: BTreeMap<u8, u8>,
+    pub cos_to_tc: BTreeMap<u8, u8>,
+    pub tc_to_dscp: BTreeMap<u8, u8>,
+    pub tc_to_cos: BTreeMap<u8, u8>,
+}
+
+impl QosMaps {
+    /// One table by map type.
+    pub fn table(&self, kind: QosMapType) -> &BTreeMap<u8, u8> {
+        match kind {
+            QosMapType::DscpToTc => &self.dscp_to_tc,
+            QosMapType::Dot1pToTc => &self.cos_to_tc,
+            QosMapType::TcToDscp => &self.tc_to_dscp,
+            QosMapType::TcToDot1p => &self.tc_to_cos,
+        }
+    }
+}
+
+/// A port's ingress classification mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QosTrust {
+    /// Everything lands in the port's default traffic class.
+    #[default]
+    Untrusted,
+    Dscp,
+    Cos,
+}
+
+impl QosTrust {
+    pub fn word(self) -> &'static str {
+        match self {
+            QosTrust::Untrusted => "untrusted",
+            QosTrust::Dscp => "dscp",
+            QosTrust::Cos => "cos",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "untrusted" | "" => Some(QosTrust::Untrusted),
+            "dscp" => Some(QosTrust::Dscp),
+            "cos" => Some(QosTrust::Cos),
+            _ => None,
+        }
+    }
+
+    /// The ingress classification map this trust mode needs bound.
+    pub fn map(self) -> Option<QosMapType> {
+        match self {
+            QosTrust::Untrusted => None,
+            QosTrust::Dscp => Some(QosMapType::DscpToTc),
+            QosTrust::Cos => Some(QosMapType::Dot1pToTc),
+        }
+    }
+}
+
+/// One port's whole QoS program, as pushed by `SetPortQos`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PortQosProgram {
+    pub trust: QosTrust,
+    pub default_tc: u8,
+    /// Port shaper in bits/sec.
+    pub shape_bps: Option<u64>,
+    /// Non-default queues, keyed by queue index.
+    pub queues: BTreeMap<u8, QueueQosProgram>,
+}
+
+/// One egress queue's program. Absent from
+/// [`PortQosProgram::queues`] = the platform default (DWRR weight 1,
+/// unshaped, no WRED).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueueQosProgram {
+    pub strict: bool,
+    /// DWRR weight; 1 unless set.
+    pub weight: u8,
+    pub shape_bps: Option<u64>,
+    /// WRED profile name; empty = none.
+    pub wred_profile: String,
+}
+
+impl QueueQosProgram {
+    /// The scheduler shape this queue asks for.
+    pub fn scheduler(&self) -> SchedulerSpec {
+        SchedulerSpec {
+            strict: self.strict,
+            weight: if self.weight == 0 { 1 } else { self.weight },
+            max_rate_bps: self.shape_bps,
+        }
+    }
+}
+
+/// What one physical port currently has programmed, so a re-push can
+/// touch only what changed and a clear knows what to undo.
+#[derive(Debug, Clone, Default)]
+pub struct AppliedPortQos {
+    /// The display name whose program this is — the port itself, or the
+    /// Port-Channel it belongs to.
+    pub source: String,
+    pub trust: QosTrust,
+    pub default_tc: u8,
+    pub shape_bps: Option<u64>,
+    /// Per-queue scheduler objects this port holds a reference on.
+    pub queue_schedulers: BTreeMap<u8, (SchedulerSpec, Oid)>,
+    /// Per-queue WRED bindings, by profile name.
+    pub queue_wreds: BTreeMap<u8, String>,
+    /// Map types currently bound on the port.
+    pub bound_maps: BTreeSet<QosMapType>,
+}
+
+/// One named WRED profile: its config and, once a queue references it,
+/// the refcounted SAI object behind it.
+#[derive(Debug, Clone, Default)]
+pub struct WredProfileState {
+    pub spec: WredSpec,
+    pub oid: Option<Oid>,
+    /// Queues currently bound to it.
+    pub refs: u32,
+}
+
+pub type SharedQos = Arc<RwLock<QosWorld>>;
 
 /// Resolve a SAI port id back to a port name (for event handling).
 pub fn name_for(ports: &HashMap<String, PortState>, id: PortId) -> Option<String> {

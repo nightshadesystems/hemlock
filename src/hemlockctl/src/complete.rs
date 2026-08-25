@@ -28,6 +28,9 @@ pub struct State {
     pub mode: CliMode,
     pub ports: Vec<String>,
     pub acls: Vec<String>,
+    /// WRED profile names cached from the mgmtd candidate, so a
+    /// profile completes while it is being configured.
+    pub wreds: Vec<String>,
 }
 
 pub struct CliHelper {
@@ -49,6 +52,11 @@ const ANY: &str = "\0any";
 /// from the mgmtd candidate, but accepts any token (a new ACL's name
 /// is completable nowhere).
 const ACL: &str = "\0acl";
+
+/// Sentinel meaning "a WRED profile name goes here". Like [`ACL`], it
+/// offers the names cached from the mgmtd candidate but accepts any
+/// token.
+const WRED: &str = "\0wred";
 
 /// The `show interfaces` subcommand words (the interface argument is
 /// optional and completes separately via [`PORT`]).
@@ -141,7 +149,10 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "port-security",
             "dot1x",
             "dhcp",
+            "qos",
         ],
+        (CliMode::Operational, ["show", "qos"]) => &["maps", "wred", "interface", "interfaces"],
+        (CliMode::Operational, ["show", "qos", "interface"]) => &[PORT],
         (CliMode::Operational, ["show", "acl"]) => &["summary", ACL],
         (CliMode::Operational, ["show", "port-security" | "dot1x"]) => &["interface"],
         (CliMode::Operational, ["show", "port-security" | "dot1x", "interface"]) => &[PORT],
@@ -219,6 +230,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "protocols",
             "switching",
             "security",
+            "qos",
         ],
         (CliMode::Config, ["set" | "delete", "interfaces"]) => &[PORT],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT]) => &[
@@ -238,7 +250,30 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "dot1x",
             "dhcp-snooping",
             "arp-inspection",
+            "qos",
         ],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "qos"]) => {
+            &["trust", "default-tc", "shape", "queue"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "qos", "trust"]) => {
+            &["dscp", "cos", "untrusted"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "qos", "default-tc"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "qos", "shape"]) => &["rate"],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "qos", "queue"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "qos", "queue", NUM]) => {
+            &["priority", "weight", "shape", "wred-profile"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "qos", "queue", NUM, "priority"]) => {
+            &["strict"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "qos", "queue", NUM, "weight"]) => &[NUM],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "qos", "queue", NUM, "shape"]) => {
+            &["rate"]
+        }
+        (CliMode::Config, ["set", "interfaces", PORT, "qos", "queue", NUM, "wred-profile"]) => {
+            &[WRED]
+        }
         (CliMode::Config, ["set", "interfaces", PORT, "access-group"]) => &[ACL],
         (CliMode::Config, ["set", "interfaces", PORT, "access-group", ACL]) => &["in", "out"],
         (CliMode::Config, ["delete", "interfaces", PORT, "access-group"]) => &["in", "out"],
@@ -518,6 +553,21 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set" | "delete", "security", "arp-inspection", "validate"]) => {
             &["src-mac", "dst-mac", "ip"]
         }
+        (CliMode::Config, ["set" | "delete", "qos"]) => &["map", "wred-profile"],
+        (CliMode::Config, ["set" | "delete", "qos", "map"]) => {
+            &["dscp-to-tc", "cos-to-tc", "tc-to-dscp", "tc-to-cos"]
+        }
+        (CliMode::Config, ["set" | "delete", "qos", "map", "dscp-to-tc"]) => &["dscp"],
+        (CliMode::Config, ["set" | "delete", "qos", "map", "cos-to-tc"]) => &["cos"],
+        (CliMode::Config, ["set" | "delete", "qos", "map", "tc-to-dscp" | "tc-to-cos"]) => &["tc"],
+        (CliMode::Config, ["set" | "delete", "qos", "map", _, "dscp" | "cos" | "tc"]) => &[ANY],
+        (CliMode::Config, ["set", "qos", "map", "dscp-to-tc" | "cos-to-tc", _, ANY]) => &["tc"],
+        (CliMode::Config, ["set", "qos", "map", "tc-to-dscp", "tc", ANY]) => &["dscp"],
+        (CliMode::Config, ["set", "qos", "map", "tc-to-cos", "tc", ANY]) => &["cos"],
+        (CliMode::Config, ["set" | "delete", "qos", "wred-profile"]) => &[WRED],
+        (CliMode::Config, ["set" | "delete", "qos", "wred-profile", WRED]) => {
+            &["min-threshold", "max-threshold", "drop-probability", "ecn"]
+        }
         (CliMode::Config, ["commit"]) => &["confirmed"],
         _ => &[],
     }
@@ -603,21 +653,23 @@ fn resolve_word<'a>(input: &str, words: impl Iterator<Item = &'a str>) -> Option
 /// Candidates for the word being typed: canonicalize the completed
 /// `tokens`, then filter the next level by `partial`. The ACL-less
 /// convenience form the tests exercise; the live completer goes
-/// through [`candidates_with_acls`].
+/// through [`candidates_with_names`].
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn candidates(mode: CliMode, tokens: &[&str], partial: &str, ports: &[String]) -> Vec<String> {
-    expand(mode, tokens, partial, ports, &[], false)
+    expand(mode, tokens, partial, ports, &[], &[], false)
 }
 
-/// [`candidates`] with the candidate-tree ACL names for the ACL slots.
-pub fn candidates_with_acls(
+/// [`candidates`] with the candidate-tree ACL and WRED-profile names
+/// for their respective slots.
+pub fn candidates_with_names(
     mode: CliMode,
     tokens: &[&str],
     partial: &str,
     ports: &[String],
     acls: &[String],
+    wreds: &[String],
 ) -> Vec<String> {
-    expand(mode, tokens, partial, ports, acls, false)
+    expand(mode, tokens, partial, ports, acls, wreds, false)
 }
 
 /// [`candidates`] for the EOS-style `?` contextual help: where an
@@ -630,8 +682,17 @@ pub fn help_candidates(
     partial: &str,
     ports: &[String],
     acls: &[String],
+    wreds: &[String],
 ) -> Vec<String> {
-    expand(mode, tokens, partial, ports, acls, partial.is_empty())
+    expand(
+        mode,
+        tokens,
+        partial,
+        ports,
+        acls,
+        wreds,
+        partial.is_empty(),
+    )
 }
 
 fn expand(
@@ -640,6 +701,7 @@ fn expand(
     partial: &str,
     ports: &[String],
     acls: &[String],
+    wreds: &[String],
     placeholder_ports: bool,
 ) -> Vec<String> {
     let mut path: Vec<&str> = Vec::with_capacity(tokens.len());
@@ -667,6 +729,8 @@ fn expand(
             // (`show acl s<TAB>` means summary); anything else is the
             // name — completable when cached, accepted regardless.
             resolve_word(token, level.iter().copied().filter(|w| *w != ACL)).or(Some(ACL))
+        } else if level.contains(&WRED) && !token.is_empty() {
+            resolve_word(token, level.iter().copied().filter(|w| *w != WRED)).or(Some(WRED))
         } else if level.contains(&ANY) && !token.is_empty() {
             Some(ANY)
         } else {
@@ -688,6 +752,8 @@ fn expand(
                 }
             } else if *w == ACL {
                 acls.to_vec()
+            } else if *w == WRED {
+                wreds.to_vec()
             } else if *w == NUM || *w == ANY {
                 Vec::new() // free-form value; nothing to offer
             } else {
@@ -718,13 +784,20 @@ impl Completer for CliHelper {
         let Ok(state) = self.state.lock() else {
             return Ok((start, Vec::new()));
         };
-        let pairs = candidates_with_acls(state.mode, &tokens, partial, &state.ports, &state.acls)
-            .into_iter()
-            .map(|w| Pair {
-                display: w.clone(),
-                replacement: format!("{w} "),
-            })
-            .collect();
+        let pairs = candidates_with_names(
+            state.mode,
+            &tokens,
+            partial,
+            &state.ports,
+            &state.acls,
+            &state.wreds,
+        )
+        .into_iter()
+        .map(|w| Pair {
+            display: w.clone(),
+            replacement: format!("{w} "),
+        })
+        .collect();
         Ok((start, pairs))
     }
 }
@@ -752,11 +825,171 @@ mod tests {
     }
 
     #[test]
+    fn qos_paths_complete() {
+        let wreds = vec!["BULK".to_string(), "VOICE".to_string()];
+        // The config nouns, the map tables, and the key/value words.
+        let c = candidates(CliMode::Config, &["set", "qos"], "", &ports());
+        assert_eq!(c, vec!["map".to_string(), "wred-profile".to_string()]);
+        let c = candidates(CliMode::Config, &["set", "qos", "map"], "", &ports());
+        assert_eq!(
+            c,
+            vec![
+                "dscp-to-tc".to_string(),
+                "cos-to-tc".to_string(),
+                "tc-to-dscp".to_string(),
+                "tc-to-cos".to_string(),
+            ]
+        );
+        let c = candidates(
+            CliMode::Config,
+            &["set", "qos", "map", "dscp-to-tc"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["dscp".to_string()]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "qos", "map", "dscp-to-tc", "dscp", "46"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["tc".to_string()]);
+        // Prefixes resolve the same way the handlers do.
+        let c = candidates(CliMode::Config, &["set", "q", "m", "dscp-to"], "", &ports());
+        assert_eq!(c, vec!["dscp".to_string()]);
+
+        // Profile names complete from the candidate cache, in both the
+        // definition and the reference slots.
+        let c = candidates_with_names(
+            CliMode::Config,
+            &["set", "qos", "wred-profile"],
+            "",
+            &ports(),
+            &[],
+            &wreds,
+        );
+        assert_eq!(c, wreds);
+        let c = candidates_with_names(
+            CliMode::Config,
+            &["set", "qos", "wred-profile", "BULK"],
+            "",
+            &ports(),
+            &[],
+            &wreds,
+        );
+        assert_eq!(
+            c,
+            vec![
+                "min-threshold".to_string(),
+                "max-threshold".to_string(),
+                "drop-probability".to_string(),
+                "ecn".to_string(),
+            ]
+        );
+        let c = candidates_with_names(
+            CliMode::Config,
+            &[
+                "set",
+                "interfaces",
+                "Eth0",
+                "qos",
+                "queue",
+                "3",
+                "wred-profile",
+            ],
+            "B",
+            &ports(),
+            &[],
+            &wreds,
+        );
+        assert_eq!(c, vec!["BULK".to_string()]);
+
+        // The per-port tree.
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth0", "qos"],
+            "",
+            &ports(),
+        );
+        assert_eq!(
+            c,
+            vec![
+                "trust".to_string(),
+                "default-tc".to_string(),
+                "shape".to_string(),
+                "queue".to_string(),
+            ]
+        );
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth0", "qos", "trust"],
+            "",
+            &ports(),
+        );
+        assert_eq!(
+            c,
+            vec![
+                "dscp".to_string(),
+                "cos".to_string(),
+                "untrusted".to_string()
+            ]
+        );
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth0", "qos", "queue", "7"],
+            "",
+            &ports(),
+        );
+        assert_eq!(
+            c,
+            vec![
+                "priority".to_string(),
+                "weight".to_string(),
+                "shape".to_string(),
+                "wred-profile".to_string(),
+            ]
+        );
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth0", "qos", "queue", "7", "priority"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["strict".to_string()]);
+
+        // The operational side.
+        let c = candidates(CliMode::Operational, &["show", "qos"], "", &ports());
+        assert_eq!(
+            c,
+            vec![
+                "maps".to_string(),
+                "wred".to_string(),
+                "interface".to_string(),
+                "interfaces".to_string(),
+            ]
+        );
+        let c = candidates(
+            CliMode::Operational,
+            &["show", "qos", "interface"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, ports());
+    }
+
+    #[test]
     fn security_paths_complete() {
         let acls = vec!["EDGE-IN".to_string(), "MGMT6-IN".to_string()];
         // ACL names complete from the candidate cache; `summary` shares
         // the level.
-        let c = candidates_with_acls(CliMode::Operational, &["show", "acl"], "", &ports(), &acls);
+        let c = candidates_with_names(
+            CliMode::Operational,
+            &["show", "acl"],
+            "",
+            &ports(),
+            &acls,
+            &[],
+        );
         assert_eq!(
             c,
             vec![
@@ -765,24 +998,33 @@ mod tests {
                 "MGMT6-IN".to_string()
             ]
         );
-        let c = candidates_with_acls(CliMode::Operational, &["show", "acl"], "E", &ports(), &acls);
+        let c = candidates_with_names(
+            CliMode::Operational,
+            &["show", "acl"],
+            "E",
+            &ports(),
+            &acls,
+            &[],
+        );
         assert_eq!(c, vec!["EDGE-IN".to_string()]);
         // A binding's name slot completes too, and the direction follows
         // a typed name.
-        let c = candidates_with_acls(
+        let c = candidates_with_names(
             CliMode::Config,
             &["set", "interfaces", "Eth0", "access-group"],
             "",
             &ports(),
             &acls,
+            &[],
         );
         assert_eq!(c, vec!["EDGE-IN".to_string(), "MGMT6-IN".to_string()]);
-        let c = candidates_with_acls(
+        let c = candidates_with_names(
             CliMode::Config,
             &["set", "interfaces", "Eth0", "access-group", "EDGE-IN"],
             "",
             &ports(),
             &acls,
+            &[],
         );
         assert_eq!(c, vec!["in".to_string(), "out".to_string()]);
         // The config-side rule tree keys off the family.
@@ -903,6 +1145,7 @@ mod tests {
                 "dot1x".to_string(),
                 "dhcp-snooping".to_string(),
                 "arp-inspection".to_string(),
+                "qos".to_string(),
             ]
         );
         let c = candidates(
@@ -942,6 +1185,7 @@ mod tests {
                 "protocols".to_string(),
                 "switching".to_string(),
                 "security".to_string(),
+                "qos".to_string(),
             ]
         );
         // delete shares the tree.
