@@ -1,0 +1,17 @@
+{
+  "dhcp_relay": {
+    "vlans": [
+      {
+        "dropped": 2,
+        "giaddr": "10.42.10.9",
+        "servers": [
+          "10.42.0.5",
+          "10.42.0.6"
+        ],
+        "to_client": 1198,
+        "to_server": 1204,
+        "vlan": 99
+      }
+    ]
+  }
+}

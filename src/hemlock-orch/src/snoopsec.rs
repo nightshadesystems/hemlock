@@ -18,6 +18,20 @@
 //! or drops with a counted reason and a syslog line. The CPU load of
 //! both paths is bounded by the CoPP dhcp/arp classes.
 
+//!
+//! The relay lives here too, deliberately: it is a capability of this
+//! engine rather than a daemon of its own, so there is exactly one DHCP
+//! packet path on the box. A relayed request rides the same
+//! trap/validate/re-inject pipeline as a snooped one — the chaddr check
+//! runs before anything is forwarded — and the lease in the reply lands
+//! in the same binding table, so DAI protects relayed clients without
+//! any extra configuration.
+//!
+//! The server side is a UDP socket rather than the packet path: a
+//! relayed request is unicast to an address the kernel routes and ARPs
+//! for, which is exactly what a socket bound to the SVI address does.
+//! The client side stays on the packet path, because a reply has to
+//! reach a station that has no address yet.
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -46,6 +60,18 @@ pub struct Config {
     pub arp_trusted: BTreeSet<String>,
     /// Static bindings keyed by (mac, vlan).
     pub statics: BTreeMap<(String, u16), StaticBinding>,
+    /// Relay-enabled SVIs, keyed by VLAN.
+    pub relay: BTreeMap<u16, RelayVlan>,
+}
+
+/// One VLAN's relay configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayVlan {
+    /// Servers a request is relayed to, in config order.
+    pub servers: Vec<Ipv4Addr>,
+    /// The SVI's address: the giaddr a server sees, and the address
+    /// replies come back to.
+    pub giaddr: Ipv4Addr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +121,15 @@ pub struct DhcpVlanStats {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayVlanStats {
+    /// Client requests relayed on to the servers.
+    pub to_server: u64,
+    /// Server replies relayed back to the client.
+    pub to_client: u64,
+    pub dropped: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DaiVlanStats {
     pub forwarded: u64,
     pub dropped: u64,
@@ -123,6 +158,8 @@ pub struct Snapshot {
     pub dhcp_stats: BTreeMap<u16, DhcpVlanStats>,
     pub untrusted_server_drops: u64,
     pub arp_stats: BTreeMap<u16, DaiVlanStats>,
+    /// Per-VLAN relay state: servers, giaddr and counters.
+    pub relay: BTreeMap<u16, (RelayVlan, RelayVlanStats)>,
 }
 
 struct Inner {
@@ -138,6 +175,19 @@ struct Inner {
     arp_stats: BTreeMap<u16, DaiVlanStats>,
     pushed_redirects: Option<RedirectProgram>,
     store: Option<std::path::PathBuf>,
+    relay_stats: BTreeMap<u16, RelayVlanStats>,
+    /// The switch MAC, used as the source of relayed replies.
+    system_mac: [u8; 6],
+}
+
+/// One BOOTP payload on its way to a relay server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDatagram {
+    pub server: Ipv4Addr,
+    /// The source address to send from — the SVI's, so the server
+    /// replies to the right relay.
+    pub giaddr: Ipv4Addr,
+    pub payload: Vec<u8>,
 }
 
 pub struct EngineIo {
@@ -147,6 +197,10 @@ pub struct EngineIo {
     pub packet_out: mpsc::UnboundedReceiver<(String, Vec<u8>)>,
     /// Redirect programs -> syncd SetSnoopRedirects.
     pub redirects: mpsc::UnboundedReceiver<RedirectProgram>,
+    /// Relayed requests, for the UDP runtime to send on.
+    pub relay_out: mpsc::UnboundedReceiver<RelayDatagram>,
+    /// Server replies the UDP runtime received, by giaddr.
+    pub relay_in: mpsc::UnboundedSender<(Ipv4Addr, Vec<u8>)>,
 }
 
 #[derive(Clone)]
@@ -154,15 +208,18 @@ pub struct Engine {
     inner: Arc<Mutex<Inner>>,
     packet_out: mpsc::UnboundedSender<(String, Vec<u8>)>,
     redirects_tx: mpsc::UnboundedSender<RedirectProgram>,
+    relay_out: mpsc::UnboundedSender<RelayDatagram>,
 }
 
 impl Engine {
     /// `store` = the binding persistence file (None in tests that don't
     /// exercise it). Existing bindings load immediately.
-    pub fn spawn(store: Option<std::path::PathBuf>) -> (Engine, EngineIo) {
+    pub fn spawn(store: Option<std::path::PathBuf>, system_mac: [u8; 6]) -> (Engine, EngineIo) {
         let (packet_in_tx, mut packet_in_rx) = mpsc::unbounded_channel::<(String, u16, Vec<u8>)>();
         let (packet_out_tx, packet_out_rx) = mpsc::unbounded_channel();
         let (redirects_tx, redirects_rx) = mpsc::unbounded_channel();
+        let (relay_out_tx, relay_out_rx) = mpsc::unbounded_channel();
+        let (relay_in_tx, mut relay_in_rx) = mpsc::unbounded_channel::<(Ipv4Addr, Vec<u8>)>();
         let dynamics = store.as_deref().map(load_bindings).unwrap_or_default();
         let inner = Arc::new(Mutex::new(Inner {
             config: Config::default(),
@@ -174,17 +231,29 @@ impl Engine {
             arp_stats: BTreeMap::new(),
             pushed_redirects: None,
             store,
+            relay_stats: BTreeMap::new(),
+            system_mac,
         }));
         let engine = Engine {
             inner: inner.clone(),
             packet_out: packet_out_tx,
             redirects_tx,
+            relay_out: relay_out_tx,
         };
         {
             let engine = engine.clone();
             tokio::spawn(async move {
                 while let Some((port, vlan, frame)) = packet_in_rx.recv().await {
                     engine.handle_frame(&port, vlan, &frame);
+                }
+            });
+        }
+        {
+            // Server replies arriving on the relay socket.
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                while let Some((giaddr, payload)) = relay_in_rx.recv().await {
+                    engine.handle_relay_reply(giaddr, &payload);
                 }
             });
         }
@@ -204,6 +273,8 @@ impl Engine {
                 packet_in: packet_in_tx,
                 packet_out: packet_out_rx,
                 redirects: redirects_rx,
+                relay_out: relay_out_rx,
+                relay_in: relay_in_tx,
             },
         )
     }
@@ -359,6 +430,39 @@ impl Engine {
                 inner.pending.insert((client_mac, vlan), port.to_string());
             }
         }
+        // A relay-enabled VLAN sends the validated request on to the
+        // servers rather than (only) flooding it toward a trusted port:
+        // the whole point is that there is no server in this broadcast
+        // domain. The chaddr check above has already run, so nothing
+        // unvalidated is ever relayed.
+        if let Some(relay) = inner.config.relay.get(&vlan).cloned() {
+            let stats = inner.relay_stats.entry(vlan).or_default();
+            if relay.giaddr.is_unspecified() || relay.servers.is_empty() {
+                // Config that cannot relay: counted, not silently lost.
+                stats.dropped += 1;
+                warn!(
+                    vlan,
+                    "dhcp-relay has no giaddr or no server; request dropped"
+                );
+                return;
+            }
+            let Some(payload) = bootp_payload(frame) else {
+                stats.dropped += 1;
+                return;
+            };
+            let relayed = with_giaddr(&payload, relay.giaddr);
+            stats.to_server += 1;
+            let servers = relay.servers.clone();
+            drop(inner);
+            for server in servers {
+                let _ = self.relay_out.send(RelayDatagram {
+                    server,
+                    giaddr: relay.giaddr,
+                    payload: relayed.clone(),
+                });
+            }
+            return;
+        }
         if trusted {
             // Copies from trusted ports already forwarded in hardware.
             return;
@@ -461,6 +565,93 @@ impl Engine {
         }
     }
 
+    /// One server reply arriving on the relay socket, addressed to a
+    /// giaddr. The VLAN is whichever relay-enabled SVI owns that
+    /// address; anything else is a reply for a relay we do not run.
+    fn handle_relay_reply(&self, giaddr: Ipv4Addr, payload: &[u8]) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some((&vlan, relay)) = inner
+            .config
+            .relay
+            .iter()
+            .find(|(_, relay)| relay.giaddr == giaddr)
+        else {
+            return;
+        };
+        let servers = relay.servers.clone();
+        let _ = servers;
+        let Some(reply) = parse_bootp(payload) else {
+            inner.relay_stats.entry(vlan).or_default().dropped += 1;
+            return;
+        };
+        if !reply.is_reply {
+            inner.relay_stats.entry(vlan).or_default().dropped += 1;
+            return;
+        }
+        let client_mac = mac_text(&reply.chaddr);
+
+        // Relayed leases are ordinary snooping bindings: DAI protects a
+        // relayed client exactly as it protects a locally served one.
+        match reply.message_type {
+            Some(5) if reply.yiaddr != Ipv4Addr::UNSPECIFIED => {
+                let interface = inner
+                    .pending
+                    .remove(&(client_mac.clone(), vlan))
+                    .or_else(|| {
+                        inner
+                            .dynamics
+                            .get(&(client_mac.clone(), vlan))
+                            .map(|b| b.interface.clone())
+                    })
+                    .unwrap_or_default();
+                let lease = reply.lease_secs.unwrap_or(86400);
+                inner.dynamics.insert(
+                    (client_mac.clone(), vlan),
+                    DynamicBinding {
+                        ip: reply.yiaddr,
+                        interface,
+                        expires_at: unix_now() + u64::from(lease),
+                    },
+                );
+                save_bindings(&inner);
+            }
+            Some(6) => {
+                inner.pending.remove(&(client_mac.clone(), vlan));
+            }
+            _ => {}
+        }
+
+        // Toward the client: unicast when it already has an address and
+        // did not ask for a broadcast, else flood the VLAN — a station
+        // that has no address cannot receive a unicast.
+        let frame = build_client_reply(inner.system_mac, giaddr, &reply, payload);
+        let unicast_port = (!reply.broadcast_flag)
+            .then(|| {
+                inner
+                    .dynamics
+                    .get(&(client_mac, vlan))
+                    .map(|b| b.interface.clone())
+            })
+            .flatten()
+            .filter(|port| !port.is_empty());
+        let targets: Vec<String> = match unicast_port {
+            Some(port) => vec![port],
+            None => inner
+                .view
+                .vlan_ports
+                .get(&vlan)
+                .map(|ports| ports.iter().cloned().collect())
+                .unwrap_or_default(),
+        };
+        inner.relay_stats.entry(vlan).or_default().to_client += 1;
+        drop(inner);
+        for target in targets {
+            let _ = self.packet_out.send((target, frame.clone()));
+        }
+    }
+
     fn expire_leases(&self) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -534,6 +725,15 @@ impl Engine {
             dhcp_stats: inner.dhcp_stats.clone(),
             untrusted_server_drops: inner.untrusted_server_drops,
             arp_stats: inner.arp_stats.clone(),
+            relay: inner
+                .config
+                .relay
+                .iter()
+                .map(|(vlan, relay)| {
+                    let stats = inner.relay_stats.get(vlan).copied().unwrap_or_default();
+                    (*vlan, (relay.clone(), stats))
+                })
+                .collect(),
         }
     }
 }
@@ -730,12 +930,167 @@ fn parse_arp(frame: &[u8]) -> Option<ArpMessage> {
     })
 }
 
+// ------------------------------------------------------ relay framing
+
+/// The BOOTP payload of a trapped DHCP frame (everything after the UDP
+/// header). None = not a well-formed DHCP frame.
+fn bootp_payload(frame: &[u8]) -> Option<Vec<u8>> {
+    let ip = frame.get(14..)?;
+    if ip.len() < 20 || ip[0] >> 4 != 4 || ip[9] != 17 {
+        return None;
+    }
+    let ihl = usize::from(ip[0] & 0xf) * 4;
+    // The IP total length bounds the payload: an Ethernet frame is
+    // padded to 60 bytes, and relaying the padding would corrupt the
+    // options a server reads.
+    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    let end = total.clamp(ihl + 8, ip.len());
+    Some(ip.get(ihl + 8..end)?.to_vec())
+}
+
+/// The relayed copy of a request: hop count bumped and giaddr filled in
+/// (a request that already carries one keeps it — that relay owns the
+/// reply path).
+fn with_giaddr(payload: &[u8], giaddr: Ipv4Addr) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    if out.len() < 28 {
+        return out;
+    }
+    out[3] = out[3].saturating_add(1);
+    if out[24..28] == [0, 0, 0, 0] {
+        out[24..28].copy_from_slice(&giaddr.octets());
+    }
+    out
+}
+
+/// The BOOTP fields the relay reads back out of a reply.
+struct BootpReply {
+    is_reply: bool,
+    chaddr: [u8; 6],
+    yiaddr: Ipv4Addr,
+    broadcast_flag: bool,
+    message_type: Option<u8>,
+    lease_secs: Option<u32>,
+}
+
+/// A bare BOOTP payload (no IP/UDP headers) — what arrives on the relay
+/// socket.
+fn parse_bootp(payload: &[u8]) -> Option<BootpReply> {
+    if payload.len() < 240 || payload[236..240] != [99, 130, 83, 99] {
+        return None;
+    }
+    let mut chaddr = [0u8; 6];
+    chaddr.copy_from_slice(&payload[28..34]);
+    let mut message_type = None;
+    let mut lease_secs = None;
+    let mut rest = &payload[240..];
+    while let [code, rest_after @ ..] = rest {
+        match code {
+            0 => {
+                rest = rest_after;
+                continue;
+            }
+            255 => break,
+            _ => {}
+        }
+        let [len, value @ ..] = rest_after else { break };
+        let len = usize::from(*len);
+        if value.len() < len {
+            break;
+        }
+        match code {
+            53 if len == 1 => message_type = Some(value[0]),
+            51 if len == 4 => {
+                lease_secs = Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+            }
+            _ => {}
+        }
+        rest = &value[len..];
+    }
+    Some(BootpReply {
+        is_reply: payload[0] == 2,
+        chaddr,
+        yiaddr: Ipv4Addr::new(payload[16], payload[17], payload[18], payload[19]),
+        broadcast_flag: payload[10] & 0x80 != 0,
+        message_type,
+        lease_secs,
+    })
+}
+
+/// The RFC 1071 one's-complement checksum of an IPv4 header.
+fn ip_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for pair in header.chunks(2) {
+        let word = match pair {
+            [high, low] => u16::from_be_bytes([*high, *low]),
+            [high] => u16::from_be_bytes([*high, 0]),
+            _ => 0,
+        };
+        sum += u32::from(word);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Wrap a relayed reply in Ethernet/IPv4/UDP for the client side.
+///
+/// A client that set the broadcast flag (or has no address yet) is sent
+/// to the broadcast addresses; anything else goes to its own MAC and
+/// yiaddr. The UDP checksum is left zero, which IPv4 allows and every
+/// DHCP client accepts.
+fn build_client_reply(
+    system_mac: [u8; 6],
+    giaddr: Ipv4Addr,
+    reply: &BootpReply,
+    payload: &[u8],
+) -> Vec<u8> {
+    let broadcast = reply.broadcast_flag || reply.yiaddr == Ipv4Addr::UNSPECIFIED;
+    let (dst_mac, dst_ip) = if broadcast {
+        ([0xff; 6], Ipv4Addr::BROADCAST)
+    } else {
+        (reply.chaddr, reply.yiaddr)
+    };
+    let udp_len = 8 + payload.len();
+    let total_len = 20 + udp_len;
+
+    let mut frame = Vec::with_capacity(14 + total_len);
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&system_mac);
+    frame.extend_from_slice(&[0x08, 0x00]);
+
+    let mut ip = Vec::with_capacity(20);
+    ip.extend_from_slice(&[0x45, 0x00]);
+    ip.extend_from_slice(&(total_len as u16).to_be_bytes());
+    ip.extend_from_slice(&[0, 0, 0x40, 0x00]); // id 0, don't fragment
+    ip.extend_from_slice(&[64, 17]); // ttl, UDP
+    ip.extend_from_slice(&[0, 0]); // checksum placeholder
+    ip.extend_from_slice(&giaddr.octets());
+    ip.extend_from_slice(&dst_ip.octets());
+    let checksum = ip_checksum(&ip);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    frame.extend_from_slice(&ip);
+
+    frame.extend_from_slice(&67u16.to_be_bytes());
+    frame.extend_from_slice(&68u16.to_be_bytes());
+    frame.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    frame.extend_from_slice(&[0, 0]); // checksum: optional over IPv4
+    frame.extend_from_slice(payload);
+    // Pad to the 60-byte Ethernet minimum (the FCS follows on the wire).
+    if frame.len() < 60 {
+        frame.resize(60, 0);
+    }
+    frame
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     const CLIENT_MAC: [u8; 6] = [0x00, 0x1c, 0x73, 0x0c, 0xaa, 0x01];
+    const SWITCH_MAC: [u8; 6] = [0x2c, 0xdd, 0xe9, 0x4a, 0x1b, 0x00];
     const SERVER_MAC: [u8; 6] = [0x00, 0x50, 0x56, 0xbe, 0xef, 0x01];
 
     fn dhcp_frame(
@@ -803,6 +1158,7 @@ mod tests {
             dhcp_trusted: ["Port-Channel1".to_string()].into(),
             arp_trusted: ["Port-Channel1".to_string()].into(),
             statics: BTreeMap::new(),
+            relay: BTreeMap::new(),
         }
     }
 
@@ -835,9 +1191,284 @@ mod tests {
         last
     }
 
+    /// A bare BOOTP reply, as it arrives on the relay socket (no
+    /// Ethernet/IP/UDP headers — the server sent it to giaddr:67).
+    fn bootp_reply(
+        chaddr: [u8; 6],
+        yiaddr: Ipv4Addr,
+        giaddr: Ipv4Addr,
+        message_type: u8,
+        broadcast: bool,
+    ) -> Vec<u8> {
+        let mut payload = vec![0u8; 240];
+        payload[0] = 2;
+        payload[1] = 1;
+        payload[2] = 6;
+        if broadcast {
+            payload[10] = 0x80;
+        }
+        payload[16..20].copy_from_slice(&yiaddr.octets());
+        payload[24..28].copy_from_slice(&giaddr.octets());
+        payload[28..34].copy_from_slice(&chaddr);
+        payload[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        payload.extend_from_slice(&[53, 1, message_type]);
+        payload.extend_from_slice(&[51, 4]);
+        payload.extend_from_slice(&3600u32.to_be_bytes());
+        payload.push(255);
+        payload
+    }
+
+    fn relay_config() -> Config {
+        let mut config = seed_config();
+        config.relay.insert(
+            10,
+            RelayVlan {
+                servers: vec![Ipv4Addr::new(10, 42, 0, 5), Ipv4Addr::new(10, 42, 0, 6)],
+                giaddr: Ipv4Addr::new(10, 0, 10, 1),
+            },
+        );
+        config
+    }
+
+    /// The full relay round trip: a client broadcast is validated, has
+    /// giaddr stamped in and goes to every server; the reply comes back
+    /// on the socket, learns a binding, and re-injects toward the
+    /// client.
+    #[tokio::test]
+    async fn relay_forwards_requests_and_returns_replies() {
+        let (engine, mut io) = Engine::spawn(None, SWITCH_MAC);
+        engine.set_l2_view(seed_view());
+        engine.set_config(relay_config());
+
+        // A DISCOVER on an untrusted access port.
+        let request = dhcp_frame(CLIENT_MAC, 1, CLIENT_MAC, Ipv4Addr::UNSPECIFIED, 1, None);
+        io.packet_in
+            .send(("Ethernet1".into(), 10, request))
+            .unwrap();
+
+        // One datagram per server, each carrying the giaddr.
+        let mut relayed = Vec::new();
+        for _ in 0..2 {
+            relayed.push(io.relay_out.recv().await.unwrap());
+        }
+        assert_eq!(
+            relayed.iter().map(|d| d.server).collect::<Vec<_>>(),
+            vec![Ipv4Addr::new(10, 42, 0, 5), Ipv4Addr::new(10, 42, 0, 6)]
+        );
+        for datagram in &relayed {
+            assert_eq!(datagram.giaddr, Ipv4Addr::new(10, 0, 10, 1));
+            // giaddr stamped into the BOOTP header, hop count bumped.
+            assert_eq!(&datagram.payload[24..28], &[10, 0, 10, 1]);
+            assert_eq!(datagram.payload[3], 1);
+            // It is the client's request, not a rewrite of one.
+            assert_eq!(&datagram.payload[28..34], &CLIENT_MAC);
+        }
+        let snapshot = engine.snapshot();
+        let (_, stats) = &snapshot.relay[&10];
+        assert_eq!(stats.to_server, 1);
+
+        // The OFFER comes back on the socket, addressed to giaddr.
+        io.relay_in
+            .send((
+                Ipv4Addr::new(10, 0, 10, 1),
+                bootp_reply(
+                    CLIENT_MAC,
+                    Ipv4Addr::new(10, 0, 10, 55),
+                    Ipv4Addr::new(10, 0, 10, 1),
+                    2,
+                    true,
+                ),
+            ))
+            .unwrap();
+
+        // A broadcast reply floods the VLAN.
+        let mut targets = Vec::new();
+        let mut frame = Vec::new();
+        for _ in 0..4 {
+            let (port, bytes) = io.packet_out.recv().await.unwrap();
+            targets.push(port);
+            frame = bytes;
+        }
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec!["Ethernet1", "Ethernet2", "Ethernet49", "Ethernet50"]
+        );
+        // A well-formed broadcast reply from the SVI's address.
+        assert_eq!(&frame[0..6], &[0xff; 6]);
+        assert_eq!(&frame[6..12], &SWITCH_MAC);
+        assert_eq!(u16::from_be_bytes([frame[12], frame[13]]), 0x0800);
+        assert_eq!(&frame[26..30], &[10, 0, 10, 1], "source is the giaddr");
+        assert_eq!(&frame[30..34], &[255, 255, 255, 255]);
+        assert_eq!(u16::from_be_bytes([frame[34], frame[35]]), 67);
+        assert_eq!(u16::from_be_bytes([frame[36], frame[37]]), 68);
+        // The IPv4 header checksum is real, not zero.
+        assert_eq!(ip_checksum(&frame[14..34]), 0);
+
+        let snapshot = engine.snapshot();
+        let (_, stats) = &snapshot.relay[&10];
+        assert_eq!((stats.to_server, stats.to_client, stats.dropped), (1, 1, 0));
+    }
+
+    /// A relayed lease is an ordinary snooping binding, so DAI accepts
+    /// the client's ARP afterwards — the whole reason the relay lives
+    /// inside this engine.
+    #[tokio::test]
+    async fn relayed_leases_feed_the_binding_table() {
+        let (engine, mut io) = Engine::spawn(None, SWITCH_MAC);
+        engine.set_l2_view(seed_view());
+        engine.set_config(relay_config());
+
+        // The request remembers which port the client is on...
+        io.packet_in
+            .send((
+                "Ethernet1".into(),
+                10,
+                dhcp_frame(CLIENT_MAC, 1, CLIENT_MAC, Ipv4Addr::UNSPECIFIED, 3, None),
+            ))
+            .unwrap();
+        io.relay_out.recv().await.unwrap();
+        io.relay_out.recv().await.unwrap();
+
+        // ...and the ACK binds yiaddr to it.
+        io.relay_in
+            .send((
+                Ipv4Addr::new(10, 0, 10, 1),
+                bootp_reply(
+                    CLIENT_MAC,
+                    Ipv4Addr::new(10, 0, 10, 55),
+                    Ipv4Addr::new(10, 0, 10, 1),
+                    5,
+                    false,
+                ),
+            ))
+            .unwrap();
+        let (port, _) = io.packet_out.recv().await.unwrap();
+        // Not a broadcast: it goes straight to the client's port.
+        assert_eq!(port, "Ethernet1");
+
+        let snapshot = engine.snapshot();
+        let binding = snapshot
+            .bindings
+            .iter()
+            .find(|b| b.mac == "00:1c:73:0c:aa:01")
+            .expect("relayed lease should bind");
+        assert_eq!(binding.ip, Ipv4Addr::new(10, 0, 10, 55));
+        assert_eq!(binding.interface, "Ethernet1");
+        assert_eq!(binding.vlan, 10);
+
+        // DAI now accepts that client's ARP.
+        io.packet_in
+            .send((
+                "Ethernet1".into(),
+                10,
+                arp_frame(CLIENT_MAC, CLIENT_MAC, Ipv4Addr::new(10, 0, 10, 55), false),
+            ))
+            .unwrap();
+        let (port, _) = io.packet_out.recv().await.unwrap();
+        assert_ne!(port, "Ethernet1", "the ARP re-injects to the other ports");
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.arp_stats[&10].forwarded, 1);
+        assert_eq!(snapshot.arp_stats[&10].dropped, 0);
+    }
+
+    /// The relay validates before it forwards: a spoofed chaddr never
+    /// reaches a server, and a VLAN with no giaddr counts the drop
+    /// rather than losing the request silently.
+    #[tokio::test]
+    async fn relay_drops_what_snooping_would_drop() {
+        let (engine, mut io) = Engine::spawn(None, SWITCH_MAC);
+        engine.set_l2_view(seed_view());
+        engine.set_config(relay_config());
+
+        // chaddr does not match the source MAC.
+        io.packet_in
+            .send((
+                "Ethernet1".into(),
+                10,
+                dhcp_frame(
+                    CLIENT_MAC,
+                    1,
+                    [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+                    Ipv4Addr::UNSPECIFIED,
+                    1,
+                    None,
+                ),
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(io.relay_out.try_recv().is_err(), "spoofed request relayed");
+        assert_eq!(engine.snapshot().dhcp_stats[&10].dropped, 1);
+
+        // A relay with no giaddr cannot forward; the drop is counted.
+        let mut config = relay_config();
+        config.relay.insert(
+            10,
+            RelayVlan {
+                servers: vec![Ipv4Addr::new(10, 42, 0, 5)],
+                giaddr: Ipv4Addr::UNSPECIFIED,
+            },
+        );
+        engine.set_config(config);
+        io.packet_in
+            .send((
+                "Ethernet1".into(),
+                10,
+                dhcp_frame(CLIENT_MAC, 1, CLIENT_MAC, Ipv4Addr::UNSPECIFIED, 1, None),
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(io.relay_out.try_recv().is_err());
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.relay[&10].1.dropped, 1);
+
+        // A reply for a giaddr no relay owns is ignored entirely.
+        io.relay_in
+            .send((
+                Ipv4Addr::new(192, 0, 2, 1),
+                bootp_reply(
+                    CLIENT_MAC,
+                    Ipv4Addr::new(10, 0, 10, 55),
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    5,
+                    true,
+                ),
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(io.packet_out.try_recv().is_err());
+    }
+
+    /// The BOOTP payload is bounded by the IP header's total length, so
+    /// Ethernet padding never reaches a server as option bytes.
+    #[test]
+    fn relayed_payloads_exclude_ethernet_padding() {
+        let mut frame = dhcp_frame(CLIENT_MAC, 1, CLIENT_MAC, Ipv4Addr::UNSPECIFIED, 1, None);
+        let real = bootp_payload(&frame).unwrap();
+        frame.extend_from_slice(&[0u8; 18]);
+        assert_eq!(bootp_payload(&frame).unwrap(), real);
+        // The payload really is the BOOTP message.
+        assert_eq!(real[0], 1);
+        assert_eq!(&real[236..240], &[99, 130, 83, 99]);
+    }
+
+    /// A request that already carries a giaddr keeps it: that relay
+    /// owns the reply path, and overwriting it would strand the client.
+    #[test]
+    fn an_existing_giaddr_is_left_alone() {
+        let mut payload = vec![0u8; 240];
+        payload[24..28].copy_from_slice(&[10, 9, 9, 9]);
+        let relayed = with_giaddr(&payload, Ipv4Addr::new(10, 0, 10, 1));
+        assert_eq!(&relayed[24..28], &[10, 9, 9, 9]);
+        assert_eq!(relayed[3], 1, "the hop count still counts this relay");
+
+        let relayed = with_giaddr(&vec![0u8; 240], Ipv4Addr::new(10, 0, 10, 1));
+        assert_eq!(&relayed[24..28], &[10, 0, 10, 1]);
+    }
+
     #[tokio::test]
     async fn redirects_expand_port_channels_and_split_trust() {
-        let (engine, mut io) = Engine::spawn(None);
+        let (engine, mut io) = Engine::spawn(None, SWITCH_MAC);
         engine.set_config(seed_config());
         engine.set_l2_view(seed_view());
         let program = drain_redirects(&mut io).await;
@@ -852,7 +1483,7 @@ mod tests {
 
     #[tokio::test]
     async fn dhcp_flow_learns_bindings_and_blocks_rogue_servers() {
-        let (engine, mut io) = Engine::spawn(None);
+        let (engine, mut io) = Engine::spawn(None, SWITCH_MAC);
         engine.set_config(seed_config());
         engine.set_l2_view(seed_view());
         let _ = drain_redirects(&mut io).await;
@@ -948,7 +1579,7 @@ mod tests {
 
     #[tokio::test]
     async fn dai_validates_against_bindings_and_flags() {
-        let (engine, mut io) = Engine::spawn(None);
+        let (engine, mut io) = Engine::spawn(None, SWITCH_MAC);
         let mut config = seed_config();
         config.statics.insert(
             ("00:50:56:be:ef:99".into(), 10),
@@ -1063,7 +1694,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("dhcp-bindings.json");
         {
-            let (engine, mut io) = Engine::spawn(Some(store.clone()));
+            let (engine, mut io) = Engine::spawn(Some(store.clone()), SWITCH_MAC);
             engine.set_config(seed_config());
             engine.set_l2_view(seed_view());
             let _ = drain_redirects(&mut io).await;
@@ -1097,7 +1728,7 @@ mod tests {
             assert_eq!(engine.snapshot().bindings.len(), 1);
         }
         // A fresh engine on the same store comes back with the lease.
-        let (engine, _io) = Engine::spawn(Some(store));
+        let (engine, _io) = Engine::spawn(Some(store), SWITCH_MAC);
         engine.set_config(seed_config());
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.bindings.len(), 1);

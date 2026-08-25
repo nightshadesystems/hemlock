@@ -806,6 +806,20 @@ impl Orch for OrchService {
                 },
             );
         }
+        for relay in req.dhcp_relay {
+            let giaddr: std::net::Ipv4Addr = relay.giaddr.parse().map_err(|_| {
+                Status::invalid_argument(format!("bad relay giaddr {:?}", relay.giaddr))
+            })?;
+            let mut servers = Vec::with_capacity(relay.servers.len());
+            for server in &relay.servers {
+                servers.push(server.parse::<std::net::Ipv4Addr>().map_err(|_| {
+                    Status::invalid_argument(format!("bad relay server {server:?}"))
+                })?);
+            }
+            config
+                .relay
+                .insert(vlan16(relay.vlan)?, snoopsec::RelayVlan { servers, giaddr });
+        }
         self.snoopsec.set_config(config);
         Ok(Response::new(pb::SetSnoopSecConfigResponse {}))
     }
@@ -863,6 +877,18 @@ impl Orch for OrchService {
                     dropped: stats.dropped,
                     bad_binding: stats.bad_binding,
                     bad_src_mac: stats.bad_src_mac,
+                })
+                .collect(),
+            dhcp_relay: snapshot
+                .relay
+                .iter()
+                .map(|(vlan, (relay, stats))| pb::DhcpRelayVlanState {
+                    vlan: u32::from(*vlan),
+                    servers: relay.servers.iter().map(|s| s.to_string()).collect(),
+                    giaddr: relay.giaddr.to_string(),
+                    to_server: stats.to_server,
+                    to_client: stats.to_client,
+                    dropped: stats.dropped,
                 })
                 .collect(),
         }))
@@ -982,9 +1008,12 @@ async fn main() -> Result<()> {
     let (igmp_engine, igmp_io) = snoop::Engine::spawn(snoop::Family::Igmp, system_mac);
     let (mld_engine, mld_io) = snoop::Engine::spawn(snoop::Family::Mld, system_mac);
     let (dot1x_engine, dot1x_io) = dot1x::Engine::spawn();
-    let (snoopsec_engine, snoopsec_io) = snoopsec::Engine::spawn(Some(std::path::PathBuf::from(
-        "/var/lib/hemlock/dhcp-bindings.json",
-    )));
+    let (snoopsec_engine, snoopsec_io) = snoopsec::Engine::spawn(
+        Some(std::path::PathBuf::from(
+            "/var/lib/hemlock/dhcp-bindings.json",
+        )),
+        system_mac,
+    );
 
     // Gates -> syncd SetLagMembers; STP states -> SetPortStpState;
     // BPDU-guard trips -> SetPortErrdisable; snooping group/mrouter
@@ -1025,8 +1054,13 @@ async fn main() -> Result<()> {
         packet_in: snoopsec_packets,
         packet_out: snoopsec_out,
         redirects,
+        relay_out,
+        relay_in,
     } = snoopsec_io;
     tokio::spawn(push_snoop_redirects(syncd.clone(), redirects));
+    // The relay's server side: one socket per giaddr, so a server's
+    // reply comes back to the SVI it was relayed from.
+    tokio::spawn(run_dhcp_relay(relay_out, relay_in));
     #[cfg(target_os = "linux")]
     transport::register_snoopsec(snoopsec_packets, snoopsec_out);
     #[cfg(not(target_os = "linux"))]
@@ -1411,6 +1445,84 @@ async fn push_unknown_mcast(
         .await;
         if let Err(e) = result {
             warn!(vlan = update.vlan, error = %e, "unknown-mcast push failed");
+        }
+    }
+}
+
+/// The DHCP relay's server side.
+///
+/// A relayed request is an ordinary unicast to the server, so it goes
+/// out a UDP socket bound to the SVI's address — the kernel routes and
+/// ARPs for it, and the server's reply comes straight back to the same
+/// socket. Sockets are opened lazily per giaddr and kept for the
+/// process's life: an SVI address rarely moves, and a relay that had to
+/// rebind mid-transaction would lose the reply.
+///
+/// Binding port 67 needs privilege; without it the relay logs once and
+/// keeps running (nothing else in orch depends on it).
+async fn run_dhcp_relay(
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<snoopsec::RelayDatagram>,
+    replies: tokio::sync::mpsc::UnboundedSender<(std::net::Ipv4Addr, Vec<u8>)>,
+) {
+    let mut sockets: std::collections::BTreeMap<
+        std::net::Ipv4Addr,
+        std::sync::Arc<tokio::net::UdpSocket>,
+    > = Default::default();
+    let mut refused: std::collections::BTreeSet<std::net::Ipv4Addr> = Default::default();
+
+    while let Some(datagram) = requests.recv().await {
+        let giaddr = datagram.giaddr;
+        if refused.contains(&giaddr) {
+            continue;
+        }
+        let socket = match sockets.get(&giaddr) {
+            Some(socket) => socket.clone(),
+            None => {
+                // The server replies to giaddr:67, so that is what the
+                // relay has to listen on.
+                match tokio::net::UdpSocket::bind((giaddr, 67)).await {
+                    Ok(socket) => {
+                        let socket = std::sync::Arc::new(socket);
+                        sockets.insert(giaddr, socket.clone());
+                        tokio::spawn(read_relay_replies(socket.clone(), giaddr, replies.clone()));
+                        info!(%giaddr, "dhcp relay listening");
+                        socket
+                    }
+                    Err(err) => {
+                        warn!(%giaddr, %err, "cannot bind the dhcp relay socket");
+                        refused.insert(giaddr);
+                        continue;
+                    }
+                }
+            }
+        };
+        let target = std::net::SocketAddr::from((datagram.server, 67));
+        if let Err(err) = socket.send_to(&datagram.payload, target).await {
+            debug!(server = %datagram.server, %err, "relaying a dhcp request failed");
+        }
+    }
+}
+
+/// Server replies on one relay socket, back into the engine.
+async fn read_relay_replies(
+    socket: std::sync::Arc<tokio::net::UdpSocket>,
+    giaddr: std::net::Ipv4Addr,
+    replies: tokio::sync::mpsc::UnboundedSender<(std::net::Ipv4Addr, Vec<u8>)>,
+) {
+    // A BOOTP message is at most 576 bytes by RFC 2131, but servers do
+    // send larger option sets; one MTU is generous and bounded.
+    let mut buffer = vec![0u8; 1500];
+    loop {
+        match socket.recv_from(&mut buffer).await {
+            Ok((len, _)) => {
+                if replies.send((giaddr, buffer[..len].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!(%giaddr, %err, "dhcp relay socket read failed");
+                return;
+            }
         }
     }
 }

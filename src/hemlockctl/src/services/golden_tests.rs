@@ -92,3 +92,15 @@ fn sflow() {
         include_str!("../../tests/golden/sflow.json"),
     );
 }
+
+#[test]
+fn dhcp_relay() {
+    assert_golden(
+        &render::dhcp_relay(&fx::dhcp_relay_state()),
+        include_str!("../../tests/golden/dhcp_relay.txt"),
+    );
+    assert_golden(
+        &as_json("dhcp_relay", &fx::dhcp_relay_state()),
+        include_str!("../../tests/golden/dhcp_relay.json"),
+    );
+}

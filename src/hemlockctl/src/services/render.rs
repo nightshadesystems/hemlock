@@ -2,7 +2,7 @@
 
 use crate::interfaces::table::{pad, Col, Text};
 
-use super::model::{LldpState, NtpState, SflowState, SnmpState};
+use super::model::{DhcpRelayState, LldpState, NtpState, SflowState, SnmpState};
 
 /// The abbreviated interface form for tabular output
 /// ("Ethernet1" -> "Et1").
@@ -372,5 +372,40 @@ pub fn sflow(state: &SflowState) -> String {
         "Datagrams failed",
         &state.datagrams_failed.to_string(),
     ));
+    out.finish()
+}
+
+// ------------------------------------------------- DHCP relay
+
+/// `show dhcp relay` — one row per relay-enabled SVI.
+pub fn dhcp_relay(state: &DhcpRelayState) -> String {
+    const COLS: [Col; 4] = [Col::left(7), Col::left(28), Col::left(11), Col::left(11)];
+    let mut out = Text::new();
+    out.row(
+        &COLS,
+        &["Vlan", "Servers", "To Server", "To Client", "Dropped"],
+    );
+    out.row(
+        &COLS,
+        &[
+            "-----",
+            "--------------------------",
+            "---------",
+            "---------",
+            "-------",
+        ],
+    );
+    for relay in &state.vlans {
+        out.row(
+            &COLS,
+            &[
+                &relay.vlan.to_string(),
+                &relay.servers.join(", "),
+                &relay.to_server.to_string(),
+                &relay.to_client.to_string(),
+                &relay.dropped.to_string(),
+            ],
+        );
+    }
     out.finish()
 }

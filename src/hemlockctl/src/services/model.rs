@@ -161,3 +161,24 @@ pub struct SflowState {
     pub datagrams_sent: u64,
     pub datagrams_failed: u64,
 }
+
+// ------------------------------------------------- DHCP relay
+
+/// One relay-enabled SVI.
+#[derive(Debug, Clone, Serialize)]
+pub struct DhcpRelayVlan {
+    pub vlan: u16,
+    /// Servers in config order.
+    pub servers: Vec<String>,
+    /// The SVI address stamped into giaddr.
+    pub giaddr: String,
+    pub to_server: u64,
+    pub to_client: u64,
+    pub dropped: u64,
+}
+
+/// `show dhcp relay`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DhcpRelayState {
+    pub vlans: Vec<DhcpRelayVlan>,
+}

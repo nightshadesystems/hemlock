@@ -1062,6 +1062,15 @@ impl Engine {
                         interface: binding.interface.clone(),
                     })
                     .collect(),
+                dhcp_relay: wanted
+                    .relay
+                    .iter()
+                    .map(|(vlan, (servers, giaddr))| pb::DhcpRelayVlanConfig {
+                        vlan: u32::from(*vlan),
+                        servers: servers.iter().map(|s| s.to_string()).collect(),
+                        giaddr: giaddr.clone(),
+                    })
+                    .collect(),
             })
             .await
             .context("SetSnoopSecConfig")?;

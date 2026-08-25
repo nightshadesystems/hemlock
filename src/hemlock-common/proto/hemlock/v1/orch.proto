@@ -565,6 +565,16 @@ message StaticBindingConfig {
   string interface = 4;
 }
 
+// One relay-enabled SVI. The relay is a capability of the snooping
+// engine, not a separate daemon, so it rides this one config RPC.
+message DhcpRelayVlanConfig {
+  uint32 vlan = 1;
+  // Servers a request is relayed to, in config order.
+  repeated string servers = 2;
+  // The SVI's address: the giaddr servers see and reply to.
+  string giaddr = 3;
+}
+
 message SetSnoopSecConfigRequest {
   repeated uint32 dhcp_vlans = 1;
   repeated uint32 arp_vlans = 2;
@@ -574,6 +584,7 @@ message SetSnoopSecConfigRequest {
   repeated string dhcp_trusted = 4;
   repeated string arp_trusted = 5;
   repeated StaticBindingConfig static_bindings = 6;
+  repeated DhcpRelayVlanConfig dhcp_relay = 7;
 }
 
 message SetSnoopSecConfigResponse {}
@@ -604,6 +615,15 @@ message DaiVlanStats {
   uint64 bad_src_mac = 5;
 }
 
+message DhcpRelayVlanState {
+  uint32 vlan = 1;
+  repeated string servers = 2;
+  string giaddr = 3;
+  uint64 to_server = 4;
+  uint64 to_client = 5;
+  uint64 dropped = 6;
+}
+
 message GetSnoopSecStateResponse {
   repeated uint32 dhcp_vlans = 1;
   repeated string dhcp_trusted = 2;
@@ -614,6 +634,7 @@ message GetSnoopSecStateResponse {
   repeated string validate = 7;
   repeated string arp_trusted = 8;
   repeated DaiVlanStats arp_stats = 9;
+  repeated DhcpRelayVlanState dhcp_relay = 10;
 }
 
 message ClearSnoopBindingRequest {

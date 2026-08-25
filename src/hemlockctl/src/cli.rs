@@ -414,6 +414,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show port-security [interface <port>]  learn limits and violations");
             println!("  show dot1x [interface <port>]          802.1X port authentication");
             println!("  show dhcp snooping [binding|statistics]  DHCP snooping state");
+            println!("  show dhcp relay                        DHCP relay servers and counters");
             println!("  show arp inspection [statistics]       dynamic ARP inspection");
             println!("  show qos maps                          global DSCP/CoS/TC maps");
             println!("  show qos wred                          WRED/ECN profiles");
@@ -533,7 +534,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "snmp",
         "sflow",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|dhcp relay|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -609,7 +610,17 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
                 crate::security::cmd::show_port_security(&endpoints.syncd, &words[1..]).await
             }
             "dot1x" => crate::security::cmd::show_dot1x(&endpoints.orch, &words[1..]).await,
-            "dhcp" => crate::security::cmd::show_dhcp(&endpoints.orch, &words[1..]).await,
+            "dhcp" => {
+                // `show dhcp snooping ...` is the security suite's;
+                // `show dhcp relay` belongs to the services suite.
+                if let Some(next) = words.get(1) {
+                    if resolve(next, &["relay"]).is_ok() {
+                        return crate::services::cmd::show_dhcp_relay(&endpoints.orch, &words[2..])
+                            .await;
+                    }
+                }
+                crate::security::cmd::show_dhcp(&endpoints.orch, &words[1..]).await
+            }
             "qos" => crate::qos::cmd::show(&endpoints.syncd, &words[1..]).await,
             "lldp" => crate::services::cmd::show_lldp(&endpoints.orch, &words[1..]).await,
             "ntp" => crate::services::cmd::show_ntp(&endpoints.orch, &words[1..]).await,
@@ -767,6 +778,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces <port> lldp disable            LLDP is on by default");
             println!("  set interfaces <port> sflow disable           sampling is on by default");
             println!("  set interfaces <port|Po> dhcp-snooping trust | arp-inspection trust");
+            println!("  set interfaces Vlan<id> dhcp-relay server <ipv4>   up to 4 servers");
             println!(
                 "  set services lldp [disable | tx-interval <5-300> | hold-multiplier <2-10>]"
             );
@@ -2743,6 +2755,7 @@ async fn config_interfaces(
             "port-security",
             "dot1x",
             "dhcp-snooping",
+            "dhcp-relay",
             "arp-inspection",
             "qos",
             "lldp",
@@ -2762,7 +2775,7 @@ async fn config_interfaces(
         if matches!(subcommand, "lldp" | "sflow") {
             return Err(format!("% {port}: {subcommand} is a physical-port setting"));
         }
-        if !matches!(subcommand, "address" | "vrrp" | "mtu") {
+        if !matches!(subcommand, "address" | "vrrp" | "mtu" | "dhcp-relay") {
             return Err(format!(
                 "% {subcommand} is not supported on VLAN interfaces"
             ));
@@ -2790,6 +2803,9 @@ async fn config_interfaces(
         return Err(format!(
             "% {subcommand} is not supported on management ports"
         ));
+    }
+    if !port.starts_with("Vlan") && subcommand == "dhcp-relay" {
+        return Err(format!("% {port}: dhcp-relay is an SVI setting"));
     }
     if port.starts_with("Management") && matches!(subcommand, "lldp" | "sflow") {
         return Err(format!("% {port}: {subcommand} is a physical-port setting"));
@@ -2878,6 +2894,9 @@ async fn config_interfaces(
             })
             .await
             .map_err(fmt_err);
+        }
+        "dhcp-relay" => {
+            return config_dhcp_relay(endpoints, &port, &rest[1..], delete).await;
         }
         feature @ ("dhcp-snooping" | "arp-inspection") => {
             // `dhcp-snooping trust` / `arp-inspection trust` markers.
@@ -5616,6 +5635,112 @@ fn candidate_sflow_collectors(text: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The most relay servers one SVI forwards to — checked at the prompt
+/// for immediate feedback; mgmtd re-validates.
+const MAX_DHCP_RELAY_SERVERS: usize = 4;
+
+/// `set|delete interfaces Vlan<id> dhcp-relay server <ipv4>`.
+async fn config_dhcp_relay(
+    endpoints: &Endpoints,
+    port: &str,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let usage = format!("% Usage: set interfaces {port} dhcp-relay server <ipv4>");
+    if words.is_empty() {
+        return if delete {
+            // `delete interfaces Vlan<id> dhcp-relay` drops every server.
+            edit_interface(endpoints, port, |svi| {
+                ConfigTree::remove_leaf(svi, "dhcp-relay");
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            Err(usage)
+        };
+    }
+    resolve(words[0], &["server"])?;
+    let Some(address) = words.get(1) else {
+        return if delete {
+            edit_interface(endpoints, port, |svi| {
+                ConfigTree::remove_leaf(svi, "dhcp-relay");
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            Err(usage)
+        };
+    };
+    if words.len() > 2 {
+        return Err(format!("% Invalid input: {:?}", words[2]));
+    }
+    // IPv4 only: DHCPv6 relay is deferred, and a v6 address here would
+    // be that by another name.
+    if address.parse::<std::net::Ipv4Addr>().is_err() {
+        if address.parse::<std::net::Ipv6Addr>().is_ok() {
+            return Err("% DHCPv6 relay is not supported".into());
+        }
+        return Err(format!("% bad server address {address:?}"));
+    }
+    let address = (*address).to_string();
+    if delete {
+        let address = address.clone();
+        return edit_interface(endpoints, port, move |svi| {
+            remove_leaf_matching(svi, "dhcp-relay", &["server", &address]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    // The cap is checked here too, so a fifth server is refused before
+    // the commit says so.
+    let candidate = candidate_text(endpoints).await.map_err(fmt_err)?;
+    let existing = candidate_relay_servers(&candidate, port);
+    if !existing.contains(&address) && existing.len() >= MAX_DHCP_RELAY_SERVERS {
+        return Err(format!(
+            "% at most {MAX_DHCP_RELAY_SERVERS} dhcp-relay servers ({} configured)",
+            existing.len()
+        ));
+    }
+    edit_interface(endpoints, port, move |svi| {
+        remove_leaf_matching(svi, "dhcp-relay", &["server", &address]);
+        push_leaf(svi, "dhcp-relay", vec!["server".into(), address]);
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// The relay servers one SVI already carries in the candidate, in order.
+fn candidate_relay_servers(text: &str, port: &str) -> Vec<String> {
+    let Ok(mut tree) = hemlock_config::parse(text) else {
+        return Vec::new();
+    };
+    tree.normalize_interfaces();
+    let Some((_, interfaces)) = tree.block("interfaces") else {
+        return Vec::new();
+    };
+    interfaces
+        .iter()
+        .find_map(|item| match item {
+            hemlock_config::Item::Block { name, children, .. } if name == port => Some(children),
+            _ => None,
+        })
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|item| match item {
+                    hemlock_config::Item::Leaf { name, values }
+                        if name == "dhcp-relay"
+                            && values.first().map(String::as_str) == Some("server") =>
+                    {
+                        values.get(1).cloned()
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `set|delete switching <mac-table|mirror> ...`.

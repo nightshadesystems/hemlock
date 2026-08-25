@@ -2,7 +2,8 @@
 //! the spec's seed configuration produces on a 52-port E1031.
 
 use super::model::{
-    LldpNeighbor, LldpPort, LldpState, NtpState, SflowState, SnmpCommunity, SnmpState,
+    DhcpRelayState, DhcpRelayVlan, LldpNeighbor, LldpPort, LldpState, NtpState, SflowState,
+    SnmpCommunity, SnmpState,
 };
 
 fn neighbor(
@@ -168,5 +169,19 @@ pub fn sflow_state() -> SflowState {
         counter_samples: 10_488,
         datagrams_sent: 12_930,
         datagrams_failed: 0,
+    }
+}
+
+/// The relay state the seed produces: Vlan99 relaying to two servers.
+pub fn dhcp_relay_state() -> DhcpRelayState {
+    DhcpRelayState {
+        vlans: vec![DhcpRelayVlan {
+            vlan: 99,
+            servers: vec!["10.42.0.5".into(), "10.42.0.6".into()],
+            giaddr: "10.42.10.9".into(),
+            to_server: 1204,
+            to_client: 1198,
+            dropped: 2,
+        }],
     }
 }

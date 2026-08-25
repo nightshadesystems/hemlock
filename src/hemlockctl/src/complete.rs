@@ -162,7 +162,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Operational, ["show", "acl"]) => &["summary", ACL],
         (CliMode::Operational, ["show", "port-security" | "dot1x"]) => &["interface"],
         (CliMode::Operational, ["show", "port-security" | "dot1x", "interface"]) => &[PORT],
-        (CliMode::Operational, ["show", "dhcp"]) => &["snooping"],
+        (CliMode::Operational, ["show", "dhcp"]) => &["snooping", "relay"],
         (CliMode::Operational, ["show", "dhcp", "snooping"]) => &["binding", "statistics"],
         (CliMode::Operational, ["show", "arp"]) => &["inspection"],
         (CliMode::Operational, ["show", "arp", "inspection"]) => &["statistics"],
@@ -291,6 +291,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "port-security",
             "dot1x",
             "dhcp-snooping",
+            "dhcp-relay",
             "arp-inspection",
             "qos",
             "lldp",
@@ -339,6 +340,8 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set", "interfaces", PORT, "dhcp-snooping" | "arp-inspection"]) => {
             &["trust"]
         }
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "dhcp-relay"]) => &["server"],
+        (CliMode::Config, ["set" | "delete", "interfaces", PORT, "dhcp-relay", "server"]) => &[ANY],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "vrrp"]) => &[NUM],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "vrrp", NUM]) => &[
             "address",
@@ -1104,8 +1107,9 @@ mod tests {
             ]
         );
         // Operational security shows and clears.
+        // The services suite shares `show dhcp` with this one.
         let c = candidates(CliMode::Operational, &["show", "dhcp"], "", &ports());
-        assert_eq!(c, vec!["snooping".to_string()]);
+        assert_eq!(c, vec!["snooping".to_string(), "relay".to_string()]);
         let c = candidates(CliMode::Operational, &["clear", "dot1x"], "", &ports());
         assert_eq!(c, vec!["interface".to_string()]);
     }
@@ -1199,6 +1203,7 @@ mod tests {
                 "port-security".to_string(),
                 "dot1x".to_string(),
                 "dhcp-snooping".to_string(),
+                "dhcp-relay".to_string(),
                 "arp-inspection".to_string(),
                 "qos".to_string(),
                 "lldp".to_string(),

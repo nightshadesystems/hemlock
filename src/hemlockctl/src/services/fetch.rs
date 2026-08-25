@@ -6,7 +6,8 @@ use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 
 use super::model::{
-    LldpNeighbor, LldpPort, LldpState, NtpState, SflowState, SnmpCommunity, SnmpState,
+    DhcpRelayState, DhcpRelayVlan, LldpNeighbor, LldpPort, LldpState, NtpState, SflowState,
+    SnmpCommunity, SnmpState,
 };
 
 async fn orch_client(
@@ -168,4 +169,29 @@ pub async fn sflow_state(orch: &IpcEndpoint, syncd: &IpcEndpoint) -> Result<Sflo
         datagrams_sent: export.datagrams_sent,
         datagrams_failed: export.datagrams_failed,
     })
+}
+
+/// The DHCP relay's per-VLAN servers and counters. The relay is a
+/// capability of the snooping engine, so its state rides that engine's
+/// snapshot rather than an RPC of its own.
+pub async fn dhcp_relay_state(orch: &IpcEndpoint) -> Result<DhcpRelayState> {
+    let response = orch_client(orch)
+        .await?
+        .get_snoop_sec_state(pb::GetSnoopSecStateRequest {})
+        .await?
+        .into_inner();
+    let mut vlans: Vec<DhcpRelayVlan> = response
+        .dhcp_relay
+        .into_iter()
+        .map(|relay| DhcpRelayVlan {
+            vlan: u16::try_from(relay.vlan).unwrap_or(0),
+            servers: relay.servers,
+            giaddr: relay.giaddr,
+            to_server: relay.to_server,
+            to_client: relay.to_client,
+            dropped: relay.dropped,
+        })
+        .collect();
+    vlans.sort_by_key(|relay| relay.vlan);
+    Ok(DhcpRelayState { vlans })
 }

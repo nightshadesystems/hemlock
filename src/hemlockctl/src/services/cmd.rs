@@ -1,6 +1,6 @@
 //! Parsing and dispatch for the services-suite operational commands:
 //! `show lldp [neighbors [detail]]`, `show ntp`, `show snmp`,
-//! `show sflow`, and `clear lldp counters`.
+//! `show sflow`, `show dhcp relay`, and `clear lldp counters`.
 
 use hemlock_common::ipc::IpcEndpoint;
 
@@ -132,5 +132,19 @@ pub async fn show_sflow(
         return page_json("sflow", &state);
     }
     crate::pager::page(&render::sflow(&state));
+    Ok(())
+}
+
+/// `show dhcp relay [| json]` (the dispatcher hands over the words
+/// after `dhcp`, with `relay` already resolved).
+pub async fn show_dhcp_relay(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    no_more(&words)?;
+    let state = fetch::dhcp_relay_state(orch).await.map_err(fmt_err)?;
+    if json {
+        return page_json("dhcp_relay", &state);
+    }
+    crate::pager::page(&render::dhcp_relay(&state));
     Ok(())
 }

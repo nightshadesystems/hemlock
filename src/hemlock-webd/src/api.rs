@@ -100,6 +100,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/qos/ports/edit", post(qos_ports_edit))
         .route("/api/lldp", get(lldp))
         .route("/api/lldp/edit", post(lldp_edit))
+        .route("/api/dhcp", get(dhcp))
+        .route("/api/dhcp/relay/edit", post(dhcp_relay_edit))
         .route("/api/sflow", get(sflow))
         .route("/api/sflow/edit", post(sflow_edit))
         .route("/api/snmp", get(snmp))
@@ -965,6 +967,42 @@ async fn lldp_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::services_edit::apply_lldp_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/dhcp` — the DHCP page's state. The relay is a capability
+/// of the snooping engine, so its per-VLAN servers and counters come
+/// out of that engine's snapshot.
+async fn dhcp(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let response = orch
+        .get_snoop_sec_state(pb::GetSnoopSecStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "relay": response.dhcp_relay.iter().map(|relay| json!({
+            "vlan": relay.vlan,
+            "servers": relay.servers,
+            "giaddr": relay.giaddr,
+            "to_server": relay.to_server,
+            "to_client": relay.to_client,
+            "dropped": relay.dropped,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn dhcp_relay_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::services_edit::DhcpRelayEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::services_edit::apply_dhcp_relay_edit(tree, &edit)
     })
     .await
 }

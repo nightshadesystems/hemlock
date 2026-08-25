@@ -91,6 +91,10 @@ pub struct Intents {
     /// sampler, orch exports the datagrams. Per-port disables live on
     /// the port intents.
     pub sflow: SflowIntent,
+    /// DHCP relay servers per SVI (`interfaces { Vlan<id> {
+    /// dhcp-relay server ... } }`), keyed by VLAN id. The relay is a
+    /// capability of the snooping engine, so it rides that push.
+    pub dhcp_relay: BTreeMap<u16, Vec<std::net::Ipv4Addr>>,
     /// The four global QoS maps (`qos { map { ... } }`).
     pub qos_maps: QosMapsIntent,
     /// Named WRED/ECN profiles (`qos { wred-profile <name> { ... } }`).
@@ -1084,6 +1088,9 @@ pub enum IntentError {
     #[error("services sflow: {0}")]
     BadSflow(String),
 
+    #[error("{name}: dhcp-relay: {reason}")]
+    BadDhcpRelay { name: String, reason: String },
+
     #[error("{name}: {feature} is a physical-port setting")]
     PortServiceOnNonPort { name: String, feature: &'static str },
 
@@ -1227,6 +1234,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     duplex: duplex(children, &ifname)?,
                     mtu: mtu(children, &ifname)?,
                 };
+                no_dhcp_relay(children, &ifname)?;
                 if intent.dot1x && intent.port_security.is_some() {
                     return Err(IntentError::BadPortSecurity {
                         name: ifname,
@@ -1281,6 +1289,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                         reason: "mtu follows the member ports; set it on those".into(),
                     });
                 }
+                no_dhcp_relay(children, &ifname)?;
                 let intent = LagIntent {
                     admin_up,
                     description: ConfigTree::leaf_value(children, "description")
@@ -1352,6 +1361,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     });
                 }
                 no_link_pinning(children, &ifname, "management ports")?;
+                no_dhcp_relay(children, &ifname)?;
                 let intent = MgmtIntent {
                     admin_up,
                     address,
@@ -1397,6 +1407,10 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                 }
                 no_link_pinning(children, &ifname, "VLAN interfaces")?;
                 no_port_services(children, &ifname)?;
+                let relay = dhcp_relay_servers(children, &ifname)?;
+                if !relay.is_empty() {
+                    intents.dhcp_relay.insert(id, relay);
+                }
                 let intent = SviIntent {
                     address,
                     mtu: mtu(children, &ifname)?,
@@ -2286,6 +2300,24 @@ fn arp_inspection(items: &[Item], intents: &mut Intents) -> Result<(), IntentErr
 }
 
 fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
+    // A relay stamps the SVI's address into giaddr, and the server
+    // replies to it. Without one the relay would forward requests
+    // nothing could answer, so it is a commit error.
+    for vlan in intents.dhcp_relay.keys() {
+        let name = format!("Vlan{vlan}");
+        let addressed = intents
+            .svis
+            .get(&name)
+            .map(|svi| svi.address.is_some())
+            .unwrap_or(false);
+        if !addressed {
+            return Err(IntentError::BadDhcpRelay {
+                name,
+                reason: "the interface must carry an address (the relay's giaddr)".into(),
+            });
+        }
+    }
+
     // sFlow needs somewhere to send: a rate, a polling interval or a
     // per-port disable with no collector is config that samples
     // nothing, so it is an error rather than a silent no-op.
@@ -2896,6 +2928,64 @@ fn no_port_services(children: &[Item], ifname: &str) -> Result<(), IntentError> 
                 feature,
             });
         }
+    }
+    Ok(())
+}
+
+/// `dhcp-relay server <ipv4>` leaves on one SVI, in config order.
+/// Repeated servers collapse; the relay walks the list in order, so a
+/// duplicate would only slow failover.
+fn dhcp_relay_servers(
+    children: &[Item],
+    ifname: &str,
+) -> Result<Vec<std::net::Ipv4Addr>, IntentError> {
+    let bad = |reason: String| IntentError::BadDhcpRelay {
+        name: ifname.to_string(),
+        reason,
+    };
+    let mut servers: Vec<std::net::Ipv4Addr> = Vec::new();
+    for item in children {
+        let Item::Leaf { name, values } = item else {
+            continue;
+        };
+        if name != "dhcp-relay" {
+            continue;
+        }
+        let [keyword, address] = values.as_slice() else {
+            return Err(bad("expected `dhcp-relay server <ipv4>`".into()));
+        };
+        if keyword != "server" {
+            return Err(bad(format!("expected `server`, got {keyword:?}")));
+        }
+        // IPv4 only: DHCPv6 relay is deferred, and a v6 address here
+        // would be that by another name.
+        let Ok(server) = address.parse::<std::net::Ipv4Addr>() else {
+            return Err(bad(format!("bad server address {address:?}")));
+        };
+        if !servers.contains(&server) {
+            servers.push(server);
+        }
+    }
+    if servers.len() > MAX_DHCP_RELAY_SERVERS {
+        return Err(bad(format!(
+            "at most {MAX_DHCP_RELAY_SERVERS} servers ({} configured)",
+            servers.len()
+        )));
+    }
+    Ok(servers)
+}
+
+/// The most relay servers one SVI forwards to.
+pub const MAX_DHCP_RELAY_SERVERS: usize = 4;
+
+/// Reject `dhcp-relay` on anything that is not an SVI: a relay needs a
+/// giaddr, which only a routed VLAN interface has.
+fn no_dhcp_relay(children: &[Item], ifname: &str) -> Result<(), IntentError> {
+    if ConfigTree::has_leaf(children, "dhcp-relay") {
+        return Err(IntentError::BadDhcpRelay {
+            name: ifname.to_string(),
+            reason: "dhcp-relay is an SVI setting".into(),
+        });
     }
     Ok(())
 }
@@ -5744,6 +5834,8 @@ pub struct SnoopSecState {
     pub intent: SnoopSecIntent,
     pub dhcp_trusted: BTreeSet<String>,
     pub arp_trusted: BTreeSet<String>,
+    /// The relay: per-VLAN (servers, giaddr). One engine, one push.
+    pub relay: BTreeMap<u16, (Vec<std::net::Ipv4Addr>, String)>,
 }
 
 pub fn snoopsec_state(intents: &Intents) -> SnoopSecState {
@@ -5767,6 +5859,18 @@ pub fn snoopsec_state(intents: &Intents) -> SnoopSecState {
         if lag.arp_inspection_trust {
             state.arp_trusted.insert(name);
         }
+    }
+    for (vlan, servers) in &intents.dhcp_relay {
+        // Validation guarantees the address; the strip keeps the
+        // giaddr a bare host address, which is what a server sees.
+        let giaddr = intents
+            .svis
+            .get(&format!("Vlan{vlan}"))
+            .and_then(|svi| svi.address.as_deref())
+            .and_then(|cidr| cidr.split('/').next())
+            .unwrap_or_default()
+            .to_string();
+        state.relay.insert(*vlan, (servers.clone(), giaddr));
     }
     state
 }
@@ -7087,6 +7191,9 @@ services {
         user monitor auth sha "authpass1" priv aes "privpass1";
     }
 }
+vlans {
+    vlan 99 { }
+}
 interfaces {
     Management1 {
         address 10.42.0.9/24;
@@ -7096,6 +7203,11 @@ interfaces {
     }
     Ethernet4 {
         sflow disable;
+    }
+    Vlan99 {
+        address 10.42.10.9/24;
+        dhcp-relay server 10.42.0.5;
+        dhcp-relay server 10.42.0.6;
     }
 }
 "#;
@@ -7136,6 +7248,19 @@ interfaces {
         assert_eq!(intents.sflow.rate(), 16384);
         assert_eq!(intents.sflow.polling(), 30);
         assert_eq!(sflow_state(&intents).disabled_ports, ["Ethernet4"]);
+        assert_eq!(
+            intents.dhcp_relay[&99],
+            vec![
+                std::net::Ipv4Addr::new(10, 42, 0, 5),
+                std::net::Ipv4Addr::new(10, 42, 0, 6)
+            ]
+        );
+        // The relay's giaddr is the SVI's address, stripped of its
+        // prefix length.
+        assert_eq!(
+            snoopsec_state(&intents).relay[&99].1,
+            "10.42.10.9".to_string()
+        );
         assert_eq!(
             intents.snmp.users["monitor"],
             SnmpUser {
@@ -7392,6 +7517,97 @@ server pool.ntp.org } }",
         let change = diff_sflow(&candidate, &running).unwrap();
         assert_eq!(change, SflowState::default());
         assert!(!change.global.enabled());
+    }
+
+    /// DHCP relay: SVIs only, addressed by commit, IPv4 servers,
+    /// capped at four.
+    #[test]
+    fn dhcp_relay_validation() {
+        assert!(intents_of("").dhcp_relay.is_empty());
+
+        let intents = intents_of(
+            "vlans { vlan 99 { } }
+interfaces { Vlan99 { address 10.42.10.9/24
+dhcp-relay server 10.42.0.5
+dhcp-relay server 10.42.0.6
+dhcp-relay server 10.42.0.5 } }",
+        );
+        // Config order, duplicates collapsed.
+        assert_eq!(
+            intents.dhcp_relay[&99],
+            vec![
+                std::net::Ipv4Addr::new(10, 42, 0, 5),
+                std::net::Ipv4Addr::new(10, 42, 0, 6)
+            ]
+        );
+
+        // A relay needs a giaddr.
+        let tree =
+            parse("vlans { vlan 99 { } }\ninterfaces { Vlan99 { dhcp-relay server 10.42.0.5 } }")
+                .unwrap();
+        assert_eq!(
+            extract(&tree).unwrap_err().to_string(),
+            "Vlan99: dhcp-relay: the interface must carry an address (the relay's giaddr)"
+        );
+
+        // SVIs only.
+        for name in ["Ethernet1", "Port-Channel1", "Management1"] {
+            let tree = parse(&format!(
+                "interfaces {{ {name} {{ dhcp-relay server 10.42.0.5 }} }}"
+            ))
+            .unwrap();
+            assert_eq!(
+                extract(&tree).unwrap_err().to_string(),
+                format!("{name}: dhcp-relay: dhcp-relay is an SVI setting"),
+                "{name} should reject dhcp-relay"
+            );
+        }
+
+        let svi = |body: &str| {
+            format!("vlans {{ vlan 99 {{ }} }}\ninterfaces {{ Vlan99 {{ address 10.42.10.9/24\n{body} }} }}")
+        };
+        for body in [
+            "dhcp-relay server notanip",
+            "dhcp-relay 10.42.0.5",
+            "dhcp-relay server",
+            // DHCPv6 relay is deferred, so a v6 server is not a server.
+            "dhcp-relay server 2001:db8::5",
+            "dhcp-relay server 10.0.0.1
+dhcp-relay server 10.0.0.2
+dhcp-relay server 10.0.0.3
+dhcp-relay server 10.0.0.4
+dhcp-relay server 10.0.0.5",
+        ] {
+            let tree = parse(&svi(body)).unwrap();
+            assert!(
+                matches!(extract(&tree), Err(IntentError::BadDhcpRelay { .. })),
+                "{body} should be rejected"
+            );
+        }
+    }
+
+    /// The relay rides the snooping engine's whole-state push, so a
+    /// relay change is a snoopsec change.
+    #[test]
+    fn dhcp_relay_diffs_with_the_snooping_state() {
+        let running = intents_of("");
+        let candidate = intents_of(
+            "vlans { vlan 99 { } }
+interfaces { Vlan99 { address 10.42.10.9/24
+dhcp-relay server 10.42.0.5 } }",
+        );
+        let change = diff_snoopsec(&running, &candidate).unwrap();
+        assert_eq!(
+            change.relay[&99],
+            (
+                vec![std::net::Ipv4Addr::new(10, 42, 0, 5)],
+                "10.42.10.9".to_string()
+            )
+        );
+        // Removing the relay is a change back to nothing.
+        let change = diff_snoopsec(&candidate, &running).unwrap();
+        assert!(change.relay.is_empty());
+        assert_eq!(diff_snoopsec(&candidate, &candidate), None);
     }
 
     #[test]

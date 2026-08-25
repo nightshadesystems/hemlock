@@ -1,5 +1,5 @@
-//! Config edits for the services-suite pages: LLDP, NTP, SNMP and
-//! sFlow.
+//! Config edits for the services-suite pages: LLDP, NTP, SNMP,
+//! sFlow and the DHCP relay.
 //!
 //! Same discipline as `edit.rs`: the builders write exactly the leaves
 //! hemlockctl writes, based on the running config, and the result goes
@@ -525,6 +525,88 @@ pub fn apply_sflow_edit(tree: &mut ConfigTree, edit: &SflowEdit) -> Result<(), S
     Ok(())
 }
 
+// ------------------------------------------------------------ DHCP relay
+
+/// The most relay servers one SVI forwards to — the same cap the CLI
+/// and the intent extractor enforce.
+const MAX_DHCP_RELAY_SERVERS: usize = 4;
+
+#[derive(Debug, Deserialize)]
+pub struct DhcpRelayVlanSet {
+    pub vlan: u16,
+    /// The whole wanted server list, in order; empty removes the relay
+    /// from that SVI.
+    #[serde(default)]
+    pub servers: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DhcpRelayEdit {
+    #[serde(default)]
+    pub set: Vec<DhcpRelayVlanSet>,
+    /// VLANs to stop relaying on.
+    #[serde(default)]
+    pub delete: Vec<u16>,
+}
+
+pub fn apply_dhcp_relay_edit(tree: &mut ConfigTree, edit: &DhcpRelayEdit) -> Result<(), String> {
+    for set in &edit.set {
+        valid_vlan(set.vlan)?;
+        if set.servers.len() > MAX_DHCP_RELAY_SERVERS {
+            return Err(format!(
+                "vlan {}: at most {MAX_DHCP_RELAY_SERVERS} servers ({} given)",
+                set.vlan,
+                set.servers.len()
+            ));
+        }
+        for server in &set.servers {
+            // IPv4 only: DHCPv6 relay is deferred.
+            if server.parse::<std::net::Ipv4Addr>().is_err() {
+                return Err(format!("vlan {}: bad server address {server:?}", set.vlan));
+            }
+        }
+    }
+    for vlan in &edit.delete {
+        valid_vlan(*vlan)?;
+    }
+
+    for set in &edit.set {
+        let svi = interface_mut(tree, &format!("Vlan{}", set.vlan));
+        ConfigTree::remove_leaf(svi, "dhcp-relay");
+        // A duplicate in the list is a UI slip, not a second server.
+        let mut seen: Vec<&String> = Vec::new();
+        for server in &set.servers {
+            if seen.contains(&server) {
+                continue;
+            }
+            seen.push(server);
+            push_leaf(svi, "dhcp-relay", vec!["server".into(), server.clone()]);
+        }
+    }
+    for vlan in &edit.delete {
+        let name = format!("Vlan{vlan}");
+        let interfaces = tree.block_mut("interfaces");
+        if let Some(children) = block_children_mut(interfaces, &name) {
+            ConfigTree::remove_leaf(children, "dhcp-relay");
+            // An SVI that held nothing but the relay goes with it.
+            if children.is_empty() {
+                ConfigTree::remove_block(interfaces, &name, &[]);
+            }
+        }
+    }
+    remove_block_if_empty(tree, "interfaces");
+    Ok(())
+}
+
+/// A VLAN id the config language accepts.
+fn valid_vlan(id: u16) -> Result<(), String> {
+    if (1..=4094).contains(&id) {
+        Ok(())
+    } else {
+        Err(format!("bad VLAN id {id} (1..4094)"))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -908,6 +990,107 @@ mod tests {
             ),
             Err("Port-Channel1: sflow is a physical-port setting".into())
         );
+    }
+
+    #[test]
+    fn dhcp_relay_edit_replaces_the_whole_server_list() {
+        let mut t = tree("interfaces { Vlan99 { address 10.42.10.9/24 } }");
+        apply_dhcp_relay_edit(
+            &mut t,
+            &DhcpRelayEdit {
+                set: vec![DhcpRelayVlanSet {
+                    vlan: 99,
+                    servers: vec!["10.42.0.5".into(), "10.42.0.6".into()],
+                }],
+                ..DhcpRelayEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("dhcp-relay server 10.42.0.5"));
+        assert!(text.contains("dhcp-relay server 10.42.0.6"));
+        // Order is the list's, because the relay walks it in order.
+        assert!(text.find("10.42.0.5").unwrap() < text.find("10.42.0.6").unwrap());
+        // The SVI's own config is untouched.
+        assert!(text.contains("address 10.42.10.9/24"));
+
+        // A replacement list wins outright.
+        apply_dhcp_relay_edit(
+            &mut t,
+            &DhcpRelayEdit {
+                set: vec![DhcpRelayVlanSet {
+                    vlan: 99,
+                    servers: vec!["10.42.0.7".into()],
+                }],
+                ..DhcpRelayEdit::default()
+            },
+        )
+        .unwrap();
+        assert!(!t.to_text().contains("10.42.0.5"));
+
+        apply_dhcp_relay_edit(
+            &mut t,
+            &DhcpRelayEdit {
+                delete: vec![99],
+                ..DhcpRelayEdit::default()
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(!text.contains("dhcp-relay"));
+        // The SVI survives, because it still carries its address.
+        assert!(text.contains("address 10.42.10.9/24"));
+    }
+
+    #[test]
+    fn dhcp_relay_edit_rejects_what_the_cli_rejects() {
+        let mut t = tree("");
+        for edit in [
+            DhcpRelayEdit {
+                set: vec![DhcpRelayVlanSet {
+                    vlan: 99,
+                    servers: vec!["notanip".into()],
+                }],
+                ..DhcpRelayEdit::default()
+            },
+            // DHCPv6 relay is deferred, so a v6 server is not a server.
+            DhcpRelayEdit {
+                set: vec![DhcpRelayVlanSet {
+                    vlan: 99,
+                    servers: vec!["2001:db8::5".into()],
+                }],
+                ..DhcpRelayEdit::default()
+            },
+            DhcpRelayEdit {
+                set: vec![DhcpRelayVlanSet {
+                    vlan: 99,
+                    servers: (1..=5).map(|n| format!("10.0.0.{n}")).collect(),
+                }],
+                ..DhcpRelayEdit::default()
+            },
+            DhcpRelayEdit {
+                set: vec![DhcpRelayVlanSet {
+                    vlan: 5000,
+                    servers: vec!["10.0.0.1".into()],
+                }],
+                ..DhcpRelayEdit::default()
+            },
+        ] {
+            assert!(apply_dhcp_relay_edit(&mut t, &edit).is_err());
+        }
+        // A duplicate collapses rather than eating a slot.
+        apply_dhcp_relay_edit(
+            &mut t,
+            &DhcpRelayEdit {
+                set: vec![DhcpRelayVlanSet {
+                    vlan: 99,
+                    servers: vec!["10.0.0.1".into(), "10.0.0.1".into()],
+                }],
+                ..DhcpRelayEdit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(t.to_text().matches("dhcp-relay server 10.0.0.1").count(), 1);
     }
 
     /// The global disable is independent of the per-port set.
