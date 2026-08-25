@@ -153,6 +153,7 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "lldp",
             "ntp",
             "snmp",
+            "sflow",
         ],
         (CliMode::Operational, ["show", "lldp"]) => &["neighbors"],
         (CliMode::Operational, ["show", "lldp", "neighbors"]) => &["detail"],
@@ -239,7 +240,16 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "services",
             "qos",
         ],
-        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp", "ntp", "snmp"],
+        (CliMode::Config, ["set" | "delete", "services"]) => &["lldp", "ntp", "snmp", "sflow"],
+        (CliMode::Config, ["set" | "delete", "services", "sflow"]) => {
+            &["collector", "sample-rate", "polling-interval"]
+        }
+        (CliMode::Config, ["set" | "delete", "services", "sflow", "collector"]) => &[ANY],
+        (CliMode::Config, ["set", "services", "sflow", "collector", ANY]) => &["port"],
+        (CliMode::Config, ["set", "services", "sflow", "collector", ANY, "port"]) => &[NUM],
+        (CliMode::Config, ["set", "services", "sflow", "sample-rate" | "polling-interval"]) => {
+            &[NUM]
+        }
         (CliMode::Config, ["set" | "delete", "services", "snmp"]) => {
             &["community", "location", "contact", "user"]
         }
@@ -284,8 +294,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "arp-inspection",
             "qos",
             "lldp",
+            "sflow",
         ],
-        (CliMode::Config, ["set", "interfaces", PORT, "lldp"]) => &["disable"],
+        (CliMode::Config, ["set", "interfaces", PORT, "lldp" | "sflow"]) => &["disable"],
         (CliMode::Config, ["set" | "delete", "interfaces", PORT, "qos"]) => {
             &["trust", "default-tc", "shape", "queue"]
         }
@@ -1191,6 +1202,7 @@ mod tests {
                 "arp-inspection".to_string(),
                 "qos".to_string(),
                 "lldp".to_string(),
+                "sflow".to_string(),
             ]
         );
         let c = candidates(
@@ -1456,7 +1468,16 @@ mod tests {
         let c = candidates(CliMode::Config, &["set"], "serv", &ports());
         assert_eq!(c, vec!["services".to_string()]);
         let c = candidates(CliMode::Config, &["set", "services"], "", &ports());
-        assert_eq!(c, vec!["lldp", "ntp", "snmp"]);
+        assert_eq!(c, vec!["lldp", "ntp", "snmp", "sflow"]);
+        let c = candidates(CliMode::Config, &["set", "services", "sflow"], "", &ports());
+        assert_eq!(c, vec!["collector", "sample-rate", "polling-interval"]);
+        let c = candidates(
+            CliMode::Config,
+            &["set", "services", "sflow", "collector", "10.42.0.20"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["port"]);
         let c = candidates(CliMode::Config, &["set", "services", "snmp"], "", &ports());
         assert_eq!(c, vec!["community", "location", "contact", "user"]);
         let c = candidates(
@@ -1517,6 +1538,16 @@ mod tests {
         assert_eq!(c, vec!["ntp"]);
         let c = candidates(CliMode::Operational, &["show"], "snm", &ports());
         assert_eq!(c, vec!["snmp"]);
+        let c = candidates(CliMode::Operational, &["show"], "sf", &ports());
+        assert_eq!(c, vec!["sflow"]);
+        // Both per-port service leaves offer only the off switch.
+        let c = candidates(
+            CliMode::Config,
+            &["set", "interfaces", "Eth1", "sflow"],
+            "",
+            &ports(),
+        );
+        assert_eq!(c, vec!["disable"]);
     }
 
     #[test]

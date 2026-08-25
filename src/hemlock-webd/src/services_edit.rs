@@ -1,4 +1,5 @@
-//! Config edits for the services-suite pages: LLDP, NTP and SNMP.
+//! Config edits for the services-suite pages: LLDP, NTP, SNMP and
+//! sFlow.
 //!
 //! Same discipline as `edit.rs`: the builders write exactly the leaves
 //! hemlockctl writes, based on the running config, and the result goes
@@ -384,6 +385,146 @@ pub fn apply_snmp_edit(tree: &mut ConfigTree, edit: &SnmpEdit) -> Result<(), Str
     Ok(())
 }
 
+// ----------------------------------------------------------------- sFlow
+
+/// The most collectors, and the sampling-rate range — the same limits
+/// the CLI and the intent extractor enforce.
+const MAX_SFLOW_COLLECTORS: usize = 2;
+const MIN_SFLOW_SAMPLE_RATE: u32 = 256;
+const MAX_SFLOW_SAMPLE_RATE: u32 = 1_048_576;
+
+#[derive(Debug, Deserialize)]
+pub struct SflowCollectorSet {
+    pub address: String,
+    /// 0 = the sFlow default (6343).
+    #[serde(default)]
+    pub port: u16,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SflowEdit {
+    /// When present, replaces the whole collector list, in order. An
+    /// empty list turns sampling off.
+    #[serde(default)]
+    pub collectors: Option<Vec<SflowCollectorSet>>,
+    /// 0 clears (back to the default 16384).
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    /// 0 clears (back to the default 30).
+    #[serde(default)]
+    pub polling_interval: Option<u16>,
+    /// When present, replaces the set of ports carrying
+    /// `sflow disable`.
+    #[serde(default)]
+    pub disabled_ports: Option<Vec<String>>,
+}
+
+pub fn apply_sflow_edit(tree: &mut ConfigTree, edit: &SflowEdit) -> Result<(), String> {
+    if let Some(collectors) = &edit.collectors {
+        if collectors.len() > MAX_SFLOW_COLLECTORS {
+            return Err(format!(
+                "at most {MAX_SFLOW_COLLECTORS} collectors ({} given)",
+                collectors.len()
+            ));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for collector in collectors {
+            if collector.address.parse::<std::net::IpAddr>().is_err() {
+                return Err(format!("bad collector address {:?}", collector.address));
+            }
+            if seen.contains(&collector.address.as_str()) {
+                return Err(format!("duplicate collector {}", collector.address));
+            }
+            seen.push(&collector.address);
+        }
+    }
+    if let Some(rate) = edit.sample_rate {
+        if rate != 0
+            && (!(MIN_SFLOW_SAMPLE_RATE..=MAX_SFLOW_SAMPLE_RATE).contains(&rate)
+                || !rate.is_power_of_two())
+        {
+            return Err(format!(
+                "bad sample-rate {rate} ({MIN_SFLOW_SAMPLE_RATE}..{MAX_SFLOW_SAMPLE_RATE}, a power of two)"
+            ));
+        }
+    }
+    if let Some(interval) = edit.polling_interval {
+        if interval != 0 && !(5..=300).contains(&interval) {
+            return Err(format!("bad polling-interval {interval} (5..300)"));
+        }
+    }
+    if let Some(ports) = &edit.disabled_ports {
+        for port in ports {
+            if !port.starts_with("Ethernet") {
+                return Err(format!("{port}: sflow is a physical-port setting"));
+            }
+        }
+    }
+
+    let services = tree.block_mut("services");
+    let block = ConfigTree::ensure_block(services, "sflow", &[]);
+    if let Some(collectors) = &edit.collectors {
+        ConfigTree::remove_leaf(block, "collector");
+        for collector in collectors {
+            let mut values = vec![collector.address.clone()];
+            if collector.port != 0 {
+                values.push("port".into());
+                values.push(collector.port.to_string());
+            }
+            push_leaf(block, "collector", values);
+        }
+    }
+    for (leaf, value) in [
+        ("sample-rate", edit.sample_rate),
+        ("polling-interval", edit.polling_interval.map(u32::from)),
+    ] {
+        match value {
+            Some(0) => ConfigTree::remove_leaf(block, leaf),
+            Some(n) => ConfigTree::set_leaf(block, leaf, vec![n.to_string()]),
+            None => {}
+        }
+    }
+    if block.is_empty() {
+        ConfigTree::remove_block(services, "sflow", &[]);
+    }
+    remove_block_if_empty(tree, "services");
+
+    // The per-port disables are a whole set, like LLDP's.
+    if let Some(wanted) = &edit.disabled_ports {
+        let existing: Vec<String> = tree
+            .block("interfaces")
+            .map(|(_, items)| {
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Block { name, children, .. }
+                            if ConfigTree::has_leaf(children, "sflow") =>
+                        {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for port in existing.iter().filter(|port| !wanted.contains(port)) {
+            let interfaces = tree.block_mut("interfaces");
+            if let Some(children) = block_children_mut(interfaces, port) {
+                ConfigTree::remove_leaf(children, "sflow");
+                if children.is_empty() {
+                    ConfigTree::remove_block(interfaces, port, &[]);
+                }
+            }
+        }
+        for port in wanted {
+            let children = interface_mut(tree, port);
+            ConfigTree::set_leaf(children, "sflow", vec!["disable".into()]);
+        }
+        remove_block_if_empty(tree, "interfaces");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -665,6 +806,108 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn sflow_edit_mirrors_cli_shapes() {
+        let mut t = tree("");
+        apply_sflow_edit(
+            &mut t,
+            &SflowEdit {
+                collectors: Some(vec![
+                    SflowCollectorSet {
+                        address: "10.42.0.20".into(),
+                        port: 0,
+                    },
+                    SflowCollectorSet {
+                        address: "10.42.0.21".into(),
+                        port: 6344,
+                    },
+                ]),
+                sample_rate: Some(4096),
+                polling_interval: Some(60),
+                disabled_ports: Some(vec!["Ethernet4".into()]),
+            },
+        )
+        .unwrap();
+        let text = t.to_text();
+        assert!(text.contains("collector 10.42.0.20"));
+        assert!(text.contains("collector 10.42.0.21 port 6344"));
+        assert!(text.contains("sample-rate 4096"));
+        assert!(text.contains("polling-interval 60"));
+        assert!(text.contains("sflow disable"));
+        // Collector order is the list's order.
+        assert!(
+            text.find("collector 10.42.0.20").unwrap() < text.find("collector 10.42.0.21").unwrap()
+        );
+
+        // Clearing everything removes the block and `services` with it.
+        apply_sflow_edit(
+            &mut t,
+            &SflowEdit {
+                collectors: Some(Vec::new()),
+                sample_rate: Some(0),
+                polling_interval: Some(0),
+                disabled_ports: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+        assert_eq!(t.to_text().trim(), "");
+    }
+
+    #[test]
+    fn sflow_edit_rejects_what_the_cli_rejects() {
+        let mut t = tree("");
+        let bad = [
+            SflowEdit {
+                collectors: Some(vec![SflowCollectorSet {
+                    address: "notanip".into(),
+                    port: 0,
+                }]),
+                ..SflowEdit::default()
+            },
+            SflowEdit {
+                collectors: Some(
+                    (1..=3)
+                        .map(|n| SflowCollectorSet {
+                            address: format!("10.0.0.{n}"),
+                            port: 0,
+                        })
+                        .collect(),
+                ),
+                ..SflowEdit::default()
+            },
+            // Not a power of two, and out of range.
+            SflowEdit {
+                sample_rate: Some(10_000),
+                ..SflowEdit::default()
+            },
+            SflowEdit {
+                sample_rate: Some(128),
+                ..SflowEdit::default()
+            },
+            SflowEdit {
+                polling_interval: Some(4),
+                ..SflowEdit::default()
+            },
+            SflowEdit {
+                disabled_ports: Some(vec!["Vlan99".into()]),
+                ..SflowEdit::default()
+            },
+        ];
+        for edit in bad {
+            assert!(apply_sflow_edit(&mut t, &edit).is_err());
+        }
+        assert_eq!(
+            apply_sflow_edit(
+                &mut t,
+                &SflowEdit {
+                    disabled_ports: Some(vec!["Port-Channel1".into()]),
+                    ..SflowEdit::default()
+                }
+            ),
+            Err("Port-Channel1: sflow is a physical-port setting".into())
+        );
     }
 
     /// The global disable is independent of the per-port set.

@@ -65,6 +65,14 @@ service Orch {
   // `clear lldp counters`: baseline the per-port frame counters.
   rpc ClearLldpCounters(ClearLldpCountersRequest) returns (ClearLldpCountersResponse);
 
+  // --- sFlow (export; syncd owns the ASIC sampler) ---------------------
+  // Full desired export state (declarative). orch turns sampled frames
+  // and counter polls into v5 datagrams and sends them to the
+  // collectors; syncd programs the samplepacket session itself.
+  rpc SetSflowConfig(SetSflowConfigRequest) returns (SetSflowConfigResponse);
+  // Export settings + counters for `show sflow`.
+  rpc GetSflowExportState(GetSflowExportStateRequest) returns (GetSflowExportStateResponse);
+
   // --- SNMP (net-snmp master + orch's AgentX subagent) -----------------
   // Full desired SNMP state (declarative). mgmtd renders snmpd.conf
   // and owns the agent's transport/auth; orch's subagent registers the
@@ -753,4 +761,46 @@ message GetSnmpStateResponse {
   uint64 get_requests = 11;
   uint64 getnext_requests = 12;
   uint64 errors = 13;
+}
+
+// --- sFlow ---------------------------------------------------------------
+
+message SflowCollectorConfig {
+  string address = 1;
+  uint32 port = 2;  // 0 = default (6343)
+}
+
+message SetSflowConfigRequest {
+  // False = no collector configured; nothing is exported.
+  bool enabled = 1;
+  repeated SflowCollectorConfig collectors = 2;
+  uint32 sample_rate = 3;       // 1-in-N
+  uint32 polling_interval = 4;  // seconds between counter polls
+  // The agent address the datagrams carry (the management address),
+  // and the interface it belongs to (display only).
+  string agent_address = 5;
+  string agent_interface = 8;
+  // Ports sampling is programmed on, and ports carrying
+  // `sflow disable` — display only; syncd owns the binds.
+  repeated string enabled_ports = 6;
+  repeated string disabled_ports = 7;
+}
+
+message SetSflowConfigResponse {}
+
+message GetSflowExportStateRequest {}
+
+message GetSflowExportStateResponse {
+  bool enabled = 1;
+  repeated SflowCollectorConfig collectors = 2;
+  uint32 sample_rate = 3;
+  uint32 polling_interval = 4;
+  string agent_address = 5;
+  string agent_interface = 12;
+  repeated string enabled_ports = 6;
+  repeated string disabled_ports = 7;
+  uint64 samples_taken = 8;
+  uint64 counter_samples = 9;
+  uint64 datagrams_sent = 10;
+  uint64 datagrams_failed = 11;
 }

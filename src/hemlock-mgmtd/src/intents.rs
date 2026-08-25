@@ -87,6 +87,10 @@ pub struct Intents {
     /// SNMP agent (`services { snmp { ... } }`), rendered into
     /// snmpd.conf; orch's AgentX subagent serves the IF-MIB.
     pub snmp: SnmpIntent,
+    /// sFlow (`services { sflow { ... } }`); syncd programs the ASIC
+    /// sampler, orch exports the datagrams. Per-port disables live on
+    /// the port intents.
+    pub sflow: SflowIntent,
     /// The four global QoS maps (`qos { map { ... } }`).
     pub qos_maps: QosMapsIntent,
     /// Named WRED/ECN profiles (`qos { wred-profile <name> { ... } }`).
@@ -252,6 +256,9 @@ pub struct InterfaceIntent {
     pub qos: Option<PortQosIntent>,
     /// `lldp disable`: LLDP runs on every port by default.
     pub lldp_disabled: bool,
+    /// `sflow disable`: sampling runs on every port once a collector
+    /// exists.
+    pub sflow_disabled: bool,
     /// `speed <mbps>`: pinned line rate. None = `speed auto` or no
     /// leaf at all, which are the same thing to the ASIC.
     pub speed_mbps: Option<u32>,
@@ -481,6 +488,79 @@ pub fn management_name(intents: &Intents) -> Option<String> {
         .iter()
         .find(|(_, mgmt)| mgmt.address.is_some())
         .map(|(name, _)| name.clone())
+}
+
+/// One sFlow collector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SflowCollector {
+    pub address: String,
+    /// None = the sFlow default (6343).
+    pub port: Option<u16>,
+}
+
+/// sFlow config (`services { sflow { ... } }`). Sampling is off until
+/// a collector exists — a sampler with nowhere to send costs CPU and
+/// buys nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SflowIntent {
+    /// In config order; at most [`MAX_SFLOW_COLLECTORS`].
+    pub collectors: Vec<SflowCollector>,
+    /// 1-in-N; None = default (16384).
+    pub sample_rate: Option<u32>,
+    /// Seconds; None = default (30).
+    pub polling_interval: Option<u16>,
+}
+
+impl SflowIntent {
+    /// Anything configured at all (a rate or a polling interval on
+    /// their own still need a collector).
+    pub fn is_set(&self) -> bool {
+        *self != SflowIntent::default()
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.collectors.is_empty()
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.sample_rate.unwrap_or(DEFAULT_SFLOW_SAMPLE_RATE)
+    }
+
+    pub fn polling(&self) -> u16 {
+        self.polling_interval.unwrap_or(DEFAULT_SFLOW_POLLING)
+    }
+}
+
+/// The default 1-in-N sampling rate.
+pub const DEFAULT_SFLOW_SAMPLE_RATE: u32 = 16384;
+
+/// The default counter-poll interval, in seconds.
+pub const DEFAULT_SFLOW_POLLING: u16 = 30;
+
+/// The most collectors a datagram is duplicated to.
+pub const MAX_SFLOW_COLLECTORS: usize = 2;
+
+/// The sampling-rate range, both ends inclusive and both powers of two.
+pub const MIN_SFLOW_SAMPLE_RATE: u32 = 256;
+pub const MAX_SFLOW_SAMPLE_RATE: u32 = 1_048_576;
+
+/// The valid rate nearest below and above `rate`, so a rejection can
+/// name what the operator probably meant.
+pub fn nearest_sample_rates(rate: u32) -> (u32, u32) {
+    let mut below = MIN_SFLOW_SAMPLE_RATE;
+    let mut above = MAX_SFLOW_SAMPLE_RATE;
+    let mut candidate = MIN_SFLOW_SAMPLE_RATE;
+    while candidate <= MAX_SFLOW_SAMPLE_RATE {
+        if candidate <= rate {
+            below = candidate;
+        }
+        if candidate >= rate {
+            above = candidate;
+            break;
+        }
+        candidate *= 2;
+    }
+    (below, above)
 }
 
 /// One SNMP v3 USM user. Read-only `authPriv` only: SHA auth, AES
@@ -1001,6 +1081,9 @@ pub enum IntentError {
     #[error("services snmp: {0}")]
     BadSnmp(String),
 
+    #[error("services sflow: {0}")]
+    BadSflow(String),
+
     #[error("{name}: {feature} is a physical-port setting")]
     PortServiceOnNonPort { name: String, feature: &'static str },
 
@@ -1139,6 +1222,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
                     ),
                     qos: port_qos(children, &ifname)?,
                     lldp_disabled: port_lldp(children, &ifname)?,
+                    sflow_disabled: port_service_disable(children, &ifname, "sflow")?,
                     speed_mbps: speed(children, &ifname)?,
                     duplex: duplex(children, &ifname)?,
                     mtu: mtu(children, &ifname)?,
@@ -2202,6 +2286,16 @@ fn arp_inspection(items: &[Item], intents: &mut Intents) -> Result<(), IntentErr
 }
 
 fn finish_validation(intents: &mut Intents) -> Result<(), IntentError> {
+    // sFlow needs somewhere to send: a rate, a polling interval or a
+    // per-port disable with no collector is config that samples
+    // nothing, so it is an error rather than a silent no-op.
+    let per_port_sflow = intents.ports.values().any(|port| port.sflow_disabled);
+    if !intents.sflow.enabled() && (intents.sflow.is_set() || per_port_sflow) {
+        return Err(IntentError::BadSflow(
+            "at least one collector is required".into(),
+        ));
+    }
+
     // SNMP listens on the management port only, so snmpd needs an
     // address to bind. Without one the agent would either not start or
     // fall back to every interface — neither is what the config asked
@@ -2766,12 +2860,27 @@ fn no_link_pinning(children: &[Item], ifname: &str, what: &str) -> Result<(), In
 /// `lldp disable` on one physical port. LLDP is on by default, so the
 /// only spelling is the off switch.
 fn port_lldp(children: &[Item], ifname: &str) -> Result<bool, IntentError> {
-    match ConfigTree::leaf_values(children, "lldp") {
+    port_service_disable(children, ifname, "lldp")
+}
+
+/// `<feature> disable` on one physical port — the shape both LLDP and
+/// sFlow use, since both run by default once the feature is on.
+fn port_service_disable(
+    children: &[Item],
+    ifname: &str,
+    feature: &'static str,
+) -> Result<bool, IntentError> {
+    let bad = || {
+        let reason = format!("{ifname}: expected `{feature} disable`");
+        match feature {
+            "sflow" => IntentError::BadSflow(reason),
+            _ => IntentError::BadLldp(reason),
+        }
+    };
+    match ConfigTree::leaf_values(children, feature) {
         None => Ok(false),
         Some([word]) if word == "disable" => Ok(true),
-        Some(_) => Err(IntentError::BadLldp(format!(
-            "{ifname}: expected `lldp disable`"
-        ))),
+        Some(_) => Err(bad()),
     }
 }
 
@@ -2780,7 +2889,7 @@ fn port_lldp(children: &[Item], ifname: &str) -> Result<bool, IntentError> {
 /// sFlow run below a LAG, so a Port-Channel *member* is fine — it is
 /// the Port-Channel interface itself that has no wire.)
 fn no_port_services(children: &[Item], ifname: &str) -> Result<(), IntentError> {
-    for feature in ["lldp"] {
+    for feature in ["lldp", "sflow"] {
         if ConfigTree::has_leaf(children, feature) {
             return Err(IntentError::PortServiceOnNonPort {
                 name: ifname.to_string(),
@@ -3840,6 +3949,7 @@ fn services(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError>
             "lldp" => intents.lldp = lldp(children)?,
             "ntp" => intents.ntp = ntp(children)?,
             "snmp" => intents.snmp = snmp(children)?,
+            "sflow" => intents.sflow = sflow(children)?,
             other => {
                 return Err(IntentError::BadServices(format!(
                     "unrecognized block {other:?}"
@@ -4031,6 +4141,79 @@ fn snmp(items: &[Item]) -> Result<SnmpIntent, IntentError> {
             }
             other => return Err(bad(format!("unrecognized statement {other:?}"))),
         }
+    }
+    Ok(intent)
+}
+
+/// `services { sflow { collector ...; sample-rate ...;
+/// polling-interval ... } }`.
+fn sflow(items: &[Item]) -> Result<SflowIntent, IntentError> {
+    let bad = IntentError::BadSflow;
+    let mut intent = SflowIntent::default();
+    for item in items {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match name.as_str() {
+            "collector" => {
+                let (address, port) = match values.as_slice() {
+                    [address] => (address, None),
+                    [address, keyword, port] if keyword == "port" => {
+                        let port = parse_int(port, 1u16..=65535, "collector port").map_err(bad)?;
+                        (address, Some(port))
+                    }
+                    _ => return Err(bad("expected `collector <ip> [port <1-65535>]`".into())),
+                };
+                if address.parse::<std::net::IpAddr>().is_err() {
+                    return Err(bad(format!("bad collector address {address:?}")));
+                }
+                if intent.collectors.iter().any(|c| c.address == *address) {
+                    return Err(bad(format!("duplicate collector {address}")));
+                }
+                intent.collectors.push(SflowCollector {
+                    address: address.clone(),
+                    port,
+                });
+            }
+            "sample-rate" => {
+                let [value] = values.as_slice() else {
+                    return Err(bad("expected `sample-rate <256-1048576>`".into()));
+                };
+                let rate = parse_int(
+                    value,
+                    MIN_SFLOW_SAMPLE_RATE..=MAX_SFLOW_SAMPLE_RATE,
+                    "sample-rate",
+                )
+                .map_err(bad)?;
+                // The ASIC's sampler divides by a power of two; naming
+                // the neighbours turns a rejection into a correction.
+                if !rate.is_power_of_two() {
+                    let (below, above) = nearest_sample_rates(rate);
+                    return Err(bad(format!(
+                        "sample-rate {rate} is not a power of two (nearest: {below}, {above})"
+                    )));
+                }
+                intent.sample_rate = Some(rate);
+            }
+            "polling-interval" => {
+                let [value] = values.as_slice() else {
+                    return Err(bad("expected `polling-interval <5-300>`".into()));
+                };
+                intent.polling_interval =
+                    Some(parse_int(value, 5u16..=300, "polling-interval").map_err(bad)?);
+            }
+            // Deferred by this suite; named rather than ignored.
+            "egress" | "egress-sample-rate" => {
+                return Err(bad("sFlow egress sampling is not supported".into()));
+            }
+            other => return Err(bad(format!("unrecognized statement {other:?}"))),
+        }
+    }
+    if intent.collectors.len() > MAX_SFLOW_COLLECTORS {
+        return Err(bad(format!(
+            "at most {MAX_SFLOW_COLLECTORS} collectors ({} configured)",
+            intent.collectors.len()
+        )));
     }
     Ok(intent)
 }
@@ -5073,6 +5256,35 @@ pub fn lldp_state(intents: &Intents) -> LldpState {
 pub fn diff_lldp(running: &Intents, candidate: &Intents) -> Option<LldpState> {
     let now = lldp_state(running);
     let want = lldp_state(candidate);
+    (now != want).then_some(want)
+}
+
+/// The full wanted sFlow state: the global block plus the ports that
+/// carry `sflow disable`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SflowState {
+    pub global: SflowIntent,
+    /// Physical ports with sampling turned off, sorted.
+    pub disabled_ports: Vec<String>,
+}
+
+/// Assemble the sFlow state from one intent set.
+pub fn sflow_state(intents: &Intents) -> SflowState {
+    SflowState {
+        global: intents.sflow.clone(),
+        disabled_ports: intents
+            .ports
+            .iter()
+            .filter(|(_, port)| port.sflow_disabled)
+            .map(|(name, _)| name.clone())
+            .collect(),
+    }
+}
+
+/// sFlow delta: the full wanted state exactly when it changed.
+pub fn diff_sflow(running: &Intents, candidate: &Intents) -> Option<SflowState> {
+    let now = sflow_state(running);
+    let want = sflow_state(candidate);
     (now != want).then_some(want)
 }
 
@@ -6861,6 +7073,12 @@ services {
         server 10.42.0.5;
         server pool.ntp.org;
     }
+    sflow {
+        collector 10.42.0.20;
+        collector 10.42.0.21 port 6344;
+        sample-rate 16384;
+        polling-interval 30;
+    }
     snmp {
         community public;
         community netops source 10.42.0.0/16;
@@ -6875,6 +7093,9 @@ interfaces {
     }
     Ethernet3 {
         lldp disable;
+    }
+    Ethernet4 {
+        sflow disable;
     }
 }
 "#;
@@ -6903,6 +7124,18 @@ interfaces {
             vec![("public", None), ("netops", Some("10.42.0.0/16"))]
         );
         assert_eq!(intents.snmp.location.as_deref(), Some("rack 4, closet B"));
+        assert_eq!(
+            intents
+                .sflow
+                .collectors
+                .iter()
+                .map(|c| (c.address.as_str(), c.port))
+                .collect::<Vec<_>>(),
+            vec![("10.42.0.20", None), ("10.42.0.21", Some(6344))]
+        );
+        assert_eq!(intents.sflow.rate(), 16384);
+        assert_eq!(intents.sflow.polling(), 30);
+        assert_eq!(sflow_state(&intents).disabled_ports, ["Ethernet4"]);
         assert_eq!(
             intents.snmp.users["monitor"],
             SnmpUser {
@@ -7057,6 +7290,108 @@ server pool.ntp.org } }",
         assert!(!valid_snmp_name("9bad"));
         assert!(!valid_snmp_name(""));
         assert!(!valid_snmp_name("has space"));
+    }
+
+    /// sFlow: collectors, the power-of-two rate, the collector cap,
+    /// and the per-port rules.
+    #[test]
+    fn sflow_validation() {
+        assert_eq!(intents_of("").sflow, SflowIntent::default());
+        assert!(!intents_of("").sflow.enabled());
+
+        let intents = intents_of(
+            "services { sflow { collector 10.42.0.20\ncollector 10.42.0.21 port 6344\nsample-rate 4096\npolling-interval 60 } }",
+        );
+        assert!(intents.sflow.enabled());
+        assert_eq!(intents.sflow.rate(), 4096);
+        assert_eq!(intents.sflow.polling(), 60);
+        // Defaults apply when the leaves are absent.
+        let intents = intents_of("services { sflow { collector 10.42.0.20 } }");
+        assert_eq!(intents.sflow.rate(), DEFAULT_SFLOW_SAMPLE_RATE);
+        assert_eq!(intents.sflow.polling(), DEFAULT_SFLOW_POLLING);
+
+        for text in [
+            "services { sflow { collector notanip } }",
+            "services { sflow { collector 10.0.0.1 port 0 } }",
+            "services { sflow { collector 10.0.0.1\ncollector 10.0.0.1 } }",
+            "services { sflow { collector 10.0.0.1\ncollector 10.0.0.2\ncollector 10.0.0.3 } }",
+            "services { sflow { collector 10.0.0.1\npolling-interval 4 } }",
+            "services { sflow { collector 10.0.0.1\npolling-interval 301 } }",
+            "services { sflow { collector 10.0.0.1\nsample-rate 128 } }",
+            "services { sflow { collector 10.0.0.1\nsample-rate 2097152 } }",
+            "services { sflow { egress } }",
+            "services { sflow { nonesuch } }",
+        ] {
+            let tree = parse(text).unwrap();
+            assert!(
+                matches!(extract(&tree), Err(IntentError::BadSflow(_))),
+                "{text} should be rejected"
+            );
+        }
+
+        // A non-power-of-two rate names the neighbours it sits between.
+        let tree = parse("services { sflow { collector 10.0.0.1\nsample-rate 10000 } }").unwrap();
+        assert_eq!(
+            extract(&tree).unwrap_err().to_string(),
+            "services sflow: sample-rate 10000 is not a power of two (nearest: 8192, 16384)"
+        );
+        assert_eq!(nearest_sample_rates(16384), (16384, 16384));
+        assert_eq!(nearest_sample_rates(300), (256, 512));
+        assert_eq!(nearest_sample_rates(1_000_000), (524_288, 1_048_576));
+
+        // Anything sflow without a collector samples nothing.
+        for text in [
+            "services { sflow { sample-rate 4096 } }",
+            "services { sflow { polling-interval 30 } }",
+            "interfaces { Ethernet4 { sflow disable } }",
+        ] {
+            let tree = parse(text).unwrap();
+            assert_eq!(
+                extract(&tree).unwrap_err().to_string(),
+                "services sflow: at least one collector is required",
+                "{text} should demand a collector"
+            );
+        }
+
+        // Per-port: physical ports only, Po members included.
+        let intents = intents_of(
+            "services { sflow { collector 10.0.0.1 } }\ninterfaces { Ethernet4 { sflow disable }\nEthernet5 { channel-group 1 mode active\nsflow disable } }",
+        );
+        assert!(intents.ports["Ethernet4"].sflow_disabled);
+        assert!(intents.ports["Ethernet5"].sflow_disabled);
+        let tree = parse("interfaces { Ethernet1 { sflow enable } }").unwrap();
+        assert!(matches!(extract(&tree), Err(IntentError::BadSflow(_))));
+        for name in ["Vlan99", "Port-Channel1", "Management1"] {
+            let tree = parse(&format!(
+                "vlans {{ vlan 99 {{ }} }}\ninterfaces {{ {name} {{ sflow disable }} }}"
+            ))
+            .unwrap();
+            assert_eq!(
+                extract(&tree).unwrap_err().to_string(),
+                format!("{name}: sflow is a physical-port setting"),
+                "{name} should reject a per-port sflow leaf"
+            );
+        }
+    }
+
+    /// The sFlow state is the global block plus the disabled ports, and
+    /// it diffs as one whole.
+    #[test]
+    fn sflow_state_and_diff() {
+        let running = intents_of("");
+        assert_eq!(sflow_state(&running), SflowState::default());
+        assert_eq!(diff_sflow(&running, &running), None);
+
+        let candidate = intents_of(
+            "services { sflow { collector 10.42.0.20 } }\ninterfaces { Ethernet4 { sflow disable }\nEthernet1 { } }",
+        );
+        let change = diff_sflow(&running, &candidate).unwrap();
+        assert!(change.global.enabled());
+        assert_eq!(change.disabled_ports, ["Ethernet4"]);
+        // Removing the block reverts to "off".
+        let change = diff_sflow(&candidate, &running).unwrap();
+        assert_eq!(change, SflowState::default());
+        assert!(!change.global.enabled());
     }
 
     #[test]

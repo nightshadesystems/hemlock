@@ -15,6 +15,7 @@ mod lacp;
 mod lldp;
 mod ntpshow;
 mod rib;
+mod sflow;
 mod snmpsub;
 mod snoop;
 mod snoopsec;
@@ -29,7 +30,7 @@ use hemlock_common::proto::v1 as pb;
 use hemlock_common::proto::v1::orch_server::{Orch, OrchServer};
 use tokio::time::Duration;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Parser)]
 #[command(name = "hemlock-orch", version = hemlock_common::VERSION, about)]
@@ -48,6 +49,7 @@ struct OrchService {
     stp: stp::Engine,
     lldp: lldp::Engine,
     snmp: snmpsub::Engine,
+    sflow: sflow::Engine,
     igmp: snoop::Engine,
     mld: snoop::Engine,
     rib: rib::Engine,
@@ -238,6 +240,69 @@ impl Orch for OrchService {
     ) -> Result<Response<pb::ClearLldpCountersResponse>, Status> {
         let cleared = self.lldp.clear_counters(&request.into_inner().port);
         Ok(Response::new(pb::ClearLldpCountersResponse { cleared }))
+    }
+
+    async fn set_sflow_config(
+        &self,
+        request: Request<pb::SetSflowConfigRequest>,
+    ) -> Result<Response<pb::SetSflowConfigResponse>, Status> {
+        let req = request.into_inner();
+        let mut collectors = Vec::new();
+        for collector in req.collectors {
+            let address: std::net::IpAddr = collector
+                .address
+                .parse()
+                .map_err(|_| Status::invalid_argument("bad collector address"))?;
+            let port = match collector.port {
+                0 => sflow::DEFAULT_COLLECTOR_PORT,
+                other => u16::try_from(other)
+                    .map_err(|_| Status::invalid_argument("bad collector port"))?,
+            };
+            collectors.push(std::net::SocketAddr::new(address, port));
+        }
+        self.sflow.set_config(sflow::Config {
+            enabled: req.enabled,
+            collectors,
+            sample_rate: req.sample_rate,
+            polling_interval: req.polling_interval,
+            agent_address: req
+                .agent_address
+                .parse()
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            agent_interface: req.agent_interface,
+            enabled_ports: req.enabled_ports,
+            disabled_ports: req.disabled_ports,
+        });
+        Ok(Response::new(pb::SetSflowConfigResponse {}))
+    }
+
+    async fn get_sflow_export_state(
+        &self,
+        _request: Request<pb::GetSflowExportStateRequest>,
+    ) -> Result<Response<pb::GetSflowExportStateResponse>, Status> {
+        let snapshot = self.sflow.snapshot();
+        Ok(Response::new(pb::GetSflowExportStateResponse {
+            enabled: snapshot.config.enabled,
+            collectors: snapshot
+                .config
+                .collectors
+                .iter()
+                .map(|collector| pb::SflowCollectorConfig {
+                    address: collector.ip().to_string(),
+                    port: u32::from(collector.port()),
+                })
+                .collect(),
+            sample_rate: snapshot.config.sample_rate,
+            polling_interval: snapshot.config.polling_interval,
+            agent_address: snapshot.config.agent_address.to_string(),
+            agent_interface: snapshot.config.agent_interface,
+            enabled_ports: snapshot.config.enabled_ports,
+            disabled_ports: snapshot.config.disabled_ports,
+            samples_taken: snapshot.samples_taken,
+            counter_samples: snapshot.counter_samples,
+            datagrams_sent: snapshot.datagrams_sent,
+            datagrams_failed: snapshot.datagrams_failed,
+        }))
     }
 
     async fn set_snmp_config(
@@ -907,6 +972,7 @@ async fn main() -> Result<()> {
         errdisable,
     } = stp_io;
     let snmp_engine = snmpsub::Engine::new();
+    let sflow_engine = sflow::Engine::new();
     let (lldp_engine, lldp_io) = lldp::Engine::spawn(system_mac);
     let lldp::EngineIo {
         links: lldp_links,
@@ -979,6 +1045,10 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     tokio::spawn(rib::run_feed(rib_engine.clone()));
 
+    // The sFlow exporter: syncd streams hardware samples up, orch packs
+    // them into v5 datagrams and sends them to the collectors.
+    tokio::spawn(run_sflow(sflow_engine.clone(), syncd.clone()));
+
     // The AgentX subagent: it keeps a session with snmpd's master and
     // answers the IF-MIB from syncd's interface state.
     #[cfg(target_os = "linux")]
@@ -1021,6 +1091,7 @@ async fn main() -> Result<()> {
         stp: stp_engine,
         lldp: lldp_engine,
         snmp: snmp_engine,
+        sflow: sflow_engine,
         igmp: igmp_engine,
         mld: mld_engine,
         rib: rib_engine,
@@ -1342,6 +1413,183 @@ async fn push_unknown_mcast(
             warn!(vlan = update.vlan, error = %e, "unknown-mcast push failed");
         }
     }
+}
+
+/// The sFlow exporter's runtime: one UDP socket, syncd's sample
+/// stream, the counter poll, and the pacing flush.
+///
+/// Everything is best-effort and self-healing: a dropped stream
+/// reconnects, and a collector that refuses a datagram counts as
+/// failed rather than stalling the exporter.
+async fn run_sflow(engine: sflow::Engine, syncd: IpcEndpoint) {
+    // The exporter binds an ephemeral source port; sFlow collectors
+    // identify the agent by the datagram's agent address, not by where
+    // it came from.
+    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(socket) => std::sync::Arc::new(socket),
+        Err(err) => {
+            warn!(%err, "cannot open the sflow export socket; sflow will not export");
+            return;
+        }
+    };
+    tokio::spawn(poll_sflow_counters(
+        engine.clone(),
+        syncd.clone(),
+        socket.clone(),
+    ));
+    tokio::spawn(pace_sflow(engine.clone(), socket.clone()));
+
+    loop {
+        if !engine.config().enabled {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        if let Err(err) = follow_samples(&engine, &syncd, &socket).await {
+            debug!(%err, "sflow sample stream ended; reconnecting");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// syncd's sampled-packet stream into flow samples.
+async fn follow_samples(
+    engine: &sflow::Engine,
+    syncd: &IpcEndpoint,
+    socket: &tokio::net::UdpSocket,
+) -> Result<()> {
+    let channel = syncd.connect().await?;
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    let mut stream = client
+        .watch_sampled_packets(pb::WatchSampledPacketsRequest {})
+        .await?
+        .into_inner();
+    // The ifIndex map is refreshed with the stream rather than per
+    // sample: ports do not renumber while one is open.
+    let mut indexes = sflow_if_indexes(syncd).await;
+    let mut refreshed = tokio::time::Instant::now();
+    while let Some(sample) = stream.message().await? {
+        if refreshed.elapsed() > Duration::from_secs(60) {
+            indexes = sflow_if_indexes(syncd).await;
+            refreshed = tokio::time::Instant::now();
+        }
+        let Some(if_index) = indexes.get(&sample.port).copied() else {
+            // A sample from a port with no ifIndex (a backplane link)
+            // has nothing a collector could attribute it to.
+            debug!(port = %sample.port, "sflow sample from an unindexed port");
+            continue;
+        };
+        let taken = sflow::Sample {
+            if_index,
+            original_length: sample.original_length,
+            bytes: sample.bytes,
+        };
+        if let Some(datagram) = engine.take_sample(&taken) {
+            sflow::export(engine, socket, &datagram).await;
+        }
+    }
+    Ok(())
+}
+
+/// Poll syncd for interface counters at the configured interval and
+/// queue one counter sample per sampled port.
+async fn poll_sflow_counters(
+    engine: sflow::Engine,
+    syncd: IpcEndpoint,
+    socket: std::sync::Arc<tokio::net::UdpSocket>,
+) {
+    loop {
+        let config = engine.config();
+        if !config.enabled {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        let interval = Duration::from_secs(u64::from(config.polling_interval.max(1)));
+        tokio::time::sleep(interval).await;
+        let counters = sflow_counters(&syncd, &config.enabled_ports).await;
+        for datagram in engine.take_counters(&counters) {
+            sflow::export(&engine, &socket, &datagram).await;
+        }
+    }
+}
+
+/// Send a partly-filled datagram once it has waited long enough.
+async fn pace_sflow(engine: sflow::Engine, socket: std::sync::Arc<tokio::net::UdpSocket>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if let Some(datagram) = engine.flush_due(tokio::time::Instant::now()) {
+            sflow::export(&engine, &socket, &datagram).await;
+        }
+    }
+}
+
+/// Port name -> ifIndex, shared with the SNMP subagent's numbering so
+/// one poller sees the same interface in both.
+async fn sflow_if_indexes(syncd: &IpcEndpoint) -> std::collections::BTreeMap<String, u32> {
+    let Ok(channel) = syncd.connect().await else {
+        return Default::default();
+    };
+    let Ok(response) = pb::syncd_client::SyncdClient::new(channel)
+        .get_interfaces(pb::GetInterfacesRequest { names: vec![] })
+        .await
+    else {
+        return Default::default();
+    };
+    response
+        .into_inner()
+        .interfaces
+        .into_iter()
+        .filter_map(|iface| {
+            snmpsub::if_index(&iface.kind, &iface.name, iface.index)
+                .map(|index| (iface.name, index))
+        })
+        .collect()
+}
+
+/// One poll's generic interface counters for the sampled ports.
+async fn sflow_counters(syncd: &IpcEndpoint, ports: &[String]) -> Vec<sflow::InterfaceCounters> {
+    let Ok(channel) = syncd.connect().await else {
+        return Vec::new();
+    };
+    let Ok(response) = pb::syncd_client::SyncdClient::new(channel)
+        .get_interfaces(pb::GetInterfacesRequest {
+            names: ports.to_vec(),
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    response
+        .into_inner()
+        .interfaces
+        .into_iter()
+        .filter_map(|iface| {
+            let if_index = snmpsub::if_index(&iface.kind, &iface.name, iface.index)?;
+            let counters = iface.counters.unwrap_or_default();
+            Some(sflow::InterfaceCounters {
+                if_index,
+                // ethernetCsmacd(6) for real ports, propVirtual(53).
+                if_type: if iface.kind == "ethernet" { 6 } else { 53 },
+                if_speed_bps: iface.speed_mbps.saturating_mul(1_000_000),
+                full_duplex: iface.duplex != "half",
+                admin_up: iface.admin_state != pb::AdminState::Down as i32,
+                oper_up: iface.oper_status == pb::OperStatus::Up as i32,
+                in_octets: counters.in_octets,
+                in_ucast_pkts: counters.in_ucast_pkts as u32,
+                in_mcast_pkts: counters.in_mcast_pkts as u32,
+                in_bcast_pkts: counters.in_bcast_pkts as u32,
+                in_discards: counters.in_discards as u32,
+                in_errors: counters.in_errors as u32,
+                out_octets: counters.out_octets,
+                out_ucast_pkts: counters.out_ucast_pkts as u32,
+                out_mcast_pkts: counters.out_mcast_pkts as u32,
+                out_bcast_pkts: counters.out_bcast_pkts as u32,
+                out_discards: counters.out_discards as u32,
+                out_errors: counters.out_errors as u32,
+            })
+        })
+        .collect()
 }
 
 /// Keep the snooping engines' VLAN membership view fresh from syncd

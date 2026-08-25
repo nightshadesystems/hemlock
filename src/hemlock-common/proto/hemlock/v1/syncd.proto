@@ -195,6 +195,19 @@ service Syncd {
   // the global maps, the profiles, and per-port effective config with
   // live per-queue counters.
   rpc GetQosState(GetQosStateRequest) returns (GetQosStateResponse);
+
+  // --- sFlow (hardware ingress sampling) --------------------------------
+  // Full desired sampling program (declarative): one shared
+  // samplepacket session at `rate`, bound to `ports`. rate 0 or an
+  // empty port list tears it down. Fails with the platform error when
+  // the SAI has no samplepacket support.
+  rpc SetSflowSampling(SetSflowSamplingRequest) returns (SetSflowSamplingResponse);
+  // The programmed sampler for `show sflow`.
+  rpc GetSflowState(GetSflowStateRequest) returns (GetSflowStateResponse);
+  // Hardware-sampled frames off the punt path, for orch's sFlow
+  // exporter. The metadata (ingress port, wire length) only exists on
+  // the ASIC side, so this is the one packet path that rides gRPC.
+  rpc WatchSampledPackets(WatchSampledPacketsRequest) returns (stream SampledPacket);
 }
 
 message GetSwitchInfoRequest {}
@@ -248,6 +261,8 @@ message SwitchCapabilities {
   bool queue_shaper = 23;
   // WRED-drop / ECN-marked queue stats; absent renders those columns 0.
   bool wred_queue_stats = 24;
+  // Hardware ingress sampling (sFlow).
+  bool sflow = 25;
 }
 
 message EnsureNeighborRequest {
@@ -1205,4 +1220,35 @@ message GetQosStateResponse {
   bool queue_shaper_supported = 11;
   // Queues per front-panel port, from the platform definition.
   uint32 queue_count = 12;
+}
+
+// --- sFlow ---------------------------------------------------------------
+
+message SetSflowSamplingRequest {
+  // 1-in-N; 0 disables sampling entirely.
+  uint32 rate = 1;
+  // Front-panel ports to sample on ingress.
+  repeated string ports = 2;
+}
+
+message SetSflowSamplingResponse {}
+
+message GetSflowStateRequest {}
+
+message GetSflowStateResponse {
+  // False where the platform's SAI serves no samplepacket objects.
+  bool supported = 1;
+  uint32 rate = 2;
+  repeated string ports = 3;
+  // Samples the punt path has delivered since boot.
+  uint64 samples = 4;
+}
+
+message WatchSampledPacketsRequest {}
+
+message SampledPacket {
+  string port = 1;
+  // The frame's length on the wire; `bytes` may be shorter.
+  uint32 original_length = 2;
+  bytes bytes = 3;
 }

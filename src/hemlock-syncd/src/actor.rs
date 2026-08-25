@@ -136,6 +136,19 @@ pub enum SaiCmd {
         monitor: PortId,
         reply: oneshot::Sender<Result<Oid, SaiError>>,
     },
+    CreateSamplepacket {
+        rate: u32,
+        reply: oneshot::Sender<Result<Oid, SaiError>>,
+    },
+    RemoveSamplepacket {
+        session: Oid,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
+    SetPortSampleSession {
+        port: PortId,
+        session: Option<Oid>,
+        reply: oneshot::Sender<Result<(), SaiError>>,
+    },
     RemoveMirrorSession {
         session: Oid,
         reply: oneshot::Sender<Result<(), SaiError>>,
@@ -504,6 +517,10 @@ pub struct SaiHandle {
     pub fdb_events: broadcast::Sender<FdbNotify>,
     /// Learn-limit violations (port-security engine input).
     pub violations: broadcast::Sender<ViolationNotify>,
+    /// The programmed sFlow sampler (session, rate, bound ports).
+    pub sflow: crate::sflow::SharedSflow,
+    /// Hardware-sampled frames on their way to orch's sFlow engine.
+    pub samples: broadcast::Sender<crate::sflow::SampleNotify>,
 }
 
 impl SaiHandle {
@@ -676,6 +693,29 @@ impl SaiHandle {
             port,
             ingress,
             egress,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn create_samplepacket(&self, rate: u32) -> Result<Oid, SaiError> {
+        self.call(|reply| SaiCmd::CreateSamplepacket { rate, reply })
+            .await
+    }
+
+    pub async fn remove_samplepacket(&self, session: Oid) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::RemoveSamplepacket { session, reply })
+            .await
+    }
+
+    pub async fn set_port_sample_session(
+        &self,
+        port: PortId,
+        session: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.call(|reply| SaiCmd::SetPortSampleSession {
+            port,
+            session,
             reply,
         })
         .await
@@ -1535,6 +1575,19 @@ impl SaiActor {
                         SaiCmd::RemoveMirrorSession { session, reply } => {
                             let _ = reply.send(backend.remove_mirror_session(session));
                         }
+                        SaiCmd::CreateSamplepacket { rate, reply } => {
+                            let _ = reply.send(backend.create_samplepacket(rate));
+                        }
+                        SaiCmd::RemoveSamplepacket { session, reply } => {
+                            let _ = reply.send(backend.remove_samplepacket(session));
+                        }
+                        SaiCmd::SetPortSampleSession {
+                            port,
+                            session,
+                            reply,
+                        } => {
+                            let _ = reply.send(backend.set_port_sample_session(port, session));
+                        }
                         SaiCmd::SetPortMirror {
                             port,
                             ingress,
@@ -1640,6 +1693,11 @@ impl SaiActor {
         let (events, _) = broadcast::channel(256);
         let (fdb_events, _) = broadcast::channel(1024);
         let (violations, _) = broadcast::channel(256);
+        // Samples arrive at the configured rate, so the channel is
+        // sized for a burst rather than a trickle; a slow subscriber
+        // loses samples, which sFlow is designed to tolerate.
+        let (samples, _) = broadcast::channel(1024);
+        let sflow = crate::sflow::SharedSflow::default();
         tokio::spawn(pump_events(
             sai_events,
             ports.clone(),
@@ -1649,6 +1707,8 @@ impl SaiActor {
             events.clone(),
             fdb_events.clone(),
             violations.clone(),
+            sflow.clone(),
+            samples.clone(),
         ));
 
         Ok(SaiHandle {
@@ -1665,6 +1725,8 @@ impl SaiActor {
             stps: crate::state::SharedStps::default(),
             l2mc: crate::state::SharedL2mc::default(),
             unknown_mcast: crate::state::SharedUnknownMcast::default(),
+            sflow,
+            samples,
             fib: crate::state::SharedFib::default(),
             acls: crate::state::SharedAcls::default(),
             copp: crate::state::SharedCopp::default(),
@@ -1800,9 +1862,33 @@ async fn pump_events(
     out: broadcast::Sender<OperEvent>,
     fdb_out: broadcast::Sender<FdbNotify>,
     violations_out: broadcast::Sender<ViolationNotify>,
+    sflow: crate::sflow::SharedSflow,
+    samples_out: broadcast::Sender<crate::sflow::SampleNotify>,
 ) {
     while let Some(event) = sai_events.recv().await {
         match event {
+            SaiEvent::SampledPacket {
+                port,
+                original_length,
+                bytes,
+            } => {
+                let Some(name) = ports.read().ok().and_then(|table| name_for(&table, port)) else {
+                    // A sample from a port syncd does not know is a
+                    // backplane link; counting it would skew the rate.
+                    continue;
+                };
+                if let Ok(mut state) = sflow.write() {
+                    state.samples += 1;
+                }
+                // No subscriber (orch down, or sFlow off) is normal:
+                // the sample is dropped, and the counter above still
+                // records that the ASIC produced it.
+                let _ = samples_out.send(crate::sflow::SampleNotify {
+                    port: name,
+                    original_length,
+                    bytes,
+                });
+            }
             SaiEvent::LearnLimitViolation { port, mac } => {
                 let Some(name) = ports.read().ok().and_then(|table| name_for(&table, port)) else {
                     warn!(%port, "learn-limit violation on unknown port");

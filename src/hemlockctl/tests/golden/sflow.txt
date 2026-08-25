@@ -1,0 +1,12 @@
+sFlow is enabled
+Agent address    : 10.42.0.9 (Management1)
+Sample rate      : 1 in 16384
+Polling interval : 30s
+Collectors       : 10.42.0.20:6343, 10.42.0.21:6344
+
+Sampling ports   : 51 enabled, 1 disabled (Et4)
+
+Samples taken    : 48211
+Counter samples  : 10488
+Datagrams sent   : 12930
+Datagrams failed : 0

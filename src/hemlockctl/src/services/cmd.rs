@@ -1,6 +1,6 @@
 //! Parsing and dispatch for the services-suite operational commands:
-//! `show lldp [neighbors [detail]]`, `show ntp`, `show snmp`, and
-//! `clear lldp counters`.
+//! `show lldp [neighbors [detail]]`, `show ntp`, `show snmp`,
+//! `show sflow`, and `clear lldp counters`.
 
 use hemlock_common::ipc::IpcEndpoint;
 
@@ -109,5 +109,28 @@ pub async fn show_snmp(orch: &IpcEndpoint, args: &[&str]) -> Result<(), String> 
         return page_json("snmp", &state);
     }
     crate::pager::page(&render::snmp(&state));
+    Ok(())
+}
+
+/// `show sflow [| json]`.
+pub async fn show_sflow(
+    orch: &IpcEndpoint,
+    syncd: &IpcEndpoint,
+    args: &[&str],
+) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    // Deferred by this suite.
+    if let Some(first) = words.first() {
+        if resolve(first, &["egress"]).is_ok() {
+            return Err("% sFlow egress sampling is not supported".into());
+        }
+    }
+    no_more(&words)?;
+    let state = fetch::sflow_state(orch, syncd).await.map_err(fmt_err)?;
+    if json {
+        return page_json("sflow", &state);
+    }
+    crate::pager::page(&render::sflow(&state));
     Ok(())
 }

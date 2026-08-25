@@ -422,6 +422,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show lldp [neighbors [detail]]         LLDP settings and neighbors");
             println!("  show ntp                               NTP client servers and sync");
             println!("  show snmp                              SNMP agent settings and counters");
+            println!("  show sflow                             sFlow sampling and export state");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -530,8 +531,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "lldp",
         "ntp",
         "snmp",
+        "sflow",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -612,6 +614,10 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "lldp" => crate::services::cmd::show_lldp(&endpoints.orch, &words[1..]).await,
             "ntp" => crate::services::cmd::show_ntp(&endpoints.orch, &words[1..]).await,
             "snmp" => crate::services::cmd::show_snmp(&endpoints.orch, &words[1..]).await,
+            "sflow" => {
+                crate::services::cmd::show_sflow(&endpoints.orch, &endpoints.syncd, &words[1..])
+                    .await
+            }
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -759,6 +765,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set interfaces <port> port-security [maximum <1-1024>|violation <protect|shutdown>]");
             println!("  set interfaces <port> dot1x");
             println!("  set interfaces <port> lldp disable            LLDP is on by default");
+            println!("  set interfaces <port> sflow disable           sampling is on by default");
             println!("  set interfaces <port|Po> dhcp-snooping trust | arp-inspection trust");
             println!(
                 "  set services lldp [disable | tx-interval <5-300> | hold-multiplier <2-10>]"
@@ -787,7 +794,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             );
             println!("                            channel-group|lacp|spanning-tree|storm-control|min-links|");
             println!("                            access-group|port-security|dot1x|dhcp-snooping|");
-            println!("                            arp-inspection|lldp|qos ...]");
+            println!("                            arp-inspection|lldp|sflow|qos ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system <ssh|http|https> [authentication]");
             println!("  delete routing [static [<prefix> [<next-hop>]] | arp [<ip>]]");
@@ -2739,6 +2746,7 @@ async fn config_interfaces(
             "arp-inspection",
             "qos",
             "lldp",
+            "sflow",
         ],
     )?;
     // SVIs carry an address (and, with the routing suite, VRRP groups)
@@ -2751,8 +2759,8 @@ async fn config_interfaces(
         if subcommand == "qos" {
             return Err("% QoS is a front-panel concept; configure it on the physical port".into());
         }
-        if subcommand == "lldp" {
-            return Err(format!("% {port}: lldp is a physical-port setting"));
+        if matches!(subcommand, "lldp" | "sflow") {
+            return Err(format!("% {port}: {subcommand} is a physical-port setting"));
         }
         if !matches!(subcommand, "address" | "vrrp" | "mtu") {
             return Err(format!(
@@ -2783,8 +2791,8 @@ async fn config_interfaces(
             "% {subcommand} is not supported on management ports"
         ));
     }
-    if port.starts_with("Management") && subcommand == "lldp" {
-        return Err(format!("% {port}: lldp is a physical-port setting"));
+    if port.starts_with("Management") && matches!(subcommand, "lldp" | "sflow") {
+        return Err(format!("% {port}: {subcommand} is a physical-port setting"));
     }
     let is_lag = port.starts_with("Port-Channel");
     if is_lag && subcommand == "mtu" {
@@ -2802,8 +2810,8 @@ async fn config_interfaces(
     }
     // LLDP and sFlow run below a LAG: the members carry them, the
     // Port-Channel interface has no wire of its own.
-    if is_lag && subcommand == "lldp" {
-        return Err(format!("% {port}: lldp is a physical-port setting"));
+    if is_lag && matches!(subcommand, "lldp" | "sflow") {
+        return Err(format!("% {port}: {subcommand} is a physical-port setting"));
     }
     if !is_lag && subcommand == "min-links" {
         return Err("% min-links is only supported on port-channel interfaces".into());
@@ -2839,12 +2847,16 @@ async fn config_interfaces(
             .await
             .map_err(fmt_err);
         }
-        "lldp" => {
-            // LLDP is on by default; `disable` is the only spelling.
+        feature @ ("lldp" | "sflow") => {
+            // Both run by default once the feature is on, so `disable`
+            // is the only per-port spelling either takes.
             match rest.get(1) {
                 Some(word) => {
-                    if resolve(word, &["med"]).is_ok() {
+                    if feature == "lldp" && resolve(word, &["med"]).is_ok() {
                         return Err("% LLDP-MED TLVs are not supported".into());
+                    }
+                    if feature == "sflow" && resolve(word, &["egress"]).is_ok() {
+                        return Err("% sFlow egress sampling is not supported".into());
                     }
                     resolve(word, &["disable"])?;
                     if let Some(extra) = rest.get(2) {
@@ -2852,15 +2864,16 @@ async fn config_interfaces(
                     }
                 }
                 None if !delete => {
-                    return Err(format!("% Usage: set interfaces {port} lldp disable"));
+                    return Err(format!("% Usage: set interfaces {port} {feature} disable"));
                 }
                 None => {}
             }
+            let feature = feature.to_string();
             return edit_interface(endpoints, &port, move |eth| {
                 if delete {
-                    ConfigTree::remove_leaf(eth, "lldp");
+                    ConfigTree::remove_leaf(eth, &feature);
                 } else {
-                    ConfigTree::set_leaf(eth, "lldp", vec!["disable".into()]);
+                    ConfigTree::set_leaf(eth, &feature, vec!["disable".into()]);
                 }
             })
             .await
@@ -4992,16 +5005,19 @@ async fn config_services(
         .map_err(fmt_err);
     }
     let Some(first) = words.first() else {
-        return Err(format!("% Usage: {verb} services <lldp|ntp|snmp> ..."));
+        return Err(format!(
+            "% Usage: {verb} services <lldp|ntp|snmp|sflow> ..."
+        ));
     };
     // Deferred by this suite, rejected at parse rather than ignored.
     if resolve(first, &["ptp"]).is_ok() {
         return Err("% PTP/1588 is not supported".into());
     }
-    match resolve(first, &["lldp", "ntp", "snmp"])? {
+    match resolve(first, &["lldp", "ntp", "snmp", "sflow"])? {
         "lldp" => config_lldp(endpoints, &words[1..], delete).await,
         "ntp" => config_ntp(endpoints, &words[1..], delete).await,
         "snmp" => config_snmp(endpoints, &words[1..], delete).await,
+        "sflow" => config_sflow(endpoints, &words[1..], delete).await,
         _ => unreachable!(),
     }
 }
@@ -5406,6 +5422,200 @@ async fn config_snmp(endpoints: &Endpoints, words: &[&str], delete: bool) -> Res
         }
         _ => unreachable!(),
     }
+}
+
+/// The most sFlow collectors the config accepts, and the sampling-rate
+/// range — checked at the prompt for immediate feedback; mgmtd
+/// re-validates.
+const MAX_SFLOW_COLLECTORS: usize = 2;
+const MIN_SFLOW_SAMPLE_RATE: u32 = 256;
+const MAX_SFLOW_SAMPLE_RATE: u32 = 1_048_576;
+
+/// The valid rate nearest below and above `rate`, so a rejection can
+/// name what the operator probably meant.
+fn nearest_sample_rates(rate: u32) -> (u32, u32) {
+    let mut below = MIN_SFLOW_SAMPLE_RATE;
+    let mut above = MAX_SFLOW_SAMPLE_RATE;
+    let mut candidate = MIN_SFLOW_SAMPLE_RATE;
+    while candidate <= MAX_SFLOW_SAMPLE_RATE {
+        if candidate <= rate {
+            below = candidate;
+        }
+        if candidate >= rate {
+            above = candidate;
+            break;
+        }
+        candidate *= 2;
+    }
+    (below, above)
+}
+
+/// `set|delete services sflow [collector <ip> [port <1-65535>] |
+/// sample-rate <256-1048576> | polling-interval <5-300>]`.
+async fn config_sflow(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = move || {
+        format!(
+            "% Usage: {verb} services sflow [collector <ip> [port <1-65535>] | sample-rate <256-1048576> | polling-interval <5-300>]"
+        )
+    };
+    let edit_sflow = |edit: BlockEdit| async move {
+        edit_config(endpoints, move |tree| {
+            let services = tree.block_mut("services");
+            let block = ConfigTree::ensure_block(services, "sflow", &[]);
+            edit(block);
+        })
+        .await
+        .map_err(fmt_err)
+    };
+    let delete_in_sflow = |edit: BlockEdit| async move {
+        edit_config(endpoints, move |tree| {
+            let services = tree.block_mut("services");
+            if let Some(block) = block_children_mut(services, "sflow") {
+                edit(block);
+                if block.is_empty() {
+                    ConfigTree::remove_block(services, "sflow", &[]);
+                }
+            }
+            remove_block_if_empty(tree, "services");
+        })
+        .await
+        .map_err(fmt_err)
+    };
+
+    if words.is_empty() {
+        return if delete {
+            delete_in_sflow(Box::new(|block| block.clear())).await
+        } else {
+            Err(usage())
+        };
+    }
+    // Deferred by this suite, named rather than silently ignored.
+    if words[0] == "egress" || words[0] == "egress-sample-rate" {
+        return Err("% sFlow egress sampling is not supported".into());
+    }
+    match resolve(words[0], &["collector", "sample-rate", "polling-interval"])? {
+        "collector" => {
+            let Some(address) = words.get(1) else {
+                return if delete {
+                    delete_in_sflow(Box::new(|block| {
+                        ConfigTree::remove_leaf(block, "collector")
+                    }))
+                    .await
+                } else {
+                    Err(usage())
+                };
+            };
+            if address.parse::<std::net::IpAddr>().is_err() {
+                return Err(format!("% bad collector address {address:?}"));
+            }
+            let address = (*address).to_string();
+            if delete {
+                if words.len() > 2 {
+                    return Err(format!("% Invalid input: {:?}", words[2]));
+                }
+                return delete_in_sflow(Box::new(move |block| {
+                    remove_leaf_matching(block, "collector", &[&address]);
+                }))
+                .await;
+            }
+            let mut values = vec![address.clone()];
+            match words.get(2) {
+                None => {}
+                Some(keyword) => {
+                    resolve(keyword, &["port"])?;
+                    let Some(port) = words.get(3) else {
+                        return Err(format!(
+                            "% Usage: set services sflow collector {address} port <1-65535>"
+                        ));
+                    };
+                    if words.len() > 4 {
+                        return Err(format!("% Invalid input: {:?}", words[4]));
+                    }
+                    let port = int_arg(port, 1..=65535u16, "collector port")?;
+                    values.push("port".into());
+                    values.push(port.to_string());
+                }
+            }
+            // The cap is checked at the prompt too, so a third
+            // collector is refused before the commit says so.
+            let candidate = candidate_text(endpoints).await.map_err(fmt_err)?;
+            let existing = candidate_sflow_collectors(&candidate);
+            if !existing.contains(&address) && existing.len() >= MAX_SFLOW_COLLECTORS {
+                return Err(format!(
+                    "% at most {MAX_SFLOW_COLLECTORS} sflow collectors ({} configured)",
+                    existing.len()
+                ));
+            }
+            edit_sflow(Box::new(move |block| {
+                remove_leaf_matching(block, "collector", &[&address]);
+                push_leaf(block, "collector", values);
+            }))
+            .await
+        }
+        leaf @ ("sample-rate" | "polling-interval") => {
+            let name = leaf.to_string();
+            if delete {
+                if words.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", words[1]));
+                }
+                return delete_in_sflow(Box::new(move |block| {
+                    ConfigTree::remove_leaf(block, &name);
+                }))
+                .await;
+            }
+            let Some(raw) = words.get(1) else {
+                return Err(usage());
+            };
+            if words.len() > 2 {
+                return Err(format!("% Invalid input: {:?}", words[2]));
+            }
+            let value = if leaf == "sample-rate" {
+                let rate = int_arg(
+                    raw,
+                    MIN_SFLOW_SAMPLE_RATE..=MAX_SFLOW_SAMPLE_RATE,
+                    "sample-rate",
+                )?;
+                if !rate.is_power_of_two() {
+                    let (below, above) = nearest_sample_rates(rate);
+                    return Err(format!(
+                        "% sample-rate {rate} is not a power of two (nearest: {below}, {above})"
+                    ));
+                }
+                rate.to_string()
+            } else {
+                int_arg(raw, 5..=300u16, "polling-interval")?.to_string()
+            };
+            edit_sflow(Box::new(move |block| {
+                ConfigTree::set_leaf(block, &name, vec![value]);
+            }))
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// The sFlow collector addresses a config tree carries, in order — the
+/// prompt's cap check.
+fn candidate_sflow_collectors(text: &str) -> Vec<String> {
+    let Ok(tree) = hemlock_config::parse(text) else {
+        return Vec::new();
+    };
+    let Some((_, services)) = tree.block("services") else {
+        return Vec::new();
+    };
+    let Some((_, sflow)) = ConfigTree::blocks_named(services, "sflow").next() else {
+        return Vec::new();
+    };
+    sflow
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "collector" => {
+                values.first().cloned()
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// `set|delete switching <mac-table|mirror> ...`.

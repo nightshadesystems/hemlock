@@ -80,3 +80,15 @@ fn snmp() {
         include_str!("../../tests/golden/snmp.json"),
     );
 }
+
+#[test]
+fn sflow() {
+    assert_golden(
+        &render::sflow(&fx::sflow_state()),
+        include_str!("../../tests/golden/sflow.txt"),
+    );
+    assert_golden(
+        &as_json("sflow", &fx::sflow_state()),
+        include_str!("../../tests/golden/sflow.json"),
+    );
+}

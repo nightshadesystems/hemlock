@@ -209,6 +209,20 @@ impl Engine {
             }
         }
 
+        // sFlow is hardware sampling, so a platform whose SAI serves no
+        // samplepacket objects fails the commit here rather than
+        // pretending to sample.
+        if wanted.sflow.enabled() {
+            if let Ok(mut client) = self.syncd_client().await {
+                if let Ok(info) = client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
+                    let caps = info.into_inner().capabilities.unwrap_or_default();
+                    if !caps.sflow {
+                        anyhow::bail!("sflow sampling is not supported by this platform's SAI");
+                    }
+                }
+            }
+        }
+
         let port_references = !wanted.ports.is_empty()
             || !wanted.mac_table.statics.is_empty()
             || !wanted.mirror.is_empty()
@@ -617,6 +631,29 @@ impl Engine {
                 .context("pushing STP config to orch")?;
         }
 
+        // sFlow: syncd owns the ASIC sampler (session + port binds),
+        // orch owns the export. syncd goes first — a collector should
+        // never be told about a sampler that failed to program.
+        let sflow_change = intents::diff_sflow(&running_intents, &wanted_intents);
+        if let Some(wanted) = &sflow_change {
+            let ports = sflow_sampled_ports(&wanted_intents);
+            let mut client = self.syncd_client().await?;
+            client
+                .set_sflow_sampling(pb::SetSflowSamplingRequest {
+                    rate: if wanted.global.enabled() {
+                        wanted.global.rate()
+                    } else {
+                        0
+                    },
+                    ports: ports.clone(),
+                })
+                .await
+                .context("programming sflow sampling in syncd")?;
+            self.push_sflow_config(&wanted_intents, &ports)
+                .await
+                .context("pushing sflow config to orch")?;
+        }
+
         // SNMP: mgmtd renders snmpd.conf below (with the OS pass) and
         // pushes the same state to orch, whose AgentX subagent serves
         // the IF-MIB on the socket the render names.
@@ -736,6 +773,9 @@ impl Engine {
         }
         if snmp_change.is_some() {
             described.push("snmp configuration updated".into());
+        }
+        if sflow_change.is_some() {
+            described.push("sflow configuration updated".into());
         }
         described.extend(mac_changes.describe());
         described.extend(storm_changes.iter().map(intents::StormChange::describe));
@@ -883,6 +923,35 @@ impl Engine {
             })
             .await
             .context("SetSnoopingConfig")?;
+        Ok(())
+    }
+
+    /// Push the whole wanted sFlow export state to orch. `ports` is
+    /// the same sampled-port list syncd was programmed with, so
+    /// `show sflow` and the ASIC can never disagree.
+    async fn push_sflow_config(&self, wanted: &Intents, ports: &[String]) -> Result<()> {
+        let mut client = self.orch_client().await?;
+        client
+            .set_sflow_config(pb::SetSflowConfigRequest {
+                enabled: wanted.sflow.enabled(),
+                collectors: wanted
+                    .sflow
+                    .collectors
+                    .iter()
+                    .map(|collector| pb::SflowCollectorConfig {
+                        address: collector.address.clone(),
+                        port: u32::from(collector.port.unwrap_or(0)),
+                    })
+                    .collect(),
+                sample_rate: wanted.sflow.rate(),
+                polling_interval: u32::from(wanted.sflow.polling()),
+                agent_address: crate::intents::management_address(wanted).unwrap_or_default(),
+                agent_interface: crate::intents::management_name(wanted).unwrap_or_default(),
+                enabled_ports: ports.to_vec(),
+                disabled_ports: intents::sflow_state(wanted).disabled_ports,
+            })
+            .await
+            .context("SetSflowConfig")?;
         Ok(())
     }
 
@@ -1316,6 +1385,26 @@ fn needs_syncd_replay(running: &Intents) -> bool {
         // global (LLDP timers touch no interface at all).
         || intents::lldp_state(running) != intents::LldpState::default()
         || running.snmp != intents::SnmpIntent::default()
+        || intents::sflow_state(running) != intents::SflowState::default()
+}
+
+/// The front-panel ports sampling is programmed on: every port the
+/// config knows about, minus the ones carrying `sflow disable`. An
+/// empty list (or no collector) is how sampling gets torn down.
+///
+/// Only ports the config mentions are listed, which is deliberate:
+/// syncd binds by name, and a port absent from the config is one
+/// mgmtd cannot name.
+fn sflow_sampled_ports(intents: &Intents) -> Vec<String> {
+    if !intents.sflow.enabled() {
+        return Vec::new();
+    }
+    intents
+        .ports
+        .iter()
+        .filter(|(_, port)| !port.sflow_disabled)
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 fn qos_maps_request(maps: &intents::QosMapsIntent) -> pb::SetQosMapsRequest {
@@ -1492,6 +1581,27 @@ impl Engine {
             self.push_stp_config(&stp_state)
                 .await
                 .context("replaying STP config to orch")?;
+            applied += 1;
+        }
+
+        // sFlow replays the sampler into the ASIC and the export
+        // config into orch, in the same order a commit uses.
+        if intents::sflow_state(&running) != intents::SflowState::default() {
+            let ports = sflow_sampled_ports(&running);
+            client
+                .set_sflow_sampling(pb::SetSflowSamplingRequest {
+                    rate: if running.sflow.enabled() {
+                        running.sflow.rate()
+                    } else {
+                        0
+                    },
+                    ports: ports.clone(),
+                })
+                .await
+                .context("replaying sflow sampling")?;
+            self.push_sflow_config(&running, &ports)
+                .await
+                .context("replaying sflow config to orch")?;
             applied += 1;
         }
 
@@ -1968,7 +2078,8 @@ queue 7 { priority strict } } }
             "qos { map { dscp-to-tc { dscp 46 tc 5 } } }
 ",
             "services { lldp { tx-interval 15 }
-snmp { community public } }
+snmp { community public }
+sflow { collector 10.42.0.20 } }
 ",
         );
         let running = intents_of(text);
@@ -1990,6 +2101,13 @@ snmp { community public } }
         assert!(!intents::port_qos_state(&running).is_empty());
         assert_ne!(intents::lldp_state(&running), intents::LldpState::default());
         assert_ne!(running.snmp, intents::SnmpIntent::default());
+        assert_ne!(
+            intents::sflow_state(&running),
+            intents::SflowState::default()
+        );
+        // Every front-panel port in the config samples; none is
+        // disabled, so the list is the whole set.
+        assert_eq!(sflow_sampled_ports(&running).len(), running.ports.len());
     }
 
     /// LLDP is orch-owned and entirely global-capable, so it gates the
@@ -2007,5 +2125,26 @@ snmp { community public } }
             "interfaces { Management1 { address 10.42.0.9/24 } }
 services { snmp { community public } }"
         )));
+        assert!(needs_syncd_replay(&intents_of(
+            "services { sflow { collector 10.42.0.20 } }"
+        )));
+    }
+
+    /// The sampled-port list is every configured front-panel port
+    /// minus the ones carrying `sflow disable` — and it is empty
+    /// whenever sFlow is off, which is how the sampler gets torn down.
+    #[test]
+    fn sflow_sampled_ports_exclude_disabled_ones() {
+        let intents = intents_of(
+            "services { sflow { collector 10.42.0.20 } }
+interfaces { Ethernet1 { } Ethernet2 { } Ethernet4 { sflow disable } }",
+        );
+        assert_eq!(
+            sflow_sampled_ports(&intents),
+            vec!["Ethernet1".to_string(), "Ethernet2".to_string()]
+        );
+        // No collector = nothing sampled, whatever the ports say.
+        let intents = intents_of("interfaces { Ethernet1 { } }");
+        assert!(sflow_sampled_ports(&intents).is_empty());
     }
 }

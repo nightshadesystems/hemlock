@@ -195,6 +195,7 @@ pub struct VendorSai {
     fdb_api: *mut ffi::sai_fdb_api_t,
     policer_api: *mut ffi::sai_policer_api_t,
     mirror_api: *mut ffi::sai_mirror_api_t,
+    samplepacket_api: *mut ffi::sai_samplepacket_api_t,
     lag_api: *mut ffi::sai_lag_api_t,
     stp_api: *mut ffi::sai_stp_api_t,
     l2mc_api: *mut ffi::sai_l2mc_api_t,
@@ -376,6 +377,11 @@ impl VendorSai {
                 "sai_api_query(MIRROR)",
                 api_query(ffi::_sai_api_t::SAI_API_MIRROR, &mut mirror_api),
             )?;
+            let mut samplepacket_api: *mut c_void = std::ptr::null_mut();
+            check(
+                "sai_api_query(SAMPLEPACKET)",
+                api_query(ffi::_sai_api_t::SAI_API_SAMPLEPACKET, &mut samplepacket_api),
+            )?;
             let mut lag_api: *mut c_void = std::ptr::null_mut();
             check(
                 "sai_api_query(LAG)",
@@ -453,6 +459,7 @@ impl VendorSai {
                 fdb_api as *mut ffi::sai_fdb_api_t,
                 policer_api as *mut ffi::sai_policer_api_t,
                 mirror_api as *mut ffi::sai_mirror_api_t,
+                samplepacket_api as *mut ffi::sai_samplepacket_api_t,
                 lag_api as *mut ffi::sai_lag_api_t,
                 stp_api as *mut ffi::sai_stp_api_t,
                 l2mc_api as *mut ffi::sai_l2mc_api_t,
@@ -479,6 +486,7 @@ impl VendorSai {
             fdb_api,
             policer_api,
             mirror_api,
+            samplepacket_api,
             lag_api,
             stp_api,
             l2mc_api,
@@ -519,6 +527,7 @@ impl VendorSai {
             fdb_api,
             policer_api,
             mirror_api,
+            samplepacket_api,
             lag_api,
             stp_api,
             l2mc_api,
@@ -1445,6 +1454,7 @@ impl VendorSai {
             TrapKind::Ospf => trap::SAI_HOSTIF_TRAP_TYPE_OSPF,
             TrapKind::Bgp => trap::SAI_HOSTIF_TRAP_TYPE_BGP,
             TrapKind::Vrrp => trap::SAI_HOSTIF_TRAP_TYPE_VRRP,
+            TrapKind::SamplePacket => trap::SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET,
             TrapKind::AclLog => return None,
         })
     }
@@ -2637,6 +2647,15 @@ impl SaiBackend for VendorSai {
         // The WRED-drop / ECN-marked queue stats are read once at boot
         // on the first port; a refused read turns the two columns off.
         let wred_queue_stats = wred && self.probe_wred_queue_stats();
+        // sFlow needs both halves: a samplepacket object to create and
+        // the port attribute to bind it to. Either missing means the
+        // config would sample nothing, so the commit fails instead.
+        let sflow = unsafe { (*self.samplepacket_api).create_samplepacket.is_some() }
+            && self.attr_supported(
+                object::SAI_OBJECT_TYPE_PORT,
+                ffi::_sai_port_attr_t::SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE,
+                true,
+            );
 
         Ok(SaiCapabilities {
             lag: self.attr_supported(
@@ -2688,6 +2707,7 @@ impl SaiBackend for VendorSai {
             ecn,
             queue_shaper,
             wred_queue_stats,
+            sflow,
         })
     }
 
@@ -2980,6 +3000,72 @@ impl SaiBackend for VendorSai {
             }
         }
         Ok(())
+    }
+
+    fn create_samplepacket(&mut self, rate: u32) -> Result<Oid, SaiError> {
+        let switch = self.switch_oid()?;
+        // SAFETY: valid samplepacket api table; attrs outlive the call.
+        let create = unsafe {
+            (*self.samplepacket_api)
+                .create_samplepacket
+                .ok_or(SaiError::Other(
+                    "samplepacket api lacks create_samplepacket".into(),
+                ))?
+        };
+        use ffi::_sai_samplepacket_attr_t as attr;
+        let mut rate_attr = Self::zeroed_attr(attr::SAI_SAMPLEPACKET_ATTR_SAMPLE_RATE);
+        rate_attr.value.u32_ = rate;
+        // SLOW_PATH copies the sample to the CPU (the punt path the
+        // sFlow trap delivers on); SHARED lets every sampled port bind
+        // the one session, so the ASIC keeps a single sampler.
+        let mut type_attr = Self::zeroed_attr(attr::SAI_SAMPLEPACKET_ATTR_TYPE);
+        type_attr.value.s32 = ffi::_sai_samplepacket_type_t::SAI_SAMPLEPACKET_TYPE_SLOW_PATH as i32;
+        let mut mode_attr = Self::zeroed_attr(attr::SAI_SAMPLEPACKET_ATTR_MODE);
+        mode_attr.value.s32 = ffi::_sai_samplepacket_mode_t::SAI_SAMPLEPACKET_MODE_SHARED as i32;
+        let attrs = [rate_attr, type_attr, mode_attr];
+        let mut oid: ffi::sai_object_id_t = 0;
+        // SAFETY: attr array outlives the call.
+        unsafe {
+            check(
+                "create_samplepacket",
+                create(&mut oid, switch, attrs.len() as u32, attrs.as_ptr()),
+            )?;
+        }
+        Ok(Oid(oid))
+    }
+
+    fn remove_samplepacket(&mut self, session: Oid) -> Result<(), SaiError> {
+        self.switch_oid()?;
+        // SAFETY: valid samplepacket api table.
+        unsafe {
+            let remove = (*self.samplepacket_api)
+                .remove_samplepacket
+                .ok_or(SaiError::Other(
+                    "samplepacket api lacks remove_samplepacket".into(),
+                ))?;
+            check("remove_samplepacket", remove(session.0))
+        }
+    }
+
+    fn set_port_sample_session(
+        &mut self,
+        port: PortId,
+        session: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        let mut attr =
+            Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_INGRESS_SAMPLEPACKET_ENABLE);
+        // NULL_OBJECT_ID disables sampling on the port.
+        attr.value.oid = session.map(|oid| oid.0).unwrap_or(0);
+        // SAFETY: valid port api table; attr outlives the call.
+        unsafe {
+            let set = (*self.port_api)
+                .set_port_attribute
+                .ok_or(SaiError::Other("port api lacks set_port_attribute".into()))?;
+            check(
+                "set_port_attribute(INGRESS_SAMPLEPACKET_ENABLE)",
+                set(port.0, &attr),
+            )
+        }
     }
 
     fn set_port_tpid(&mut self, port: PortId, tpid: u16) -> Result<(), SaiError> {

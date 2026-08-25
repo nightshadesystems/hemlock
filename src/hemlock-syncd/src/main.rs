@@ -15,6 +15,7 @@ mod netdev;
 mod qos;
 mod security;
 mod service;
+mod sflow;
 mod state;
 
 use anyhow::{bail, Context, Result};

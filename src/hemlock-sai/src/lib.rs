@@ -277,6 +277,12 @@ pub struct SaiCapabilities {
     /// WRED-drop and ECN-marked queue stats; absent means those two
     /// counter columns render zero.
     pub wred_queue_stats: bool,
+
+    // --- Services suite ----------------------------------------------
+    /// Hardware ingress sampling (`samplepacket` objects bound to
+    /// ports). Absent means `services { sflow }` fails the commit
+    /// rather than silently sampling nothing.
+    pub sflow: bool,
 }
 
 impl SaiCapabilities {
@@ -308,6 +314,7 @@ impl SaiCapabilities {
             ecn: true,
             queue_shaper: true,
             wred_queue_stats: true,
+            sflow: true,
         }
     }
 }
@@ -491,6 +498,8 @@ pub enum TrapKind {
     Ospf,
     Bgp,
     Vrrp,
+    /// Hardware-sampled packets on their way to the sFlow engine.
+    SamplePacket,
     /// ACL `log` copies (a user-defined trap).
     AclLog,
 }
@@ -553,6 +562,14 @@ pub enum SaiEvent {
     LearnLimitViolation {
         port: PortId,
         mac: [u8; 6],
+    },
+    /// One hardware-sampled packet off the punt path. `original_length`
+    /// is the frame's length on the wire — the delivered `bytes` may be
+    /// shorter, and sFlow reports both.
+    SampledPacket {
+        port: PortId,
+        original_length: u32,
+        bytes: Vec<u8>,
     },
 }
 
@@ -809,6 +826,23 @@ pub trait SaiBackend: Send {
         port: PortId,
         ingress: Option<Oid>,
         egress: Option<Oid>,
+    ) -> Result<(), SaiError>;
+
+    // --- Ingress sampling (sFlow) ------------------------------------------
+
+    /// Create a samplepacket session sampling 1 in `rate` packets.
+    /// Gated on [`SaiCapabilities::sflow`].
+    fn create_samplepacket(&mut self, rate: u32) -> Result<Oid, SaiError>;
+
+    /// Remove a samplepacket session; ports must be unbound first.
+    fn remove_samplepacket(&mut self, session: Oid) -> Result<(), SaiError>;
+
+    /// Bind (or, with `None`, unbind) a port's *ingress* sampling to a
+    /// session. Egress sampling is deliberately not exposed.
+    fn set_port_sample_session(
+        &mut self,
+        port: PortId,
+        session: Option<Oid>,
     ) -> Result<(), SaiError>;
 
     // --- QinQ --------------------------------------------------------------

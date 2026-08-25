@@ -47,6 +47,7 @@ const MOCK_TRAP_OID_BASE: u64 = 0x2100_0000_0001_5000;
 const MOCK_QOS_MAP_OID_BASE: u64 = 0x2100_0000_0001_6000;
 const MOCK_SCHEDULER_OID_BASE: u64 = 0x2100_0000_0001_7000;
 const MOCK_WRED_OID_BASE: u64 = 0x2100_0000_0001_8000;
+const MOCK_SAMPLE_OID_BASE: u64 = 0x2100_0000_0001_9000;
 
 /// The mock TCAM's entry capacity per stage — Helix4-shaped numbers so
 /// `show acl summary` has something honest to report (IPv6 entries
@@ -90,6 +91,11 @@ pub struct MockSai {
     storm: HashMap<(PortId, StormClass), u64>,
     mirror_sessions: HashMap<Oid, PortId>,
     port_mirrors: HashMap<PortId, (Option<Oid>, Option<Oid>)>,
+    /// sFlow model: samplepacket sessions (by rate) and their ingress
+    /// port bindings, both inspectable so tests can assert what the
+    /// engine programmed.
+    sample_sessions: HashMap<Oid, u32>,
+    port_samples: HashMap<PortId, Oid>,
     tpids: HashMap<PortId, u16>,
     /// Forced link parameters, as programmed: pinned speed, forced
     /// duplex (true = full), autoneg state, and L2 MTU. Absent = the
@@ -179,6 +185,8 @@ impl MockSai {
             storm: HashMap::new(),
             mirror_sessions: HashMap::new(),
             port_mirrors: HashMap::new(),
+            sample_sessions: HashMap::new(),
+            port_samples: HashMap::new(),
             tpids: HashMap::new(),
             forced_speeds: HashMap::new(),
             forced_duplex: HashMap::new(),
@@ -300,6 +308,49 @@ impl MockSai {
     /// violations).
     pub fn event_injector(&self) -> mpsc::UnboundedSender<SaiEvent> {
         self.events_tx.clone()
+    }
+
+    /// The samplepacket sessions the mock holds: (oid, 1-in-N rate).
+    pub fn sample_sessions(&self) -> Vec<(Oid, u32)> {
+        let mut sessions: Vec<(Oid, u32)> = self
+            .sample_sessions
+            .iter()
+            .map(|(oid, rate)| (*oid, *rate))
+            .collect();
+        sessions.sort_by_key(|(oid, _)| oid.0);
+        sessions
+    }
+
+    /// Which ports are bound to a sampling session, and to which.
+    pub fn port_sample_bindings(&self) -> Vec<(PortId, Oid)> {
+        let mut bindings: Vec<(PortId, Oid)> = self
+            .port_samples
+            .iter()
+            .map(|(port, oid)| (*port, *oid))
+            .collect();
+        bindings.sort_by_key(|(port, _)| port.0);
+        bindings
+    }
+
+    /// Deliver one hardware-sampled packet, as the punt path would.
+    /// Ports with no sampling session bound drop it, so a test cannot
+    /// accidentally sample an unbound port.
+    pub fn inject_sampled_packet(
+        &self,
+        port: PortId,
+        original_length: u32,
+        bytes: Vec<u8>,
+    ) -> bool {
+        if !self.port_samples.contains_key(&port) {
+            return false;
+        }
+        self.events_tx
+            .send(SaiEvent::SampledPacket {
+                port,
+                original_length,
+                bytes,
+            })
+            .is_ok()
     }
 
     /// Make ACL match counters and policer stats advance on every read
@@ -956,6 +1007,53 @@ impl SaiBackend for MockSai {
             self.port_mirrors.remove(&port);
         } else {
             self.port_mirrors.insert(port, (ingress, egress));
+        }
+        Ok(())
+    }
+
+    fn create_samplepacket(&mut self, rate: u32) -> Result<Oid, SaiError> {
+        self.require_switch()?;
+        if !self.capabilities.sflow {
+            return Err(SaiError::Other("samplepacket is not supported".into()));
+        }
+        if rate == 0 {
+            return Err(SaiError::Other("sample rate must be at least 1".into()));
+        }
+        let oid = self.alloc(MOCK_SAMPLE_OID_BASE);
+        self.sample_sessions.insert(oid, rate);
+        Ok(oid)
+    }
+
+    fn remove_samplepacket(&mut self, session: Oid) -> Result<(), SaiError> {
+        self.require_switch()?;
+        if self.port_samples.values().any(|bound| *bound == session) {
+            return Err(SaiError::Other(format!(
+                "sample session {session} still has bound ports"
+            )));
+        }
+        if self.sample_sessions.remove(&session).is_none() {
+            return Err(SaiError::Other(format!("no such sample session {session}")));
+        }
+        Ok(())
+    }
+
+    fn set_port_sample_session(
+        &mut self,
+        port: PortId,
+        session: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        self.require_switch()?;
+        self.require_port(port)?;
+        match session {
+            Some(session) => {
+                if !self.sample_sessions.contains_key(&session) {
+                    return Err(SaiError::Other(format!("no such sample session {session}")));
+                }
+                self.port_samples.insert(port, session);
+            }
+            None => {
+                self.port_samples.remove(&port);
+            }
         }
         Ok(())
     }

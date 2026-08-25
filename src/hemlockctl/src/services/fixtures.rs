@@ -1,7 +1,9 @@
 //! Test fixtures behind the services-suite golden outputs: the state
 //! the spec's seed configuration produces on a 52-port E1031.
 
-use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState, SnmpCommunity, SnmpState};
+use super::model::{
+    LldpNeighbor, LldpPort, LldpState, NtpState, SflowState, SnmpCommunity, SnmpState,
+};
 
 fn neighbor(
     port: &str,
@@ -143,5 +145,28 @@ pub fn snmp_state() -> SnmpState {
         get_requests: 71_022,
         getnext_requests: 17_101,
         errors: 0,
+    }
+}
+
+/// The sFlow state the seed produces on a 52-port E1031: two
+/// collectors, default rate and polling, `sflow disable` on Ethernet4.
+pub fn sflow_state() -> SflowState {
+    SflowState {
+        enabled: true,
+        supported: true,
+        agent_address: "10.42.0.9".into(),
+        agent_interface: "Management1".into(),
+        sample_rate: 16384,
+        polling_interval: 30,
+        collectors: vec!["10.42.0.20:6343".into(), "10.42.0.21:6344".into()],
+        enabled_ports: (1..=52)
+            .filter(|n| *n != 4)
+            .map(|n| format!("Ethernet{n}"))
+            .collect(),
+        disabled_ports: vec!["Ethernet4".into()],
+        samples_taken: 48_211,
+        counter_samples: 10_488,
+        datagrams_sent: 12_930,
+        datagrams_failed: 0,
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::interfaces::table::{pad, Col, Text};
 
-use super::model::{LldpState, NtpState, SnmpState};
+use super::model::{LldpState, NtpState, SflowState, SnmpState};
 
 /// The abbreviated interface form for tabular output
 /// ("Ethernet1" -> "Et1").
@@ -310,6 +310,67 @@ pub fn snmp(state: &SnmpState) -> String {
     out.line(format!(
         "Get requests: {}   GetNext/Bulk: {}   Errors: {}",
         state.get_requests, state.getnext_requests, state.errors
+    ));
+    out.finish()
+}
+
+// ------------------------------------------------- sFlow
+
+/// `show sflow` — the sampler's settings and the exporter's counters.
+pub fn sflow(state: &SflowState) -> String {
+    let mut out = Text::new();
+    if !state.enabled {
+        out.line("sFlow is disabled (no collector configured)");
+        if !state.supported {
+            out.blank();
+            out.line("sFlow sampling is not supported by this platform's SAI.");
+        }
+        return out.finish();
+    }
+    out.line("sFlow is enabled");
+    let field = |name: &str, value: &str| format!("{} : {}", pad(name, Col::left(16)), value);
+    out.line(field(
+        "Agent address",
+        &if state.agent_interface.is_empty() {
+            state.agent_address.clone()
+        } else {
+            format!("{} ({})", state.agent_address, state.agent_interface)
+        },
+    ));
+    out.line(field("Sample rate", &format!("1 in {}", state.sample_rate)));
+    out.line(field(
+        "Polling interval",
+        &format!("{}s", state.polling_interval),
+    ));
+    out.line(field("Collectors", &state.collectors.join(", ")));
+    out.blank();
+    // Naming the disabled ports matters more than counting them: an
+    // operator reads this line to check one port, not fifty-one.
+    let disabled = if state.disabled_ports.is_empty() {
+        "0 disabled".to_string()
+    } else {
+        format!(
+            "{} disabled ({})",
+            state.disabled_ports.len(),
+            state
+                .disabled_ports
+                .iter()
+                .map(|port| short_name(port))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    out.line(field(
+        "Sampling ports",
+        &format!("{} enabled, {disabled}", state.enabled_ports.len()),
+    ));
+    out.blank();
+    out.line(field("Samples taken", &state.samples_taken.to_string()));
+    out.line(field("Counter samples", &state.counter_samples.to_string()));
+    out.line(field("Datagrams sent", &state.datagrams_sent.to_string()));
+    out.line(field(
+        "Datagrams failed",
+        &state.datagrams_failed.to_string(),
     ));
     out.finish()
 }

@@ -132,3 +132,32 @@ pub struct SnmpState {
     pub getnext_requests: u64,
     pub errors: u64,
 }
+
+// ------------------------------------------------- sFlow
+
+/// `show sflow`: the sampler's settings and the exporter's counters.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SflowState {
+    /// False = no collector configured, so nothing is sampled.
+    pub enabled: bool,
+    /// False where the platform's SAI serves no samplepacket objects.
+    pub supported: bool,
+    /// The agent address the datagrams carry, and the interface it
+    /// belongs to.
+    pub agent_address: String,
+    pub agent_interface: String,
+    /// 1-in-N.
+    pub sample_rate: u32,
+    pub polling_interval: u32,
+    /// Pre-rendered `10.42.0.20:6343` collector endpoints, in config
+    /// order.
+    pub collectors: Vec<String>,
+    /// Ports sampling is programmed on, and ports carrying
+    /// `sflow disable`.
+    pub enabled_ports: Vec<String>,
+    pub disabled_ports: Vec<String>,
+    pub samples_taken: u64,
+    pub counter_samples: u64,
+    pub datagrams_sent: u64,
+    pub datagrams_failed: u64,
+}

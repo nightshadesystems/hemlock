@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 
-use super::model::{LldpNeighbor, LldpPort, LldpState, NtpState, SnmpCommunity, SnmpState};
+use super::model::{
+    LldpNeighbor, LldpPort, LldpState, NtpState, SflowState, SnmpCommunity, SnmpState,
+};
 
 async fn orch_client(
     orch: &IpcEndpoint,
@@ -124,5 +126,46 @@ pub async fn snmp_state(orch: &IpcEndpoint) -> Result<SnmpState> {
         get_requests: response.get_requests,
         getnext_requests: response.getnext_requests,
         errors: response.errors,
+    })
+}
+
+/// The sFlow sampler and exporter. The programmed sampler comes from
+/// syncd (it owns the ASIC), the export settings and counters from
+/// orch — one `show`, both halves.
+pub async fn sflow_state(orch: &IpcEndpoint, syncd: &IpcEndpoint) -> Result<SflowState> {
+    let export = orch_client(orch)
+        .await?
+        .get_sflow_export_state(pb::GetSflowExportStateRequest {})
+        .await?
+        .into_inner();
+    // A syncd that cannot answer leaves `supported` true: the commit
+    // gate already refused an unsupported platform, so a transient
+    // failure here should not read as "your ASIC cannot do this".
+    let supported = match syncd.connect().await {
+        Ok(channel) => pb::syncd_client::SyncdClient::new(channel)
+            .get_sflow_state(pb::GetSflowStateRequest {})
+            .await
+            .map(|response| response.into_inner().supported)
+            .unwrap_or(true),
+        Err(_) => true,
+    };
+    Ok(SflowState {
+        enabled: export.enabled,
+        supported,
+        agent_address: export.agent_address,
+        agent_interface: export.agent_interface,
+        sample_rate: export.sample_rate,
+        polling_interval: export.polling_interval,
+        collectors: export
+            .collectors
+            .iter()
+            .map(|collector| format!("{}:{}", collector.address, collector.port))
+            .collect(),
+        enabled_ports: export.enabled_ports,
+        disabled_ports: export.disabled_ports,
+        samples_taken: export.samples_taken,
+        counter_samples: export.counter_samples,
+        datagrams_sent: export.datagrams_sent,
+        datagrams_failed: export.datagrams_failed,
     })
 }

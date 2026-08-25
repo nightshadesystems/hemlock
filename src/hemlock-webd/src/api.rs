@@ -100,6 +100,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/qos/ports/edit", post(qos_ports_edit))
         .route("/api/lldp", get(lldp))
         .route("/api/lldp/edit", post(lldp_edit))
+        .route("/api/sflow", get(sflow))
+        .route("/api/sflow/edit", post(sflow_edit))
         .route("/api/snmp", get(snmp))
         .route("/api/snmp/edit", post(snmp_edit))
         .route("/api/ntp", get(ntp))
@@ -963,6 +965,59 @@ async fn lldp_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::services_edit::apply_lldp_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/sflow` — the exporter's view from orch plus the
+/// programmed sampler from syncd (which owns the ASIC).
+async fn sflow(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut orch = orch_client(&state).await?;
+    let export = orch
+        .get_sflow_export_state(pb::GetSflowExportStateRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    // A syncd that cannot answer leaves `supported` true: the commit
+    // gate already refused an unsupported platform.
+    let supported = match syncd_client(&state).await {
+        Ok(mut syncd) => syncd
+            .get_sflow_state(pb::GetSflowStateRequest {})
+            .await
+            .map(|response| response.into_inner().supported)
+            .unwrap_or(true),
+        Err(_) => true,
+    };
+    Ok(Json(json!({
+        "enabled": export.enabled,
+        "supported": supported,
+        "agent_address": export.agent_address,
+        "agent_interface": export.agent_interface,
+        "sample_rate": export.sample_rate,
+        "polling_interval": export.polling_interval,
+        "collectors": export.collectors.iter().map(|collector| json!({
+            "address": collector.address,
+            "port": collector.port,
+        })).collect::<Vec<_>>(),
+        "enabled_ports": export.enabled_ports,
+        "disabled_ports": export.disabled_ports,
+        "samples_taken": export.samples_taken,
+        "counter_samples": export.counter_samples,
+        "datagrams_sent": export.datagrams_sent,
+        "datagrams_failed": export.datagrams_failed,
+    })))
+}
+
+async fn sflow_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::services_edit::SflowEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::services_edit::apply_sflow_edit(tree, &edit)
     })
     .await
 }

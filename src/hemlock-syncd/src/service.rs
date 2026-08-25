@@ -1280,6 +1280,7 @@ impl pb::syncd_server::Syncd for SyncdService {
                 ecn: caps.ecn,
                 queue_shaper: caps.queue_shaper,
                 wred_queue_stats: caps.wred_queue_stats,
+                sflow: caps.sflow,
             }),
         }))
     }
@@ -3915,6 +3916,54 @@ impl pb::syncd_server::Syncd for SyncdService {
         Ok(Response::new(pb::RemoveWredProfileResponse {}))
     }
 
+    async fn set_sflow_sampling(
+        &self,
+        request: Request<pb::SetSflowSamplingRequest>,
+    ) -> Result<Response<pb::SetSflowSamplingResponse>, Status> {
+        self.require_capability(self.handle.capabilities.sflow, "sflow sampling")?;
+        let req = request.into_inner();
+        crate::sflow::apply(&self.handle, req.rate, &req.ports)
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(pb::SetSflowSamplingResponse {}))
+    }
+
+    async fn get_sflow_state(
+        &self,
+        _request: Request<pb::GetSflowStateRequest>,
+    ) -> Result<Response<pb::GetSflowStateResponse>, Status> {
+        let program = crate::sflow::snapshot(&self.handle);
+        Ok(Response::new(pb::GetSflowStateResponse {
+            supported: self.handle.capabilities.sflow,
+            rate: program.rate,
+            ports: program.ports,
+            samples: program.samples,
+        }))
+    }
+
+    type WatchSampledPacketsStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::SampledPacket, Status>> + Send>,
+    >;
+
+    async fn watch_sampled_packets(
+        &self,
+        _request: Request<pb::WatchSampledPacketsRequest>,
+    ) -> Result<Response<Self::WatchSampledPacketsStream>, Status> {
+        let stream =
+            BroadcastStream::new(self.handle.samples.subscribe()).filter_map(|item| match item {
+                Ok(sample) => Some(Ok(pb::SampledPacket {
+                    port: sample.port,
+                    original_length: sample.original_length,
+                    bytes: sample.bytes,
+                })),
+                // A lagging exporter loses samples rather than the
+                // stream: sFlow is statistical, so a gap is survivable
+                // and a stall is not.
+                Err(BroadcastStreamRecvError::Lagged(_)) => None,
+            });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn get_qos_state(
         &self,
         _request: Request<pb::GetQosStateRequest>,
@@ -5527,6 +5576,134 @@ lanes = [1, 2]
             .unwrap();
     }
 
+    /// The sampler is programmed declaratively: one shared session
+    /// bound to the wanted ports, re-rated by rebuild, torn down when
+    /// the config goes away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sflow_sampling_programs_and_tears_down_over_mock_sai() {
+        let platform = test_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+
+        // Nothing programmed yet.
+        let state = service
+            .get_sflow_state(Request::new(pb::GetSflowStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(state.supported);
+        assert_eq!(state.rate, 0);
+        assert!(state.ports.is_empty());
+
+        service
+            .set_sflow_sampling(Request::new(pb::SetSflowSamplingRequest {
+                rate: 16384,
+                ports: vec!["Ethernet1".into(), "Ethernet2".into()],
+            }))
+            .await
+            .unwrap();
+        let state = service
+            .get_sflow_state(Request::new(pb::GetSflowStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.rate, 16384);
+        assert_eq!(state.ports, vec!["Ethernet1", "Ethernet2"]);
+
+        // Dropping a port unbinds only that one; the session stays.
+        service
+            .set_sflow_sampling(Request::new(pb::SetSflowSamplingRequest {
+                rate: 16384,
+                ports: vec!["Ethernet1".into()],
+            }))
+            .await
+            .unwrap();
+        let state = service
+            .get_sflow_state(Request::new(pb::GetSflowStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.ports, vec!["Ethernet1"]);
+
+        // A rate change rebuilds the session and rebinds everything.
+        service
+            .set_sflow_sampling(Request::new(pb::SetSflowSamplingRequest {
+                rate: 4096,
+                ports: vec!["Ethernet1".into(), "Ethernet2".into()],
+            }))
+            .await
+            .unwrap();
+        let state = service
+            .get_sflow_state(Request::new(pb::GetSflowStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.rate, 4096);
+        assert_eq!(state.ports, vec!["Ethernet1", "Ethernet2"]);
+
+        // Rate 0 tears the whole program down, so nothing is left
+        // bound and the session is freed.
+        service
+            .set_sflow_sampling(Request::new(pb::SetSflowSamplingRequest {
+                rate: 0,
+                ports: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let state = service
+            .get_sflow_state(Request::new(pb::GetSflowStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.rate, 0);
+        assert!(state.ports.is_empty());
+        assert!(handle.sflow.read().unwrap().session.is_none());
+    }
+
+    /// A platform whose SAI has no samplepacket support refuses the
+    /// program with the platform error, rather than sampling nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sflow_without_the_capability_fails_cleanly() {
+        let platform = test_platform();
+        let mut mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        mock.set_capabilities(hemlock_sai::SaiCapabilities {
+            sflow: false,
+            ..hemlock_sai::SaiCapabilities::all()
+        });
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+        let state = service
+            .get_sflow_state(Request::new(pb::GetSflowStateRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!state.supported);
+
+        let err = service
+            .set_sflow_sampling(Request::new(pb::SetSflowSamplingRequest {
+                rate: 16384,
+                ports: vec!["Ethernet1".into()],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "sflow sampling is not supported by this platform's SAI"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn security_copp_and_port_security_over_mock_sai() {
         let platform = test_platform();
@@ -6333,6 +6510,7 @@ lanes = [1, 2, 3, 4]
             wred: false,
             queue_shaper: false,
             wred_queue_stats: false,
+            sflow: false,
             buffer_bytes_total: 4 * 1024 * 1024,
             ..hemlock_sai::SaiCapabilities::all()
         });
