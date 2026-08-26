@@ -461,7 +461,10 @@ async fn operational(
             println!("  show ntp                               NTP client servers and sync");
             println!("  show snmp                              SNMP agent settings and counters");
             println!("  show sflow                             sFlow sampling and export state");
-            println!("  show system users                      configured accounts + live sessions");
+            println!(
+                "  show system users                      configured accounts + live sessions"
+            );
+            println!("  show logging [<count>]                 forwarding config + journal tail");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -573,8 +576,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "snmp",
         "sflow",
         "system",
+        "logging",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|dhcp relay|dhcp server|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow|system users>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|dhcp relay|dhcp server|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow|system users|logging>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -677,6 +681,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
                     .await
             }
             "system" => crate::system::cmd::show(&endpoints.mgmtd, &words[1..]).await,
+            "logging" => crate::system::cmd::show_logging(&endpoints.mgmtd, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -792,7 +797,9 @@ async fn config(
             println!("  set switching mac-table [aging-time <s> | static <mac> vlan <id> interface <port>|drop]");
             println!("  set switching mirror session <1-4> [source <port> [rx|tx|both] | destination <port>]");
             println!("  set system hostname <name>                    RFC-1123 label, max 63");
-            println!("  set system timezone <tz>                      tzdata name, e.g. America/Detroit");
+            println!(
+                "  set system timezone <tz>                      tzdata name, e.g. America/Detroit"
+            );
             println!("  set system name-server <ip>                   up to 3 resolvers");
             println!("  set system domain-name <name>                 resolver search domain");
             println!("  set system banner login <text>                shown before login (ssh + console)");
@@ -3696,6 +3703,7 @@ async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> R
         "domain-name",
         "banner",
         "login",
+        "logging",
         "web",
         "ssh",
         "http",
@@ -3707,6 +3715,7 @@ async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> R
     let noun = resolve(first, NOUNS)?;
     match noun {
         "login" => return config_system_login(endpoints, &words[1..], delete).await,
+        "logging" => return config_system_logging(endpoints, &words[1..], delete).await,
         "web" => return config_system_web(endpoints, &words[1..], delete).await,
         "ssh" | "http" | "https" => {}
         _ => return config_system_identity(endpoints, noun, &words[1..], delete).await,
@@ -4130,10 +4139,8 @@ async fn config_system_login(
                     SSH_KEY_TYPES.join(", ")
                 ));
             }
-            let existing = candidate_ssh_keys(
-                &candidate_text(endpoints).await.map_err(fmt_err)?,
-                &name,
-            );
+            let existing =
+                candidate_ssh_keys(&candidate_text(endpoints).await.map_err(fmt_err)?, &name);
             if !existing.contains(&key) && existing.len() >= MAX_SSH_KEYS {
                 return Err(format!(
                     "% at most {MAX_SSH_KEYS} ssh-keys ({} configured)",
@@ -4165,9 +4172,9 @@ fn candidate_ssh_keys(text: &str, name: &str) -> Vec<String> {
     let Some((_, login)) = ConfigTree::blocks_named(system, "login").next() else {
         return Vec::new();
     };
-    let Some((_, user)) = ConfigTree::blocks_named(login, "user").find(|(keys, _)| {
-        keys.first().map(String::as_str) == Some(name)
-    }) else {
+    let Some((_, user)) = ConfigTree::blocks_named(login, "user")
+        .find(|(keys, _)| keys.first().map(String::as_str) == Some(name))
+    else {
         return Vec::new();
     };
     user.iter()
@@ -4206,6 +4213,219 @@ async fn edit_login_user(
             }
         }
         remove_block_if_empty(tree, "system");
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// The most syslog collectors the config accepts, and the level
+/// keywords — mirrored from mgmtd for prompt-time feedback.
+const MAX_LOG_HOSTS: usize = 4;
+const LOG_LEVELS: &[&str] = &[
+    "emergencies",
+    "alerts",
+    "critical",
+    "errors",
+    "warnings",
+    "notifications",
+    "informational",
+    "debugging",
+];
+
+/// The collectors a candidate already carries, in order.
+fn candidate_log_hosts(text: &str) -> Vec<String> {
+    let Ok(tree) = hemlock_config::parse(text) else {
+        return Vec::new();
+    };
+    let Some((_, system)) = tree.block("system") else {
+        return Vec::new();
+    };
+    let Some((_, logging)) = ConfigTree::blocks_named(system, "logging").next() else {
+        return Vec::new();
+    };
+    logging
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "host" => {
+                values.first().cloned()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `set|delete system logging <host <ip> [port <n>] [protocol
+/// <udp|tcp>] | level <keyword>>`.
+///
+/// One `host` leaf carries its whole transport, so a later `port` or
+/// `protocol` for the same address rewrites that leaf rather than
+/// adding a second one.
+async fn config_system_logging(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = || {
+        format!(
+            "% Usage: {verb} system logging <host <ip> [port <1-65535>] \
+             [protocol <udp|tcp>] | level <keyword>>"
+        )
+    };
+    // `delete system logging` drops the whole block.
+    let Some(first) = words.first() else {
+        return if delete {
+            edit_system(endpoints, |system| {
+                ConfigTree::remove_block(system, "logging", &[]);
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            Err(usage())
+        };
+    };
+
+    match resolve(first, &["host", "level"])? {
+        "level" => {
+            if delete {
+                if let Some(extra) = words.get(1) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_logging(endpoints, |logging| {
+                    ConfigTree::remove_leaf(logging, "level");
+                })
+                .await;
+            }
+            let Some(level) = words.get(1).filter(|_| words.len() == 2) else {
+                return Err(format!(
+                    "% Usage: set system logging level <{}>",
+                    LOG_LEVELS.join("|")
+                ));
+            };
+            let level = resolve(level, LOG_LEVELS)?.to_string();
+            edit_logging(endpoints, move |logging| {
+                ConfigTree::set_leaf(logging, "level", vec![level]);
+            })
+            .await
+        }
+        "host" => {
+            let Some(address) = words.get(1) else {
+                // `delete system logging host` drops every collector.
+                return if delete {
+                    edit_logging(endpoints, |logging| {
+                        ConfigTree::remove_leaf(logging, "host");
+                    })
+                    .await
+                } else {
+                    Err(usage())
+                };
+            };
+            let address = canonical_ip(address)?;
+            let rest = &words[2..];
+            if delete {
+                if let Some(extra) = rest.first() {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_logging(endpoints, move |logging| {
+                    remove_leaf_matching(logging, "host", &[&address]);
+                })
+                .await;
+            }
+
+            let text = candidate_text(endpoints).await.map_err(fmt_err)?;
+            let existing = candidate_log_hosts(&text);
+            if !existing.contains(&address) && existing.len() >= MAX_LOG_HOSTS {
+                return Err(format!(
+                    "% at most {MAX_LOG_HOSTS} logging hosts ({} configured)",
+                    existing.len()
+                ));
+            }
+            // The settings already on this collector stay unless this
+            // command names them: `set ... host <ip> protocol tcp` must
+            // not silently reset a port set a moment ago.
+            let mut port: Option<String> = None;
+            let mut protocol: Option<String> = None;
+            let mut rest = rest.iter();
+            while let Some(keyword) = rest.next() {
+                let keyword = resolve(keyword, &["port", "protocol"])?;
+                let Some(value) = rest.next() else {
+                    return Err(format!(
+                        "% Usage: set system logging host {address} {keyword} <value>"
+                    ));
+                };
+                match keyword {
+                    "port" => port = Some(int_arg(value, 1..=65535u16, "port")?.to_string()),
+                    "protocol" => protocol = Some(resolve(value, &["udp", "tcp"])?.to_string()),
+                    _ => unreachable!(),
+                }
+            }
+            let carried = candidate_log_host_settings(&text, &address);
+            let port = port.or(carried.0);
+            let protocol = protocol.or(carried.1);
+            edit_logging(endpoints, move |logging| {
+                let mut values = vec![address.clone()];
+                if let Some(port) = port {
+                    values.push("port".into());
+                    values.push(port);
+                }
+                if let Some(protocol) = protocol {
+                    values.push("protocol".into());
+                    values.push(protocol);
+                }
+                remove_leaf_matching(logging, "host", &[&address]);
+                push_leaf(logging, "host", values);
+            })
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// The `port` and `protocol` one candidate collector already carries.
+fn candidate_log_host_settings(text: &str, address: &str) -> (Option<String>, Option<String>) {
+    let Ok(tree) = hemlock_config::parse(text) else {
+        return (None, None);
+    };
+    let Some((_, system)) = tree.block("system") else {
+        return (None, None);
+    };
+    let Some((_, logging)) = ConfigTree::blocks_named(system, "logging").next() else {
+        return (None, None);
+    };
+    let values = logging.iter().find_map(|item| match item {
+        hemlock_config::Item::Leaf { name, values }
+            if name == "host" && values.first().map(String::as_str) == Some(address) =>
+        {
+            Some(&values[1..])
+        }
+        _ => None,
+    });
+    let Some(values) = values else {
+        return (None, None);
+    };
+    let setting = |wanted: &str| {
+        values
+            .chunks(2)
+            .find(|pair| pair.first().map(String::as_str) == Some(wanted))
+            .and_then(|pair| pair.get(1).cloned())
+    };
+    (setting("port"), setting("protocol"))
+}
+
+/// [`edit_system`] scoped to `system { logging { ... } }`, pruning the
+/// block when a delete empties it.
+async fn edit_logging(
+    endpoints: &Endpoints,
+    edit: impl FnOnce(&mut Vec<hemlock_config::Item>),
+) -> Result<(), String> {
+    edit_system(endpoints, |system| {
+        edit(ConfigTree::ensure_block(system, "logging", &[]));
+        if ConfigTree::blocks_named(system, "logging")
+            .next()
+            .is_some_and(|(_, children)| children.is_empty())
+        {
+            ConfigTree::remove_block(system, "logging", &[]);
+        }
     })
     .await
     .map_err(fmt_err)
@@ -7318,7 +7538,8 @@ mod tests {
     /// The resolver cap counts what the candidate already carries.
     #[test]
     fn name_servers_are_read_back_from_the_candidate() {
-        let text = "system {\n    hostname sw1\n    name-server 10.0.0.1\n    name-server 10.0.0.2\n}\n";
+        let text =
+            "system {\n    hostname sw1\n    name-server 10.0.0.1\n    name-server 10.0.0.2\n}\n";
         assert_eq!(candidate_name_servers(text), ["10.0.0.1", "10.0.0.2"]);
         assert!(candidate_name_servers("").is_empty());
         assert!(candidate_name_servers("system { hostname sw1 }").is_empty());

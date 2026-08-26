@@ -117,6 +117,7 @@ pub const ADMIN_WEB_PATHS: &[&str] = &[
     "/api/storm-control/edit",
     "/api/svis/edit",
     "/api/system/identity/edit",
+    "/api/system/logging/edit",
     "/api/system/users/edit",
     "/api/system/web/edit",
     "/api/upgrade/apply",

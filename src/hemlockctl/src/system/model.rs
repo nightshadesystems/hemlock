@@ -38,3 +38,37 @@ pub struct UsersState {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unmanaged: Vec<String>,
 }
+
+// ------------------------------------------------- logging
+
+/// One journal line.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogEntry {
+    /// Unix seconds; rendered as a wall-clock stamp.
+    pub time: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    /// The syslog identifier, e.g. "mgmtd".
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+    /// 0 = the journal recorded none.
+    pub pid: u32,
+    pub message: String,
+    /// Syslog severity 0..7; 8 = the journal did not say.
+    pub severity: u32,
+}
+
+/// `show logging`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct LoggingState {
+    /// The configured forwarding level.
+    pub level: String,
+    /// Pre-rendered `10.42.0.30:514 (udp)` collectors, in config order.
+    pub hosts: Vec<String>,
+    /// The journal tail, oldest first.
+    pub entries: Vec<LogEntry>,
+    /// How many lines were asked for, so the footer can say.
+    pub requested: u32,
+    /// False when the journal could not be read at all.
+    pub journal_available: bool,
+}

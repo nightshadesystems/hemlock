@@ -152,7 +152,10 @@ impl IdentityApplier {
             return;
         }
         self.apply_hostname(identity);
-        run("timedatectl", &["set-timezone", identity.effective_timezone()]);
+        run(
+            "timedatectl",
+            &["set-timezone", identity.effective_timezone()],
+        );
         self.apply_resolver(identity);
         self.apply_banner(identity);
     }
@@ -212,8 +215,8 @@ impl IdentityApplier {
                     warn!(%err, path = ISSUE_NET, "cannot write the login banner");
                     return;
                 }
-                let dropin_changed = std::fs::read_to_string(BANNER_DROPIN).ok().as_deref()
-                    != Some(dropin.as_str());
+                let dropin_changed =
+                    std::fs::read_to_string(BANNER_DROPIN).ok().as_deref() != Some(dropin.as_str());
                 if let Err(err) = std::fs::write(BANNER_DROPIN, &dropin) {
                     warn!(%err, path = BANNER_DROPIN, "cannot write the sshd banner drop-in");
                     return;
@@ -321,7 +324,10 @@ system {
         let domain_only = identity_of("system { domain-name nightshade.systems }");
         let rendered = render_resolved(&domain_only).unwrap();
         assert!(!rendered.contains("DNS="), "{rendered}");
-        assert!(rendered.contains("Domains=nightshade.systems"), "{rendered}");
+        assert!(
+            rendered.contains("Domains=nightshade.systems"),
+            "{rendered}"
+        );
 
         let servers_only = identity_of("system { name-server 10.42.0.5 }");
         let rendered = render_resolved(&servers_only).unwrap();

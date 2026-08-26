@@ -32,6 +32,11 @@ hostapd
 # registers the IF-MIB (kernel netdev counters on the hostifs would not
 # reflect hardware forwarding).
 snmpd
+# Remote syslog forwarding. The journal stays the local log store;
+# mgmtd renders /etc/rsyslog.d/20-hemlock.conf from `system { logging }`
+# and starts rsyslog only when a collector is configured, so a switch
+# that forwards nowhere runs no forwarder.
+rsyslog
 # The DHCP server. mgmtd renders /etc/dnsmasq.d/hemlock.conf from the
 # pools and starts dnsmasq only when one exists; the render turns
 # dnsmasq's DNS half off (`port=0`), so it serves DHCP and nothing else.

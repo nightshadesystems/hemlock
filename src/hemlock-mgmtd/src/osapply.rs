@@ -495,7 +495,8 @@ pub fn manageable_account(name: &str) -> bool {
 /// header names the owner so an operator reading it knows not to edit
 /// it by hand.
 pub fn render_authorized_keys(user: &UserIntent) -> String {
-    let mut out = String::from("# Managed by hemlock-mgmtd; edit via the Hemlock config, not here.\n");
+    let mut out =
+        String::from("# Managed by hemlock-mgmtd; edit via the Hemlock config, not here.\n");
     for key in &user.ssh_keys {
         out.push_str(key);
         out.push('\n');
@@ -588,7 +589,14 @@ fn write_authorized_keys(name: &str, user: &UserIntent) {
     // chown/chmod through the OS tools: the applier is already a
     // shell-out layer, and this keeps the unix-permissions handling in
     // one idiom rather than behind a cfg(unix) fs::Permissions branch.
-    run("chown", &["-R", &format!("{name}:{name}"), &ssh_dir.display().to_string()]);
+    run(
+        "chown",
+        &[
+            "-R",
+            &format!("{name}:{name}"),
+            &ssh_dir.display().to_string(),
+        ],
+    );
     run("chmod", &["700", &ssh_dir.display().to_string()]);
     run("chmod", &["600", &path.display().to_string()]);
 }
@@ -797,7 +805,10 @@ server 10.0.0.1 } }",
         assert_eq!(os_role_in(PRIMARY, PASSWD, "admin"), Role::Admin);
         assert_eq!(os_role_in(PRIMARY, PASSWD, "noc"), Role::Operator);
         // No sudo group at all: everyone is an operator.
-        assert_eq!(os_role_in("hemlock:x:990:admin\n", PASSWD, "admin"), Role::Operator);
+        assert_eq!(
+            os_role_in("hemlock:x:990:admin\n", PASSWD, "admin"),
+            Role::Operator
+        );
     }
 
     /// `authorized_keys` is rendered whole, in config order, with the

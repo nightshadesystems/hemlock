@@ -20,6 +20,7 @@ pub struct Engine {
     orch: IpcEndpoint,
     os: OsApplier,
     identity: crate::identityapply::IdentityApplier,
+    rsyslog: crate::rsyslogapply::RsyslogApplier,
     frr: crate::frrapply::FrrApplier,
     snmp: crate::snmpapply::SnmpApplier,
     dnsmasq: crate::dnsmasqapply::DnsmasqApplier,
@@ -45,6 +46,7 @@ impl Engine {
             orch,
             os,
             identity: crate::identityapply::IdentityApplier::new(),
+            rsyslog: crate::rsyslogapply::RsyslogApplier::new(),
             frr: crate::frrapply::FrrApplier::new(),
             snmp: crate::snmpapply::SnmpApplier::new(),
             dnsmasq: crate::dnsmasqapply::DnsmasqApplier::new(),
@@ -766,6 +768,31 @@ impl Engine {
             self.snmp.apply(&wanted_intents);
         }
 
+        // rsyslog forwards on the same render-diff gate: a restart
+        // drops the queue, so it happens only when the collectors moved.
+        let rsyslog_changed = crate::rsyslogapply::render_rsyslog(&running_intents.logging)
+            != crate::rsyslogapply::render_rsyslog(&wanted_intents.logging);
+        let logging_change = rsyslog_changed.then(|| {
+            let logging = &wanted_intents.logging;
+            if logging.enabled() {
+                format!(
+                    "logging: forwarding at {} to {}",
+                    logging.effective_level(),
+                    logging
+                        .hosts
+                        .iter()
+                        .map(intents::LogHost::display)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                "logging: remote forwarding disabled".to_string()
+            }
+        });
+        if rsyslog_changed {
+            self.rsyslog.apply(&wanted_intents.logging);
+        }
+
         // dnsmasq likewise: a restart hands every renewing client a new
         // transaction, so it happens only when the pools really moved.
         let dnsmasq_changed = crate::dnsmasqapply::render_dnsmasq(&running_intents)
@@ -783,6 +810,7 @@ impl Engine {
         )?;
         self.commit_seq += 1;
         let mut described: Vec<String> = port_changes.iter().map(PortChange::describe).collect();
+        described.extend(logging_change);
         described.extend(vlan_changes.iter().map(intents::VlanChange::describe));
         described.extend(
             switchport_changes
@@ -1964,6 +1992,8 @@ impl Engine {
         // the replay always runs (a hostname the config no longer sets
         // must go back to `hemlock`).
         self.identity.apply(&running.identity);
+        // Declarative too: no collectors means rsyslog stops.
+        self.rsyslog.apply(&running.logging);
         self.frr.apply(&running);
         self.snmp.apply(&running);
         self.dnsmasq.apply(&running);
@@ -2225,6 +2255,41 @@ impl pb::mgmt_server::Mgmt for MgmtService {
             })
             .collect();
         Ok(Response::new(pb::ListSessionsResponse { sessions }))
+    }
+
+    async fn get_log(
+        &self,
+        request: Request<pb::GetLogRequest>,
+    ) -> Result<Response<pb::GetLogResponse>, Status> {
+        let count = match request.into_inner().count {
+            0 => crate::journal::DEFAULT_LINES,
+            count => count,
+        };
+        // Reading the journal shells out and can block; keep it off the
+        // engine lock entirely, since it touches no engine state.
+        let entries = tokio::task::spawn_blocking(move || crate::journal::tail(count))
+            .await
+            .map_err(|e| Status::internal(format!("journal read failed: {e}")))?;
+        Ok(Response::new(match entries {
+            Some(entries) => pb::GetLogResponse {
+                entries: entries
+                    .into_iter()
+                    .map(|entry| pb::LogEntry {
+                        time_unix: entry.time_unix,
+                        host: entry.host,
+                        tag: entry.tag,
+                        pid: entry.pid,
+                        message: entry.message,
+                        severity: entry.severity,
+                    })
+                    .collect(),
+                available: true,
+            },
+            None => pb::GetLogResponse {
+                entries: Vec::new(),
+                available: false,
+            },
+        }))
     }
 
     async fn install_image(

@@ -69,6 +69,7 @@ fn get_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/system", get(system)),
         ("/api/system/identity", get(system_identity)),
         ("/api/system/users", get(system_users)),
+        ("/api/system/logging", get(system_logging)),
         ("/api/users", get(users)),
         ("/api/config", get(config)),
         ("/api/maintenance", get(maintenance)),
@@ -87,7 +88,10 @@ fn post_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/svis/edit", post(svis_edit)),
         ("/api/lags/edit", post(lags_edit)),
         ("/api/spanning-tree/edit", post(spanning_tree_edit)),
-        ("/api/spanning-tree/clear-errdisable", post(clear_errdisable)),
+        (
+            "/api/spanning-tree/clear-errdisable",
+            post(clear_errdisable),
+        ),
         ("/api/mac-table/edit", post(mac_table_edit)),
         ("/api/mac-table/flush", post(mac_table_flush)),
         ("/api/snooping/edit", post(snooping_edit)),
@@ -109,7 +113,10 @@ fn post_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/dot1x/edit", post(dot1x_edit)),
         ("/api/dot1x/reauth", post(dot1x_reauth)),
         ("/api/snooping-sec/edit", post(snooping_sec_edit)),
-        ("/api/snooping-sec/bindings/clear", post(snooping_sec_bindings_clear)),
+        (
+            "/api/snooping-sec/bindings/clear",
+            post(snooping_sec_bindings_clear),
+        ),
         ("/api/qos/maps/edit", post(qos_maps_edit)),
         ("/api/qos/wred/edit", post(qos_wred_edit)),
         ("/api/qos/ports/edit", post(qos_ports_edit)),
@@ -122,6 +129,7 @@ fn post_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/ntp/edit", post(ntp_edit)),
         ("/api/system/identity/edit", post(system_identity_edit)),
         ("/api/system/users/edit", post(system_users_edit)),
+        ("/api/system/logging/edit", post(system_logging_edit)),
         ("/api/system/web/edit", post(system_web_edit)),
         ("/api/users/add", post(users_add)),
         ("/api/config/restore", post(config_restore)),
@@ -153,7 +161,6 @@ pub fn router(state: SharedState) -> Router {
     ))
     .with_state(state)
 }
-
 
 // ---------------------------------------------------------------- errors
 
@@ -950,6 +957,85 @@ async fn system_users_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, &_op.0, "web console", |tree| {
         crate::system_edit::apply_user_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/system/logging` — the forwarding config plus a journal
+/// tail. `?count=` selects how many lines, so the page can poll a
+/// short window and fetch a longer one on demand.
+async fn system_logging(
+    _op: Operator,
+    State(state): State<SharedState>,
+    axum::extract::Query(query): axum::extract::Query<LogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let logging = tree
+        .block("system")
+        .and_then(|(_, system)| ConfigTree::blocks_named(system, "logging").next())
+        .map(|(_, items)| items)
+        .unwrap_or(&[]);
+    let hosts: Vec<serde_json::Value> = logging
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "host" => {
+                let address = values.first()?;
+                let setting = |wanted: &str| {
+                    values[1..]
+                        .chunks(2)
+                        .find(|pair| pair.first().map(String::as_str) == Some(wanted))
+                        .and_then(|pair| pair.get(1).cloned())
+                };
+                Some(json!({
+                    "address": address,
+                    "port": setting("port")
+                        .and_then(|port| port.parse::<u16>().ok())
+                        .unwrap_or(514),
+                    "protocol": setting("protocol").unwrap_or_else(|| "udp".into()),
+                }))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut client = mgmtd_client(&state).await?;
+    let log = client
+        .get_log(pb::GetLogRequest { count: query.count })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+
+    Ok(Json(json!({
+        "level": ConfigTree::leaf_value(logging, "level").unwrap_or("informational"),
+        "hosts": hosts,
+        "journal_available": log.available,
+        "entries": log.entries.iter().map(|entry| json!({
+            "time": entry.time_unix,
+            "host": entry.host,
+            "tag": entry.tag,
+            "pid": entry.pid,
+            "severity": entry.severity,
+            "message": entry.message,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    /// 0 = mgmtd's default window.
+    #[serde(default)]
+    count: u32,
+}
+
+async fn system_logging_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::system_edit::LoggingEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, &_op.0, "web console", |tree| {
+        crate::system_edit::apply_logging_edit(tree, &edit)
     })
     .await
 }
@@ -3165,7 +3251,10 @@ mod tests {
             .map(|(path, _)| path)
             .filter(|path| hemlock_common::role::web_requires_admin(path))
             .collect();
-        assert!(gated.is_empty(), "read-only routes must stay open: {gated:?}");
+        assert!(
+            gated.is_empty(),
+            "read-only routes must stay open: {gated:?}"
+        );
     }
 
     #[test]

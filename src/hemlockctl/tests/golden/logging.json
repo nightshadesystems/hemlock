@@ -1,0 +1,37 @@
+{
+  "logging": {
+    "entries": [
+      {
+        "host": "hemlock-a1",
+        "message": "session opened for cody from 10.42.0.100",
+        "pid": 977,
+        "severity": 6,
+        "tag": "webd",
+        "time": 1787654335
+      },
+      {
+        "host": "hemlock-a1",
+        "message": "lldp: neighbor core-sw-01 on Et49 refreshed",
+        "pid": 901,
+        "severity": 6,
+        "tag": "orch",
+        "time": 1787654402
+      },
+      {
+        "host": "hemlock-a1",
+        "message": "commit 0 applied by cody (cli)",
+        "pid": 812,
+        "severity": 6,
+        "tag": "mgmtd",
+        "time": 1787654472
+      }
+    ],
+    "hosts": [
+      "10.42.0.30:514 (udp)",
+      "10.42.0.31:6514 (tcp)"
+    ],
+    "journal_available": true,
+    "level": "informational",
+    "requested": 50
+  }
+}

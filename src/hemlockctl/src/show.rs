@@ -451,7 +451,10 @@ mod tests {
         assert!(text.contains(r#"password-hash "<hidden>""#), "{text}");
         // The role and the (public) ssh key still read as config.
         assert!(text.contains("role admin"), "{text}");
-        assert!(text.contains("AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3"), "{text}");
+        assert!(
+            text.contains("AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3"),
+            "{text}"
+        );
         assert!(!text.contains("s3cret"), "radius key leaked: {text}");
         assert!(
             !text.contains("authpass1"),

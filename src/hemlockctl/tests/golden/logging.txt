@@ -1,0 +1,7 @@
+Logging level: informational
+Remote hosts : 10.42.0.30:514 (udp), 10.42.0.31:6514 (tcp)
+
+2026-08-25 10:38:55 hemlock-a1 webd[977]: session opened for cody from 10.42.0.100
+2026-08-25 10:40:02 hemlock-a1 orch[901]: lldp: neighbor core-sw-01 on Et49 refreshed
+2026-08-25 10:41:12 hemlock-a1 mgmtd[812]: commit 0 applied by cody (cli)
+(last 3 lines; `show logging 200` for more)

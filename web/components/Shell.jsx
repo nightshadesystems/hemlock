@@ -76,6 +76,7 @@ const SIDE_NAV = {
     items: [
       { id: '/system/general/', label: 'General', icon: 'cog' },
       { id: '/system/users/', label: 'Users', icon: 'users' },
+      { id: '/system/logging/', label: 'Logging', icon: 'list' },
       { id: '/system/maintenance/', label: 'Maintenance', icon: 'wrench' },
     ],
   },

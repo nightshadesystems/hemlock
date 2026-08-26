@@ -7,7 +7,7 @@ use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 use hemlock_config::ConfigTree;
 
-use super::model::{ActiveSession, ConfiguredUser, UsersState};
+use super::model::{ActiveSession, ConfiguredUser, LogEntry, LoggingState, UsersState};
 
 async fn mgmt_client(
     mgmtd: &IpcEndpoint,
@@ -132,6 +132,95 @@ pub fn os_login_users_in(passwd: &str) -> Vec<String> {
     users
 }
 
+// ------------------------------------------------- logging
+
+/// The forwarding defaults, mirrored from mgmtd so the display of an
+/// unset leaf matches what the applier would do.
+const DEFAULT_LOG_LEVEL: &str = "informational";
+const DEFAULT_LOG_PORT: &str = "514";
+const DEFAULT_LOG_PROTOCOL: &str = "udp";
+
+/// `show logging [<count>]`: the configured forwarding beside the tail
+/// of the local journal, both from mgmtd (which is root, so it can read
+/// a journal an operator account may not).
+pub async fn logging_state(mgmtd: &IpcEndpoint, count: u32) -> Result<LoggingState> {
+    let mut client = mgmt_client(mgmtd).await?;
+    let text = client
+        .get_config(pb::GetConfigRequest {
+            source: pb::ConfigSource::Running as i32,
+        })
+        .await?
+        .into_inner()
+        .text;
+    let tree = hemlock_config::parse(&text)
+        .map_err(|e| anyhow::anyhow!("running config unparsable: {e}"))?;
+    let (level, hosts) = logging_config(&tree);
+
+    let log = client
+        .get_log(pb::GetLogRequest { count })
+        .await?
+        .into_inner();
+
+    Ok(LoggingState {
+        level,
+        hosts,
+        entries: log
+            .entries
+            .into_iter()
+            .map(|entry| LogEntry {
+                time: entry.time_unix,
+                host: entry.host,
+                tag: entry.tag,
+                pid: entry.pid,
+                message: entry.message,
+                severity: entry.severity,
+            })
+            .collect(),
+        requested: count,
+        journal_available: log.available,
+    })
+}
+
+/// `system { logging { ... } }` as the level and the display forms of
+/// its collectors.
+fn logging_config(tree: &ConfigTree) -> (String, Vec<String>) {
+    let Some((_, system)) = tree.block("system") else {
+        return (DEFAULT_LOG_LEVEL.to_string(), Vec::new());
+    };
+    let Some((_, logging)) = ConfigTree::blocks_named(system, "logging").next() else {
+        return (DEFAULT_LOG_LEVEL.to_string(), Vec::new());
+    };
+    let level = ConfigTree::leaf_value(logging, "level")
+        .unwrap_or(DEFAULT_LOG_LEVEL)
+        .to_string();
+    let hosts = logging
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "host" => {
+                let address = values.first()?;
+                let setting = |wanted: &str, fallback: &str| {
+                    values[1..]
+                        .chunks(2)
+                        .find(|pair| pair.first().map(String::as_str) == Some(wanted))
+                        .and_then(|pair| pair.get(1).map(String::as_str))
+                        .unwrap_or(fallback)
+                        .to_string()
+                };
+                let port = setting("port", DEFAULT_LOG_PORT);
+                let protocol = setting("protocol", DEFAULT_LOG_PROTOCOL);
+                // A v6 literal needs brackets to keep the port readable.
+                Some(if address.contains(':') {
+                    format!("[{address}]:{port} ({protocol})")
+                } else {
+                    format!("{address}:{port} ({protocol})")
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    (level, hosts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +259,33 @@ mod tests {
         // root is out of range, svc and nobody have no real shell.
         assert_eq!(os_login_users_in(PASSWD), ["admin", "noc"]);
         assert!(os_login_users_in("").is_empty());
+    }
+
+    #[test]
+    fn reads_logging_config_with_its_defaults() {
+        let tree = hemlock_config::parse(
+            "system { logging {
+             host 10.42.0.30
+             host 10.42.0.31 port 6514 protocol tcp
+             host 2001:db8::30 protocol tcp
+             level informational
+             } }",
+        )
+        .unwrap_or_default();
+        let (level, hosts) = logging_config(&tree);
+        assert_eq!(level, "informational");
+        assert_eq!(
+            hosts,
+            [
+                "10.42.0.30:514 (udp)",
+                "10.42.0.31:6514 (tcp)",
+                "[2001:db8::30]:514 (tcp)",
+            ]
+        );
+        // No block at all: the default level, nothing forwarded.
+        let (level, hosts) = logging_config(&ConfigTree::default());
+        assert_eq!(level, "informational");
+        assert!(hosts.is_empty());
     }
 
     #[test]

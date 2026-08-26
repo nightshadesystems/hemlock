@@ -31,6 +31,9 @@ pub struct Intents {
     /// ... } } }`), keyed by account name. Empty = the config manages
     /// no users, and the OS accounts stand as they are.
     pub login: BTreeMap<String, UserIntent>,
+    /// Remote syslog (`system { logging { ... } }`), rendered into
+    /// rsyslog.
+    pub logging: LoggingIntent,
     pub ssh: SshIntent,
     /// Web console listeners (`system { http }` / `system { https }`).
     pub web: WebIntent,
@@ -1099,9 +1102,31 @@ pub const MAX_SSH_KEYS: usize = 8;
 /// one to the config would let a commit lock the box out of itself.
 /// The uid < 1000 sweep at commit time catches the rest.
 pub const RESERVED_USERS: &[&str] = &[
-    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news", "uucp", "proxy",
-    "www-data", "backup", "list", "irc", "nobody", "systemd-network", "systemd-resolve", "sshd",
-    "messagebus", "frr", "snmp", "dnsmasq", "hemlock",
+    "root",
+    "daemon",
+    "bin",
+    "sys",
+    "sync",
+    "games",
+    "man",
+    "lp",
+    "mail",
+    "news",
+    "uucp",
+    "proxy",
+    "www-data",
+    "backup",
+    "list",
+    "irc",
+    "nobody",
+    "systemd-network",
+    "systemd-resolve",
+    "sshd",
+    "messagebus",
+    "frr",
+    "snmp",
+    "dnsmasq",
+    "hemlock",
 ];
 
 /// Account-name syntax: `[a-z_][a-z0-9_-]{0,31}` — useradd's own
@@ -1150,6 +1175,85 @@ pub fn valid_ssh_key(key: &str) -> bool {
         && body
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+}
+
+/// The eight syslog severities, from most to least urgent, in the
+/// spelling the CLI keyword takes and the one rsyslog does. The
+/// configured level is a floor: everything at or above it forwards.
+pub const LOG_LEVELS: &[(&str, &str)] = &[
+    ("emergencies", "emerg"),
+    ("alerts", "alert"),
+    ("critical", "crit"),
+    ("errors", "err"),
+    ("warnings", "warning"),
+    ("notifications", "notice"),
+    ("informational", "info"),
+    ("debugging", "debug"),
+];
+
+/// The level a switch forwards at with nothing configured.
+pub const DEFAULT_LOG_LEVEL: &str = "informational";
+
+/// The most collectors the config forwards to. Beyond a handful the
+/// answer is a relay, not a longer list on every switch.
+pub const MAX_LOG_HOSTS: usize = 4;
+
+/// The transport defaults for a bare `host <ip>`.
+pub const DEFAULT_LOG_PORT: u16 = 514;
+pub const DEFAULT_LOG_PROTOCOL: &str = "udp";
+
+/// The rsyslog severity name for a CLI level keyword.
+pub fn log_level_severity(level: &str) -> Option<&'static str> {
+    LOG_LEVELS
+        .iter()
+        .find(|(keyword, _)| *keyword == level)
+        .map(|(_, severity)| *severity)
+}
+
+/// One remote collector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogHost {
+    /// Canonical address text (v4 or v6).
+    pub address: String,
+    pub port: u16,
+    /// "udp" or "tcp".
+    pub protocol: String,
+}
+
+impl LogHost {
+    /// The display form both `show logging` and the console print.
+    pub fn display(&self) -> String {
+        // A v6 literal needs brackets to keep the port readable.
+        if self.address.contains(':') {
+            format!("[{}]:{} ({})", self.address, self.port, self.protocol)
+        } else {
+            format!("{}:{} ({})", self.address, self.port, self.protocol)
+        }
+    }
+}
+
+/// Remote syslog (`system { logging { host ...; level ... } }`).
+///
+/// No hosts means nothing is forwarded, and the applier stops rsyslog
+/// outright: a forwarder with nowhere to send costs a daemon and buys
+/// nothing. The journal keeps everything locally either way.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoggingIntent {
+    /// Collectors in config order.
+    pub hosts: Vec<LogHost>,
+    /// None = the default level.
+    pub level: Option<String>,
+}
+
+impl LoggingIntent {
+    pub fn effective_level(&self) -> &str {
+        self.level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL)
+    }
+
+    /// Is anything forwarded at all?
+    pub fn enabled(&self) -> bool {
+        !self.hosts.is_empty()
+    }
 }
 
 /// Session timeout bounds for the web console, in minutes.
@@ -1231,6 +1335,9 @@ pub enum IntentError {
 
     #[error("system login user {name}: {reason}")]
     BadLoginUser { name: String, reason: String },
+
+    #[error("system logging: {0}")]
+    BadLogging(String),
 
     #[error("system web: {0}")]
     BadWeb(String),
@@ -3747,6 +3854,7 @@ fn system(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
                 }
                 match name.as_str() {
                     "login" => intents.login = login(children)?,
+                    "logging" => intents.logging = logging(children)?,
                     // `web` carries the console's session timeout; the
                     // listener half is block presence (`http`/`https`),
                     // parsed by `web`.
@@ -3876,7 +3984,7 @@ fn login(items: &[Item]) -> Result<BTreeMap<String, UserIntent>, IntentError> {
         .any(|user| user.role.is_admin() && user.password_hash.is_some())
     {
         return Err(bad(
-            "at least one admin user with a password is required".into(),
+            "at least one admin user with a password is required".into()
         ));
     }
     Ok(users)
@@ -3944,6 +4052,95 @@ fn user(account: &str, items: &[Item]) -> Result<UserIntent, IntentError> {
     }
     if intent.password_hash.is_none() && intent.ssh_keys.is_empty() {
         return Err(bad("needs a password or at least one ssh-key".into()));
+    }
+    Ok(intent)
+}
+
+/// `system { logging { host <ip> [port <n>] [protocol <udp|tcp>];
+/// level <keyword> } }`.
+fn logging(items: &[Item]) -> Result<LoggingIntent, IntentError> {
+    let bad = IntentError::BadLogging;
+    let mut intent = LoggingIntent::default();
+    for item in items {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match name.as_str() {
+            "host" => {
+                let Some((address, rest)) = values.split_first() else {
+                    return Err(bad(
+                        "expected `host <ip> [port <n>] [protocol <udp|tcp>]`".into()
+                    ));
+                };
+                let address: std::net::IpAddr = address
+                    .parse()
+                    .map_err(|_| bad(format!("bad host {address:?}")))?;
+                let mut host = LogHost {
+                    address: address.to_string(),
+                    port: DEFAULT_LOG_PORT,
+                    protocol: DEFAULT_LOG_PROTOCOL.to_string(),
+                };
+                // The trailing settings are keyword/value pairs, in any
+                // order, each at most once.
+                let mut rest = rest.iter();
+                while let Some(keyword) = rest.next() {
+                    let Some(value) = rest.next() else {
+                        return Err(bad(format!(
+                            "host {}: {keyword} takes a value",
+                            host.address
+                        )));
+                    };
+                    match keyword.as_str() {
+                        "port" => {
+                            host.port = parse_int(value, 1u16..=65535, "port").map_err(bad)?;
+                        }
+                        "protocol" => match value.as_str() {
+                            "udp" | "tcp" => host.protocol = value.clone(),
+                            other => {
+                                return Err(bad(format!("bad protocol {other:?} (udp or tcp)")));
+                            }
+                        },
+                        // Deferred by this suite; named rather than
+                        // silently accepted as plaintext forwarding.
+                        "tls" => return Err(bad("syslog over TLS is not supported".into())),
+                        other => {
+                            return Err(bad(format!("unrecognized host setting {other:?}")));
+                        }
+                    }
+                }
+                if intent
+                    .hosts
+                    .iter()
+                    .any(|existing| existing.address == host.address)
+                {
+                    return Err(bad(format!("duplicate host {}", host.address)));
+                }
+                intent.hosts.push(host);
+            }
+            "level" => {
+                let [level] = values.as_slice() else {
+                    return Err(bad("expected `level <keyword>`".into()));
+                };
+                if log_level_severity(level).is_none() {
+                    return Err(bad(format!(
+                        "bad level {level:?} (one of: {})",
+                        LOG_LEVELS
+                            .iter()
+                            .map(|(keyword, _)| *keyword)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                intent.level = Some(level.clone());
+            }
+            other => return Err(bad(format!("unrecognized statement {other:?}"))),
+        }
+    }
+    if intent.hosts.len() > MAX_LOG_HOSTS {
+        return Err(bad(format!(
+            "at most {MAX_LOG_HOSTS} hosts ({} configured)",
+            intent.hosts.len()
+        )));
     }
     Ok(intent)
 }
@@ -5667,7 +5864,12 @@ impl UserChange {
                     1 => ", 1 ssh-key".into(),
                     n => format!(", {n} ssh-keys"),
                 };
-                format!("user {} ({}, {}{keys})", self.name, user.role, user.auth_method())
+                format!(
+                    "user {} ({}, {}{keys})",
+                    self.name,
+                    user.role,
+                    user.auth_method()
+                )
             }
         }
     }
@@ -8081,8 +8283,7 @@ system {
     /// one administrator who can log in.
     #[test]
     fn login_lockout_guard() {
-        const MESSAGE: &str =
-            "system login: at least one admin user with a password is required";
+        const MESSAGE: &str = "system login: at least one admin user with a password is required";
         let hash = "$6$abcdefgh$ijklmnop";
         // Only operators.
         let text = format!("system {{ login {{ user noc {{ password-hash \"{hash}\" }} }} }}");
@@ -8144,9 +8345,15 @@ system {
 
         // Roles, hashes and keys are all checked.
         for (body, what) in [
-            ("user noc { role superuser\npassword-hash \"$6$a$b\" }", "role"),
+            (
+                "user noc { role superuser\npassword-hash \"$6$a$b\" }",
+                "role",
+            ),
             ("user noc { password-hash plaintext }", "hash"),
-            ("user noc { ssh-key \"ssh-dss AAAAB3NzaC1kc3MAAACB comment\" }", "key type"),
+            (
+                "user noc { ssh-key \"ssh-dss AAAAB3NzaC1kc3MAAACB comment\" }",
+                "key type",
+            ),
             ("user noc { ssh-key \"ssh-ed25519\" }", "key shape"),
             ("user noc { nonsense 1 }", "statement"),
         ] {
@@ -8226,14 +8433,116 @@ system {
         assert_eq!(changes.users.len(), 1);
         assert_eq!(changes.users[0].name, "noc");
         assert!(changes.users[0].set.is_none());
-        assert!(changes
-            .describe()
-            .contains(&"user noc removed".to_string()));
+        assert!(changes.describe().contains(&"user noc removed".to_string()));
 
         // Dropping the whole block does not: those accounts stop being
         // config-managed, they are not deleted.
         assert!(diff_os(&before, &intents_of("")).users.is_empty());
         assert!(diff_os(&before, &before).users.is_empty());
+    }
+
+    /// The system suite's logging block, round-tripped through the
+    /// serializer and re-extracted.
+    #[test]
+    fn logging_seed_round_trips_and_extracts() {
+        let text = r#"
+system {
+    logging {
+        host 10.42.0.30;
+        host 10.42.0.31 port 6514 protocol tcp;
+        level informational;
+    }
+}
+"#;
+        let tree = parse(text).unwrap();
+        assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+        let logging = extract(&tree).unwrap().logging;
+        assert_eq!(logging.hosts.len(), 2);
+        assert_eq!(
+            logging.hosts[0],
+            LogHost {
+                address: "10.42.0.30".into(),
+                port: DEFAULT_LOG_PORT,
+                protocol: DEFAULT_LOG_PROTOCOL.into(),
+            }
+        );
+        assert_eq!(logging.hosts[1].port, 6514);
+        assert_eq!(logging.hosts[1].protocol, "tcp");
+        assert_eq!(logging.hosts[1].display(), "10.42.0.31:6514 (tcp)");
+        assert_eq!(logging.effective_level(), "informational");
+        assert!(logging.enabled());
+    }
+
+    /// Every logging rejection in the spec, plus the defaults an
+    /// absent leaf stands for.
+    #[test]
+    fn logging_validation() {
+        // Defaults with nothing configured: the level stands, nothing
+        // is forwarded.
+        let empty = intents_of("");
+        assert_eq!(empty.logging.effective_level(), "informational");
+        assert!(!empty.logging.enabled());
+
+        // Transport settings come in either order, and canonicalize.
+        let logging =
+            intents_of("system { logging { host 2001:0db8:0000::30 protocol tcp port 601 } }")
+                .logging;
+        assert_eq!(logging.hosts[0].address, "2001:db8::30");
+        assert_eq!(logging.hosts[0].port, 601);
+
+        // Hosts are unique and capped.
+        assert!(matches!(
+            extract(&parse("system { logging { host 10.0.0.1\nhost 10.0.0.1 } }").unwrap())
+                .unwrap_err(),
+            IntentError::BadLogging(_)
+        ));
+        let many: String = (1..=MAX_LOG_HOSTS + 1)
+            .map(|n| format!("host 10.0.0.{n}\n"))
+            .collect();
+        assert!(matches!(
+            extract(&parse(&format!("system {{ logging {{ {many} }} }}")).unwrap()).unwrap_err(),
+            IntentError::BadLogging(_)
+        ));
+
+        // Bad values are all named.
+        for text in [
+            "system { logging { host not-an-ip } }",
+            "system { logging { host 10.0.0.1 port 0 } }",
+            "system { logging { host 10.0.0.1 port 65536 } }",
+            "system { logging { host 10.0.0.1 protocol sctp } }",
+            "system { logging { host 10.0.0.1 port } }",
+            "system { logging { host 10.0.0.1 nonsense 1 } }",
+            "system { logging { level chatty } }",
+            "system { logging { nonsense 1 } }",
+        ] {
+            assert!(
+                matches!(
+                    extract(&parse(text).unwrap()).unwrap_err(),
+                    IntentError::BadLogging(_)
+                ),
+                "accepted {text:?}"
+            );
+        }
+
+        // The deferred transport is named rather than silently taken
+        // as plaintext forwarding.
+        assert_eq!(
+            extract(&parse("system { logging { host 10.0.0.1 tls on } }").unwrap())
+                .unwrap_err()
+                .to_string(),
+            "system logging: syslog over TLS is not supported"
+        );
+
+        // Every level keyword maps to an rsyslog severity.
+        for (keyword, severity) in LOG_LEVELS {
+            let text = format!("system {{ logging {{ host 10.0.0.1\nlevel {keyword} }} }}");
+            let logging = intents_of(&text).logging;
+            assert_eq!(logging.effective_level(), *keyword);
+            assert_eq!(
+                log_level_severity(logging.effective_level()),
+                Some(*severity)
+            );
+        }
     }
 
     /// `system { web { session-timeout } }` rides the existing web

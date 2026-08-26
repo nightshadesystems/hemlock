@@ -228,9 +228,7 @@ pub fn apply_user_edit(tree: &mut ConfigTree, edit: &UserEdit) -> Result<(), Str
     // candidate exactly as it was.
     let role = match edit.role.as_deref() {
         None => None,
-        Some(role) => {
-            Some(Role::parse(role).ok_or_else(|| format!("bad role {role:?}"))?)
-        }
+        Some(role) => Some(Role::parse(role).ok_or_else(|| format!("bad role {role:?}"))?),
     };
     let hash = match edit.password.as_deref() {
         None => None,
@@ -347,6 +345,108 @@ fn configured_users_with_password(tree: &ConfigTree) -> Vec<(String, Role, bool)
             ))
         })
         .collect()
+}
+
+// -------------------------------------------------------------- logging
+
+/// The collector cap and the level keywords — mirrored from mgmtd,
+/// which re-validates both.
+const MAX_LOG_HOSTS: usize = 4;
+const LOG_LEVELS: &[&str] = &[
+    "emergencies",
+    "alerts",
+    "critical",
+    "errors",
+    "warnings",
+    "notifications",
+    "informational",
+    "debugging",
+];
+
+/// One remote collector as the page edits it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogHostEdit {
+    pub address: String,
+    /// 0 = the default (514).
+    #[serde(default)]
+    pub port: u16,
+    /// Empty = the default (udp).
+    #[serde(default)]
+    pub protocol: String,
+}
+
+/// The whole `system { logging { ... } }` block, replaced wholesale —
+/// the page edits the collector list as a set, which is what it is.
+#[derive(Debug, Default, Deserialize)]
+pub struct LoggingEdit {
+    #[serde(default)]
+    pub hosts: Vec<LogHostEdit>,
+    /// Empty = clear the leaf (back to the default level).
+    #[serde(default)]
+    pub level: String,
+}
+
+pub fn apply_logging_edit(tree: &mut ConfigTree, edit: &LoggingEdit) -> Result<(), String> {
+    // Validate everything before touching the tree.
+    if !edit.level.is_empty() && !LOG_LEVELS.contains(&edit.level.as_str()) {
+        return Err(format!("bad level {:?}", edit.level));
+    }
+    if edit.hosts.len() > MAX_LOG_HOSTS {
+        return Err(format!(
+            "at most {MAX_LOG_HOSTS} logging hosts ({} given)",
+            edit.hosts.len()
+        ));
+    }
+    let mut hosts: Vec<(String, u16, String)> = Vec::new();
+    for host in &edit.hosts {
+        let address: std::net::IpAddr = host
+            .address
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad host {:?}", host.address))?;
+        let address = address.to_string();
+        if hosts.iter().any(|(existing, _, _)| *existing == address) {
+            return Err(format!("duplicate host {address}"));
+        }
+        let protocol = match host.protocol.as_str() {
+            "" | "udp" => "udp",
+            "tcp" => "tcp",
+            other => return Err(format!("bad protocol {other:?} (udp or tcp)")),
+        };
+        hosts.push((address, host.port, protocol.to_string()));
+    }
+
+    let system = tree.block_mut("system");
+    if hosts.is_empty() && edit.level.is_empty() {
+        ConfigTree::remove_block(system, "logging", &[]);
+        remove_block_if_empty(tree, "system");
+        return Ok(());
+    }
+    let logging = ConfigTree::ensure_block(system, "logging", &[]);
+    ConfigTree::remove_leaf(logging, "host");
+    for (address, port, protocol) in hosts {
+        let mut values = vec![address];
+        // Defaults stay unwritten, so the stored config says only what
+        // the operator actually chose.
+        if port != 0 && port != 514 {
+            values.push("port".into());
+            values.push(port.to_string());
+        }
+        if protocol != "udp" {
+            values.push("protocol".into());
+            values.push(protocol);
+        }
+        logging.push(Item::Leaf {
+            name: "host".into(),
+            values,
+        });
+    }
+    if edit.level.is_empty() {
+        ConfigTree::remove_leaf(logging, "level");
+    } else {
+        ConfigTree::set_leaf(logging, "level", vec![edit.level.clone()]);
+    }
+    Ok(())
 }
 
 /// `system { web { session-timeout <minutes> } }`.
@@ -619,6 +719,117 @@ mod tests {
     }
 
     #[test]
+    fn writes_the_logging_block() {
+        let mut tree = ConfigTree::default();
+        apply_logging_edit(
+            &mut tree,
+            &LoggingEdit {
+                hosts: vec![
+                    LogHostEdit {
+                        address: "10.42.0.30".into(),
+                        port: 0,
+                        protocol: String::new(),
+                    },
+                    LogHostEdit {
+                        address: "10.42.0.31".into(),
+                        port: 6514,
+                        protocol: "tcp".into(),
+                    },
+                ],
+                level: "informational".into(),
+            },
+        )
+        .unwrap();
+        // Defaults stay unwritten: the stored config says only what
+        // was actually chosen.
+        assert_eq!(
+            tree.to_text(),
+            "system {\n    logging {\n        \
+             host 10.42.0.30\n        \
+             host 10.42.0.31 port 6514 protocol tcp\n        \
+             level informational\n    }\n}\n"
+        );
+
+        // The list is a set: a second edit replaces it whole.
+        apply_logging_edit(
+            &mut tree,
+            &LoggingEdit {
+                hosts: vec![LogHostEdit {
+                    address: "10.0.0.9".into(),
+                    port: 514,
+                    protocol: "udp".into(),
+                }],
+                level: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tree.to_text(),
+            "system {\n    logging {\n        host 10.0.0.9\n    }\n}\n"
+        );
+
+        // Emptying it takes the blocks with it.
+        apply_logging_edit(&mut tree, &LoggingEdit::default()).unwrap();
+        assert_eq!(tree.to_text(), "");
+    }
+
+    #[test]
+    fn rejects_bad_logging_edits() {
+        let before = "system {\n    logging {\n        host 10.0.0.1\n    }\n}\n";
+        for edit in [
+            LoggingEdit {
+                level: "chatty".into(),
+                ..LoggingEdit::default()
+            },
+            LoggingEdit {
+                hosts: vec![LogHostEdit {
+                    address: "not-an-ip".into(),
+                    port: 0,
+                    protocol: String::new(),
+                }],
+                ..LoggingEdit::default()
+            },
+            LoggingEdit {
+                hosts: vec![LogHostEdit {
+                    address: "10.0.0.1".into(),
+                    port: 0,
+                    protocol: "sctp".into(),
+                }],
+                ..LoggingEdit::default()
+            },
+            LoggingEdit {
+                hosts: vec![
+                    LogHostEdit {
+                        address: "10.0.0.1".into(),
+                        port: 0,
+                        protocol: String::new(),
+                    },
+                    LogHostEdit {
+                        address: "10.0.0.1".into(),
+                        port: 0,
+                        protocol: String::new(),
+                    },
+                ],
+                ..LoggingEdit::default()
+            },
+            LoggingEdit {
+                hosts: (1..=5)
+                    .map(|n| LogHostEdit {
+                        address: format!("10.0.0.{n}"),
+                        port: 0,
+                        protocol: String::new(),
+                    })
+                    .collect(),
+                ..LoggingEdit::default()
+            },
+        ] {
+            let mut tree = tree_of(before);
+            assert!(apply_logging_edit(&mut tree, &edit).is_err());
+            assert_eq!(tree.to_text(), before, "a rejected edit changed the tree");
+        }
+    }
+
+    #[test]
     fn writes_the_web_session_timeout() {
         let mut tree = ConfigTree::default();
         apply_web_edit(
@@ -635,13 +846,7 @@ mod tests {
         // 0 clears the block; an emptied system block goes too.
         apply_web_edit(&mut tree, &WebEdit { session_timeout: 0 }).unwrap();
         assert_eq!(tree.to_text(), "");
-        assert!(apply_web_edit(
-            &mut tree,
-            &WebEdit {
-                session_timeout: 4
-            }
-        )
-        .is_err());
+        assert!(apply_web_edit(&mut tree, &WebEdit { session_timeout: 4 }).is_err());
     }
 
     #[test]

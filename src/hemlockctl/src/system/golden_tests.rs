@@ -76,3 +76,42 @@ fn clocks_and_stamps() {
     assert_eq!(render::clock(90_061), "25:01:01");
     assert_eq!(render::stamp(1_787_649_164), "2026-08-25 09:12:44");
 }
+
+#[test]
+fn logging() {
+    assert_golden(
+        &render::logging(&fx::logging_state()),
+        include_str!("../../tests/golden/logging.txt"),
+    );
+    assert_golden(
+        &as_json("logging", &fx::logging_state()),
+        include_str!("../../tests/golden/logging.json"),
+    );
+}
+
+/// Nothing forwarded, and an unreadable journal, both say so rather
+/// than rendering as a quiet switch.
+#[test]
+fn logging_edge_cases() {
+    let mut state = super::model::LoggingState {
+        level: "informational".into(),
+        requested: 50,
+        journal_available: true,
+        ..Default::default()
+    };
+    let text = render::logging(&state);
+    assert!(
+        text.contains("Remote hosts : none (local journal only)"),
+        "{text}"
+    );
+    assert!(text.contains("(the journal is empty)"), "{text}");
+
+    state.journal_available = false;
+    let text = render::logging(&state);
+    assert!(
+        text.contains("% the system journal is not readable here"),
+        "{text}"
+    );
+    // With no journal there is no tail footer to print.
+    assert!(!text.contains("for more"), "{text}");
+}

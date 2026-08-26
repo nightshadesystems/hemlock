@@ -142,10 +142,7 @@ pub struct ConfigAccount {
 }
 
 /// The `system { login { user <name> { ... } } }` account, if any.
-pub fn config_account(
-    tree: &hemlock_config::ConfigTree,
-    username: &str,
-) -> Option<ConfigAccount> {
+pub fn config_account(tree: &hemlock_config::ConfigTree, username: &str) -> Option<ConfigAccount> {
     use hemlock_config::ConfigTree;
     let (_, system) = tree.block("system")?;
     let (_, login) = ConfigTree::blocks_named(system, "login").next()?;

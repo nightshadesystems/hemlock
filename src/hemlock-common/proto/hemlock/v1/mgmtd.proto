@@ -35,6 +35,11 @@ service Mgmt {
   rpc TouchSession(TouchSessionRequest) returns (TouchSessionResponse);
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+
+  // The tail of the system journal, for `show logging` and the web
+  // console's live tail. mgmtd runs as root, so it can read the whole
+  // journal where an operator account may not.
+  rpc GetLog(GetLogRequest) returns (GetLogResponse);
 }
 
 enum ConfigSource {
@@ -152,6 +157,30 @@ message ListSessionsRequest {}
 
 message ListSessionsResponse {
   repeated SessionEntry sessions = 1;
+}
+
+message GetLogRequest {
+  // Lines to return, newest last; 0 means the default (50).
+  uint32 count = 1;
+}
+
+message GetLogResponse {
+  repeated LogEntry entries = 1;
+  // False when the journal could not be read at all (no journalctl, or
+  // a development host) — the caller says so rather than showing an
+  // empty log as if the box were silent.
+  bool available = 2;
+}
+
+message LogEntry {
+  int64 time_unix = 1;
+  string host = 2;
+  // The syslog identifier, e.g. "mgmtd".
+  string tag = 3;
+  uint32 pid = 4;   // 0 = none recorded
+  string message = 5;
+  // Syslog severity 0..7; 8 = the journal did not say.
+  uint32 severity = 6;
 }
 
 message SessionEntry {
