@@ -36,9 +36,15 @@ jobs:
       # headers, even though it can only run on hardware with a vendor blob.
       - run: cargo clippy -p hemlock-sai --features real-sai --all-targets -- -D warnings
       - run: cargo build -p hemlock-syncd --features real-sai
-      # Definition-of-done gates
-      - run: cargo run -p hemlockctl -- platform lint platforms/cel-e1031
-        if: hashFiles('platforms/cel-e1031/platform.toml') != ''
+      # Definition-of-done gates: every shipped platform must lint.
+      - name: Lint platform manifests
+        run: |
+          for dir in platforms/*/; do
+            id="$(basename "$dir")"
+            case "$id" in _*) continue ;; esac
+            echo "== $id"
+            cargo run -q -p hemlockctl -- platform lint "$dir"
+          done
       # The image workflow's platform dropdown must list every platform
       # (GitHub choice inputs are static YAML; keep them in sync here).
       - name: Check image-workflow platform dropdown

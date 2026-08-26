@@ -115,18 +115,34 @@ fn write_io_port(_port: u64, _value: u8) -> std::io::Result<()> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
+/// Edgecore AS4610-54T (Accton). Placeholder: the board needs a
+/// `pre_asic_init` that unbinds the iProc CMICd platform driver and
+/// deasserts the external PHYs' CPLD reset (without which the SDK's PHY
+/// probe finds nothing), plus a `post_asic_init` that loads the Helix4
+/// LED program. Both land in phase 3, with the OpenBCM shim they drive —
+/// there is nothing to poke until the datapath exists. Registered now so
+/// the manifest can name it.
+pub struct As4610Quirks;
+
+impl PlatformQuirks for As4610Quirks {
+    fn name(&self) -> &'static str {
+        "as4610"
+    }
+}
+
 /// Look up a quirks implementation by registry name.
 pub fn by_name(name: &str) -> Option<Box<dyn PlatformQuirks>> {
     match name {
         "generic" => Some(Box::new(GenericQuirks)),
         "haliburton" => Some(Box::new(HaliburtonQuirks)),
+        "as4610" => Some(Box::new(As4610Quirks)),
         _ => None,
     }
 }
 
 /// Names known to the registry, for lint diagnostics.
 pub fn known_names() -> &'static [&'static str] {
-    &["generic", "haliburton"]
+    &["generic", "haliburton", "as4610"]
 }
 
 #[cfg(test)]

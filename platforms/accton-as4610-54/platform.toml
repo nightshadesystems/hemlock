@@ -1,0 +1,275 @@
+# Edgecore AS4610-54T (Accton AS4610-54) — Hemlock platform manifest
+#
+# 48x1G copper + 4x10G SFP+ + 2x20G QSFP+ stacking. Broadcom BCM56340
+# (Helix4) with an ON-DIE iProc Cortex-A9 host CPU — no PCIe, and no SAI
+# build published for armhf, so this board runs the OpenBCM backend.
+# Background and the whole plan: docs/as4610-54-port.md.
+#
+# Sources (data referenced, never code ported):
+#   Cumulus Linux porttab for arm-accton-as4610-54-r0  (faceplate -> geN)
+#   edgenos platform/accton-as4610-54/                 (config.bcm, DTS,
+#                                                       bcmd-prep.sh)
+#   ONL packages/platforms/accton/armxx/arm-accton-as4610/  (CPLD map)
+# Provenance table + the raw porttab: README.md next to this file.
+
+schema_version = 1
+
+[platform]
+id = "accton-as4610-54"
+onie_machine = "arm-accton-as4610-54-r0"
+vendor = "Edgecore"
+model = "AS4610-54T"
+asic_family = "broadcom-xgs"
+asic = "helix4"
+# 32-bit ARMv7 hard-float (Cortex-A9). Selects an armhf rootfs, a FIT
+# boot image instead of GRUB, and the armv7 installer target.
+cpu_arch = "armhf"
+# The CMIC is on-die on the SoC bus (`iproc_cmicd@48000000`), so there is
+# no PCI device to find: a pcie probe would report "no ASIC" on a live
+# switch and let --auto-mock mock it.
+asic_attach = "soc"
+
+# ---------------------------------------------------------------------------
+# Datapath: OpenBCM, not SAI.
+#
+# SONiC's platform/broadcom/sai.mk publishes libsaibcm for amd64 only (the
+# package server 404s on _armhf and _arm64), and sonic-buildimage has no
+# as4610 device directory at all. There is no SAI for this CPU, so the
+# datapath is Hemlock's own C shim over the OpenBCM SDK, behind the same
+# SaiBackend trait. Nothing above hemlock-sai can tell the difference.
+# ---------------------------------------------------------------------------
+
+[sai]
+backend = "openbcm"
+shim_path = "/usr/lib/libhemlockbcm.so.1"
+abi_major = 1
+# Dumped from the stock ICOS NOS on this board (`bcmsh config show`) and
+# carried by edgenos; placed by vendor/fetch-vendor.sh, never committed.
+config_bcm = "as4610-54.config.bcm"
+
+[kernel]
+# The BDE pair plus KNET, built from OpenBCM's own GPL kernel modules
+# (systems/bde/linux/kernel and systems/linux/kernel/modules).
+#
+# No psample and no linux-knet-cb: OpenBCM 6.5.16's knet-cb.c includes
+# only gmodule.h/kcom.h/bcm-knet.h — the psample sFlow callback is a SONiC
+# saibcm-modules addition, so the E1031's module list does not transfer.
+# Listing psample here would fail the image build's loadability gate for
+# nothing. (Consequence for phase 6: sFlow has no psample punt path on
+# this platform; the shim delivers sampled packets itself.)
+required_modules = ["linux-kernel-bde", "linux-user-bde", "linux-bcm-knet"]
+
+[kernel.module_args]
+# dmasize=8M is edgenos's value for this board — a quarter of the E1031's
+# 32M, because the iProc SoC's DMA pool is smaller. Phase 5 validates the
+# MTU below against it: 52 netdevs of 9238-byte rx buffers is the load.
+linux-kernel-bde = "dmasize=8M"
+# 9100 for parity with the E1031. edgenos runs 1600, but their own comment
+# says that was to match their peer network, not a hardware limit.
+linux-bcm-knet = "use_rx_skb=1 rx_buffer_size=9238 default_mtu=9100"
+
+# Out-of-band management: the iProc GMAC (`gmac0`, phy-mode sgmii).
+# ONL's udev rules are what rename it to `ma1`, and Hemlock does not ship
+# ONL userspace — so a stock kernel should present it as eth0. Confirmed
+# in phase 5; a udev rename is the fallback if the kernel disagrees.
+[management]
+interface = "Management1"
+os_device = "eth0"
+
+# ---------------------------------------------------------------------------
+# Ports: 48x1G copper + 4x10G SFP+ front panel.
+#
+# `lanes` on the OpenBCM backend is the SDK LOGICAL PORT NUMBER, which is
+# how the shim identifies a port (there are no SONiC serdes lanes here).
+# From config.bcm's bitmaps and bcmd.c: geN is logical N+1
+# (pbmp_xport_ge = 0x3fffffffffffe, bits 1..49) and xeN is logical 50+N
+# (pbmp_xport_xe = 0xfc000000000000, bits 50..55).
+#
+# The faceplate -> geN map is SCRAMBLED and pair-swapped, and is copied
+# verbatim from the Cumulus Linux porttab (reproduced in README.md).
+# Faceplate 1-24 sit on ge24-47 and 25-48 on ge0-23; within each block of
+# four the first pair is swapped. Do not "simplify" it into a formula.
+#
+# `sdk_names` is the same table's right-hand column. syncd asserts it
+# against the name the shim reports for each logical port at startup, so
+# the +1 above is never relied on and a mistranscription fails on first
+# boot rather than silently mis-cabling a rack.
+#
+# Not modeled: ge48 (logical 49) is internal — config.bcm gives it
+# port_phy_addr_ge48=0 — and the two QSFP+ stacking ports (xe4/xe5,
+# logical 54/55), which Cumulus does not expose either. syncd logs and
+# ignores ASIC ports the manifest does not claim.
+# ---------------------------------------------------------------------------
+
+# Helix4 egress queues: 8 unicast + 1 multicast, as on the E1031.
+[ports]
+uc_queues = 8
+mc_queues = 1
+
+[[ports.group]]
+prefix = "Ethernet"
+name_start = 1
+index_start = 1
+speed_mbps = 1000
+autoneg = true
+alias_prefix = "etp"
+media = "1000BASE-T"
+# Six octal PHYs, one per bank of eight faceplate ports: config.bcm's
+# port_phy_addr_ge* run 0x1-0x8, 0xb-0x12, 0x15-0x1c, 0x21-0x28,
+# 0x2b-0x32, 0x35-0x3c. (edgenos's config.bcm header comment says
+# "BCM5464S"; a 5464 is a quad PHY and cannot produce banks of eight.
+# edgenos's own packet-flow doc and the datasheet both say BCM54282.)
+phy_model = "BCM54282"
+supported_modes = ["10M/half", "10M/full", "100M/half", "100M/full", "1G/full", "auto"]
+lanes = [
+     26,  25,  27,  28,  30,  29,  31,  32,  34,  33,  35,  36,
+     38,  37,  39,  40,  42,  41,  43,  44,  46,  45,  47,  48,
+      2,   1,   3,   4,   6,   5,   7,   8,  10,   9,  11,  12,
+     14,  13,  15,  16,  18,  17,  19,  20,  22,  21,  23,  24,
+]
+sdk_names = [
+    "ge25", "ge24", "ge26", "ge27", "ge29", "ge28",
+    "ge30", "ge31", "ge33", "ge32", "ge34", "ge35",
+    "ge37", "ge36", "ge38", "ge39", "ge41", "ge40",
+    "ge42", "ge43", "ge45", "ge44", "ge46", "ge47",
+    "ge1",  "ge0",  "ge2",  "ge3",  "ge5",  "ge4",
+    "ge6",  "ge7",  "ge9",  "ge8",  "ge10", "ge11",
+    "ge13", "ge12", "ge14", "ge15", "ge17", "ge16",
+    "ge18", "ge19", "ge21", "ge20", "ge22", "ge23",
+]
+
+[[ports.group]]
+prefix = "Ethernet"
+name_start = 49
+index_start = 49
+speed_mbps = 10000
+autoneg = false
+alias_prefix = "etp"
+media = "SFP+"
+# config.bcm: port_phy_addr_xe0..3 = 0x40..0x43. Needs bcm84758_ucode
+# (a request_firmware blob, fetched at image build; never committed).
+phy_model = "BCM84758"
+supported_modes = ["1G/full", "10G/full", "auto"]
+lanes = [50, 51, 52, 53]
+sdk_names = ["xe0", "xe1", "xe2", "xe3"]
+
+# ---------------------------------------------------------------------------
+# I2C topology, from the device tree (edgenos
+# platform/accton-as4610-54/dts/arm-accton-as4610.dts):
+#
+#   i2c-0 (SoC)  cpld @0x30
+#   i2c-1 (SoC)  pca9548 @0x70 -> buses 2-9
+#                  ch0-3  optoe2 @0x50   SFP+  (Ethernet49-52)
+#                  ch4-5  optoe1 @0x50   QSFP+ (not modeled)
+#                  ch6    psu eeproms @0x50/0x51, pmbus @0x58/0x59
+#                  ch7    lm77 @0x48, board eeprom @0x50, RTC @0x68
+#
+# Both roots are SoC controllers registering as "iproc-smbus"
+# (xgs_iproc_smbus.c), so they are told apart by instance, not by name.
+#
+# The DTS instantiates all of this in-tree today; Hemlock's DTS keeps only
+# the two controllers and lets pmon create the rest, so the numbering
+# above is the manifest's own (see child_bus_base). Bus numbers are names,
+# not predictions: pmon follows the mux's channel-N links at bring-up and
+# warns if the kernel disagrees.
+#
+# The RTC (M41T11 @0x68) stays out: a dead battery makes the 4.19+ RTC
+# core re-arm an expired alarm through a muxed read every pass, holding
+# i2c1's xfer lock until userspace wedges. NTP sets the clock.
+# ---------------------------------------------------------------------------
+
+[[hardware.i2c.root]]
+name = "cpld-bus"
+adapter = "iproc-smbus"
+instance = 0
+
+[[hardware.i2c.root]]
+name = "mux-bus"
+adapter = "iproc-smbus"
+instance = 1
+
+[[hardware.i2c.mux]]
+name = "main-mux"
+driver = "pca9548"
+parent_bus = "mux-bus"
+address = 0x70
+child_bus_base = 2
+channels = 8
+
+[[hardware.i2c.device]]
+driver = "as4610_54_cpld"
+bus = "cpld-bus"
+address = 0x30
+purpose = "cpld"
+
+[[hardware.i2c.device]]
+driver = "lm77"
+bus = 9
+address = 0x48
+purpose = "board-thermal"
+
+[[hardware.i2c.device]]
+driver = "24c04"
+bus = 9
+address = 0x50
+purpose = "syseeprom"
+
+# The board's one temperature sensor (lm77 on mux channel 7). Thresholds
+# follow the E1031's convention: warn well below the Helix4's own limit,
+# crit at the point the chip is in trouble. Both want confirming against
+# the board's thermal design in phase 5.
+[[hardware.thermal.sensor]]
+name = "board-ambient"
+hwmon = "9-0048"
+input = "temp1"
+warn_c = 55.0
+crit_c = 65.0
+
+# ---------------------------------------------------------------------------
+# NOT YET MODELED: fans and PSUs.
+#
+# The board has 2 fans and 2 PSUs, both read through the CPLD at
+# i2c-0 0x30 (ONL: fan tach 0x2c/0x2d with rpm = raw*379*60/2/100, fan PWM
+# 0x2b low nibble, PSU present/power-good bits in 0x11). pmon reads fans
+# and PSU state from *sysfs*, so which attributes exist here depends on an
+# open question in docs/as4610-54-port.md: whether to port ONL's
+# accton_as4610_{cpld,fan,psu}.c into kmod/ (the cel-e1031 smc.c
+# precedent) or teach pmon to talk to the CPLD directly.
+#
+# Until that is settled these sections stay absent rather than guessing at
+# attribute names, so `show environment` reports the sensor above and no
+# fans — which is true — instead of inventing readings. Note that ONL's
+# fan driver registers hwmon on a *platform* device with non-standard
+# attribute names (`fan1_speed_rpm`, `fan_duty_cycle_percentage`), which
+# the manifest's `hwmon = "<bus>-<addr>"` form cannot address; adopting it
+# needs one more schema field. There is deliberately no
+# [hardware.thermal.fan_control] either: a fan curve with no fans to drive
+# would be a lie.
+# ---------------------------------------------------------------------------
+
+# SFP+ cages: optoe2 (SFP-style, 2-wire, EEPROM at 0x50), one per mux
+# channel. The DTS labels these port49..port52, matching the faceplate.
+[[hardware.transceiver]]
+port = "Ethernet49"
+bus = 2
+driver = "optoe2"
+
+[[hardware.transceiver]]
+port = "Ethernet50"
+bus = 3
+driver = "optoe2"
+
+[[hardware.transceiver]]
+port = "Ethernet51"
+bus = 4
+driver = "optoe2"
+
+[[hardware.transceiver]]
+port = "Ethernet52"
+bus = 5
+driver = "optoe2"
+
+# CMICd unbind + the CPLD PHY-reset deassert before datapath init, and the
+# Helix4 LED program after it. Implemented in phase 3 alongside the shim.
+[hardware.quirks]
+driver = "as4610"

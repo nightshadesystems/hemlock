@@ -22,6 +22,7 @@ on:
         description: "Platform ID"
         type: choice
         options:
+          - accton-as4610-54
           - cel-e1031
         default: cel-e1031
       mode:

@@ -6,10 +6,13 @@ It is a sibling project to Nightshade (a Debian-based firewall OS) and shares
 its operational model: a curly-brace hierarchical configuration with
 candidate/running separation, `commit`, `commit confirm`, and `rollback`.
 
-Hemlock drives Broadcom XGS switch ASICs exclusively through the vendor's
-**SAI** (Switch Abstraction Interface) library — never the raw Broadcom SDK,
-OpenNSL, or switchdev. Base OS is Debian 13 (trixie) with systemd, installed
-via ONIE self-extracting images built per platform.
+Hemlock drives Broadcom XGS switch ASICs through the vendor's **SAI**
+(Switch Abstraction Interface) library — never OpenNSL or switchdev. SAI is
+the default and the preference; where no SAI build exists for a platform's
+CPU architecture, a second backend over the source-available OpenBCM SDK is
+permitted, behind the same trait and selected by the platform manifest (see
+[the AS4610 port](docs/as4610-54-port.md)). Base OS is Debian 13 (trixie)
+with systemd, installed via ONIE self-extracting images built per platform.
 
 ## Design principles
 
@@ -51,9 +54,14 @@ $ cargo run -p hemlockctl -- platform lint platforms/cel-e1031
 | Platform | ASIC | Status |
 |---|---|---|
 | Celestica E1031 (Seastone) | Broadcom Helix4, 48x1G + 4x10G | phase 1 bring-up |
+| Edgecore AS4610-54T | Broadcom Helix4 (ARM iProc), 48x1G + 4x10G | manifest + mock ([port plan](docs/as4610-54-port.md)) |
 | Celestica Questone 2A | Broadcom Trident3 | planned |
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Vendor SAI libraries and ASIC data files are
-proprietary and are never distributed with this repository.
+MIT — see [LICENSE](LICENSE), and it covers Hemlock's own code only.
+Vendor SAI libraries and ASIC data files are proprietary and are never
+distributed with this repository. Neither is the OpenBCM SDK (Broadcom's
+Switch-APIs licence, with GPL-2.0 kernel modules) that the AS4610's
+backend builds against: like every vendor artifact it is fetched at image
+build time on the operator's machine, never committed here.
