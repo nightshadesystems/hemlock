@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
-use crate::schema::{BusRef, I2cSection, KernelSection, Manifest};
+use crate::schema::{BusRef, I2cSection, KernelSection, Manifest, DEFAULT_ROOT_NAME};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SysinitError {
@@ -172,6 +172,7 @@ fn usable_mac(mac: [u8; 6]) -> bool {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BusMap {
     map: BTreeMap<u32, u32>,
+    roots: BTreeMap<String, u32>,
 }
 
 impl BusMap {
@@ -179,9 +180,24 @@ impl BusMap {
         self.map.insert(declared, actual);
     }
 
+    /// Record a named root adapter's kernel bus number.
+    pub fn insert_root(&mut self, name: impl Into<String>, bus: u32) {
+        self.roots.insert(name.into(), bus);
+    }
+
     /// The kernel bus number for a declared one.
     pub fn resolve(&self, declared: u32) -> u32 {
         self.map.get(&declared).copied().unwrap_or(declared)
+    }
+
+    /// Resolve a manifest bus reference: a named root adapter, or a
+    /// declared number translated through the map. `None` means the
+    /// manifest named a root that does not exist.
+    pub fn resolve_ref(&self, bus: &BusRef) -> Option<u32> {
+        match bus {
+            BusRef::Number(n) => Some(self.resolve(*n)),
+            BusRef::Named(name) => self.roots.get(name).copied(),
+        }
     }
 
     /// Translate a `<bus>-<addr>` sysfs identity (a manifest `hwmon`
@@ -239,6 +255,17 @@ impl Sysfs {
     /// Find the bus number of the adapter whose name starts with `prefix`
     /// (PCI SMBus adapter numbering varies between boots).
     pub fn find_root_adapter(&self, prefix: &str) -> Result<u32, SysinitError> {
+        self.find_root_adapter_instance(prefix, 0)
+    }
+
+    /// The `instance`-th adapter whose name starts with `prefix`, counting
+    /// in bus-number order. SoC i2c controllers share one driver name, so
+    /// a prefix alone cannot tell `i2c0` from `i2c1`.
+    pub fn find_root_adapter_instance(
+        &self,
+        prefix: &str,
+        instance: u32,
+    ) -> Result<u32, SysinitError> {
         let dir = self.i2c_dev_dir();
         let entries = std::fs::read_dir(&dir)
             .map_err(|_| SysinitError::RootAdapterNotFound(prefix.to_string()))?;
@@ -254,20 +281,37 @@ impl Sysfs {
             .collect();
         buses.sort_unstable();
         buses
-            .first()
+            .get(instance as usize)
             .copied()
             .ok_or_else(|| SysinitError::RootAdapterNotFound(prefix.to_string()))
     }
 
-    fn resolve(&self, bus: &BusRef, root: Option<u32>, what: &str) -> Result<u32, SysinitError> {
-        match bus {
-            BusRef::Number(n) => Ok(*n),
-            BusRef::Named(_) => root.ok_or_else(|| SysinitError::I2c {
-                action: "resolve",
-                bus: 0,
-                detail: format!("{what} references \"root\" but no root_adapter is declared"),
-            }),
+    /// Locate every declared root adapter. `root_adapter = "..."` is
+    /// shorthand for one root named `root`; `[[hardware.i2c.root]]`
+    /// entries name theirs and disambiguate same-named adapters by
+    /// instance.
+    fn find_roots(&self, i2c: &I2cSection) -> Result<BTreeMap<String, u32>, SysinitError> {
+        let mut roots = BTreeMap::new();
+        if let Some(prefix) = &i2c.root_adapter {
+            let bus = self.find_root_adapter(prefix)?;
+            info!(bus, adapter = %prefix, name = DEFAULT_ROOT_NAME, "root i2c adapter located");
+            roots.insert(DEFAULT_ROOT_NAME.to_string(), bus);
         }
+        for root in &i2c.roots {
+            let bus = self.find_root_adapter_instance(&root.adapter, root.instance)?;
+            info!(bus, adapter = %root.adapter, name = %root.name, instance = root.instance,
+                  "root i2c adapter located");
+            roots.insert(root.name.clone(), bus);
+        }
+        Ok(roots)
+    }
+
+    fn resolve(&self, bus: &BusRef, buses: &BusMap, what: &str) -> Result<u32, SysinitError> {
+        buses.resolve_ref(bus).ok_or_else(|| SysinitError::I2c {
+            action: "resolve",
+            bus: 0,
+            detail: format!("{what} references root {bus} but no such root adapter is declared"),
+        })
     }
 
     /// Does `<bus>-<addr>` already exist (previous run, or udev)?
@@ -337,18 +381,15 @@ impl Sysfs {
     pub fn instantiate_i2c(&self, i2c: &I2cSection) -> Result<I2cReport, SysinitError> {
         let mut report = I2cReport::default();
 
-        let root = match &i2c.root_adapter {
-            Some(prefix) => {
-                let bus = self.find_root_adapter(prefix)?;
-                info!(bus, adapter = %prefix, "root i2c adapter located");
-                Some(bus)
-            }
-            None => None,
-        };
-        report.root_bus = root;
+        for (name, bus) in self.find_roots(i2c)? {
+            report.buses.insert_root(name, bus);
+        }
+        report.root_bus = report
+            .buses
+            .resolve_ref(&BusRef::Named(crate::schema::DEFAULT_ROOT_NAME.to_string()));
 
         for write in &i2c.pre_writes {
-            let bus = self.resolve(&write.bus, root, "pre_write")?;
+            let bus = self.resolve(&write.bus, &report.buses, "pre_write")?;
             self.raw_write(bus, write.address, &write.data, &write.purpose)?;
         }
 
@@ -356,8 +397,7 @@ impl Sysfs {
         // mux's channel — so each one's parent is resolved through the map
         // built so far, and its own channels are recorded before the next.
         for mux in &i2c.muxes {
-            let declared_parent = self.resolve(&mux.parent_bus, root, &mux.name)?;
-            let parent = report.buses.resolve(declared_parent);
+            let parent = self.resolve(&mux.parent_bus, &report.buses, &mux.name)?;
             let label = format!(
                 "mux {} ({}@{parent}-0x{:02x})",
                 mux.name, mux.driver, mux.address
@@ -386,7 +426,7 @@ impl Sysfs {
         }
 
         for device in &i2c.devices {
-            let bus = report.buses.resolve(device.bus);
+            let bus = self.resolve(&device.bus, &report.buses, &device.purpose)?;
             let label = format!(
                 "{} ({}@{bus}-0x{:02x})",
                 device.purpose, device.driver, device.address
@@ -414,7 +454,10 @@ impl Sysfs {
     /// fatal — presence is reported separately. Idempotent.
     pub fn instantiate_psus(&self, psus: &[crate::schema::Psu], report: &mut I2cReport) {
         for psu in psus {
-            let bus = report.buses.resolve(psu.bus);
+            let Some(bus) = report.buses.resolve_ref(&psu.bus) else {
+                warn!(psu = %psu.name, bus = %psu.bus, "PSU references an undeclared root adapter");
+                continue;
+            };
             let label = format!("{} ({}@{bus}-0x{:02x})", psu.name, psu.driver, psu.address);
             if self.device_present(bus, psu.address) {
                 report.already_present.push(label);
@@ -457,16 +500,17 @@ impl Sysfs {
     /// TlvInfo; the magic makes a false positive implausible.
     fn syseeprom_base_mac(&self, i2c: &I2cSection) -> Option<[u8; 6]> {
         let dev = i2c.devices.iter().find(|d| d.purpose == "syseeprom")?;
-        let eeprom = |bus: u32| {
-            self.i2c_dev_dir()
+        if let BusRef::Number(bus) = dev.bus {
+            let path = self
+                .i2c_dev_dir()
                 .join(format!("{bus}-{:04x}", dev.address))
-                .join("eeprom")
-        };
-        if let Some(mac) = std::fs::read(eeprom(dev.bus))
-            .ok()
-            .and_then(|blob| parse_onie_base_mac(&blob))
-        {
-            return Some(mac);
+                .join("eeprom");
+            if let Some(mac) = std::fs::read(path)
+                .ok()
+                .and_then(|blob| parse_onie_base_mac(&blob))
+            {
+                return Some(mac);
+            }
         }
         let suffix = format!("-{:04x}", dev.address);
         std::fs::read_dir(self.i2c_dev_dir())
@@ -566,6 +610,7 @@ mod tests {
     fn e1031_like_topology() -> I2cSection {
         I2cSection {
             root_adapter: Some("SMBus iSMT adapter".into()),
+            roots: Vec::new(),
             pre_writes: vec![I2cWrite {
                 bus: BusRef::Named("root".into()),
                 address: 0x73,
@@ -582,7 +627,7 @@ mod tests {
             }],
             devices: vec![I2cDevice {
                 driver: "24lc64t".into(),
-                bus: 2,
+                bus: BusRef::Number(2),
                 address: 0x50,
                 purpose: "syseeprom".into(),
             }],
@@ -717,7 +762,7 @@ mod tests {
         // covered by `devices_follow_actual_child_buses`.)
         topology.devices = vec![I2cDevice {
             driver: "emc2305".into(),
-            bus: 18,
+            bus: BusRef::Number(18),
             address: 0x4d,
             purpose: "fan-controller".into(),
         }];
@@ -882,11 +927,12 @@ lanes = [1]
         let (_dir, sysfs) = fake_sysfs(&[(5, "some adapter")]);
         let i2c = I2cSection {
             root_adapter: None,
+            roots: Vec::new(),
             pre_writes: vec![],
             muxes: vec![],
             devices: vec![I2cDevice {
                 driver: "24c02".into(),
-                bus: 5,
+                bus: BusRef::Number(5),
                 address: 0x52,
                 purpose: "psu-eeprom".into(),
             }],

@@ -163,14 +163,24 @@ impl HwBackend for SysfsBackend {
 
     fn read_fan_rpm(&self, fan: &FanDef) -> Result<u32, HwError> {
         let hwmon = self.buses.resolve_hwmon(&fan.hwmon);
-        let path = Self::hwmon_attr(&hwmon, &format!("{}_input", fan.tach))?;
+        // Standard hwmon spells the tach `<tach>_input`; drivers that
+        // don't (ONL's AS4610 fan driver: `fan1_speed_rpm`) name the
+        // attribute outright.
+        let attr = match &fan.rpm_attr {
+            Some(attr) => attr.clone(),
+            None => format!("{}_input", fan.tach),
+        };
+        let path = Self::hwmon_attr(&hwmon, &attr)?;
         Ok(Self::read_u64(&path)? as u32)
     }
 
     fn set_fan_pwm(&self, fan: &FanDef, percent: u32) -> Result<(), HwError> {
         let hwmon = self.buses.resolve_hwmon(&fan.hwmon);
-        let path = Self::hwmon_attr(&hwmon, &fan.pwm)?;
-        let raw = (percent.min(100) * 255 / 100).to_string();
+        let attr = fan.pwm_attr.as_ref().unwrap_or(&fan.pwm);
+        let path = Self::hwmon_attr(&hwmon, attr)?;
+        // pwm_max is the attribute's full scale: 255 for hwmon `pwmN`,
+        // 100 for a driver that takes a percentage directly.
+        let raw = (percent.min(100) * fan.pwm_max / 100).to_string();
         std::fs::write(&path, &raw).map_err(|source| HwError::Write { path, source })
     }
 
@@ -206,7 +216,12 @@ impl HwBackend for SysfsBackend {
         }
         // Fallback: pmbus driver bound => device dir exists; a readable
         // status/power attribute means the PSU answers on the bus.
-        let device = format!("{}-{:04x}", self.buses.resolve(psu.bus), psu.address);
+        // An unresolvable bus (a root the manifest never declared) is a
+        // lint error; here it just means the PSU cannot be read.
+        let Some(bus) = self.buses.resolve_ref(&psu.bus) else {
+            return Ok((false, false));
+        };
+        let device = format!("{bus}-{:04x}", psu.address);
         let dir = format!("/sys/bus/i2c/devices/{device}");
         if !std::path::Path::new(&dir).exists() {
             return Ok((false, false));
@@ -219,10 +234,10 @@ impl HwBackend for SysfsBackend {
     }
 
     fn read_transceiver(&self, xcvr: &Transceiver) -> Result<Option<TransceiverInfo>, HwError> {
-        let path = format!(
-            "/sys/bus/i2c/devices/{}-0050/eeprom",
-            self.buses.resolve(xcvr.bus)
-        );
+        let Some(bus) = self.buses.resolve_ref(&xcvr.bus) else {
+            return Ok(None);
+        };
+        let path = format!("/sys/bus/i2c/devices/{bus}-0050/eeprom");
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             // Empty cage: EEPROM reads fail with EIO/ENXIO.
@@ -488,6 +503,9 @@ mod tests {
             hwmon: "23-004d".into(),
             tach: "fan4".into(),
             pwm: "pwm4".into(),
+            rpm_attr: None,
+            pwm_attr: None,
+            pwm_max: 255,
             presence_attr: None,
             presence_active_low: false,
             led_attr: None,

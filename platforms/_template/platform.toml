@@ -29,20 +29,50 @@ model = "SW48 example switch"
 asic_family = "broadcom-xgs"
 # Concrete ASIC name, informational + used by the build pipeline.
 asic = "helix4"
+# CPU architecture, in Debian's spelling. Selects the rootfs arch, the
+# boot artifacts (GRUB on amd64, a FIT image on armhf) and the installer
+# target triple. Known: "amd64" (default), "armhf". Lint cross-checks it
+# against onie_machine's prefix, so the two can never disagree quietly.
+# cpu_arch = "amd64"
+# How the host CPU reaches the ASIC, which is what syncd's "is the ASIC
+# really here" probe looks for. "pcie" (default) scans the PCI bus for
+# the vendor id; "soc" looks for the on-die CMIC platform device, for
+# boards where there is no PCI device to find. Getting this wrong means
+# --auto-mock cheerfully mocks a live switch.
+# asic_attach = "pcie"
+
+# ----------------------------------------------------------------------------
+# The datapath library.
+#
+# `backend` picks which one drives the ASIC:
+#   "sai"     (default) the vendor's libsai — always prefer this;
+#   "openbcm" Hemlock's own C shim over the OpenBCM SDK, for boards where
+#             no SAI build is published for the CPU architecture.
+# Both sit behind the same SaiBackend trait; nothing above hemlock-sai can
+# tell them apart. Fields below marked (sai) or (openbcm) are required for
+# that backend and rejected for the other — lint says which.
+# ----------------------------------------------------------------------------
 
 [sai]
-# Vendor SAI package name (Debian package providing libsai).
+# backend = "sai"
+# (openbcm) Absolute path of the shim inside the image, and the ABI major
+# version the image provides. syncd refuses a shim reporting a different
+# major. See docs/as4610-54-port.md for the ABI contract.
+# shim_path = "/usr/lib/libhemlockbcm.so.1"
+# abi_major = 1
+#
+# (sai) Vendor SAI package name (Debian package providing libsai).
 package = "libsaibcm"
-# Per-platform version pin: the exact vendor package version this board
+# (sai) Per-platform version pin: the exact vendor package version this board
 # ships with, resolved to a .deb by vendor/fetch-vendor.sh (the SONiC
 # public package server hosts these). Pinning is PER PLATFORM, never
 # global — different boards may ride different SAI eras.
 version_pin = "8.4.50.0"
-# The SAI API version that build implements — selects which header set
+# (sai) The SAI API version that build implements — selects which header set
 # under vendor/sai-headers/ bindgen uses for this platform's image. Get it
 # from saiversion.h in the matching libsaibcm-dev package.
 api_headers = "v1.11.0"
-# Absolute path of the vendor library inside the installed image. syncd
+# (sai) Absolute path of the vendor library inside the installed image. syncd
 # dlopens exactly this path.
 libsai_path = "/usr/lib/libsai.so.1"
 # ASIC init config, relative to this directory. Placed by
@@ -126,6 +156,13 @@ lanes = [53, 54, 55, 56]
 # Breakout capability declaration (consumed in a later phase), e.g. a
 # 40G port splittable into 4x10G:
 # breakout = ["4x10G"]
+# Vendor SDK port names, one per port, in the order the group expands (so
+# parallel to `lanes` for single-lane ports). On the openbcm backend the
+# shim reports each port's SDK name beside its logical number and syncd
+# asserts them against this list at startup, so a wrong port map fails on
+# first boot instead of quietly mis-cabling a rack. Copy them verbatim
+# from the vendor port map; lint checks one name per port.
+# sdk_names = ["xe0", "xe1", "xe2", "xe3"]
 
 # Example of an explicit single port (delete if unused):
 # [[ports.port]]
@@ -144,8 +181,24 @@ lanes = [53, 54, 55, 56]
 
 [hardware.i2c]
 # Name prefix of the root SMBus adapter. Matched by name because kernel bus
-# numbers for PCI SMBus adapters can vary between boots.
+# numbers for PCI SMBus adapters can vary between boots. This is shorthand
+# for a single root named "root", which `bus`/`parent_bus` refer to as
+# bus = "root".
 root_adapter = "SMBus iSMT adapter"
+
+# Boards with more than one root adapter name each one instead. SoC i2c
+# controllers usually share a driver name, so `instance` picks the nth
+# match in bus-number order rather than relying on the prefix:
+#
+# [[hardware.i2c.root]]
+# name = "cpld"                              # referenced as bus = "cpld"
+# adapter = "Broadcom iProc SMBus adapter"
+# instance = 0
+#
+# [[hardware.i2c.root]]
+# name = "mux"
+# adapter = "Broadcom iProc SMBus adapter"
+# instance = 1
 
 # Raw i2c writes before mux instantiation, for boards whose muxes need a
 # wake/select poke before the kernel driver binds (check your platform's
@@ -205,12 +258,19 @@ input = "temp1"
 warn_c = 55.0
 crit_c = 65.0
 
-# Fans: tach input + pwm output channels on the fan controller.
+# Fans: tach input + pwm output channels on the fan controller. pmon reads
+# `<tach>_input` and writes `<pwm>` as 0-255, the standard hwmon spelling.
 [[hardware.thermal.fan]]
 name = "FAN-1"
 hwmon = "3-004d"
 tach = "fan1"
 pwm = "pwm1"
+# Drivers that do not follow those conventions name the attributes
+# outright and declare the PWM's full scale (ONL's AS4610 fan driver
+# exposes `fan1_speed_rpm` and takes a percentage):
+# rpm_attr = "fan1_speed_rpm"
+# pwm_attr = "fan_duty_cycle_percentage"
+# pwm_max = 100                             # default 255
 
 # Fan curve: linear interpolation between points, driven by one sensor.
 # Below the first point fans hold its pwm; above the last, 100%.

@@ -51,18 +51,104 @@ pub struct PlatformSection {
     pub asic_family: String,
     /// Concrete ASIC, e.g. `helix4`.
     pub asic: String,
+    /// CPU architecture of the board, in Debian's spelling (`amd64`,
+    /// `armhf`). Selects the rootfs architecture, the boot artifacts
+    /// (GRUB vs. FIT) and the installer target triple. Lint cross-checks
+    /// it against `onie_machine`'s prefix.
+    #[serde(default = "default_cpu_arch")]
+    pub cpu_arch: String,
+    /// How the host CPU reaches the ASIC. `pcie` is an ordinary
+    /// PCI-attached switch chip; `soc` is an on-die CMIC with no PCI
+    /// device to find (the Helix4 iProc boards). syncd's "is the ASIC
+    /// actually here" probe differs per kind, and getting it wrong means
+    /// `--auto-mock` mocking a real switch.
+    #[serde(default)]
+    pub asic_attach: AsicAttach,
 }
 
+fn default_cpu_arch() -> String {
+    "amd64".into()
+}
+
+/// Known CPU architectures and the ONIE machine-string prefix each one
+/// implies.
+pub const KNOWN_CPU_ARCHES: [(&str, &str); 2] = [("amd64", "x86_64-"), ("armhf", "arm-")];
+
+/// How the host CPU reaches the switch ASIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AsicAttach {
+    /// PCI-attached: probe for the vendor id on the PCI bus.
+    #[default]
+    Pcie,
+    /// On-die CMIC on the SoC bus: probe for the platform device.
+    Soc,
+}
+
+impl AsicAttach {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AsicAttach::Pcie => "pcie",
+            AsicAttach::Soc => "soc",
+        }
+    }
+}
+
+/// Which datapath library backs this platform.
+///
+/// SAI is the default and the preference. `openbcm` exists for boards
+/// where no SAI build is published for the CPU architecture — the Helix4
+/// iProc boards — and drives the OpenBCM SDK through Hemlock's own C shim.
+/// Both sit behind the same `SaiBackend` trait; nothing above
+/// `hemlock-sai` can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SaiBackendKind {
+    #[default]
+    Sai,
+    Openbcm,
+}
+
+impl SaiBackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SaiBackendKind::Sai => "sai",
+            SaiBackendKind::Openbcm => "openbcm",
+        }
+    }
+}
+
+/// The datapath library section. Named `[sai]` for continuity: SAI is the
+/// default backend, and the fields below that only apply to one backend
+/// are enforced by lint rather than by the type.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SaiSection {
-    /// Vendor SAI package name, e.g. `libsaibcm`.
-    pub package: String,
+    /// Which backend drives the ASIC.
+    #[serde(default)]
+    pub backend: SaiBackendKind,
+    /// Vendor SAI package name, e.g. `libsaibcm`. Required for the `sai`
+    /// backend; meaningless for `openbcm`, which has no vendor package.
+    #[serde(default)]
+    pub package: Option<String>,
     /// Abstract per-platform pin (e.g. `3.7.x-helix4`), resolved to a
     /// concrete vendor blob by the build pipeline. Never global.
-    pub version_pin: String,
-    /// Absolute path of the vendor library inside the image.
-    pub libsai_path: PathBuf,
+    /// Required for the `sai` backend.
+    #[serde(default)]
+    pub version_pin: Option<String>,
+    /// Absolute path of the vendor library inside the image. Required for
+    /// the `sai` backend.
+    #[serde(default)]
+    pub libsai_path: Option<PathBuf>,
+    /// Absolute path of Hemlock's OpenBCM shim inside the image, dlopened
+    /// by syncd. Required for the `openbcm` backend.
+    #[serde(default)]
+    pub shim_path: Option<PathBuf>,
+    /// Shim ABI major version this platform's image provides. syncd
+    /// refuses a shim reporting a different major. Required for the
+    /// `openbcm` backend.
+    #[serde(default)]
+    pub abi_major: Option<u32>,
     /// ASIC init config, relative to the platform directory.
     pub config_bcm: PathBuf,
     /// Additional vendor data files (LED microcode etc.), relative paths.
@@ -151,6 +237,14 @@ pub struct PortGroup {
     /// "auto"]`.
     #[serde(default)]
     pub supported_modes: Vec<String>,
+    /// Vendor SDK port names, one per port, in the order this group
+    /// expands — so for single-lane ports it runs parallel to `lanes`.
+    /// On the OpenBCM backend the shim reports each port's SDK name
+    /// beside its logical number and syncd asserts them against this
+    /// list at startup, so a wrong port map fails loudly on first boot
+    /// instead of quietly mis-cabling a rack. Empty = no assertion.
+    #[serde(default)]
+    pub sdk_names: Vec<String>,
 }
 
 /// A single explicitly described port.
@@ -173,6 +267,9 @@ pub struct PortEntry {
     pub phy_model: Option<String>,
     #[serde(default)]
     pub supported_modes: Vec<String>,
+    /// Vendor SDK port name; see [`PortGroup::sdk_names`].
+    #[serde(default)]
+    pub sdk_name: Option<String>,
 }
 
 fn one() -> u32 {
@@ -181,6 +278,11 @@ fn one() -> u32 {
 
 fn eight() -> u32 {
     8
+}
+
+/// Standard hwmon `pwmN` full scale.
+fn default_pwm_max() -> u32 {
+    255
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -205,8 +307,14 @@ pub struct HardwareSection {
 pub struct I2cSection {
     /// Adapter-name prefix identifying the root SMBus adapter (its kernel
     /// bus number can vary between boots, so it is matched by name).
+    /// Shorthand for a single `[[root]]` named `root`.
     #[serde(default)]
     pub root_adapter: Option<String>,
+    /// Named root adapters, for boards with more than one — SoC i2c
+    /// controllers usually share a driver name, so they are told apart
+    /// by `instance` rather than by prefix.
+    #[serde(default, rename = "root")]
+    pub roots: Vec<I2cRoot>,
     /// Raw i2c writes performed before any mux is instantiated (some boards
     /// need a wake-up/select write to a mux before the kernel driver binds).
     #[serde(default, rename = "pre_write")]
@@ -217,13 +325,43 @@ pub struct I2cSection {
     pub devices: Vec<I2cDevice>,
 }
 
-/// Reference to an i2c bus: the root adapter or a numbered bus created by a
-/// mux. In TOML: `parent_bus = "root"` or `parent_bus = 8`.
+/// The name Hemlock gives the adapter declared by the `root_adapter`
+/// shorthand.
+pub const DEFAULT_ROOT_NAME: &str = "root";
+
+/// One root i2c adapter: an adapter the kernel provides, which the
+/// manifest's topology hangs off.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct I2cRoot {
+    /// Manifest-local name, referenced as `bus = "<name>"` /
+    /// `parent_bus = "<name>"`.
+    pub name: String,
+    /// Adapter-name prefix, matched against `/sys/.../i2c-N/name`.
+    pub adapter: String,
+    /// Which match to take when several adapters share the prefix, in
+    /// bus-number order. SoC controllers routinely do.
+    #[serde(default)]
+    pub instance: u32,
+}
+
+/// Reference to an i2c bus: a named root adapter, or a bus number in the
+/// manifest's declared numbering (see `child_bus_base`). In TOML:
+/// `bus = "root"`, `bus = "cpld"`, or `bus = 8`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum BusRef {
     Number(u32),
-    Named(String), // "root"
+    Named(String),
+}
+
+impl std::fmt::Display for BusRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BusRef::Number(n) => write!(f, "{n}"),
+            BusRef::Named(name) => write!(f, "{name:?}"),
+        }
+    }
 }
 
 /// One raw write, executed with i2cset-style block semantics.
@@ -256,7 +394,7 @@ pub struct I2cMux {
 pub struct I2cDevice {
     /// Kernel driver name to bind, e.g. `24lc64t`, `max6699`, `emc2305`.
     pub driver: String,
-    pub bus: u32,
+    pub bus: BusRef,
     pub address: u32,
     /// What this device is for, e.g. `syseeprom`; shows up in diagnostics.
     pub purpose: String,
@@ -290,10 +428,25 @@ pub struct ThermalSensor {
 pub struct FanDef {
     pub name: String,
     pub hwmon: String,
-    /// Tach input within the device, e.g. `fan4`.
+    /// Tach input within the device, e.g. `fan4`; pmon reads
+    /// `<tach>_input`. Ignored when `rpm_attr` is set.
     pub tach: String,
-    /// PWM output within the device, e.g. `pwm4`.
+    /// PWM output within the device, e.g. `pwm4`. Ignored when `pwm_attr`
+    /// is set.
     pub pwm: String,
+    /// Verbatim tach attribute name, for drivers that do not follow the
+    /// hwmon `<tach>_input` convention (ONL's AS4610 fan driver exposes
+    /// `fan1_speed_rpm`). Overrides `tach` when present.
+    #[serde(default)]
+    pub rpm_attr: Option<String>,
+    /// Verbatim PWM attribute name, for the same reason
+    /// (`fan_duty_cycle_percentage`). Overrides `pwm` when present.
+    #[serde(default)]
+    pub pwm_attr: Option<String>,
+    /// Full-scale value of the PWM attribute. Standard hwmon `pwmN` is
+    /// 0-255; a driver taking a percentage wants 100.
+    #[serde(default = "default_pwm_max")]
+    pub pwm_max: u32,
     /// Absolute sysfs attribute holding tray presence (integer), e.g. a
     /// CPLD's `fan1_prs`. Absent = no presence detect (always present).
     #[serde(default)]
@@ -336,7 +489,7 @@ fn default_interval() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct Psu {
     pub name: String,
-    pub bus: u32,
+    pub bus: BusRef,
     pub address: u32,
     pub driver: String,
     #[serde(default)]
@@ -356,7 +509,7 @@ pub struct Psu {
 #[serde(deny_unknown_fields)]
 pub struct Transceiver {
     pub port: String,
-    pub bus: u32,
+    pub bus: BusRef,
     /// EEPROM driver, e.g. `optoe1` (QSFP) or `optoe2` (SFP).
     pub driver: String,
 }

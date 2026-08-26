@@ -83,10 +83,20 @@ daemons, the configuration model, and the image/installer pipeline.
 `platform.toml` (schema v1) declares everything board-specific:
 
 - **`[platform]`** — identity: `id`, `onie_machine` (matched against ONIE's
-  `machine.conf` at install time), vendor/model/ASIC strings.
-- **`[sai]`** — the vendor package name, the abstract `version_pin`, the
-  in-image `libsai_path`, and the `config_bcm` + `extra_files` data files
-  (relative to the platform dir; never committed).
+  `machine.conf` at install time), vendor/model/ASIC strings, plus
+  `cpu_arch` (which rootfs, boot artifacts and installer target the image
+  build uses — lint cross-checks it against `onie_machine`'s prefix) and
+  `asic_attach` (`pcie` or `soc`, selecting how syncd probes for the
+  ASIC's presence; an on-die CMIC has no PCI device, and a wrong answer
+  here is what would let `--auto-mock` mock a live switch).
+- **`[sai]`** — the datapath library. `backend` selects it: `sai` (the
+  default, the vendor's libsai) or `openbcm` (Hemlock's own C shim over
+  the OpenBCM SDK, for boards where no SAI is published for the CPU
+  architecture). The `sai` backend pins `package` / `version_pin` /
+  `api_headers` / `libsai_path`; the `openbcm` backend declares
+  `shim_path` and `abi_major` instead, and lint rejects either backend's
+  fields on the other. Both share `config_bcm` + `extra_files` (relative
+  to the platform dir; never committed).
 - **`[kernel]`** — modules that must be loaded before syncd (the Broadcom
   BDE pair must match the pinned SAI's SDK ABI, which is a second reason
   images are assembled per platform).
@@ -94,7 +104,11 @@ daemons, the configuration model, and the image/installer pipeline.
   `[[ports.group]]` (prefix, name/index start, speed, and an explicit flat
   lane list — explicit because boards really do swap lanes in hardware, as
   the E1031's pair-swapped 1G bank shows); oddballs use `[[ports.port]]`.
-  Groups expand to a flat, index-sorted `Vec<PortDef>` at load time.
+  Groups expand to a flat, index-sorted `Vec<PortDef>` at load time. A
+  group may also carry `sdk_names` — the vendor SDK's own name for each
+  port, which syncd asserts against what the backend reports at startup,
+  so a mistranscribed port map fails on first boot instead of quietly
+  mis-cabling a rack.
 - **`[hardware]`** — i2c mux/device topology, thermal sensors, fans, the
   fan curve, PSUs, and per-port transceiver EEPROM buses. This is the
   entirety of pmon's board knowledge. The bus numbers in it are a

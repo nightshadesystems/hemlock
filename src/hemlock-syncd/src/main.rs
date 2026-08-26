@@ -234,6 +234,17 @@ fn build_backend(
         )));
     }
 
+    // The OpenBCM backend is selected by the manifest but does not exist
+    // until phase 2; say so rather than falling through to the SAI path
+    // and failing to dlopen a library this platform never had.
+    if platform.manifest.sai.backend == hemlock_platform::schema::SaiBackendKind::Openbcm {
+        bail!(
+            "platform {} selects the openbcm backend, which this build does not have \
+             (use --mock)",
+            platform.manifest.platform.id
+        );
+    }
+
     #[cfg(feature = "real-sai")]
     {
         // Real hardware prerequisites: kernel modules (BDE pair + platform
@@ -261,8 +272,16 @@ fn build_backend(
         if diag_shell {
             info!("vendor diag shell enabled — BCM.0> will appear on this terminal");
         }
+        // Required by lint for this backend; a manifest that skipped it
+        // would otherwise dlopen an empty path.
+        let Some(libsai_path) = platform.manifest.sai.libsai_path.clone() else {
+            bail!(
+                "platform {} declares no sai.libsai_path (required for the sai backend)",
+                platform.manifest.platform.id
+            );
+        };
         let init = hemlock_sai::SwitchInit {
-            libsai_path: platform.manifest.sai.libsai_path.clone(),
+            libsai_path,
             config_bcm_path: platform.config_bcm_path(),
             profile: platform
                 .manifest

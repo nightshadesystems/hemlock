@@ -59,6 +59,9 @@ pub struct PortDef {
     pub phy_model: Option<String>,
     /// Speed/duplex modes for `show interfaces capabilities`.
     pub supported_modes: Vec<String>,
+    /// Vendor SDK port name (`ge25`), asserted against what the backend
+    /// reports at startup. `None` = no assertion for this port.
+    pub sdk_name: Option<String>,
 }
 
 /// A loaded platform: manifest + its directory + the expanded port table.
@@ -163,7 +166,11 @@ fn expand_ports(manifest: &Manifest) -> Result<Vec<PortDef>, PlatformError> {
                 lpp
             )));
         }
+        // sdk_names is one entry per port, in expansion order. A length
+        // mismatch is a lint error rather than a load failure, so take
+        // what is there and let lint say why the rest is missing.
         for (i, chunk) in group.lanes.chunks(lpp).enumerate() {
+            let sdk_name = group.sdk_names.get(i).cloned();
             let i = i as u32;
             let index = group.index_start + i;
             ports.push(PortDef {
@@ -177,6 +184,7 @@ fn expand_ports(manifest: &Manifest) -> Result<Vec<PortDef>, PlatformError> {
                 breakout: group.breakout.clone(),
                 phy_model: group.phy_model.clone(),
                 supported_modes: group.supported_modes.clone(),
+                sdk_name,
             });
         }
     }
@@ -193,6 +201,7 @@ fn expand_ports(manifest: &Manifest) -> Result<Vec<PortDef>, PlatformError> {
             breakout: entry.breakout.clone(),
             phy_model: entry.phy_model.clone(),
             supported_modes: entry.supported_modes.clone(),
+            sdk_name: entry.sdk_name.clone(),
         });
     }
 

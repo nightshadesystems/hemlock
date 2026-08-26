@@ -1986,6 +1986,7 @@ mod tests {
                 breakout: vec![],
                 phy_model: None,
                 supported_modes: vec![],
+                sdk_name: None,
             })
             .collect()
     }

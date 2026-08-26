@@ -295,3 +295,4 @@ topology is wrong, this is where it shows.
 | A newer SAI API era | `vendor/sai-headers/<ver>/` + `HEMLOCK_SAI_HEADERS` | build-time only |
 | A new manifest field | `hemlock-platform::schema` + lint + this guide | schema review |
 | A new SAI object family | `SaiBackend` trait + mock + vendor impl | design review |
+| An ASIC with no SAI for your CPU arch | `[sai] backend` + a second `SaiBackend` impl | design review — see [as4610-54-port.md](as4610-54-port.md) |
