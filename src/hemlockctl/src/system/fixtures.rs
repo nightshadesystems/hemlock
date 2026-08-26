@@ -2,8 +2,9 @@
 //! the spec's Part 1.1 seed.
 
 use super::model::{
-    ActiveSession, CableDiagState, CablePair, Commit, CommitsState, ConfiguredUser, ImageState,
-    LogEntry, LoggingState, UsersState,
+    ActiveSession, CableDiagState, CablePair, Commit, CommitsState, ConfiguredUser,
+    EnvironmentState, Fan, ImageState, LogEntry, LoggingState, Psu, SwitchSummary,
+    TemperatureSensor, UsersState, VersionState,
 };
 
 /// 2026-08-25 09:12:44 UTC — the seed's first login.
@@ -157,6 +158,90 @@ pub fn cable_diag_state() -> CableDiagState {
             pair("B", "ok", 42),
             pair("C", "open", 11),
             pair("D", "open", 11),
+        ],
+    }
+}
+
+pub fn switch_state() -> SwitchSummary {
+    SwitchSummary {
+        platform_id: "x86_64-cel_e1031-r0".into(),
+        backend: "mock".into(),
+        switch_oid: 0x2100_0000_0000_0000,
+        port_count: 52,
+    }
+}
+
+pub fn version_state() -> VersionState {
+    VersionState {
+        version: "1.4.0".into(),
+        switch: Some(switch_state()),
+        syncd_error: String::new(),
+    }
+}
+
+/// The environment of a healthy box with one warm sensor, an absent
+/// fan tray and a failed PSU — every branch of the renderer at once.
+pub fn environment_state() -> EnvironmentState {
+    EnvironmentState {
+        temperatures: vec![
+            TemperatureSensor {
+                name: "CPU Core".into(),
+                celsius: 41.5,
+                warn_celsius: 85.0,
+                crit_celsius: 95.0,
+            },
+            TemperatureSensor {
+                name: "Switch ASIC".into(),
+                celsius: 88.0,
+                warn_celsius: 85.0,
+                crit_celsius: 100.0,
+            },
+            TemperatureSensor {
+                name: "Inlet".into(),
+                celsius: 105.0,
+                warn_celsius: 60.0,
+                crit_celsius: 70.0,
+            },
+        ],
+        fans: vec![
+            Fan {
+                name: "Fan Tray 1".into(),
+                present: true,
+                rpm: 8400,
+                pwm_percent: 45,
+                ok: true,
+            },
+            Fan {
+                name: "Fan Tray 2".into(),
+                present: true,
+                rpm: 0,
+                pwm_percent: 45,
+                ok: false,
+            },
+            Fan {
+                name: "Fan Tray 3".into(),
+                present: false,
+                rpm: 0,
+                pwm_percent: 0,
+                ok: false,
+            },
+        ],
+        psus: vec![
+            Psu {
+                name: "PSU 1".into(),
+                present: true,
+                ok: true,
+            },
+            Psu {
+                name: "PSU 2".into(),
+                present: true,
+                ok: false,
+            },
+            Psu {
+                name: "PSU 3".into(),
+                present: false,
+                ok: false,
+            },
         ],
     }
 }

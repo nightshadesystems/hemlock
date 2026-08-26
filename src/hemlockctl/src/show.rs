@@ -1,103 +1,14 @@
-//! `hemlockctl show ...` — read-only views of daemon state.
+//! `show configuration` — the running configuration merged with the
+//! live interface inventory.
+//!
+//! The rest of the once-inline system shows (`version`, `switch`,
+//! `environment`) moved into the `system/` module with the rest of
+//! the suite, so they have a data model, a `| json` form and goldens
+//! like every other family.
 
 use anyhow::{Context, Result};
 use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
-
-/// Software + platform summary. Daemon state is best-effort: `show
-/// version` must work even when syncd is down.
-pub async fn version(endpoint: IpcEndpoint) {
-    println!("Hemlock  {}", hemlock_common::VERSION);
-    match endpoint.connect().await {
-        Ok(channel) => {
-            let mut client = pb::syncd_client::SyncdClient::new(channel);
-            match client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
-                Ok(info) => {
-                    let info = info.into_inner();
-                    println!("Platform:  {}", info.platform_id);
-                    println!("Backend:   {}", info.backend);
-                    println!("Ports:     {}", info.port_count);
-                }
-                Err(e) => println!("(syncd unavailable: {})", e.message()),
-            }
-        }
-        Err(_) => println!("(syncd not running)"),
-    }
-}
-
-pub async fn switch(endpoint: IpcEndpoint) -> Result<()> {
-    let channel = endpoint.connect().await.context("connecting to syncd")?;
-    let mut client = pb::syncd_client::SyncdClient::new(channel);
-    let info = client
-        .get_switch_info(pb::GetSwitchInfoRequest {})
-        .await?
-        .into_inner();
-    println!("Platform:   {}", info.platform_id);
-    println!("Backend:    {}", info.backend);
-    println!("Switch OID: {:#x}", info.switch_oid);
-    println!("Ports:      {}", info.port_count);
-    Ok(())
-}
-
-pub async fn environment(endpoint: IpcEndpoint) -> Result<()> {
-    use std::fmt::Write;
-
-    let channel = endpoint.connect().await.context("connecting to pmon")?;
-    let mut client = pb::pmon_client::PmonClient::new(channel);
-    let env = client
-        .get_environment(pb::GetEnvironmentRequest {})
-        .await?
-        .into_inner();
-
-    let mut out = String::new();
-    if !env.temperatures.is_empty() {
-        let _ = writeln!(out, "Temperatures:");
-        for t in &env.temperatures {
-            let flag = if t.celsius >= t.crit_celsius {
-                "  CRIT"
-            } else if t.celsius >= t.warn_celsius {
-                "  WARN"
-            } else {
-                ""
-            };
-            let _ = writeln!(
-                out,
-                "  {:<28} {:>6.1} C  (warn {:.0}, crit {:.0}){flag}",
-                t.name, t.celsius, t.warn_celsius, t.crit_celsius
-            );
-        }
-    }
-    if !env.fans.is_empty() {
-        let _ = writeln!(out, "Fans:");
-        for f in &env.fans {
-            if !f.present {
-                let _ = writeln!(out, "  {:<28} not present", f.name);
-                continue;
-            }
-            let _ = writeln!(
-                out,
-                "  {:<28} {:>5} rpm  pwm {:>3}%  {}",
-                f.name,
-                f.rpm,
-                f.pwm_percent,
-                if f.ok { "ok" } else { "FAULT" }
-            );
-        }
-    }
-    if !env.psus.is_empty() {
-        let _ = writeln!(out, "PSUs:");
-        for p in &env.psus {
-            let status = match (p.present, p.ok) {
-                (false, _) => "absent",
-                (true, true) => "ok",
-                (true, false) => "FAULT",
-            };
-            let _ = writeln!(out, "  {:<28} {status}", p.name);
-        }
-    }
-    crate::pager::page(&out);
-    Ok(())
-}
 
 /// `show configuration` — the running configuration merged with the full
 /// interface inventory, so every stock port (and the management port from

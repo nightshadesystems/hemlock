@@ -145,3 +145,65 @@ pub struct CableDiagState {
     pub run_at: i64,
     pub pairs: Vec<CablePair>,
 }
+
+// ------------------------------------------------- version and switch
+
+/// The switch summary `show version` and `show switch` share.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SwitchSummary {
+    pub platform_id: String,
+    /// "mock" or "vendor:<libsai path>".
+    pub backend: String,
+    pub switch_oid: u64,
+    pub port_count: u32,
+}
+
+/// `show version`.
+///
+/// Daemon state is best-effort here on purpose: `show version` has to
+/// answer even when syncd is down, which is exactly when someone is
+/// asking. `switch` is then absent and `syncd_error` says why.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct VersionState {
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch: Option<SwitchSummary>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub syncd_error: String,
+}
+
+// ------------------------------------------------- environment
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TemperatureSensor {
+    pub name: String,
+    pub celsius: f64,
+    pub warn_celsius: f64,
+    pub crit_celsius: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Fan {
+    pub name: String,
+    /// Fan tray present (always true on platforms without presence
+    /// detect).
+    pub present: bool,
+    pub rpm: u32,
+    pub pwm_percent: u32,
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Psu {
+    pub name: String,
+    pub present: bool,
+    pub ok: bool,
+}
+
+/// `show environment`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EnvironmentState {
+    pub temperatures: Vec<TemperatureSensor>,
+    pub fans: Vec<Fan>,
+    pub psus: Vec<Psu>,
+}

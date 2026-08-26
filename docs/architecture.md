@@ -66,15 +66,15 @@ daemons, the configuration model, and the image/installer pipeline.
 
 | Crate | Kind | Purpose |
 |---|---|---|
-| `hemlock-common` | lib | Error conventions, tracing init, IPC endpoints, generated gRPC types |
+| `hemlock-common` | lib | Error conventions, tracing init, IPC endpoints, generated gRPC types (all `Serialize`, so any RPC response can be dumped as JSON); the shared login pieces — `role` (the one privileged-operation table both front-ends enforce), `passwd`, `tz`, `cert` |
 | `hemlock-platform` | lib | Manifest schema, loader, port-table expansion, lint, `PlatformQuirks` |
 | `hemlock-sai` | lib | `SaiBackend` trait; `mock-sai` (default) and `real-sai` (bindgen + dlopen) backends |
 | `hemlock-syncd` | bin | The only ASIC owner: switch create, port bring-up, port state gRPC |
 | `hemlock-pmon` | bin | Manifest-driven environment monitoring + fan control |
-| `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring |
+| `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring; the login-session registry both consoles register with; the journal tail, image info, reboot and tech-support bundle |
 | `hemlock-orch` | bin | Protocol engines: LACP, spanning tree, IGMP/MLD snooping, 802.1X (hostapd), DHCP snooping + DAI + relay, LLDP; packet I/O; the kernel-RIB → syncd FIB pipeline; the sFlow exporter and the SNMP AgentX subagent; FRR, NTP and DHCP-lease state queries |
 | `hemlock-webd` | bin | Web console: serves the exported Next.js UI (`web/`) + JSON API over HTTP/HTTPS; config-driven via `set system http`/`https` |
-| `hemlock-config` | lib | Curly-brace config language: lexer, parser, tree |
+| `hemlock-config` | lib | Curly-brace config language: lexer, parser, tree, and the secret-redaction pass every reader of a configuration shares |
 | `hemlockctl` | bin | Operator CLI |
 | `hemlock-installer` | bin | ONIE installer: machine verification, disk TUI, GRUB |
 
@@ -392,22 +392,38 @@ never renders FRR config. Details:
   `GetNeighbors` snapshots — statics, connected, and FRR routes appear
   uniformly, with FIB (hardware) state — never from vtysh.
 
-**Render-and-reload appliers.** Four families are rendered into a
+**Render-and-reload appliers.** Six families are rendered into a
 package's own config file and reloaded, all to one pattern: a pure,
 deterministic render function pinned by golden files, plus a
 best-effort apply that is inert when the package is absent and is
 gated on a render diff so an unrelated commit never bounces the
-service. They are FRR (`frrapply.rs` → `/etc/frr/frr.conf` +
-`daemons`), the NTP client (`osapply.rs` → a
-`/etc/systemd/timesyncd.conf.d` drop-in), SNMP (`snmpapply.rs` →
-`/etc/snmp/snmpd.conf`) and the DHCP server (`dnsmasqapply.rs` →
-`/etc/dnsmasq.d/hemlock.conf`). `snmpd` and `dnsmasq` run only when
-their block exists; timesyncd stops when no server is configured.
-Two wrinkles are recorded in the appliers themselves: net-snmp
+service.
+
+| Applier | Renders | Runs when |
+|---|---|---|
+| `frrapply.rs` | `/etc/frr/frr.conf` + `daemons` | a routing protocol is configured |
+| `osapply.rs` (NTP half) | `/etc/systemd/timesyncd.conf.d` drop-in | a server is configured |
+| `snmpapply.rs` | `/etc/snmp/snmpd.conf` | `services { snmp }` exists |
+| `dnsmasqapply.rs` | `/etc/dnsmasq.d/hemlock.conf` | a DHCP pool exists |
+| `identityapply.rs` | `/etc/hosts` self-line, `hostnamectl`, `timedatectl`, a `systemd-resolved` drop-in, `/etc/issue.net` + an sshd `Banner` drop-in | always (an absent leaf means the default) |
+| `rsyslogapply.rs` | `/etc/rsyslog.d/20-hemlock.conf` | a collector is configured |
+
+`snmpd`, `dnsmasq` and `rsyslog` run only when their config says there
+is something to do; timesyncd stops when no server is configured.
+Three wrinkles are recorded in the appliers themselves: net-snmp
 persists derived USM keys that would shadow a changed passphrase, so
-a changed render drops that state first; and dnsmasq's DNS half is
+a changed render drops that state first; dnsmasq's DNS half is
 turned off outright (`port=0`), because a switch answering DNS on its
-management network is a surprise nobody asked for.
+management network is a surprise nobody asked for; and rsyslog's TCP
+forwarding gets a disk-assisted queue with infinite resume retries, so
+a collector that goes away stalls the queue rather than the daemons
+doing the logging.
+
+The identity applier is the one that is *not* gated on a config block
+existing: the hostname, time zone and resolver all have defaults, so an
+absent leaf is a value like any other and the applier converges to it.
+Its hostname change reaches the CLI prompt and the MOTD for free —
+both already read the OS hostname when they render.
 
 **FRR (OSPFv2, BGP IPv4 unicast, VRRP).** FRR is the protocol stack
 (pinned Debian package in the image). mgmtd's FRR applier
@@ -517,7 +533,8 @@ commit.
   far: interface admin-state/description/addresses, link parameters
   (`speed`, `duplex`, `mtu`), VLANs (including
   `state suspend`), switchport modes (access/trunk/dot1q-tunnel), static
-  routes, system (hostname, users, http/https), the switching suite —
+  routes, the system suite (identity, login users, remote logging, the
+  console session timeout, ssh/http/https), the switching suite —
   LAGs + LACP, spanning tree, MAC table (aging + statics), IGMP/MLD
   snooping, storm control, and mirror sessions — the security suite:
   ACLs (with per-port/LAG bindings), CoPP class overrides, port
@@ -547,6 +564,47 @@ commit.
 - **Rollback** — `rollback N` loads ring entry N into the candidate and
   commits it (the underlying RPCs are separate, so a future interactive
   mode can load-then-inspect).
+- **Commit metadata** — every stored configuration carries the time,
+  user and console (`cli`/`web`) of the commit that *created* it:
+  `running.json` for the running config, `rollback/N.json` for the ring.
+  `show system commits` prints them with index 0 as the running config,
+  and `rollback N` names its target before the confirm flow. Rings
+  written before the metadata existed load with the fields defaulted and
+  render `-`, so an upgrade never has to migrate the ring.
+
+### Login users and roles
+
+Since the system suite the configuration is the source of truth for who
+may log in: `system { login { user <name> { role; password-hash;
+ssh-key } } }`. `set ... password <plaintext>` hashes at the prompt, so
+only the SHA-512-crypt string ever reaches the candidate — not
+`candidate.conf`, not `show configuration`, not the rollback ring, not a
+tech-support bundle. The OS applier materializes the accounts
+(`useradd`/`usermod`, group membership per role, `authorized_keys`) and
+never touches an account outside the regular-user uid range, whatever
+the config says.
+
+Two roles: `admin` may do everything, `operator` may look but not touch.
+Both front-ends enforce **one** table (`hemlock_common::role`) — the CLI
+per verb, webd as path-based middleware in front of every route — and
+three tests in webd make that table load-bearing: an ungated POST route,
+a stale entry, or a gated read-only route each fail the build. The
+refusal wording is identical in both consoles.
+
+This is a guard rail, not a privilege boundary: an operator with shell
+access can still run whatever their OS account permits. What it buys is
+that a read-only operator cannot change the switch by accident through
+either console.
+
+A commit that manages users at all must leave one administrator with a
+password — the lockout guard, enforced in the intent extractor and
+mirrored client-side by the console. A config with no `login` block
+manages no users, and dropping the block never deletes accounts.
+
+mgmtd also owns the **session registry**: both consoles register at
+login (`WhoAmI`), slide an idle timer, and close on the way out, so
+`show system users` can list CLI and web logins together from one place
+without either front-end talking to the other.
 
 ## The operator CLI
 
@@ -564,6 +622,22 @@ auto-rollback). The services suite adds `show lldp [neighbors
 [detail]]`, `show ntp`, `show snmp`, `show sflow`, `show dhcp relay`
 and `show dhcp server [leases]`, plus `clear lldp counters` and
 `clear dhcp server lease <ip>`.
+
+The system suite adds `show system users|commits|image`, `show logging
+[<count>]`, `show interfaces <port> cable-diagnostics`, the live
+passthroughs `ping`/`traceroute <host> [source <interface>]`, and a
+`request` verb for the operations that *do* something rather than show
+it: `request reboot [onie-rescue]`, `request cable-diagnostics <port>`,
+`request tech-support` and `request certificate regenerate`. Every
+`request` is admin-only, and the two that interrupt forwarding (a
+reboot, a TDR sweep) need `yes` typed in full — in both consoles.
+
+`show version`, `show switch` and `show environment` predate the
+per-suite module convention; the system suite moved them into
+`system/` with the rest, so they now have a data model, a `| json`
+form and goldens. A test in that module reproduces the original inline
+format expressions and asserts the migration changed no byte of
+layout.
 `show interfaces status` renders the EOS-style summary
 (Status = connected/notconnect/disabled; Type comes from the manifest's
 per-port `media` field). Subcommand form (`hemlockctl show interfaces
@@ -581,6 +655,48 @@ that reference them. A family that reaches `Intents` but not
 commits again — which for an ACL is a fail-open, so the gate deciding
 whether a replay is needed at all is a pure function (`needs_syncd_replay`)
 with a test naming each family.
+
+## Diagnostics and support
+
+**Cable diagnostics (copper TDR).** syncd owns the PHY, so syncd runs
+the sweep: `SAI_PORT_ATTR_CABLE_PAIR_STATE`/`_LENGTH` read back as two
+parallel lists, behind a capability probe. Those attributes arrived in
+SAI 1.13 and the pinned 1.11 headers do not declare them — their
+numeric ids are not ours to guess — so `hemlock-sai`'s build script
+greps the generated bindings and compiles the real implementation only
+where they exist. Elsewhere the capability reads `false` and the
+request fails with the platform error, and pinning newer headers via
+`HEMLOCK_SAI_HEADERS` lights it up with no other change. Copper only
+(the manifest media string decides), the last result is kept in memory
+for `show interfaces <port> cable-diagnostics` to replay, and the sweep
+interrupts the link, so both consoles confirm first.
+
+**ping / traceroute.** Not rendered, on purpose. The CLI maps its
+arguments onto the system tools and hands over the terminal, so output
+appears as replies arrive and Ctrl-C behaves the way it always does;
+what is tested is the argument mapping, not the output. The console
+cannot hand a terminal to a child, so webd runs the tool to completion
+with a bounded deadline and returns the whole output.
+
+**Tech-support bundle.** mgmtd assembles it, because mgmtd is the one
+daemon that can reach every source: the config, the commit ring, the
+journal (as root) and syncd/orch/pmon. State dumps are the RPC
+responses serialized as JSON — the generated proto types derive
+`Serialize`, so there is no hand-written mirror of each message to go
+stale. Two rules shape it: **no secrets** (the config goes through the
+same redaction pass `show configuration` uses, and a test asserts it),
+and **partial beats absent** (a daemon that is down is what the bundle
+is being collected about, so it is recorded in the manifest and the
+rest is still written).
+
+**Web certificate.** The self-signed pair lives in
+`hemlock_common::cert` rather than in webd, because two daemons need
+it: webd generates and serves it, and mgmtd regenerates it for `request
+certificate regenerate` — the CLI cannot reach webd. Sessions survive a
+regeneration (they are in webd's memory, not in the TLS material); webd
+restarts to serve the new pair, deferred the same way the web-unit
+change is, so a request from the console cannot deadlock against its
+own restart.
 
 ## Image and installer
 
@@ -656,7 +772,12 @@ streaming. The services suite drew its own line too, and every
 deferred spelling is rejected at parse with `% ... not supported`
 rather than silently ignored: PTP/1588, LLDP-MED TLVs, DHCP option-82,
 DHCPv6 (relay and server), SNMP traps/informs, SNMP write access, NTP
-server mode and authentication, and sFlow egress sampling. The seams they will land on already exist:
+server mode and authentication, and sFlow egress sampling. The system
+suite drew the same kind of line: RADIUS/TACACS+ login AAA (802.1X
+RADIUS under `security dot1x` is unrelated and stays),
+SNMP-trap-on-alarm, scheduled config archives, dual-partition image A/B
+beyond what `upgrade` already does, and syslog over TLS. The seams they
+will land on already exist:
 
 - New routing families extend the `routing { ... }` intent extractors,
   the FRR render, and — where the ASIC is involved — the RIB pipeline's
@@ -666,5 +787,11 @@ server mode and authentication, and sFlow egress sampling. The seams they will l
   platform (the routing suite added neighbors, next hops, ECMP groups,
   and My-MAC exactly this way).
 - New config families add an intent extractor + apply step in mgmtd.
+- A new privileged endpoint or CLI verb joins
+  `hemlock_common::role`; webd's router tests refuse to let one be
+  added without it.
+- A new secret leaf joins the redaction pass in `hemlock-config`, and
+  is then hidden by `show configuration`, the console and the
+  tech-support bundle at once.
 - Telemetry can subscribe to syncd's event broadcasts (port and FDB)
   and pmon's state.

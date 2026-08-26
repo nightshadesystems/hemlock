@@ -1,0 +1,4 @@
+Hemlock  1.4.0
+Platform:  x86_64-cel_e1031-r0
+Backend:   mock
+Ports:     52

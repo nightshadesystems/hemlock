@@ -1,5 +1,6 @@
 //! Golden-file tests for the system-suite show family, byte-exact
 //! against `tests/golden/` (text and `| json` forms both).
+#![allow(clippy::unwrap_used)]
 
 use super::fixtures as fx;
 use super::render;
@@ -194,4 +195,161 @@ fn unmeasured_pairs_render_a_dash() {
     let text = render::cable_diagnostics(&state);
     assert!(text.contains("C     unknown    -"), "{text}");
     assert!(text.contains("A     ok         42 m"), "{text}");
+}
+
+// ------------------------------------------- the migrated system shows
+
+#[test]
+fn version() {
+    assert_golden(
+        &render::version(&fx::version_state()),
+        include_str!("../../tests/golden/version.txt"),
+    );
+    assert_golden(
+        &as_json("version", &fx::version_state()),
+        include_str!("../../tests/golden/version.json"),
+    );
+}
+
+#[test]
+fn switch() {
+    assert_golden(
+        &render::switch(&fx::switch_state()),
+        include_str!("../../tests/golden/switch.txt"),
+    );
+    assert_golden(
+        &as_json("switch", &fx::switch_state()),
+        include_str!("../../tests/golden/switch.json"),
+    );
+}
+
+#[test]
+fn environment() {
+    assert_golden(
+        &render::environment(&fx::environment_state()),
+        include_str!("../../tests/golden/environment.txt"),
+    );
+    assert_golden(
+        &as_json("environment", &fx::environment_state()),
+        include_str!("../../tests/golden/environment.json"),
+    );
+}
+
+/// `show version` has to answer when syncd does not: the platform lines
+/// are replaced by a note saying why, exactly as before the migration.
+#[test]
+fn version_without_syncd() {
+    let down = super::model::VersionState {
+        version: "1.4.0".into(),
+        switch: None,
+        syncd_error: "syncd not running".into(),
+    };
+    assert_eq!(
+        render::version(&down),
+        "Hemlock  1.4.0\n(syncd not running)\n"
+    );
+    let refused = super::model::VersionState {
+        version: "1.4.0".into(),
+        switch: None,
+        syncd_error: "syncd unavailable: transport error".into(),
+    };
+    assert_eq!(
+        render::version(&refused),
+        "Hemlock  1.4.0\n(syncd unavailable: transport error)\n"
+    );
+}
+
+/// A section with nothing in it is omitted, not printed empty — the
+/// pre-migration behaviour.
+#[test]
+fn environment_omits_empty_sections() {
+    let mut state = fx::environment_state();
+    state.fans.clear();
+    let text = render::environment(&state);
+    assert!(!text.contains("Fans:"), "{text}");
+    assert!(
+        text.contains("Temperatures:") && text.contains("PSUs:"),
+        "{text}"
+    );
+    assert_eq!(
+        render::environment(&super::model::EnvironmentState::default()),
+        ""
+    );
+}
+
+/// The migration's own proof: these three shows printed inline before
+/// the system suite, with no model and no golden. The expressions below
+/// are the originals, verbatim from the pre-migration `show.rs`; if the
+/// move changed a single byte of layout, this fails.
+#[test]
+fn the_migrated_shows_are_byte_identical() {
+    use std::fmt::Write as _;
+
+    // --- show version (the reachable-syncd branch) --------------------
+    let state = fx::version_state();
+    let switch = state.switch.clone().unwrap();
+    let mut legacy = String::new();
+    let _ = writeln!(legacy, "Hemlock  {}", state.version);
+    let _ = writeln!(legacy, "Platform:  {}", switch.platform_id);
+    let _ = writeln!(legacy, "Backend:   {}", switch.backend);
+    let _ = writeln!(legacy, "Ports:     {}", switch.port_count);
+    assert_eq!(render::version(&state), legacy);
+
+    // --- show switch ---------------------------------------------------
+    let mut legacy = String::new();
+    let _ = writeln!(legacy, "Platform:   {}", switch.platform_id);
+    let _ = writeln!(legacy, "Backend:    {}", switch.backend);
+    let _ = writeln!(legacy, "Switch OID: {:#x}", switch.switch_oid);
+    let _ = writeln!(legacy, "Ports:      {}", switch.port_count);
+    assert_eq!(render::switch(&switch), legacy);
+
+    // --- show environment ----------------------------------------------
+    let env = fx::environment_state();
+    let mut legacy = String::new();
+    if !env.temperatures.is_empty() {
+        let _ = writeln!(legacy, "Temperatures:");
+        for t in &env.temperatures {
+            let flag = if t.celsius >= t.crit_celsius {
+                "  CRIT"
+            } else if t.celsius >= t.warn_celsius {
+                "  WARN"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                legacy,
+                "  {:<28} {:>6.1} C  (warn {:.0}, crit {:.0}){flag}",
+                t.name, t.celsius, t.warn_celsius, t.crit_celsius
+            );
+        }
+    }
+    if !env.fans.is_empty() {
+        let _ = writeln!(legacy, "Fans:");
+        for f in &env.fans {
+            if !f.present {
+                let _ = writeln!(legacy, "  {:<28} not present", f.name);
+                continue;
+            }
+            let _ = writeln!(
+                legacy,
+                "  {:<28} {:>5} rpm  pwm {:>3}%  {}",
+                f.name,
+                f.rpm,
+                f.pwm_percent,
+                if f.ok { "ok" } else { "FAULT" }
+            );
+        }
+    }
+    if !env.psus.is_empty() {
+        let _ = writeln!(legacy, "PSUs:");
+        for p in &env.psus {
+            let status = match (p.present, p.ok) {
+                (false, _) => "absent",
+                (true, true) => "ok",
+                (true, false) => "FAULT",
+            };
+            let _ = writeln!(legacy, "  {:<28} {status}", p.name);
+        }
+    }
+    assert_eq!(render::environment(&env), legacy);
 }

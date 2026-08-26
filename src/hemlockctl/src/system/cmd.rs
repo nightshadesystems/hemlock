@@ -56,6 +56,46 @@ pub async fn show_logging(mgmtd: &IpcEndpoint, args: &[&str]) -> Result<(), Stri
 const DEFAULT_LOG_LINES: u32 = 50;
 const MAX_LOG_LINES: u32 = 5000;
 
+/// `show version [| json]` — software and platform. Never fails: a
+/// switch with syncd down still answers, which is when it is asked.
+pub async fn show_version(syncd: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    no_more(&words)?;
+    let state = fetch::version_state(syncd).await;
+    if json {
+        return page_json("version", &state);
+    }
+    crate::pager::page(&render::version(&state));
+    Ok(())
+}
+
+/// `show switch [| json]` — the ASIC summary.
+pub async fn show_switch(syncd: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    no_more(&words)?;
+    let state = fetch::switch_state(syncd).await.map_err(fmt_err)?;
+    if json {
+        return page_json("switch", &state);
+    }
+    crate::pager::page(&render::switch(&state));
+    Ok(())
+}
+
+/// `show environment [| json]` — temperatures, fans and PSUs.
+pub async fn show_environment(pmon: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
+    let mut words: Vec<&str> = args.to_vec();
+    let json = take_json(&mut words)?;
+    no_more(&words)?;
+    let state = fetch::environment_state(pmon).await.map_err(fmt_err)?;
+    if json {
+        return page_json("environment", &state);
+    }
+    crate::pager::page(&render::environment(&state));
+    Ok(())
+}
+
 /// `show system <users|commits|image> [| json]`.
 pub async fn show(mgmtd: &IpcEndpoint, args: &[&str]) -> Result<(), String> {
     const USAGE: &str = "% Usage: show system <users|commits|image>";

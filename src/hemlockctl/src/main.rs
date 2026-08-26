@@ -236,8 +236,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
                 .map_err(|message| anyhow::anyhow!("{}", message.trim_start_matches("% ")))
             }
-            ShowCommand::Switch => show::switch(endpoint(&cli.syncd, Daemon::Syncd)?).await,
-            ShowCommand::Environment => show::environment(endpoint(&cli.pmon, Daemon::Pmon)?).await,
+            ShowCommand::Switch => {
+                system::cmd::show_switch(&endpoint(&cli.syncd, Daemon::Syncd)?, &[])
+                    .await
+                    .map_err(|message| anyhow::anyhow!("{}", message.trim_start_matches("% ")))
+            }
+            ShowCommand::Environment => {
+                system::cmd::show_environment(&endpoint(&cli.pmon, Daemon::Pmon)?, &[])
+                    .await
+                    .map_err(|message| anyhow::anyhow!("{}", message.trim_start_matches("% ")))
+            }
             ShowCommand::Transceivers => interfaces::cmd::run(
                 &endpoint(&cli.syncd, Daemon::Syncd)?,
                 &endpoint(&cli.pmon, Daemon::Pmon)?,

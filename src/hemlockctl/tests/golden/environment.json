@@ -1,0 +1,64 @@
+{
+  "environment": {
+    "fans": [
+      {
+        "name": "Fan Tray 1",
+        "ok": true,
+        "present": true,
+        "pwm_percent": 45,
+        "rpm": 8400
+      },
+      {
+        "name": "Fan Tray 2",
+        "ok": false,
+        "present": true,
+        "pwm_percent": 45,
+        "rpm": 0
+      },
+      {
+        "name": "Fan Tray 3",
+        "ok": false,
+        "present": false,
+        "pwm_percent": 0,
+        "rpm": 0
+      }
+    ],
+    "psus": [
+      {
+        "name": "PSU 1",
+        "ok": true,
+        "present": true
+      },
+      {
+        "name": "PSU 2",
+        "ok": false,
+        "present": true
+      },
+      {
+        "name": "PSU 3",
+        "ok": false,
+        "present": false
+      }
+    ],
+    "temperatures": [
+      {
+        "celsius": 41.5,
+        "crit_celsius": 95.0,
+        "name": "CPU Core",
+        "warn_celsius": 85.0
+      },
+      {
+        "celsius": 88.0,
+        "crit_celsius": 100.0,
+        "name": "Switch ASIC",
+        "warn_celsius": 85.0
+      },
+      {
+        "celsius": 105.0,
+        "crit_celsius": 70.0,
+        "name": "Inlet",
+        "warn_celsius": 60.0
+      }
+    ]
+  }
+}

@@ -8,8 +8,9 @@ use hemlock_common::proto::v1 as pb;
 use hemlock_config::ConfigTree;
 
 use super::model::{
-    ActiveSession, CableDiagState, CablePair, Commit, CommitsState, ConfiguredUser, ImageState,
-    LogEntry, LoggingState, UsersState,
+    ActiveSession, CableDiagState, CablePair, Commit, CommitsState, ConfiguredUser,
+    EnvironmentState, Fan, ImageState, LogEntry, LoggingState, Psu, SwitchSummary,
+    TemperatureSensor, UsersState, VersionState,
 };
 
 async fn mgmt_client(
@@ -343,6 +344,103 @@ pub async fn cable_diagnostics(syncd: &IpcEndpoint, port: &str) -> Result<CableD
         .await?
         .into_inner();
     Ok(cable_state(response))
+}
+
+// ---------------------------------------------- version and switch
+
+async fn pmon_client(
+    pmon: &IpcEndpoint,
+) -> Result<pb::pmon_client::PmonClient<tonic::transport::Channel>> {
+    let channel = pmon.connect().await.context("connecting to pmon")?;
+    Ok(pb::pmon_client::PmonClient::new(channel))
+}
+
+fn switch_summary(info: pb::SwitchInfo) -> SwitchSummary {
+    SwitchSummary {
+        platform_id: info.platform_id,
+        backend: info.backend,
+        switch_oid: info.switch_oid,
+        port_count: info.port_count,
+    }
+}
+
+/// `show version`. Deliberately total: a switch whose syncd is down
+/// still answers, with a note saying why the platform lines are
+/// missing.
+pub async fn version_state(syncd: &IpcEndpoint) -> VersionState {
+    let version = hemlock_common::VERSION.to_string();
+    let Ok(channel) = syncd.connect().await else {
+        return VersionState {
+            version,
+            switch: None,
+            syncd_error: "syncd not running".into(),
+        };
+    };
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    match client.get_switch_info(pb::GetSwitchInfoRequest {}).await {
+        Ok(info) => VersionState {
+            version,
+            switch: Some(switch_summary(info.into_inner())),
+            syncd_error: String::new(),
+        },
+        Err(status) => VersionState {
+            version,
+            switch: None,
+            syncd_error: format!("syncd unavailable: {}", status.message()),
+        },
+    }
+}
+
+/// `show switch`.
+pub async fn switch_state(syncd: &IpcEndpoint) -> Result<SwitchSummary> {
+    let channel = syncd.connect().await.context("connecting to syncd")?;
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    let info = client
+        .get_switch_info(pb::GetSwitchInfoRequest {})
+        .await?
+        .into_inner();
+    Ok(switch_summary(info))
+}
+
+/// `show environment`.
+pub async fn environment_state(pmon: &IpcEndpoint) -> Result<EnvironmentState> {
+    let mut client = pmon_client(pmon).await?;
+    let env = client
+        .get_environment(pb::GetEnvironmentRequest {})
+        .await?
+        .into_inner();
+    Ok(EnvironmentState {
+        temperatures: env
+            .temperatures
+            .into_iter()
+            .map(|sensor| TemperatureSensor {
+                name: sensor.name,
+                celsius: sensor.celsius,
+                warn_celsius: sensor.warn_celsius,
+                crit_celsius: sensor.crit_celsius,
+            })
+            .collect(),
+        fans: env
+            .fans
+            .into_iter()
+            .map(|fan| Fan {
+                name: fan.name,
+                present: fan.present,
+                rpm: fan.rpm,
+                pwm_percent: fan.pwm_percent,
+                ok: fan.ok,
+            })
+            .collect(),
+        psus: env
+            .psus
+            .into_iter()
+            .map(|psu| Psu {
+                name: psu.name,
+                present: psu.present,
+                ok: psu.ok,
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]

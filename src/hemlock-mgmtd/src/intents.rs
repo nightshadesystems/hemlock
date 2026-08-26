@@ -3855,6 +3855,23 @@ fn system(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
                 match name.as_str() {
                     "login" => intents.login = login(children)?,
                     "logging" => intents.logging = logging(children)?,
+                    // Deferred by this suite; named rather than read as
+                    // an unrecognized block, so an operator who tries
+                    // one learns what the box actually does.
+                    "aaa" | "radius" | "tacacs" | "tacacs+" => {
+                        return Err(bad(
+                            "RADIUS/TACACS+ login authentication is not supported".into()
+                        ));
+                    }
+                    "archive" => {
+                        return Err(bad("scheduled config archives are not supported".into()));
+                    }
+                    "boot" | "image" => {
+                        return Err(bad(
+                            "dual-partition image selection is not supported (single image slot)"
+                                .into(),
+                        ));
+                    }
                     // `web` carries the console's session timeout; the
                     // listener half is block presence (`http`/`https`),
                     // parsed by `web`.
@@ -4002,6 +4019,13 @@ fn user(account: &str, items: &[Item]) -> Result<UserIntent, IntentError> {
             return Err(bad(format!("unrecognized block {:?}", item.name())));
         };
         match name.as_str() {
+            // Deferred by this suite: login AAA is the box's own user
+            // database only.
+            "aaa" | "radius" | "tacacs" | "tacacs+" => {
+                return Err(bad(
+                    "RADIUS/TACACS+ login authentication is not supported".into()
+                ));
+            }
             "role" => {
                 let [role] = values.as_slice() else {
                     return Err(bad("expected `role <admin|operator>`".into()));
@@ -5043,7 +5067,7 @@ fn snmp(items: &[Item]) -> Result<SnmpIntent, IntentError> {
                 *slot = Some(text.clone());
             }
             // Deferred by this suite; named rather than ignored.
-            "trap" | "trap2sink" | "informs" | "trapsink" => {
+            "trap" | "trap2sink" | "informs" | "trapsink" | "alarm" => {
                 return Err(bad("SNMP traps and informs are not supported".into()));
             }
             "rwcommunity" | "rwuser" => {
@@ -8541,6 +8565,57 @@ system {
             assert_eq!(
                 log_level_severity(logging.effective_level()),
                 Some(*severity)
+            );
+        }
+    }
+
+    /// Everything this suite deferred is refused by name, so an
+    /// operator who tries one learns what the box actually does rather
+    /// than reading "unrecognized statement".
+    #[test]
+    fn the_deferred_families_are_named() {
+        let hash = "$6$abcdefgh$ijklmnop";
+        let admin = format!(
+            "user cody {{ role admin
+password-hash \"{hash}\" }}"
+        );
+        for (text, wanted) in [
+            (
+                "system { aaa { } }".to_string(),
+                "RADIUS/TACACS+ login authentication is not supported",
+            ),
+            (
+                "system { radius { } }".to_string(),
+                "RADIUS/TACACS+ login authentication is not supported",
+            ),
+            (
+                format!(
+                    "system {{ login {{ {admin}
+user noc {{ radius yes }} }} }}"
+                ),
+                "RADIUS/TACACS+ login authentication is not supported",
+            ),
+            (
+                "system { archive { } }".to_string(),
+                "scheduled config archives are not supported",
+            ),
+            (
+                "system { image { } }".to_string(),
+                "dual-partition image selection is not supported (single image slot)",
+            ),
+            (
+                "system { logging { host 10.0.0.1 tls on } }".to_string(),
+                "syslog over TLS is not supported",
+            ),
+            (
+                "services { snmp { alarm high } }".to_string(),
+                "SNMP traps and informs are not supported",
+            ),
+        ] {
+            let message = extract(&parse(&text).unwrap()).unwrap_err().to_string();
+            assert!(
+                message.contains(wanted),
+                "{text:?} said {message:?}, wanted {wanted:?}"
             );
         }
     }

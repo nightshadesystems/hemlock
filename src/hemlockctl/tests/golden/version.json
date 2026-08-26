@@ -1,0 +1,11 @@
+{
+  "version": {
+    "switch": {
+      "backend": "mock",
+      "platform_id": "x86_64-cel_e1031-r0",
+      "port_count": 52,
+      "switch_oid": 2377900603251621888
+    },
+    "version": "1.4.0"
+  }
+}

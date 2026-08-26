@@ -2,7 +2,10 @@
 
 use crate::interfaces::table::{Col, Text};
 
-use super::model::{CableDiagState, CommitsState, ImageState, LoggingState, UsersState};
+use super::model::{
+    CableDiagState, CommitsState, EnvironmentState, ImageState, LoggingState, UsersState,
+    VersionState,
+};
 
 /// A duration as `HH:MM:SS`, the shape an idle timer reads best in.
 /// Days roll into the hours field rather than adding a unit.
@@ -280,6 +283,90 @@ pub fn cable_diagnostics(state: &CableDiagState) -> String {
                 },
             ],
         );
+    }
+    out.finish()
+}
+
+// ---------------------------------------------- migrated system shows
+//
+// `show version`, `show switch` and `show environment` predate the
+// per-suite module convention: they printed inline, so there was
+// nothing to golden. The output below is byte-for-byte what they
+// produced — `golden_tests` asserts that against the original format
+// expressions — and now it comes from a model like every other show,
+// so `| json` works and the layout is pinned.
+
+/// `show version` — software and platform.
+pub fn version(state: &VersionState) -> String {
+    let mut out = Text::new();
+    out.line(format!("Hemlock  {}", state.version));
+    match &state.switch {
+        Some(switch) => {
+            out.line(format!("Platform:  {}", switch.platform_id));
+            out.line(format!("Backend:   {}", switch.backend));
+            out.line(format!("Ports:     {}", switch.port_count));
+        }
+        None => out.line(format!("({})", state.syncd_error)),
+    }
+    out.finish()
+}
+
+/// `show switch` — the ASIC summary, including the switch object id.
+pub fn switch(state: &super::model::SwitchSummary) -> String {
+    let mut out = Text::new();
+    out.line(format!("Platform:   {}", state.platform_id));
+    out.line(format!("Backend:    {}", state.backend));
+    out.line(format!("Switch OID: {:#x}", state.switch_oid));
+    out.line(format!("Ports:      {}", state.port_count));
+    out.finish()
+}
+
+/// `show environment` — temperatures, fans and PSUs. A section with
+/// nothing in it is omitted rather than printed empty.
+pub fn environment(state: &EnvironmentState) -> String {
+    let mut out = Text::new();
+    if !state.temperatures.is_empty() {
+        out.line("Temperatures:");
+        for sensor in &state.temperatures {
+            let flag = if sensor.celsius >= sensor.crit_celsius {
+                "  CRIT"
+            } else if sensor.celsius >= sensor.warn_celsius {
+                "  WARN"
+            } else {
+                ""
+            };
+            out.line(format!(
+                "  {:<28} {:>6.1} C  (warn {:.0}, crit {:.0}){flag}",
+                sensor.name, sensor.celsius, sensor.warn_celsius, sensor.crit_celsius
+            ));
+        }
+    }
+    if !state.fans.is_empty() {
+        out.line("Fans:");
+        for fan in &state.fans {
+            if !fan.present {
+                out.line(format!("  {:<28} not present", fan.name));
+                continue;
+            }
+            out.line(format!(
+                "  {:<28} {:>5} rpm  pwm {:>3}%  {}",
+                fan.name,
+                fan.rpm,
+                fan.pwm_percent,
+                if fan.ok { "ok" } else { "FAULT" }
+            ));
+        }
+    }
+    if !state.psus.is_empty() {
+        out.line("PSUs:");
+        for psu in &state.psus {
+            let status = match (psu.present, psu.ok) {
+                (false, _) => "absent",
+                (true, true) => "ok",
+                (true, false) => "FAULT",
+            };
+            out.line(format!("  {:<28} {status}", psu.name));
+        }
     }
     out.finish()
 }

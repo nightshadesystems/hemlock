@@ -767,9 +767,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             "interfaces" => {
                 crate::interfaces::cmd::run(&endpoints.syncd, &endpoints.pmon, &words[1..]).await
             }
-            "environment" => show::environment(endpoints.pmon.clone())
-                .await
-                .map_err(fmt_err),
+            "environment" => {
+                crate::system::cmd::show_environment(&endpoints.pmon, &words[1..]).await
+            }
             "configuration" | "config" | "conf" => show::configuration(
                 endpoints.syncd.clone(),
                 endpoints.mgmtd.clone(),
@@ -777,10 +777,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
             )
             .await
             .map_err(fmt_err),
-            "version" => {
-                show::version(endpoints.syncd.clone()).await;
-                Ok(())
-            }
+            "version" => crate::system::cmd::show_version(&endpoints.syncd, &words[1..]).await,
             "vlan" => crate::switching::cmd::show_vlan(&endpoints.syncd, &words[1..]).await,
             "mac" => crate::switching::cmd::show_mac(&endpoints.syncd, &words[1..]).await,
             "storm-control" => {

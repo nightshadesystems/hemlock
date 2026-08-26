@@ -1,0 +1,12 @@
+Temperatures:
+  CPU Core                       41.5 C  (warn 85, crit 95)
+  Switch ASIC                    88.0 C  (warn 85, crit 100)  WARN
+  Inlet                         105.0 C  (warn 60, crit 70)  CRIT
+Fans:
+  Fan Tray 1                    8400 rpm  pwm  45%  ok
+  Fan Tray 2                       0 rpm  pwm  45%  FAULT
+  Fan Tray 3                   not present
+PSUs:
+  PSU 1                        ok
+  PSU 2                        FAULT
+  PSU 3                        absent
