@@ -321,7 +321,12 @@ impl Engine {
     /// through syncd, OS-side families through the OS applier — then
     /// persist `new_text` as running. Returns the applied changes,
     /// described.
-    async fn apply_and_persist(&mut self, new_text: &str, comment: &str) -> Result<Vec<String>> {
+    async fn apply_and_persist(
+        &mut self,
+        new_text: &str,
+        comment: &str,
+        by: (&str, &str),
+    ) -> Result<Vec<String>> {
         let running_intents = Self::parse_intents(&self.store.running()?).unwrap_or_default();
         let wanted_intents = Self::parse_intents(new_text)?;
         let port_changes = intents::diff(&running_intents.ports, &wanted_intents.ports);
@@ -806,6 +811,8 @@ impl Engine {
             &RollbackMeta {
                 committed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 comment: comment.to_string(),
+                user: by.0.to_string(),
+                client: by.1.to_string(),
             },
         )?;
         self.commit_seq += 1;
@@ -2077,7 +2084,7 @@ impl pb::mgmt_server::Mgmt for MgmtService {
         // silently.
         let warnings = engine.self_change_warnings(&req.user, &candidate);
         let changes = engine
-            .apply_and_persist(&candidate, &req.comment)
+            .apply_and_persist(&candidate, &req.comment, (&req.user, &req.client))
             .await
             .map_err(internal)?;
         // A promotion or demotion reaches the sessions already open,
@@ -2105,7 +2112,11 @@ impl pb::mgmt_server::Mgmt for MgmtService {
                         }
                         warn!("commit-confirm window expired; rolling back");
                         match engine
-                            .apply_and_persist(&pre_commit_running, "auto-rollback (commit-confirm expired)")
+                            .apply_and_persist(
+                                &pre_commit_running,
+                                "auto-rollback (commit-confirm expired)",
+                                ("", "system"),
+                            )
                             .await
                         {
                             Ok(_) => info!("auto-rollback complete"),
@@ -2158,17 +2169,84 @@ impl pb::mgmt_server::Mgmt for MgmtService {
         _request: Request<pb::ListRollbacksRequest>,
     ) -> Result<Response<pb::ListRollbacksResponse>, Status> {
         let engine = self.engine.lock().await;
-        Ok(Response::new(pb::ListRollbacksResponse {
-            entries: engine
-                .store
-                .list_rollbacks()
-                .into_iter()
-                .map(|(n, meta)| pb::RollbackEntry {
-                    revisions_back: n,
-                    committed_at: meta.committed_at,
-                    comment: meta.comment,
-                })
-                .collect(),
+        let entry = |n: u32, meta: crate::store::RollbackMeta| pb::RollbackEntry {
+            revisions_back: n,
+            committed_at: meta.committed_at,
+            comment: meta.comment,
+            user: meta.user,
+            client: meta.client,
+        };
+        // Index 0 is the running config, described by the commit that
+        // produced it; the ring follows, newest first.
+        let entries = std::iter::once(entry(0, engine.store.running_meta()))
+            .chain(
+                engine
+                    .store
+                    .list_rollbacks()
+                    .into_iter()
+                    .map(|(n, meta)| entry(n, meta)),
+            )
+            .collect();
+        Ok(Response::new(pb::ListRollbacksResponse { entries }))
+    }
+
+    async fn get_image_info(
+        &self,
+        _request: Request<pb::GetImageInfoRequest>,
+    ) -> Result<Response<pb::GetImageInfoResponse>, Status> {
+        let record = hemlock_common::image::installed_image().unwrap_or_default();
+        // The built-in version is the fallback for an image installed
+        // before the record existed — it is what this binary *is*.
+        let version = if record.version.is_empty() {
+            hemlock_common::VERSION.to_string()
+        } else {
+            record.version.clone()
+        };
+        let onie_rescue_armed = hemlock_common::image::onie_rescue_armed();
+        Ok(Response::new(pb::GetImageInfoResponse {
+            next_boot: if onie_rescue_armed {
+                "ONIE rescue (this boot only)".to_string()
+            } else {
+                // Single image slot: barring a rescue boot, the next
+                // boot runs exactly what this one does.
+                version.clone()
+            },
+            version,
+            installed_at: i64::try_from(record.installed_at).unwrap_or(0),
+            image_file: record.file,
+            kernel: hemlock_common::image::kernel_release(),
+            onie_rescue_armed,
+            platform: if record.platform.is_empty() {
+                hemlock_common::image::installed_platform().unwrap_or_default()
+            } else {
+                record.platform
+            },
+        }))
+    }
+
+    async fn reboot(
+        &self,
+        request: Request<pb::RebootRequest>,
+    ) -> Result<Response<pb::RebootResponse>, Status> {
+        let req = request.into_inner();
+        // Hold the engine lock while arming: no commit lands between
+        // the decision to reboot and the reboot itself.
+        let _engine = self.engine.lock().await;
+        if req.onie_rescue {
+            hemlock_common::image::arm_onie_rescue().map_err(Status::failed_precondition)?;
+            warn!("ONIE rescue armed for the next boot");
+        }
+        info!(onie_rescue = req.onie_rescue, "rebooting");
+        // Grace period so the reply reaches the caller first.
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            let _ = tokio::process::Command::new("systemctl")
+                .arg("reboot")
+                .status()
+                .await;
+        });
+        Ok(Response::new(pb::RebootResponse {
+            onie_rescue_armed: req.onie_rescue,
         }))
     }
 

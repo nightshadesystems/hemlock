@@ -115,3 +115,59 @@ fn logging_edge_cases() {
     // With no journal there is no tail footer to print.
     assert!(!text.contains("for more"), "{text}");
 }
+
+#[test]
+fn system_commits() {
+    assert_golden(
+        &render::commits(&fx::commits_state()),
+        include_str!("../../tests/golden/system_commits.txt"),
+    );
+    assert_golden(
+        &as_json("system_commits", &fx::commits_state()),
+        include_str!("../../tests/golden/system_commits.json"),
+    );
+}
+
+#[test]
+fn system_image() {
+    assert_golden(
+        &render::image(&fx::image_state()),
+        include_str!("../../tests/golden/system_image.txt"),
+    );
+    assert_golden(
+        &as_json("system_image", &fx::image_state()),
+        include_str!("../../tests/golden/system_image.json"),
+    );
+}
+
+/// An armed rescue boot changes what the next boot says, and a commit
+/// entry with a comment shows it instead of the dash.
+#[test]
+fn system_image_and_commits_edge_cases() {
+    let mut image = fx::image_state();
+    image.onie_rescue_armed = true;
+    image.next_boot = "ONIE rescue (this boot only)".into();
+    let text = render::image(&image);
+    assert!(
+        text.contains("ONIE rescue    : armed for the next boot"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Next boot      : ONIE rescue (this boot only)"),
+        "{text}"
+    );
+
+    // Nothing recorded at all still renders a full block of dashes.
+    let text = render::image(&super::model::ImageState::default());
+    assert!(text.contains("Current image  : -"), "{text}");
+    assert!(!text.contains("installed"), "{text}");
+
+    let mut commits = fx::commits_state();
+    commits.commits[1].comment = "pre-maintenance".into();
+    let text = render::commits(&commits);
+    assert!(text.contains("pre-maintenance"), "{text}");
+    // Index 0 always reads as the running config.
+    assert!(text.contains("(current)"), "{text}");
+    let text = render::commits(&super::model::CommitsState::default());
+    assert!(text.contains("(no commits recorded)"), "{text}");
+}

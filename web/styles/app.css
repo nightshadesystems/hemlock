@@ -17,6 +17,8 @@
 .dim{color:var(--cds-alias-typography-color-300)}
 .page-loading{display:flex;align-items:center;justify-content:center;gap:12px;padding:64px;color:var(--cds-alias-typography-color-300);font-size:13px}
 .card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start}
+/* A card holding a table wants the whole row, not a 320px column. */
+.card-grid>.card-wide{grid-column:1/-1}
 .kv{display:grid;grid-template-columns:minmax(140px,40%) 1fr;font-size:13px}
 .kv>div{padding:6px 0;border-top:1px solid var(--cds-alias-object-border-subtle)}
 .kv>div:nth-child(-n+2){border-top:none}

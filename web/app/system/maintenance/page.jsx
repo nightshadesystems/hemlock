@@ -6,6 +6,7 @@ import { Alert, Card, CardBlock, Label } from '@/components/ds/misc';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
 import { FormField, Input, Checkbox } from '@/components/ds/forms';
+import { Datagrid } from '@/components/ds/Datagrid';
 
 const MONO = { fontFamily: 'var(--ns-font-mono)', letterSpacing: '0.06em' };
 
@@ -21,6 +22,11 @@ const formatWhen = (unixSecs) =>
     weekday: 'short', hour: '2-digit', minute: '2-digit',
     month: 'short', day: 'numeric',
   });
+
+// An RFC-3339 commit time as the CLI prints it; `-` when the ring
+// entry predates recorded metadata.
+const commitStamp = (rfc3339) =>
+  rfc3339 ? rfc3339.replace('T', ' ').replace('Z', '') : '—';
 
 const stamp = () => {
   const d = new Date();
@@ -154,7 +160,72 @@ function RestoreModal({ open, onClose, onRestored }) {
   );
 }
 
-function RebootNowModal({ open, onClose, onRebooting }) {
+/// Reboot, optionally into ONIE rescue. Both need `yes` typed in full,
+/// the same confirmation the CLI asks for — a reboot is not something
+/// to trigger with one stray click.
+function RebootNowModal({ open, onieRescue, onClose, onRebooting }) {
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [typed, setTyped] = useState('');
+
+  useEffect(() => {
+    if (open) { setError(null); setBusy(false); setTyped(''); }
+  }, [open]);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api('/api/reboot', {
+        method: 'POST',
+        body: JSON.stringify({ in_minutes: 0, onie_rescue: !!onieRescue }),
+      });
+      onRebooting();
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={open}
+      title={onieRescue ? 'Reboot into ONIE Rescue' : 'Reboot Switch'}
+      size="sm"
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
+          <Button variant="danger" onClick={submit} loading={busy}
+            disabled={busy || typed.trim() !== 'yes'}>
+            {onieRescue ? 'Reboot into ONIE' : 'Reboot Now'}
+          </Button>
+        </>
+      }
+    >
+      {error && <Alert status="danger" sm style={{ marginBottom: 12 }}>{error}</Alert>}
+      <p>
+        {onieRescue
+          ? 'Reboot into ONIE rescue mode? The switch comes up in ONIE, not Hemlock — '
+            + 'it stops forwarding and this console will not be there. The arming applies '
+            + 'to the next boot only.'
+          : 'Reboot the switch immediately? All ports go down until the switch has booted '
+            + 'and reconverged, and unsaved candidate changes are discarded.'}
+      </p>
+      <div className="clr-form-compact">
+        <FormField label="Confirmation" required htmlFor="reboot-confirm"
+          helper="Type `yes` to enable the button.">
+          <Input id="reboot-confirm" autoFocus className="mono" value={typed}
+            onChange={(e) => setTyped(e.target.value)} />
+        </FormField>
+      </div>
+    </Modal>
+  );
+}
+
+/// Rolling back is a commit like any other: the dialog names exactly
+/// which entry it is about to make current.
+function RollbackModal({ open, commit, onClose, onRolledBack }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -166,31 +237,39 @@ function RebootNowModal({ open, onClose, onRebooting }) {
     setBusy(true);
     setError(null);
     try {
-      await api('/api/reboot', { method: 'POST', body: JSON.stringify({ in_minutes: 0 }) });
-      onRebooting();
+      const result = await api('/api/system/rollback', {
+        method: 'POST',
+        body: JSON.stringify({ index: commit.index }),
+      });
+      onRolledBack(result);
     } catch (err) {
       setError(err.message);
       setBusy(false);
     }
   };
 
+  if (!commit) return null;
   return (
     <Modal
       open={open}
-      title="Reboot Switch"
+      title={`Roll Back to Commit ${commit.index}`}
       size="sm"
       onClose={onClose}
       footer={
         <>
           <Button variant="link-neutral" onClick={onClose}>Cancel</Button>
-          <Button variant="danger" onClick={submit} loading={busy} disabled={busy}>Reboot Now</Button>
+          <Button variant="warning" onClick={submit} loading={busy} disabled={busy}>
+            Roll Back
+          </Button>
         </>
       }
     >
       {error && <Alert status="danger" sm style={{ marginBottom: 12 }}>{error}</Alert>}
       <p>
-        Reboot the switch immediately? All ports go down until the switch has booted and
-        reconverged, and unsaved candidate changes are discarded.
+        Load commit {commit.index} ({commitStamp(commit.time)}
+        {commit.user ? `, ${commit.user}` : ''}
+        {commit.client ? `, ${commit.client}` : ''}) and commit it? The configuration running
+        now becomes commit 1, so this is itself reversible.
       </p>
     </Modal>
   );
@@ -336,13 +415,22 @@ export default function MaintenancePage() {
   const [applied, setApplied] = useState(null);
   const [modal, setModal] = useState(null); // 'restore' | 'reboot' | 'schedule' | 'install'
   const [rebooting, setRebooting] = useState(false);
+  const [image, setImage] = useState(null);
+  const [commits, setCommits] = useState(null);
+  const [session, setSession] = useState(null);
+  const [rollback, setRollback] = useState(null);
   const [upload, setUpload] = useState(null); // { name, progress } while uploading
   const fileRef = useRef(null);
 
   const refresh = useCallback(() => {
     api('/api/maintenance').then(setData).catch((e) => setError(e.message));
+    api('/api/system/image').then(setImage).catch(() => {});
+    api('/api/system/commits').then((r) => setCommits(r.commits)).catch(() => {});
   }, []);
   useEffect(refresh, [refresh]);
+  useEffect(() => {
+    api('/api/session').then(setSession).catch(() => {});
+  }, []);
 
   const downloadConfig = async () => {
     try {
@@ -393,6 +481,8 @@ export default function MaintenancePage() {
 
   const staged = data && data.staged_image;
   const scheduled = data && data.scheduled_reboot;
+  const isAdmin = !session || session.admin;
+  const adminTitle = isAdmin ? undefined : 'Operator role: this console is read-only.';
 
   if (rebooting) {
     return (
@@ -451,14 +541,101 @@ export default function MaintenancePage() {
               text="Reboot the switch immediately, or schedule one for a maintenance window. A scheduled reboot can be cancelled until it fires." />
             <CardBlock>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <Button sm icon="power" variant="danger-outline" onClick={() => setModal('reboot')}>
+                <Button sm icon="power" variant="danger-outline" disabled={!isAdmin}
+                  title={adminTitle} onClick={() => setModal('reboot')}>
                   Reboot Now
                 </Button>
-                <Button sm icon="clock" onClick={() => setModal('schedule')} disabled={!!scheduled}>
+                <Button sm icon="clock" onClick={() => setModal('schedule')}
+                  disabled={!!scheduled || !isAdmin} title={adminTitle}>
                   Schedule Reboot…
+                </Button>
+                <Button sm icon="rescue" variant="danger-outline" disabled={!isAdmin}
+                  title={adminTitle} onClick={() => setModal('onie-rescue')}>
+                  Reboot into ONIE…
                 </Button>
               </div>
             </CardBlock>
+          </Card>
+
+          <Card header="Image">
+            {!image && <CardBlock text="Reading the installed image…" />}
+            {image && (
+              <CardBlock>
+                <div className="kv">
+                  <div className="k">Current Image</div>
+                  <div className="v mono">
+                    {image.version || '—'}
+                    {image.installed_at > 0 && (
+                      <span className="dim">
+                        {' '}(installed {commitStamp(new Date(image.installed_at * 1000)
+                          .toISOString())})
+                      </span>
+                    )}
+                  </div>
+                  <div className="k">Image File</div>
+                  <div className="v mono">{image.image_file || '—'}</div>
+                  <div className="k">Kernel</div>
+                  <div className="v mono">{image.kernel || '—'}</div>
+                  {image.platform && <div className="k">Platform</div>}
+                  {image.platform && <div className="v mono">{image.platform}</div>}
+                  <div className="k">Next Boot</div>
+                  <div className="v mono">{image.next_boot || '—'}</div>
+                  <div className="k">ONIE Rescue</div>
+                  <div className="v">
+                    {image.onie_rescue_armed
+                      ? <Label status="warning" style={MONO}>ARMED</Label>
+                      : <Label style={MONO}>NOT ARMED</Label>}
+                  </div>
+                </div>
+              </CardBlock>
+            )}
+          </Card>
+
+          <Card header="Commit History" className="card-wide">
+            {!commits && <CardBlock text="Reading the rollback ring…" />}
+            {commits && (
+              <Datagrid
+                rowKey={(r) => r.index}
+                compact
+                pageSize={10}
+                onRefresh={refresh}
+                columns={[
+                  {
+                    key: 'index', label: 'Idx', width: 60,
+                    render: (r) => <span className="cell-mono">{r.index}</span>,
+                  },
+                  {
+                    key: 'time', label: 'Time',
+                    render: (r) => <span className="cell-mono">{commitStamp(r.time)}</span>,
+                  },
+                  { key: 'user', label: 'User', render: (r) => r.user || '—' },
+                  {
+                    key: 'client', label: 'Client',
+                    render: (r) => (r.client ? <Label>{r.client}</Label> : '—'),
+                  },
+                  {
+                    key: 'comment', label: 'Comment',
+                    render: (r) =>
+                      r.index === 0
+                        ? <Label status="success">current</Label>
+                        : r.comment || <span className="dim">—</span>,
+                  },
+                  {
+                    key: 'actions', label: '', width: 110,
+                    render: (r) =>
+                      r.index === 0 ? null : (
+                        <Button variant="link" sm icon="undo" disabled={!isAdmin}
+                          title={adminTitle}
+                          onClick={() => setRollback(r)}>
+                          Roll Back
+                        </Button>
+                      ),
+                  },
+                ]}
+                rows={commits}
+                placeholder="No commits recorded yet."
+              />
+            )}
           </Card>
 
           <Card header="Software">
@@ -527,11 +704,25 @@ export default function MaintenancePage() {
         }}
       />
       <RebootNowModal
-        open={modal === 'reboot'}
+        open={modal === 'reboot' || modal === 'onie-rescue'}
+        onieRescue={modal === 'onie-rescue'}
         onClose={() => setModal(null)}
         onRebooting={() => {
           setModal(null);
           setRebooting(true);
+        }}
+      />
+      <RollbackModal
+        open={!!rollback}
+        commit={rollback}
+        onClose={() => setRollback(null)}
+        onRolledBack={(result) => {
+          setRollback(null);
+          setApplied([
+            ...(result.applied.length ? result.applied : ['No changes needed.']),
+            ...(result.warnings || []),
+          ]);
+          refresh();
         }}
       />
       <ScheduleRebootModal

@@ -1,0 +1,10 @@
+{
+  "system_image": {
+    "image_file": "hemlock-e1031-1.4.0.bin",
+    "installed_at": 1787148131,
+    "kernel": "6.12.30-hemlock",
+    "next_boot": "hemlock-1.4.0",
+    "onie_rescue_armed": false,
+    "version": "hemlock-1.4.0"
+  }
+}

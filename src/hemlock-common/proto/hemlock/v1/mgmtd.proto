@@ -40,6 +40,13 @@ service Mgmt {
   // console's live tail. mgmtd runs as root, so it can read the whole
   // journal where an operator account may not.
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
+
+  // --- Software and reboot ----------------------------------------------
+  // What the box runs and what it will boot next (`show system image`).
+  rpc GetImageInfo(GetImageInfoRequest) returns (GetImageInfoResponse);
+  // Reboot the switch, optionally into ONIE rescue for the next boot
+  // only. Both consoles confirm before calling this.
+  rpc Reboot(RebootRequest) returns (RebootResponse);
 }
 
 enum ConfigSource {
@@ -96,13 +103,47 @@ message RollbackResponse {
 message ListRollbacksRequest {}
 
 message ListRollbacksResponse {
+  // Index 0 is the running configuration; 1..N are the ring, newest
+  // first. Each entry carries the metadata of the commit that *created*
+  // that configuration.
   repeated RollbackEntry entries = 1;
 }
 
 message RollbackEntry {
   uint32 revisions_back = 1;
-  string committed_at = 2;   // RFC 3339
+  string committed_at = 2;   // RFC 3339; empty = not recorded
   string comment = 3;
+  // Who committed and from which console. Empty in ring entries written
+  // before the system suite; both render as `-`.
+  string user = 4;
+  string client = 5;
+}
+
+message GetImageInfoRequest {}
+
+message GetImageInfoResponse {
+  // The running version, from the install record when there is one and
+  // the built-in version otherwise.
+  string version = 1;
+  // Unix seconds the image was installed; 0 = not recorded.
+  int64 installed_at = 2;
+  // Basename of the .bin it was installed from; empty = not recorded.
+  string image_file = 3;
+  string kernel = 4;
+  // What the next boot will run.
+  string next_boot = 5;
+  // An ONIE rescue boot armed for the next boot only.
+  bool onie_rescue_armed = 6;
+  string platform = 7;
+}
+
+message RebootRequest {
+  // Arm ONIE rescue mode for this reboot only.
+  bool onie_rescue = 1;
+}
+
+message RebootResponse {
+  bool onie_rescue_armed = 1;
 }
 
 message DiscardRequest {}

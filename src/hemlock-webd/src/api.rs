@@ -70,6 +70,8 @@ fn get_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/system/identity", get(system_identity)),
         ("/api/system/users", get(system_users)),
         ("/api/system/logging", get(system_logging)),
+        ("/api/system/commits", get(system_commits)),
+        ("/api/system/image", get(system_image)),
         ("/api/users", get(users)),
         ("/api/config", get(config)),
         ("/api/maintenance", get(maintenance)),
@@ -130,6 +132,7 @@ fn post_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/system/identity/edit", post(system_identity_edit)),
         ("/api/system/users/edit", post(system_users_edit)),
         ("/api/system/logging/edit", post(system_logging_edit)),
+        ("/api/system/rollback", post(system_rollback)),
         ("/api/system/web/edit", post(system_web_edit)),
         ("/api/users/add", post(users_add)),
         ("/api/config/restore", post(config_restore)),
@@ -1038,6 +1041,103 @@ async fn system_logging_edit(
         crate::system_edit::apply_logging_edit(tree, &edit)
     })
     .await
+}
+
+/// `GET /api/system/commits` — the commit history, index 0 being the
+/// running configuration.
+async fn system_commits(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = mgmtd_client(&state).await?;
+    let entries = client
+        .list_rollbacks(pb::ListRollbacksRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner()
+        .entries;
+    Ok(Json(json!({
+        "commits": entries.iter().map(|entry| json!({
+            "index": entry.revisions_back,
+            "time": entry.committed_at,
+            "user": entry.user,
+            "client": entry.client,
+            "comment": entry.comment,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct RollbackRequestBody {
+    /// Ring index to load and commit; 0 (the running config) is not a
+    /// target.
+    index: u32,
+}
+
+/// `POST /api/system/rollback` — load ring entry N into the candidate
+/// and commit it, the same two RPCs `rollback <n>` uses.
+async fn system_rollback(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<RollbackRequestBody>,
+) -> Result<Response, ApiError> {
+    if request.index == 0 {
+        return Ok(errors(vec![
+            "commit 0 is the running configuration; there is nothing to roll back to".to_string(),
+        ]));
+    }
+    let mut client = mgmtd_client(&state).await?;
+    if let Err(status) = client
+        .rollback(pb::RollbackRequest {
+            revisions_back: request.index,
+        })
+        .await
+    {
+        return Ok(errors(vec![status.message().to_string()]));
+    }
+    let commit = client
+        .commit(pb::CommitRequest {
+            comment: format!("rollback {}", request.index),
+            confirm_timeout_secs: 0,
+            user: _op.0.username.clone(),
+            client: "web".into(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    tracing::info!(
+        index = request.index,
+        user = %_op.0.username,
+        "web console rollback"
+    );
+    Ok(Json(json!({
+        "commit_id": commit.commit_id,
+        "applied": commit.applied_changes,
+        "warnings": commit.warnings,
+    }))
+    .into_response())
+}
+
+/// `GET /api/system/image` — what runs now and what boots next.
+async fn system_image(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut client = mgmtd_client(&state).await?;
+    let info = client
+        .get_image_info(pb::GetImageInfoRequest {})
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner();
+    Ok(Json(json!({
+        "version": info.version,
+        "installed_at": info.installed_at,
+        "image_file": info.image_file,
+        "kernel": info.kernel,
+        "platform": info.platform,
+        "next_boot": info.next_boot,
+        "onie_rescue_armed": info.onie_rescue_armed,
+    })))
 }
 
 async fn system_web_edit(
@@ -3104,19 +3204,47 @@ struct RebootRequest {
     /// 0 = reboot now; otherwise minutes from now.
     #[serde(default)]
     in_minutes: u64,
+    /// Arm ONIE rescue mode for this boot only. Immediate reboots
+    /// only — arming and then waiting would leave the switch in a state
+    /// nobody asked for if the schedule were cancelled.
+    #[serde(default)]
+    onie_rescue: bool,
 }
 
 async fn reboot(
     _op: Operator,
-    State(_state): State<SharedState>,
+    State(state): State<SharedState>,
     Json(request): Json<RebootRequest>,
 ) -> Response {
     if !cfg!(unix) {
         return errors(vec!["reboot is only available on the switch".to_string()]);
     }
+    if request.onie_rescue && request.in_minutes != 0 {
+        return errors(vec![
+            "ONIE rescue applies to an immediate reboot only".to_string()
+        ]);
+    }
     if request.in_minutes == 0 {
-        crate::maint::reboot_now();
-        return Json(json!({ "rebooting": true })).into_response();
+        // mgmtd owns the reboot: it arms ONIE rescue and holds the
+        // engine lock, so no commit lands between the decision and the
+        // box going down. The same path `request reboot` takes.
+        let mut client = match mgmtd_client(&state).await {
+            Ok(client) => client,
+            Err(err) => return errors(vec![format!("{err:#}")]),
+        };
+        return match client
+            .reboot(pb::RebootRequest {
+                onie_rescue: request.onie_rescue,
+            })
+            .await
+        {
+            Ok(response) => Json(json!({
+                "rebooting": true,
+                "onie_rescue_armed": response.into_inner().onie_rescue_armed,
+            }))
+            .into_response(),
+            Err(status) => errors(vec![status.message().to_string()]),
+        };
     }
     if request.in_minutes > 7 * 24 * 60 {
         return errors(vec!["reboot delay must be at most a week".to_string()]);

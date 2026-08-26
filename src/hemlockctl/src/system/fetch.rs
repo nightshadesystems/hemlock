@@ -7,7 +7,10 @@ use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
 use hemlock_config::ConfigTree;
 
-use super::model::{ActiveSession, ConfiguredUser, LogEntry, LoggingState, UsersState};
+use super::model::{
+    ActiveSession, Commit, CommitsState, ConfiguredUser, ImageState, LogEntry, LoggingState,
+    UsersState,
+};
 
 async fn mgmt_client(
     mgmtd: &IpcEndpoint,
@@ -219,6 +222,56 @@ fn logging_config(tree: &ConfigTree) -> (String, Vec<String>) {
         })
         .collect();
     (level, hosts)
+}
+
+// ------------------------------------------------- commits and image
+
+/// `show system commits`, and the lookup behind the `rollback <n>`
+/// confirmation line.
+pub async fn commits_state(mgmtd: &IpcEndpoint) -> Result<CommitsState> {
+    let mut client = mgmt_client(mgmtd).await?;
+    let entries = client
+        .list_rollbacks(pb::ListRollbacksRequest {})
+        .await?
+        .into_inner()
+        .entries;
+    Ok(CommitsState {
+        commits: entries
+            .into_iter()
+            .map(|entry| Commit {
+                index: entry.revisions_back,
+                time: i64::try_from(unix_of(&entry.committed_at)).unwrap_or(0),
+                user: entry.user,
+                client: entry.client,
+                comment: entry.comment,
+            })
+            .collect(),
+    })
+}
+
+/// `show system image`.
+pub async fn image_state(mgmtd: &IpcEndpoint) -> Result<ImageState> {
+    let mut client = mgmt_client(mgmtd).await?;
+    let info = client
+        .get_image_info(pb::GetImageInfoRequest {})
+        .await?
+        .into_inner();
+    Ok(ImageState {
+        version: info.version,
+        installed_at: info.installed_at,
+        image_file: info.image_file,
+        kernel: info.kernel,
+        platform: info.platform,
+        next_boot: info.next_boot,
+        onie_rescue_armed: info.onie_rescue_armed,
+    })
+}
+
+/// `request reboot [onie-rescue]`.
+pub async fn reboot(mgmtd: &IpcEndpoint, onie_rescue: bool) -> Result<()> {
+    let mut client = mgmt_client(mgmtd).await?;
+    client.reboot(pb::RebootRequest { onie_rescue }).await?;
+    Ok(())
 }
 
 #[cfg(test)]

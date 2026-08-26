@@ -336,6 +336,7 @@ async fn operational(
         "show",
         "configure",
         "clear",
+        "request",
         "upgrade",
         "bash",
         "exit",
@@ -406,6 +407,10 @@ async fn operational(
             }
             stay(Mode::Operational)
         }
+        "request" => {
+            request_command(endpoints, &words[1..]).await?;
+            stay(Mode::Operational)
+        }
         "upgrade" => {
             upgrade_command(endpoints, &words[1..]).await?;
             stay(Mode::Operational)
@@ -465,6 +470,9 @@ async fn operational(
                 "  show system users                      configured accounts + live sessions"
             );
             println!("  show logging [<count>]                 forwarding config + journal tail");
+            println!("  show system commits                    commit history (rollback ring)");
+            println!("  show system image                      running image, kernel, next boot");
+            println!("  request reboot [onie-rescue]           reboot the switch (confirmed)");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -483,6 +491,61 @@ async fn operational(
             stay(Mode::Operational)
         }
         _ => unreachable!(),
+    }
+}
+
+/// `request <reboot> ...` — the operational verbs that *do* something
+/// rather than show it. Every one is admin-only (the shared role table
+/// gates the verb), and the disruptive ones confirm first.
+async fn request_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), String> {
+    const USAGE: &str = "request reboot [onie-rescue]";
+    let Some(first) = words.first() else {
+        return Err(format!("% Usage: {USAGE}"));
+    };
+    if matches!(*first, "?" | "help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    match resolve(first, &["reboot"])? {
+        "reboot" => {
+            let rest = &words[1..];
+            let onie_rescue = match rest.split_first() {
+                None => false,
+                Some((word, rest)) => {
+                    if let Some(extra) = rest.first() {
+                        return Err(format!("% Invalid input: {extra:?}"));
+                    }
+                    resolve(word, &["onie-rescue"])?;
+                    true
+                }
+            };
+            let what = if onie_rescue {
+                "Reboot into ONIE rescue mode? The switch will stop forwarding and                  come up in ONIE, not Hemlock."
+            } else {
+                "Reboot the switch? It will stop forwarding until it comes back."
+            };
+            if !confirm_yes(what) {
+                println!("cancelled");
+                return Ok(());
+            }
+            crate::system::cmd::request_reboot(&endpoints.mgmtd, onie_rescue).await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// A confirmation that will not be given by accident: `yes` typed in
+/// full, nothing else. Reserved for the verbs that interrupt
+/// forwarding.
+pub(crate) fn confirm_yes(prompt: &str) -> bool {
+    use std::io::Write as _;
+    println!("{prompt}");
+    print!("Type `yes` to continue: ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => answer.trim() == "yes",
     }
 }
 
@@ -750,6 +813,9 @@ async fn config(
             let Some(Ok(n)) = words.get(1).map(|w| w.parse::<u32>()) else {
                 return Err("% Usage: rollback <n>  (1 = previous running config)".into());
             };
+            if let Some(line) = crate::system::cmd::rollback_target(&endpoints.mgmtd, n).await {
+                println!("{line}");
+            }
             match rollback_to_candidate(endpoints, n).await {
                 Ok(()) => {
                     println!("rollback {n} loaded into candidate — review with `show`, apply with `commit`");

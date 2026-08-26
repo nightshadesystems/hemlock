@@ -1,0 +1,5 @@
+Current image  : hemlock-1.4.0 (installed 2026-08-19 14:02:11)
+Image file     : hemlock-e1031-1.4.0.bin
+Kernel         : 6.12.30-hemlock
+Next boot      : hemlock-1.4.0
+ONIE rescue    : not armed

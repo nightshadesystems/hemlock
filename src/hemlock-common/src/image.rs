@@ -23,6 +23,23 @@ const FLASH_ROOT: &str = "/host";
 /// time (`hemlock-installer`), addressed via the stable /hemlock link.
 const INSTALLED_ONIE_MACHINE: &str = "/hemlock/platform/onie-machine";
 
+/// What the running system was installed from, written at install time.
+///
+/// It lives beside the squashfs on the flash filesystem rather than in
+/// the platform overlay, because an install replaces the overlay
+/// wholesale and would take the record with it. Same `key=value` shape
+/// as the image header, so there is one format to read and no new
+/// dependency to carry.
+const IMAGE_RECORD: &str = "hemlock/image.env";
+
+/// Where the kernel publishes its own release string.
+const KERNEL_RELEASE: &str = "/proc/sys/kernel/osrelease";
+
+/// Marker mgmtd writes when it arms an ONIE rescue boot. `/run` is
+/// tmpfs, so the marker is gone after the reboot it applies to — which
+/// is exactly the lifetime of the arming.
+const ONIE_RESCUE_MARKER: &str = "/run/hemlock/onie-rescue";
+
 #[derive(Debug, PartialEq)]
 pub struct ImageHeader {
     /// ONIE machine string the image targets (e.g. x86_64-cel_e1031-r0).
@@ -67,6 +84,98 @@ pub fn read_header(path: &Path) -> Result<ImageHeader, String> {
         .map_err(|e| format!("cannot read image {}: {e}", path.display()))?;
     head.truncate(n);
     parse_image_header(&String::from_utf8_lossy(&head))
+}
+
+/// What the running system was installed from — the answer to
+/// `show system image`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImageRecord {
+    pub version: String,
+    pub platform: String,
+    /// The `.bin` the install came from, basename only.
+    pub file: String,
+    /// Unix seconds; 0 = not recorded (an image installed before the
+    /// record existed, or a first boot from the installer).
+    pub installed_at: u64,
+}
+
+/// Render the install record. Same `key=value` shape as the image
+/// header the installer already writes.
+pub fn render_image_record(record: &ImageRecord) -> String {
+    format!(
+        "# Written by Hemlock at install time; read by `show system image`.\n\
+         hemlock_image_version={}\n\
+         hemlock_image_platform={}\n\
+         hemlock_image_file={}\n\
+         hemlock_image_installed={}\n",
+        record.version, record.platform, record.file, record.installed_at
+    )
+}
+
+/// Parse an install record. Missing keys read as empty/zero, so a
+/// record written by an older image still loads.
+pub fn parse_image_record(text: &str) -> ImageRecord {
+    let value = |key: &str| -> String {
+        text.lines()
+            .filter_map(|line| line.split_once('='))
+            .find(|(name, _)| name.trim() == key)
+            .map(|(_, value)| value.trim().trim_matches('"').to_string())
+            .unwrap_or_default()
+    };
+    ImageRecord {
+        version: value("hemlock_image_version"),
+        platform: value("hemlock_image_platform"),
+        file: value("hemlock_image_file"),
+        installed_at: value("hemlock_image_installed").parse().unwrap_or(0),
+    }
+}
+
+/// The install record of the running system, if one was written.
+pub fn installed_image() -> Option<ImageRecord> {
+    let text = std::fs::read_to_string(Path::new(FLASH_ROOT).join(IMAGE_RECORD)).ok()?;
+    Some(parse_image_record(&text))
+}
+
+/// The running kernel's release string (`uname -r`), from procfs.
+pub fn kernel_release() -> String {
+    std::fs::read_to_string(KERNEL_RELEASE)
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Is an ONIE rescue boot armed for the next boot?
+pub fn onie_rescue_armed() -> bool {
+    Path::new(ONIE_RESCUE_MARKER).exists()
+}
+
+/// Arm ONIE rescue mode for the next boot only.
+///
+/// ONIE owns the mechanism: `onie-boot-mode` lives on the ONIE-BOOT
+/// partition of every ONIE-installed switch and writes the mode into
+/// ONIE's own grub environment. Hemlock does not reimplement that —
+/// it calls the tool and records that it did, so `show system image`
+/// can say so before the operator commits to the reboot.
+pub fn arm_onie_rescue() -> Result<(), String> {
+    if !cfg!(unix) {
+        return Err("ONIE rescue is only available on the switch".to_string());
+    }
+    let output = std::process::Command::new("onie-boot-mode")
+        .args(["-o", "rescue"])
+        .output()
+        .map_err(|e| format!("cannot run onie-boot-mode (is this an ONIE install?): {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "onie-boot-mode failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let marker = Path::new(ONIE_RESCUE_MARKER);
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(marker, "rescue\n")
+        .map_err(|e| format!("cannot record the ONIE rescue arming: {e}"))?;
+    Ok(())
 }
 
 /// The ONIE machine string of the installed system, if known (absent on
@@ -135,6 +244,27 @@ pub fn install(image: &Path, force: bool) -> Result<ImageHeader, String> {
     let result = install_payload(&extract, Path::new(FLASH_ROOT));
     let _ = std::fs::remove_dir_all(&extract);
     result?;
+    // Record what this system now runs, for `show system image`. A
+    // failure here is not an install failure: the image is on flash
+    // either way, and the record only feeds a display.
+    let record = ImageRecord {
+        version: header.version.clone(),
+        platform: header.platform.clone(),
+        file: image
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        installed_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0),
+    };
+    if let Err(err) = std::fs::write(
+        Path::new(FLASH_ROOT).join(IMAGE_RECORD),
+        render_image_record(&record),
+    ) {
+        tracing::warn!(%err, "cannot write the install record");
+    }
     tracing::info!(version = %header.version, "os image installed");
     Ok(header)
 }
@@ -234,6 +364,37 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The install record round-trips, and a record from an older
+    /// image (missing keys) still loads.
+    #[test]
+    fn install_records_round_trip() {
+        let record = ImageRecord {
+            version: "1.4.0".into(),
+            platform: "x86_64-cel_e1031-r0".into(),
+            file: "hemlock-e1031-1.4.0.bin".into(),
+            installed_at: 1_787_148_131,
+        };
+        assert_eq!(parse_image_record(&render_image_record(&record)), record);
+        // Missing keys read as empty/zero rather than failing.
+        let partial = parse_image_record(
+            "hemlock_image_version=1.3.0
+",
+        );
+        assert_eq!(partial.version, "1.3.0");
+        assert!(partial.file.is_empty());
+        assert_eq!(partial.installed_at, 0);
+        assert_eq!(parse_image_record(""), ImageRecord::default());
+        // A quoted value (the installer writes some) unquotes.
+        assert_eq!(
+            parse_image_record(
+                "hemlock_image_file=\"a b.bin\"
+"
+            )
+            .file,
+            "a b.bin"
+        );
+    }
 
     const HEADER: &str = "#!/bin/sh\n\
         # Hemlock ONIE installer image\n\

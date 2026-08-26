@@ -2,7 +2,7 @@
 
 use crate::interfaces::table::{Col, Text};
 
-use super::model::{LoggingState, UsersState};
+use super::model::{CommitsState, ImageState, LoggingState, UsersState};
 
 /// A duration as `HH:MM:SS`, the shape an idle timer reads best in.
 /// Days roll into the hours field rather than adding a unit.
@@ -146,4 +146,110 @@ fn stamp_signed(unix: i64) -> String {
         Ok(unix) => stamp(unix),
         Err(_) => "-".into(),
     }
+}
+
+/// A metadata field the ring may not carry: an entry written before the
+/// metadata existed renders `-` rather than an empty column.
+fn or_dash(text: &str) -> &str {
+    if text.is_empty() {
+        "-"
+    } else {
+        text
+    }
+}
+
+/// `show system commits` — the commit history the rollback ring keeps.
+pub fn commits(state: &CommitsState) -> String {
+    const COLS: [Col; 5] = [
+        Col::left(5),
+        Col::left(21),
+        Col::left(8),
+        Col::left(8),
+        Col::left(26),
+    ];
+    let mut out = Text::new();
+    out.row(&COLS, &["Idx", "Time", "User", "Client", "Comment"]);
+    out.row(
+        &COLS,
+        &[
+            "---",
+            "-------------------",
+            "------",
+            "------",
+            "--------------------------",
+        ],
+    );
+    for commit in &state.commits {
+        let comment = if commit.index == 0 {
+            // The running config is not a rollback target; saying so is
+            // more useful than an empty comment column.
+            "(current)".to_string()
+        } else if commit.comment.is_empty() {
+            "-".to_string()
+        } else {
+            commit.comment.clone()
+        };
+        out.row(
+            &COLS,
+            &[
+                &commit.index.to_string(),
+                &stamp_or_dash(commit.time),
+                or_dash(&commit.user),
+                or_dash(&commit.client),
+                &comment,
+            ],
+        );
+    }
+    if state.commits.is_empty() {
+        out.line("(no commits recorded)");
+    }
+    out.finish()
+}
+
+/// A stamp for an entry that may carry no recorded time.
+pub fn stamp_or_dash(unix: i64) -> String {
+    if unix <= 0 {
+        return "-".into();
+    }
+    stamp_signed(unix)
+}
+
+/// `show system image` — what runs now and what boots next.
+pub fn image(state: &ImageState) -> String {
+    let mut out = Text::new();
+    let field = |name: &str| format!("{:<15}", name);
+    let installed = if state.installed_at > 0 {
+        format!(" (installed {})", stamp_or_dash(state.installed_at))
+    } else {
+        String::new()
+    };
+    out.line(format!(
+        "{}: {}{installed}",
+        field("Current image"),
+        or_dash(&state.version)
+    ));
+    out.line(format!(
+        "{}: {}",
+        field("Image file"),
+        or_dash(&state.image_file)
+    ));
+    out.line(format!("{}: {}", field("Kernel"), or_dash(&state.kernel)));
+    if !state.platform.is_empty() {
+        out.line(format!("{}: {}", field("Platform"), state.platform));
+    }
+    out.line(format!(
+        "{}: {}",
+        field("Next boot"),
+        or_dash(&state.next_boot)
+    ));
+    out.line(format!(
+        "{}: {}",
+        field("ONIE rescue"),
+        if state.onie_rescue_armed {
+            "armed for the next boot"
+        } else {
+            "not armed"
+        }
+    ));
+    out.finish()
 }

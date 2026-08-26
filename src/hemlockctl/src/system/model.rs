@@ -72,3 +72,50 @@ pub struct LoggingState {
     /// False when the journal could not be read at all.
     pub journal_available: bool,
 }
+
+// ------------------------------------------------- commits
+
+/// One entry of the commit history: index 0 is the running config,
+/// 1..N the rollback ring, newest first.
+#[derive(Debug, Clone, Serialize)]
+pub struct Commit {
+    pub index: u32,
+    /// Unix seconds; 0 = the entry predates recorded metadata.
+    pub time: i64,
+    /// Empty = not recorded (an entry written before the system suite).
+    pub user: String,
+    /// "cli" | "web" | "system"; empty as above.
+    pub client: String,
+    pub comment: String,
+}
+
+/// `show system commits`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CommitsState {
+    pub commits: Vec<Commit>,
+}
+
+impl CommitsState {
+    /// The entry `rollback <n>` would load, for the confirmation line.
+    pub fn find(&self, index: u32) -> Option<&Commit> {
+        self.commits.iter().find(|commit| commit.index == index)
+    }
+}
+
+// ------------------------------------------------- image
+
+/// `show system image`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ImageState {
+    pub version: String,
+    /// Unix seconds; 0 = the install was not recorded.
+    pub installed_at: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub image_file: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub kernel: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub platform: String,
+    pub next_boot: String,
+    pub onie_rescue_armed: bool,
+}
