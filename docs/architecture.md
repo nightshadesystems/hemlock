@@ -97,7 +97,13 @@ daemons, the configuration model, and the image/installer pipeline.
   Groups expand to a flat, index-sorted `Vec<PortDef>` at load time.
 - **`[hardware]`** — i2c mux/device topology, thermal sensors, fans, the
   fan curve, PSUs, and per-port transceiver EEPROM buses. This is the
-  entirety of pmon's board knowledge.
+  entirety of pmon's board knowledge. The bus numbers in it are a
+  *declared* numbering (`child_bus_base + N` = channel N of that mux),
+  not a prediction of what the kernel assigns: at bring-up pmon follows
+  each mux's `channel-N` links, builds a declared → actual `BusMap`, and
+  resolves every bus number and `<bus>-<addr>` hwmon identity through it,
+  warning on divergence. Manifests therefore stay readable and stable
+  even where probe order or a device tree moves the real numbers.
 - **`[hardware.quirks]`** — names a registered `PlatformQuirks` impl.
   `generic` (the default) does nothing; boards with CPLD reset/LED behavior
   that cannot be data register a named impl in `hemlock_platform::quirks`

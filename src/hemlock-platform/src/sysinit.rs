@@ -8,6 +8,7 @@
 //! Sysfs access goes through [`Sysfs`] with an injectable root so the i2c
 //! logic is unit-testable against a fake tree.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
@@ -155,12 +156,66 @@ fn usable_mac(mac: [u8; 6]) -> bool {
     mac != [0u8; 6] && mac[0] & 1 == 0
 }
 
+/// Translation from the bus numbers a manifest *declares* to the ones the
+/// kernel actually assigned.
+///
+/// `child_bus_base` says which declared number means which (mux, channel):
+/// declared `child_bus_base + N` is channel N of that mux. What number the
+/// kernel gives that channel is its business — it depends on probe order
+/// and on how many adapters registered first, and a device tree that
+/// instantiates part of the topology can shift all of them. So bring-up
+/// follows each mux's `channel-N` symlinks and records declared → actual
+/// here; every consumer of a bus number resolves through it.
+///
+/// Unknown declared numbers resolve to themselves, so a platform whose
+/// numbering already matches (the E1031, today) is unaffected.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BusMap {
+    map: BTreeMap<u32, u32>,
+}
+
+impl BusMap {
+    pub fn insert(&mut self, declared: u32, actual: u32) {
+        self.map.insert(declared, actual);
+    }
+
+    /// The kernel bus number for a declared one.
+    pub fn resolve(&self, declared: u32) -> u32 {
+        self.map.get(&declared).copied().unwrap_or(declared)
+    }
+
+    /// Translate a `<bus>-<addr>` sysfs identity (a manifest `hwmon`
+    /// field, e.g. `"23-004d"`), keeping the address half verbatim.
+    /// Anything not in that shape is passed through untouched.
+    pub fn resolve_hwmon(&self, hwmon: &str) -> String {
+        match hwmon.split_once('-') {
+            Some((bus, addr)) => match bus.parse::<u32>() {
+                Ok(declared) => format!("{}-{addr}", self.resolve(declared)),
+                Err(_) => hwmon.to_string(),
+            },
+            None => hwmon.to_string(),
+        }
+    }
+
+    /// Declared/actual pairs that differ — what a platform's manifest got
+    /// wrong (or what a device tree moved).
+    pub fn divergences(&self) -> Vec<(u32, u32)> {
+        self.map
+            .iter()
+            .filter(|(declared, actual)| declared != actual)
+            .map(|(declared, actual)| (*declared, *actual))
+            .collect()
+    }
+}
+
 /// What one i2c instantiation pass did, for logs and diagnostics.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct I2cReport {
     pub root_bus: Option<u32>,
     pub created: Vec<String>,
     pub already_present: Vec<String>,
+    /// Declared → actual bus numbers, from the muxes' `channel-N` links.
+    pub buses: BusMap,
 }
 
 /// Sysfs accessor with an injectable root (`/` in production).
@@ -222,6 +277,47 @@ impl Sysfs {
             .exists()
     }
 
+    /// Resolve a symlink, falling back to reading the path as a text file
+    /// so the fake-sysfs tests need no symlink privileges (Windows hosts
+    /// refuse them without developer mode).
+    fn link_target(path: &Path) -> Option<String> {
+        let target = std::fs::read_link(path)
+            .ok()
+            .map(|t| t.to_string_lossy().into_owned())
+            .or_else(|| std::fs::read_to_string(path).ok())?;
+        Some(target.trim().to_string())
+    }
+
+    /// The kernel bus numbers behind a mux's channels, read from the
+    /// `channel-N` symlinks `i2c-mux.c` creates on the mux's own device
+    /// (`/sys/bus/i2c/devices/<parent>-<addr>/channel-0 -> ../../i2c-7`).
+    /// Present for both device-tree and `new_device` instantiation.
+    fn mux_child_buses(&self, parent_bus: u32, address: u32) -> Vec<(u32, u32)> {
+        let dir = self
+            .i2c_dev_dir()
+            .join(format!("{parent_bus}-{address:04x}"));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut channels: Vec<(u32, u32)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let channel: u32 = name.to_str()?.strip_prefix("channel-")?.parse().ok()?;
+                let target = Self::link_target(&entry.path())?;
+                let bus: u32 = target
+                    .rsplit(['/', '\\'])
+                    .next()?
+                    .strip_prefix("i2c-")?
+                    .parse()
+                    .ok()?;
+                Some((channel, bus))
+            })
+            .collect();
+        channels.sort_unstable();
+        channels
+    }
+
     fn new_device(&self, bus: u32, driver: &str, address: u32) -> Result<(), SysinitError> {
         let path = self
             .i2c_dev_dir()
@@ -256,33 +352,50 @@ impl Sysfs {
             self.raw_write(bus, write.address, &write.data, &write.purpose)?;
         }
 
+        // Muxes come in declaration order, and a mux may hang off another
+        // mux's channel — so each one's parent is resolved through the map
+        // built so far, and its own channels are recorded before the next.
         for mux in &i2c.muxes {
-            let parent = self.resolve(&mux.parent_bus, root, &mux.name)?;
+            let declared_parent = self.resolve(&mux.parent_bus, root, &mux.name)?;
+            let parent = report.buses.resolve(declared_parent);
             let label = format!(
                 "mux {} ({}@{parent}-0x{:02x})",
                 mux.name, mux.driver, mux.address
             );
             if self.device_present(parent, mux.address) {
                 report.already_present.push(label);
-                continue;
+            } else {
+                self.new_device(parent, &mux.driver, mux.address)?;
+                // Give the kernel a moment to create the child buses
+                // before we go looking for them.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                report.created.push(label);
             }
-            self.new_device(parent, &mux.driver, mux.address)?;
-            // Give the kernel a moment to create the child buses before the
-            // next mux (which may hang off one of them) is instantiated.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            report.created.push(label);
+            for (channel, actual) in self.mux_child_buses(parent, mux.address) {
+                if channel < mux.channels {
+                    report.buses.insert(mux.child_bus_base + channel, actual);
+                }
+            }
+        }
+
+        for (declared, actual) in report.buses.divergences() {
+            warn!(
+                declared,
+                actual, "i2c bus number differs from the manifest's child_bus_base numbering"
+            );
         }
 
         for device in &i2c.devices {
+            let bus = report.buses.resolve(device.bus);
             let label = format!(
-                "{} ({}@{}-0x{:02x})",
-                device.purpose, device.driver, device.bus, device.address
+                "{} ({}@{bus}-0x{:02x})",
+                device.purpose, device.driver, device.address
             );
-            if self.device_present(device.bus, device.address) {
+            if self.device_present(bus, device.address) {
                 report.already_present.push(label);
                 continue;
             }
-            self.new_device(device.bus, &device.driver, device.address)?;
+            self.new_device(bus, &device.driver, device.address)?;
             report.created.push(label);
         }
 
@@ -301,15 +414,13 @@ impl Sysfs {
     /// fatal — presence is reported separately. Idempotent.
     pub fn instantiate_psus(&self, psus: &[crate::schema::Psu], report: &mut I2cReport) {
         for psu in psus {
-            let label = format!(
-                "{} ({}@{}-0x{:02x})",
-                psu.name, psu.driver, psu.bus, psu.address
-            );
-            if self.device_present(psu.bus, psu.address) {
+            let bus = report.buses.resolve(psu.bus);
+            let label = format!("{} ({}@{bus}-0x{:02x})", psu.name, psu.driver, psu.address);
+            if self.device_present(bus, psu.address) {
                 report.already_present.push(label);
                 continue;
             }
-            match self.new_device(psu.bus, &psu.driver, psu.address) {
+            match self.new_device(bus, &psu.driver, psu.address) {
                 Ok(()) => report.created.push(label),
                 Err(e) => warn!(psu = %psu.name, error = %e, "PSU device instantiation failed"),
             }
@@ -338,13 +449,34 @@ impl Sysfs {
 
     /// Base MAC from the manifest's `syseeprom` i2c device, if that device
     /// exists in sysfs (pmon may not have instantiated the topology yet).
+    ///
+    /// syncd calls this without a [`BusMap`] — it does not instantiate the
+    /// topology — so the declared bus is only the first guess. When the
+    /// EEPROM sits behind a mux whose kernel numbering differs, fall back
+    /// to any device at the same address whose blob parses as ONIE
+    /// TlvInfo; the magic makes a false positive implausible.
     fn syseeprom_base_mac(&self, i2c: &I2cSection) -> Option<[u8; 6]> {
         let dev = i2c.devices.iter().find(|d| d.purpose == "syseeprom")?;
-        let path = self
-            .i2c_dev_dir()
-            .join(format!("{}-{:04x}", dev.bus, dev.address))
-            .join("eeprom");
-        parse_onie_base_mac(&std::fs::read(path).ok()?)
+        let eeprom = |bus: u32| {
+            self.i2c_dev_dir()
+                .join(format!("{bus}-{:04x}", dev.address))
+                .join("eeprom")
+        };
+        if let Some(mac) = std::fs::read(eeprom(dev.bus))
+            .ok()
+            .and_then(|blob| parse_onie_base_mac(&blob))
+        {
+            return Some(mac);
+        }
+        let suffix = format!("-{:04x}", dev.address);
+        std::fs::read_dir(self.i2c_dev_dir())
+            .ok()?
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(&suffix))
+            .find_map(|entry| {
+                let blob = std::fs::read(entry.path().join("eeprom")).ok()?;
+                parse_onie_base_mac(&blob)
+            })
     }
 
     /// MAC of a Linux netdev, e.g. the management port.
@@ -491,6 +623,140 @@ mod tests {
         let raw = std::fs::read_to_string(dir.path().join("sys/bus/i2c/devices/i2c-1/raw-writes"))
             .unwrap();
         assert_eq!(raw, "0x73 0x10 0x00 0x01\n");
+    }
+
+    /// Record a mux's channel links the way `i2c-mux.c` does, so
+    /// `mux_child_buses` can read them back. Plain files rather than
+    /// symlinks: `link_target` accepts both, and Windows hosts refuse to
+    /// create symlinks without developer mode.
+    fn fake_mux_channels(dir: &Path, parent_bus: u32, address: u32, channels: &[(u32, u32)]) {
+        let mux_dir = dir.join(format!("sys/bus/i2c/devices/{parent_bus}-{address:04x}"));
+        std::fs::create_dir_all(&mux_dir).unwrap();
+        for (channel, bus) in channels {
+            std::fs::write(
+                mux_dir.join(format!("channel-{channel}")),
+                format!("../../../i2c-{bus}"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn bus_map_resolves_and_passes_unknowns_through() {
+        let mut map = BusMap::default();
+        map.insert(2, 7);
+        assert_eq!(map.resolve(2), 7);
+        assert_eq!(map.resolve(3), 3, "unknown declared bus is identity");
+        assert_eq!(map.resolve_hwmon("2-004d"), "7-004d");
+        assert_eq!(map.resolve_hwmon("3-001a"), "3-001a");
+        // Not a <bus>-<addr> identity: untouched rather than mangled.
+        assert_eq!(map.resolve_hwmon("hwmon0"), "hwmon0");
+        assert_eq!(map.resolve_hwmon("e1031.smc-fan"), "e1031.smc-fan");
+        assert_eq!(map.divergences(), vec![(2, 7)]);
+    }
+
+    /// The E1031 case: the kernel numbering already matches the manifest,
+    /// so the map records no divergence and every path is unchanged.
+    #[test]
+    fn matching_kernel_numbering_is_a_no_op() {
+        let (dir, sysfs) = fake_sysfs(&[(1, "SMBus iSMT adapter"), (2, "ch0")]);
+        fake_mux_channels(dir.path(), 1, 0x73, &[(0, 2)]);
+        let report = sysfs.instantiate_i2c(&e1031_like_topology()).unwrap();
+        assert_eq!(report.buses.resolve(2), 2);
+        assert!(
+            report.buses.divergences().is_empty(),
+            "declared numbering matches the kernel's: {:?}",
+            report.buses.divergences()
+        );
+        // The syseeprom still landed on declared bus 2.
+        let dev_write =
+            std::fs::read_to_string(dir.path().join("sys/bus/i2c/devices/i2c-2/new_device"))
+                .unwrap();
+        assert_eq!(dev_write, "24lc64t 0x50\n");
+    }
+
+    /// The kernel put the mux's channels somewhere else: devices follow
+    /// the actual buses, and the manifest's `hwmon` identities translate.
+    #[test]
+    fn devices_follow_actual_child_buses() {
+        let (dir, sysfs) = fake_sysfs(&[(1, "SMBus iSMT adapter"), (11, "ch0")]);
+        fake_mux_channels(dir.path(), 1, 0x73, &[(0, 11)]);
+        let report = sysfs.instantiate_i2c(&e1031_like_topology()).unwrap();
+
+        assert_eq!(report.buses.resolve(2), 11);
+        assert_eq!(report.buses.divergences(), vec![(2, 11)]);
+        assert_eq!(report.buses.resolve_hwmon("2-0050"), "11-0050");
+        // The syseeprom was created on i2c-11, not the declared i2c-2.
+        let dev_write =
+            std::fs::read_to_string(dir.path().join("sys/bus/i2c/devices/i2c-11/new_device"))
+                .unwrap();
+        assert_eq!(dev_write, "24lc64t 0x50\n");
+    }
+
+    /// A mux hanging off another mux's channel resolves its parent
+    /// through the map built so far, not through the declared number.
+    #[test]
+    fn nested_mux_parent_resolves_through_the_map() {
+        let (dir, sysfs) = fake_sysfs(&[(1, "SMBus iSMT adapter"), (11, "ch0"), (20, "sub-ch0")]);
+        fake_mux_channels(dir.path(), 1, 0x73, &[(0, 11)]);
+        fake_mux_channels(dir.path(), 11, 0x72, &[(0, 20)]);
+
+        let mut topology = e1031_like_topology();
+        topology.muxes.push(I2cMux {
+            name: "main-extender".into(),
+            driver: "pca9548".into(),
+            // Declared bus 2 = cpu-extender channel 0, actually i2c-11.
+            parent_bus: BusRef::Number(2),
+            address: 0x72,
+            child_bus_base: 18,
+            channels: 8,
+        });
+        // Only the fan controller: the fake `new_device` is a file, so a
+        // second device on the same bus would overwrite the mux write
+        // this test is checking. (The syseeprom's own remapping is
+        // covered by `devices_follow_actual_child_buses`.)
+        topology.devices = vec![I2cDevice {
+            driver: "emc2305".into(),
+            bus: 18,
+            address: 0x4d,
+            purpose: "fan-controller".into(),
+        }];
+
+        let report = sysfs.instantiate_i2c(&topology).unwrap();
+
+        // Reading the nested mux's channels at all proves its parent
+        // resolved 2 -> 11: that is the only directory the links live in.
+        assert_eq!(report.buses.resolve(18), 20);
+        // Its label names the resolved parent bus, not the declared one.
+        // (The harness has to create `11-0072` to hold the channel links,
+        // so the mux reads as already present — the second-run case.)
+        assert!(
+            report
+                .already_present
+                .iter()
+                .any(|label| label.contains("main-extender") && label.contains("11-0x72")),
+            "{:?}",
+            report.already_present
+        );
+        // The fan controller landed on i2c-20.
+        let dev_write =
+            std::fs::read_to_string(dir.path().join("sys/bus/i2c/devices/i2c-20/new_device"))
+                .unwrap();
+        assert_eq!(dev_write, "emc2305 0x4d\n");
+    }
+
+    /// Channels beyond the mux's declared width are ignored, so a wrong
+    /// `channels` count cannot claim bus numbers the manifest never
+    /// declared.
+    #[test]
+    fn channels_past_the_declared_width_are_ignored() {
+        let (dir, sysfs) = fake_sysfs(&[(1, "SMBus iSMT adapter"), (2, "ch0")]);
+        let mut topology = e1031_like_topology();
+        topology.muxes[0].channels = 2;
+        fake_mux_channels(dir.path(), 1, 0x73, &[(0, 2), (1, 3), (5, 90)]);
+        let report = sysfs.instantiate_i2c(&topology).unwrap();
+        assert_eq!(report.buses.resolve(3), 3, "channel 1 -> declared 3");
+        assert_eq!(report.buses.resolve(7), 7, "channel 5 was out of range");
     }
 
     #[test]

@@ -157,8 +157,18 @@ root_adapter = "SMBus iSMT adapter"
 # purpose = "wake main mux"
 
 # Muxes, in instantiation order. parent_bus is "root" or a numeric child
-# bus created by an earlier mux. child_bus_base is the first kernel bus
-# number the mux's channels will claim (deterministic given the order).
+# bus created by an earlier mux.
+#
+# child_bus_base *declares the numbering this manifest uses*: declared bus
+# `child_bus_base + N` means channel N of this mux, and that is how every
+# `bus` field and `hwmon = "<bus>-<addr>"` identity below refers to it.
+# What number the kernel actually gives each channel is its own business —
+# probe order, adapters registered earlier, or a device tree that already
+# instantiated part of the topology can all shift it. At bring-up pmon
+# follows each mux's `channel-N` links, builds a declared -> actual table,
+# and resolves every bus number through it, warning when the two differ.
+# So pick the numbers you expect and keep them stable; they are names, not
+# predictions.
 [[hardware.i2c.mux]]
 name = "main-mux"
 driver = "pca9548"

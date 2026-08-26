@@ -5,6 +5,7 @@
 //! hardware and the mock used in CI and development.
 
 use hemlock_platform::schema::{FanDef, Psu, ThermalSensor, Transceiver};
+use hemlock_platform::sysinit::BusMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HwError {
@@ -92,9 +93,18 @@ pub trait HwBackend: Send + Sync {
 // paths only exist on Linux with the platform's i2c topology instantiated.
 // ---------------------------------------------------------------------------
 
-pub struct SysfsBackend;
+/// Every bus number and `<bus>-<addr>` identity this backend touches comes
+/// from the manifest's *declared* numbering; `buses` translates it to what
+/// the kernel actually assigned (see [`BusMap`]).
+pub struct SysfsBackend {
+    buses: BusMap,
+}
 
 impl SysfsBackend {
+    pub fn new(buses: BusMap) -> Self {
+        Self { buses }
+    }
+
     fn read_string(path: &str) -> Result<String, HwError> {
         std::fs::read_to_string(path)
             .map(|s| s.trim().to_string())
@@ -146,17 +156,20 @@ impl HwBackend for SysfsBackend {
     }
 
     fn read_temp_c(&self, sensor: &ThermalSensor) -> Result<f64, HwError> {
-        let path = Self::hwmon_attr(&sensor.hwmon, &format!("{}_input", sensor.input))?;
+        let hwmon = self.buses.resolve_hwmon(&sensor.hwmon);
+        let path = Self::hwmon_attr(&hwmon, &format!("{}_input", sensor.input))?;
         Ok(Self::read_u64(&path)? as f64 / 1000.0)
     }
 
     fn read_fan_rpm(&self, fan: &FanDef) -> Result<u32, HwError> {
-        let path = Self::hwmon_attr(&fan.hwmon, &format!("{}_input", fan.tach))?;
+        let hwmon = self.buses.resolve_hwmon(&fan.hwmon);
+        let path = Self::hwmon_attr(&hwmon, &format!("{}_input", fan.tach))?;
         Ok(Self::read_u64(&path)? as u32)
     }
 
     fn set_fan_pwm(&self, fan: &FanDef, percent: u32) -> Result<(), HwError> {
-        let path = Self::hwmon_attr(&fan.hwmon, &fan.pwm)?;
+        let hwmon = self.buses.resolve_hwmon(&fan.hwmon);
+        let path = Self::hwmon_attr(&hwmon, &fan.pwm)?;
         let raw = (percent.min(100) * 255 / 100).to_string();
         std::fs::write(&path, &raw).map_err(|source| HwError::Write { path, source })
     }
@@ -193,11 +206,12 @@ impl HwBackend for SysfsBackend {
         }
         // Fallback: pmbus driver bound => device dir exists; a readable
         // status/power attribute means the PSU answers on the bus.
-        let dir = format!("/sys/bus/i2c/devices/{}-{:04x}", psu.bus, psu.address);
+        let device = format!("{}-{:04x}", self.buses.resolve(psu.bus), psu.address);
+        let dir = format!("/sys/bus/i2c/devices/{device}");
         if !std::path::Path::new(&dir).exists() {
             return Ok((false, false));
         }
-        let ok = Self::hwmon_attr(&format!("{}-{:04x}", psu.bus, psu.address), "in2_input")
+        let ok = Self::hwmon_attr(&device, "in2_input")
             .and_then(|p| Self::read_u64(&p))
             .map(|mv| mv > 0)
             .unwrap_or(false);
@@ -205,7 +219,10 @@ impl HwBackend for SysfsBackend {
     }
 
     fn read_transceiver(&self, xcvr: &Transceiver) -> Result<Option<TransceiverInfo>, HwError> {
-        let path = format!("/sys/bus/i2c/devices/{}-0050/eeprom", xcvr.bus);
+        let path = format!(
+            "/sys/bus/i2c/devices/{}-0050/eeprom",
+            self.buses.resolve(xcvr.bus)
+        );
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             // Empty cage: EEPROM reads fail with EIO/ENXIO.

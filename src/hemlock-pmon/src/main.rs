@@ -156,9 +156,10 @@ fn real_hw_init(platform: &Platform) -> Result<Arc<dyn HwBackend>> {
     info!(
         created = report.created.len(),
         already_present = report.already_present.len(),
+        remapped_buses = report.buses.divergences().len(),
         "i2c topology ready"
     );
-    Ok(Arc::new(hw::SysfsBackend))
+    Ok(Arc::new(hw::SysfsBackend::new(report.buses)))
 }
 
 async fn router_serve(listen: IpcEndpoint, router: tonic::transport::server::Router) -> Result<()> {

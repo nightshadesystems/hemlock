@@ -169,7 +169,7 @@ name = "main-mux"
 driver = "pca9548"
 parent_bus = "root"
 address = 0x70
-child_bus_base = 2                    # first bus its channels claim
+child_bus_base = 2                    # declares: bus 2 = this mux's channel 0
 channels = 8
 
 [[hardware.i2c.device]]
@@ -188,6 +188,16 @@ mapping port name → EEPROM bus (`optoe2` for SFP, `optoe1` for QSFP).
 
 Lint cross-checks all of it: curve sensors must exist, transceiver ports
 must be real ports, mux child-bus ranges must not overlap.
+
+The bus numbers you write here are **names, not predictions**.
+`child_bus_base` declares that bus `child_bus_base + N` means channel N
+of that mux, and every `bus` field and `hwmon = "<bus>-<addr>"` identity
+refers to the topology in those terms. What the kernel actually assigns
+depends on probe order and on anything the device tree instantiated
+first, so at bring-up pmon follows each mux's `channel-N` links, builds a
+declared → actual table, and resolves every bus number through it —
+logging a warning for each one that differs. Pick the numbers you expect,
+keep them stable, and do not chase the kernel if it disagrees.
 
 ## 6. Quirks: only if the manifest can't say it
 
