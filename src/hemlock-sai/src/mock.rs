@@ -14,10 +14,10 @@ use hemlock_platform::PortDef;
 use tokio::sync::mpsc;
 
 use crate::{
-    AclAction, AclFamily, AclFields, AclStage, FdbAction, IpPrefix, Oid, PolicerSpec, PolicerStats,
-    PortCounters, PortId, QosMapType, QueueCounters, RouteTarget, SaiBackend, SaiCapabilities,
-    SaiError, SaiEvent, SaiPort, SchedulerSpec, StormClass, StpPortState, SwitchInfo, TrapKind,
-    WredSpec,
+    AclAction, AclFamily, AclFields, AclStage, CablePair, CablePairState, FdbAction, IpPrefix, Oid,
+    PolicerSpec, PolicerStats, PortCounters, PortId, QosMapType, QueueCounters, RouteTarget,
+    SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, SchedulerSpec, StormClass,
+    StpPortState, SwitchInfo, TrapKind, WredSpec,
 };
 
 /// Synthetic OIDs: obviously fake, stable, and readable in logs.
@@ -62,6 +62,19 @@ const MOCK_DEFAULT_VLAN_OID: u64 = MOCK_VLAN_OID_BASE;
 /// The default 802.1Q VLAN every port starts in.
 const DEFAULT_VLAN: u16 = 1;
 
+/// What an unscripted port reports from a TDR sweep: four terminated
+/// pairs on a 42 m run — a healthy patch, which is what a switch
+/// mostly finds.
+fn default_cable_diag() -> Vec<CablePair> {
+    vec![
+        CablePair {
+            state: CablePairState::Ok,
+            length_m: 42,
+        };
+        4
+    ]
+}
+
 pub struct MockSai {
     port_table: Vec<PortDef>,
     ports: Vec<SaiPort>,
@@ -91,6 +104,10 @@ pub struct MockSai {
     storm: HashMap<(PortId, StormClass), u64>,
     mirror_sessions: HashMap<Oid, PortId>,
     port_mirrors: HashMap<PortId, (Option<Oid>, Option<Oid>)>,
+    /// Scripted TDR results, keyed by port. Absent ports answer with
+    /// the healthy default, so a test that only cares that the sweep
+    /// ran does not have to script one.
+    cable_diag: HashMap<PortId, Vec<CablePair>>,
     /// sFlow model: samplepacket sessions (by rate) and their ingress
     /// port bindings, both inspectable so tests can assert what the
     /// engine programmed.
@@ -180,6 +197,7 @@ impl MockSai {
             default_members: std::collections::HashSet::new(),
             pvids: HashMap::new(),
             capabilities: SaiCapabilities::all(),
+            cable_diag: HashMap::new(),
             fdb_aging: 300,
             fdb_statics: HashMap::new(),
             storm: HashMap::new(),
@@ -301,6 +319,12 @@ impl MockSai {
     /// needing an absent capability fail cleanly).
     pub fn set_capabilities(&mut self, capabilities: SaiCapabilities) {
         self.capabilities = capabilities;
+    }
+
+    /// Script the TDR result one port reports (tests: a healthy run, an
+    /// open pair, a short).
+    pub fn set_cable_diag(&mut self, port: PortId, pairs: Vec<CablePair>) {
+        self.cable_diag.insert(port, pairs);
     }
 
     /// A sender that injects SAI events as if the ASIC produced them
@@ -1022,6 +1046,23 @@ impl SaiBackend for MockSai {
         let oid = self.alloc(MOCK_SAMPLE_OID_BASE);
         self.sample_sessions.insert(oid, rate);
         Ok(oid)
+    }
+
+    fn run_cable_diag(&mut self, port: PortId) -> Result<Vec<CablePair>, SaiError> {
+        self.require_switch()?;
+        if !self.capabilities.cable_diag {
+            return Err(SaiError::Other(
+                "cable diagnostics are not supported".into(),
+            ));
+        }
+        if !self.ports.iter().any(|existing| existing.id == port) {
+            return Err(SaiError::Other(format!("no such port {port:?}")));
+        }
+        Ok(self
+            .cable_diag
+            .get(&port)
+            .cloned()
+            .unwrap_or_else(default_cable_diag))
     }
 
     fn remove_samplepacket(&mut self, session: Oid) -> Result<(), SaiError> {

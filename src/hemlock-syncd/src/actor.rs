@@ -140,6 +140,10 @@ pub enum SaiCmd {
         rate: u32,
         reply: oneshot::Sender<Result<Oid, SaiError>>,
     },
+    RunCableDiag {
+        port: PortId,
+        reply: oneshot::Sender<Result<Vec<hemlock_sai::CablePair>, SaiError>>,
+    },
     RemoveSamplepacket {
         session: Oid,
         reply: oneshot::Sender<Result<(), SaiError>>,
@@ -517,6 +521,8 @@ pub struct SaiHandle {
     pub fdb_events: broadcast::Sender<FdbNotify>,
     /// Learn-limit violations (port-security engine input).
     pub violations: broadcast::Sender<ViolationNotify>,
+    /// The last TDR sweep per port, so the `show` form can replay it.
+    pub cable_diag: crate::state::SharedCableDiag,
     /// The programmed sFlow sampler (session, rate, bound ports).
     pub sflow: crate::sflow::SharedSflow,
     /// Hardware-sampled frames on their way to orch's sFlow engine.
@@ -700,6 +706,16 @@ impl SaiHandle {
 
     pub async fn create_samplepacket(&self, rate: u32) -> Result<Oid, SaiError> {
         self.call(|reply| SaiCmd::CreateSamplepacket { rate, reply })
+            .await
+    }
+
+    /// Run a TDR sweep on one copper port. The link drops for as long
+    /// as the PHY takes, which is why both front-ends confirm first.
+    pub async fn run_cable_diag(
+        &self,
+        port: PortId,
+    ) -> Result<Vec<hemlock_sai::CablePair>, SaiError> {
+        self.call(|reply| SaiCmd::RunCableDiag { port, reply })
             .await
     }
 
@@ -1578,6 +1594,9 @@ impl SaiActor {
                         SaiCmd::CreateSamplepacket { rate, reply } => {
                             let _ = reply.send(backend.create_samplepacket(rate));
                         }
+                        SaiCmd::RunCableDiag { port, reply } => {
+                            let _ = reply.send(backend.run_cable_diag(port));
+                        }
                         SaiCmd::RemoveSamplepacket { session, reply } => {
                             let _ = reply.send(backend.remove_samplepacket(session));
                         }
@@ -1726,6 +1745,7 @@ impl SaiActor {
             l2mc: crate::state::SharedL2mc::default(),
             unknown_mcast: crate::state::SharedUnknownMcast::default(),
             sflow,
+            cable_diag: crate::state::SharedCableDiag::default(),
             samples,
             fib: crate::state::SharedFib::default(),
             acls: crate::state::SharedAcls::default(),

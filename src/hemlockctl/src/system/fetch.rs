@@ -8,8 +8,8 @@ use hemlock_common::proto::v1 as pb;
 use hemlock_config::ConfigTree;
 
 use super::model::{
-    ActiveSession, Commit, CommitsState, ConfiguredUser, ImageState, LogEntry, LoggingState,
-    UsersState,
+    ActiveSession, CableDiagState, CablePair, Commit, CommitsState, ConfiguredUser, ImageState,
+    LogEntry, LoggingState, UsersState,
 };
 
 async fn mgmt_client(
@@ -267,11 +267,82 @@ pub async fn image_state(mgmtd: &IpcEndpoint) -> Result<ImageState> {
     })
 }
 
+/// `request tech-support`: (path, size in bytes).
+pub async fn tech_support(mgmtd: &IpcEndpoint) -> Result<(String, u64)> {
+    let mut client = mgmt_client(mgmtd).await?;
+    let response = client
+        .tech_support(pb::TechSupportRequest {})
+        .await?
+        .into_inner();
+    Ok((response.path, response.size_bytes))
+}
+
+/// `request certificate regenerate`: the fingerprint of the new pair.
+pub async fn regenerate_certificate(mgmtd: &IpcEndpoint) -> Result<String> {
+    let mut client = mgmt_client(mgmtd).await?;
+    Ok(client
+        .regenerate_certificate(pb::RegenerateCertificateRequest {})
+        .await?
+        .into_inner()
+        .fingerprint)
+}
+
 /// `request reboot [onie-rescue]`.
 pub async fn reboot(mgmtd: &IpcEndpoint, onie_rescue: bool) -> Result<()> {
     let mut client = mgmt_client(mgmtd).await?;
     client.reboot(pb::RebootRequest { onie_rescue }).await?;
     Ok(())
+}
+
+// ------------------------------------------------- cable diagnostics
+
+async fn syncd_client(
+    syncd: &IpcEndpoint,
+) -> Result<pb::syncd_client::SyncdClient<tonic::transport::Channel>> {
+    let channel = syncd.connect().await.context("connecting to syncd")?;
+    Ok(pb::syncd_client::SyncdClient::new(channel))
+}
+
+fn cable_state(response: pb::CableDiagnostics) -> CableDiagState {
+    CableDiagState {
+        port: response.port,
+        has_result: response.has_result,
+        run_at: response.run_at,
+        pairs: response
+            .pairs
+            .into_iter()
+            .map(|pair| CablePair {
+                pair: pair.pair,
+                state: pair.state,
+                length_m: pair.length_m,
+            })
+            .collect(),
+    }
+}
+
+/// `request cable-diagnostics <port>`: run the sweep and return what it
+/// found. syncd owns the ASIC, so it owns the PHY.
+pub async fn run_cable_diagnostics(syncd: &IpcEndpoint, port: &str) -> Result<CableDiagState> {
+    let mut client = syncd_client(syncd).await?;
+    let response = client
+        .run_cable_diagnostics(pb::RunCableDiagnosticsRequest {
+            port: port.to_string(),
+        })
+        .await?
+        .into_inner();
+    Ok(cable_state(response))
+}
+
+/// `show interfaces <port> cable-diagnostics`: replay the last sweep.
+pub async fn cable_diagnostics(syncd: &IpcEndpoint, port: &str) -> Result<CableDiagState> {
+    let mut client = syncd_client(syncd).await?;
+    let response = client
+        .get_cable_diagnostics(pb::GetCableDiagnosticsRequest {
+            port: port.to_string(),
+        })
+        .await?
+        .into_inner();
+    Ok(cable_state(response))
 }
 
 #[cfg(test)]

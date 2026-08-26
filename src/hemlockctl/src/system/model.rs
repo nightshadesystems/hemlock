@@ -119,3 +119,29 @@ pub struct ImageState {
     pub next_boot: String,
     pub onie_rescue_armed: bool,
 }
+
+// ------------------------------------------------- cable diagnostics
+
+/// One pair of a TDR sweep.
+#[derive(Debug, Clone, Serialize)]
+pub struct CablePair {
+    /// "A".."D", in wire order.
+    pub pair: String,
+    /// "ok" | "open" | "short" | "crosstalk" | "unknown".
+    pub state: String,
+    /// Metres: the run for a terminated pair, the distance to the fault
+    /// otherwise. 0 = the PHY did not measure one.
+    pub length_m: u32,
+}
+
+/// `show interfaces <port> cable-diagnostics`, and what `request
+/// cable-diagnostics <port>` prints when it finishes.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CableDiagState {
+    pub port: String,
+    /// False = no sweep has been run on this port since boot.
+    pub has_result: bool,
+    /// Unix seconds the sweep ran.
+    pub run_at: i64,
+    pub pairs: Vec<CablePair>,
+}

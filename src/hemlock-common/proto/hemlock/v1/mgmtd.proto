@@ -47,6 +47,16 @@ service Mgmt {
   // Reboot the switch, optionally into ONIE rescue for the next boot
   // only. Both consoles confirm before calling this.
   rpc Reboot(RebootRequest) returns (RebootResponse);
+
+  // Assemble a tech-support bundle and return where it landed. mgmtd
+  // is the one daemon that can reach every source: the config, the
+  // commit ring, the journal (as root), and syncd/orch/pmon.
+  rpc TechSupport(TechSupportRequest) returns (TechSupportResponse);
+
+  // Replace the web console's self-signed certificate and key. Sessions
+  // survive (they live in webd's memory, not the TLS material); the new
+  // pair is served once webd restarts, which this schedules.
+  rpc RegenerateCertificate(RegenerateCertificateRequest) returns (RegenerateCertificateResponse);
 }
 
 enum ConfigSource {
@@ -144,6 +154,22 @@ message RebootRequest {
 
 message RebootResponse {
   bool onie_rescue_armed = 1;
+}
+
+message TechSupportRequest {}
+
+message TechSupportResponse {
+  // Absolute path of the .tar.gz on the switch.
+  string path = 1;
+  uint64 size_bytes = 2;
+}
+
+message RegenerateCertificateRequest {}
+
+message RegenerateCertificateResponse {
+  // SHA-256 of the new certificate, colon-separated uppercase hex —
+  // the form a browser shows, so the two can be compared by eye.
+  string fingerprint = 1;
 }
 
 message DiscardRequest {}

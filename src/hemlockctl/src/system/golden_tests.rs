@@ -171,3 +171,27 @@ fn system_image_and_commits_edge_cases() {
     let text = render::commits(&super::model::CommitsState::default());
     assert!(text.contains("(no commits recorded)"), "{text}");
 }
+
+#[test]
+fn cable_diagnostics() {
+    assert_golden(
+        &render::cable_diagnostics(&fx::cable_diag_state()),
+        include_str!("../../tests/golden/cable_diagnostics.txt"),
+    );
+    assert_golden(
+        &as_json("cable_diagnostics", &fx::cable_diag_state()),
+        include_str!("../../tests/golden/cable_diagnostics.json"),
+    );
+}
+
+/// A pair the PHY would not measure prints a dash, not a zero-metre
+/// run — those are different findings.
+#[test]
+fn unmeasured_pairs_render_a_dash() {
+    let mut state = fx::cable_diag_state();
+    state.pairs[2].state = "unknown".into();
+    state.pairs[2].length_m = 0;
+    let text = render::cable_diagnostics(&state);
+    assert!(text.contains("C     unknown    -"), "{text}");
+    assert!(text.contains("A     ok         42 m"), "{text}");
+}

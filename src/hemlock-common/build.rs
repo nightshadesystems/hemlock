@@ -25,6 +25,10 @@ fn main() {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // Every message is serializable, so a state dump (the
+        // tech-support bundle) can write any RPC response out as JSON
+        // without a hand-written mirror of each one going stale.
+        .type_attribute(".", "#[derive(serde::Serialize)]")
         .compile_protos(&protos, &["proto"])
         .expect("compile hemlock protos");
     for p in protos {

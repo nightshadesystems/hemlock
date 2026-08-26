@@ -1,0 +1,7 @@
+Ethernet7 cable diagnostics (run 2026-08-25 10:42:30):
+Pair  Status     Length
+----  ---------  -------
+A     ok         42 m
+B     ok         42 m
+C     open       11 m
+D     open       11 m

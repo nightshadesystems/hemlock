@@ -148,6 +148,8 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "configure",
             "clear",
             "request",
+            "ping",
+            "traceroute",
             "upgrade",
             "bash",
             "exit",
@@ -244,8 +246,15 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "dot1x",
             "lldp",
         ],
-        (CliMode::Operational, ["request"]) => &["reboot"],
+        (CliMode::Operational, ["request"]) => {
+            &["reboot", "cable-diagnostics", "tech-support", "certificate"]
+        }
+        (CliMode::Operational, ["request", "certificate"]) => &["regenerate"],
         (CliMode::Operational, ["request", "reboot"]) => &["onie-rescue"],
+        (CliMode::Operational, ["request", "cable-diagnostics"]) => &[PORT],
+        (CliMode::Operational, ["ping" | "traceroute"]) => &[ANY],
+        (CliMode::Operational, ["ping" | "traceroute", ANY]) => &["source"],
+        (CliMode::Operational, ["ping" | "traceroute", ANY, "source"]) => &[PORT],
         (CliMode::Operational, ["clear", "acl" | "copp" | "lldp"]) => &["counters"],
         (CliMode::Operational, ["clear", "acl", "counters"]) => &[ACL],
         (CliMode::Operational, ["clear", "port-security"]) => &["interface"],

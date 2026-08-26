@@ -5,7 +5,7 @@ import { api, uploadFile, downloadText } from '@/lib/api';
 import { Alert, Card, CardBlock, Label } from '@/components/ds/misc';
 import { Button } from '@/components/ds/Button';
 import { Modal } from '@/components/ds/Modal';
-import { FormField, Input, Checkbox } from '@/components/ds/forms';
+import { FormField, Input, Checkbox, Select } from '@/components/ds/forms';
 import { Datagrid } from '@/components/ds/Datagrid';
 
 const MONO = { fontFamily: 'var(--ns-font-mono)', letterSpacing: '0.06em' };
@@ -408,6 +408,238 @@ function InstallModal({ open, staged, onClose, onInstalled }) {
   );
 }
 
+/// Ping and traceroute run to completion server-side (a browser has no
+/// terminal to stream into) and the whole output lands here.
+function DiagnosticsCard({ isAdmin, adminTitle, onError }) {
+  const [tool, setTool] = useState('ping');
+  const [host, setHost] = useState('');
+  const [source, setSource] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const run = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const body = JSON.stringify({ host: host.trim(), source: source.trim() });
+      const r = await api(`/api/system/diag/${tool}`, { method: 'POST', body });
+      setResult(r);
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card header="Reachability" className="card-wide">
+      <CardBlock text="Run ping or traceroute from the switch. The output is collected and shown when the run finishes." />
+      <CardBlock>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <Select value={tool} onChange={(e) => setTool(e.target.value)} aria-label="Tool"
+            options={[{ value: 'ping', label: 'ping' }, { value: 'traceroute', label: 'traceroute' }]} />
+          <Input className="mono" placeholder="host or address" value={host}
+            aria-label="Host" onChange={(e) => setHost(e.target.value)} />
+          <Input className="mono" placeholder="source interface (optional)" value={source}
+            aria-label="Source interface" onChange={(e) => setSource(e.target.value)} />
+          <Button variant="primary" sm loading={busy}
+            disabled={busy || !host.trim() || !isAdmin} title={adminTitle} onClick={run}>
+            Run
+          </Button>
+        </div>
+        {result && (
+          <pre className="mono" style={{
+            marginTop: 12, padding: 12, maxHeight: 300, overflow: 'auto',
+            fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          }}>{result.output || '(no output)'}</pre>
+        )}
+      </CardBlock>
+    </Card>
+  );
+}
+
+/// A TDR sweep interrupts the link, so running one needs the same
+/// typed confirmation the CLI asks for. Replaying the last result does
+/// not.
+function CableCard({ ports, isAdmin, adminTitle, onError }) {
+  const [port, setPort] = useState('');
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [typed, setTyped] = useState('');
+
+  const call = async (run) => {
+    setBusy(true);
+    try {
+      const r = await api('/api/system/diag/cable', {
+        method: 'POST',
+        body: JSON.stringify({ port, run }),
+      });
+      setResult(r);
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card header="Cable Diagnostics" className="card-wide">
+      <CardBlock text="A time-domain reflectometry sweep reports the state and length of each twisted pair. Copper ports only — and the sweep briefly interrupts the link." />
+      <CardBlock>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <Select value={port} onChange={(e) => { setPort(e.target.value); setResult(null); }}
+            aria-label="Port"
+            options={[{ value: '', label: 'Select a port…' },
+              ...ports.map((p) => ({ value: p, label: p }))]} />
+          <Button sm disabled={!port || busy} onClick={() => call(false)}>
+            Show Last Result
+          </Button>
+          <Button variant="warning-outline" sm disabled={!port || busy || !isAdmin}
+            title={adminTitle} onClick={() => { setTyped(''); setConfirming(true); }}>
+            Run Sweep…
+          </Button>
+        </div>
+        {result && !result.has_result && (
+          <Alert status="info" sm style={{ marginTop: 12 }}>
+            No cable diagnostics have been run on {result.port}.
+          </Alert>
+        )}
+        {result && result.has_result && (
+          <Datagrid
+            className="diag-grid"
+            compact
+            rowKey={(r) => r.pair}
+            columns={[
+              { key: 'pair', label: 'Pair', width: 80 },
+              {
+                key: 'state', label: 'Status',
+                render: (r) => (
+                  <Label status={r.state === 'ok' ? 'success' : 'warning'}>{r.state}</Label>
+                ),
+              },
+              {
+                key: 'length_m', label: 'Length',
+                render: (r) => <span className="cell-mono">{r.length_m ? `${r.length_m} m` : '—'}</span>,
+              },
+            ]}
+            rows={result.pairs}
+            footerText={`run ${commitStamp(new Date(result.run_at * 1000).toISOString())}`}
+          />
+        )}
+      </CardBlock>
+      <Modal
+        open={confirming}
+        title={`Run Cable Diagnostics on ${port}`}
+        size="sm"
+        onClose={() => setConfirming(false)}
+        footer={
+          <>
+            <Button variant="link-neutral" onClick={() => setConfirming(false)}>Cancel</Button>
+            <Button variant="warning" loading={busy} disabled={busy || typed.trim() !== 'yes'}
+              onClick={() => { setConfirming(false); call(true); }}>
+              Run Sweep
+            </Button>
+          </>
+        }
+      >
+        <p>
+          The sweep takes the link on {port} down for a few seconds. Anything behind that
+          port loses connectivity for the duration.
+        </p>
+        <div className="clr-form-compact">
+          <FormField label="Confirmation" required htmlFor="cable-confirm"
+            helper="Type `yes` to enable the button.">
+            <Input id="cable-confirm" autoFocus className="mono" value={typed}
+              onChange={(e) => setTyped(e.target.value)} />
+          </FormField>
+        </div>
+      </Modal>
+    </Card>
+  );
+}
+
+/// Collecting a bundle takes a moment; the download link appears when
+/// mgmtd says where it landed.
+function SupportCard({ isAdmin, adminTitle, onError }) {
+  const [busy, setBusy] = useState(false);
+  const [bundle, setBundle] = useState(null);
+
+  const collect = async () => {
+    setBusy(true);
+    setBundle(null);
+    try {
+      setBundle(await api('/api/system/tech-support', { method: 'POST' }));
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card header="Tech Support">
+      <CardBlock text="Collect the configuration (with secrets redacted), the commit history, daemon state and recent logs into one archive." />
+      <CardBlock>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Button sm icon="bundle" loading={busy} disabled={busy || !isAdmin}
+            title={adminTitle} onClick={collect}>
+            Collect Bundle
+          </Button>
+          {bundle && (
+            <a className="btn btn-sm btn-primary"
+              href={`/api/system/tech-support/download?path=${encodeURIComponent(bundle.path)}`}>
+              Download ({formatBytes(bundle.size_bytes)})
+            </a>
+          )}
+        </div>
+        {bundle && (
+          <div className="dim mono" style={{ marginTop: 8, fontSize: 12 }}>{bundle.path}</div>
+        )}
+      </CardBlock>
+    </Card>
+  );
+}
+
+/// Regenerating replaces the self-signed pair. Sessions survive — they
+/// live in webd memory, not in the TLS material — but the browser sees
+/// a new certificate, so the fingerprint is shown to compare against.
+function CertificateCard({ isAdmin, adminTitle, onError }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const regenerate = async () => {
+    setBusy(true);
+    try {
+      setResult(await api('/api/system/certificate/regenerate', { method: 'POST' }));
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card header="Web Certificate">
+      <CardBlock text="Replace the self-signed certificate the web console serves. Existing sessions keep working; the browser will warn about the new certificate once the console restarts." />
+      <CardBlock>
+        <Button sm icon="certificate" variant="warning-outline" loading={busy}
+          disabled={busy || !isAdmin} title={adminTitle} onClick={regenerate}>
+          Regenerate…
+        </Button>
+        {result && (
+          <div style={{ marginTop: 12 }}>
+            <div className="dim" style={{ fontSize: 12 }}>New SHA-256 fingerprint</div>
+            <div className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>
+              {result.fingerprint}
+            </div>
+          </div>
+        )}
+      </CardBlock>
+    </Card>
+  );
+}
+
 export default function MaintenancePage() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -419,6 +651,7 @@ export default function MaintenancePage() {
   const [commits, setCommits] = useState(null);
   const [session, setSession] = useState(null);
   const [rollback, setRollback] = useState(null);
+  const [copperPorts, setCopperPorts] = useState([]);
   const [upload, setUpload] = useState(null); // { name, progress } while uploading
   const fileRef = useRef(null);
 
@@ -430,6 +663,17 @@ export default function MaintenancePage() {
   useEffect(refresh, [refresh]);
   useEffect(() => {
     api('/api/session').then(setSession).catch(() => {});
+    // Only twisted-pair ports have pairs to sweep, so the picker offers
+    // exactly those — the same rule syncd enforces.
+    api('/api/interfaces')
+      .then((r) =>
+        setCopperPorts(
+          r.interfaces
+            .filter((i) => i.kind === 'ethernet' && /BASE-?T/i.test(i.media || ''))
+            .map((i) => i.name),
+        ),
+      )
+      .catch(() => {});
   }, []);
 
   const downloadConfig = async () => {
@@ -637,6 +881,12 @@ export default function MaintenancePage() {
               />
             )}
           </Card>
+
+          <DiagnosticsCard isAdmin={isAdmin} adminTitle={adminTitle} onError={setError} />
+          <CableCard ports={copperPorts} isAdmin={isAdmin} adminTitle={adminTitle}
+            onError={setError} />
+          <SupportCard isAdmin={isAdmin} adminTitle={adminTitle} onError={setError} />
+          <CertificateCard isAdmin={isAdmin} adminTitle={adminTitle} onError={setError} />
 
           <Card header="Software">
             <CardBlock>

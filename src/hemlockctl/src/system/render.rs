@@ -2,7 +2,7 @@
 
 use crate::interfaces::table::{Col, Text};
 
-use super::model::{CommitsState, ImageState, LoggingState, UsersState};
+use super::model::{CableDiagState, CommitsState, ImageState, LoggingState, UsersState};
 
 /// A duration as `HH:MM:SS`, the shape an idle timer reads best in.
 /// Days roll into the hours field rather than adding a unit.
@@ -251,5 +251,35 @@ pub fn image(state: &ImageState) -> String {
             "not armed"
         }
     ));
+    out.finish()
+}
+
+/// `show interfaces <port> cable-diagnostics` — the last TDR sweep.
+pub fn cable_diagnostics(state: &CableDiagState) -> String {
+    const COLS: [Col; 3] = [Col::left(6), Col::left(11), Col::left(7)];
+    let mut out = Text::new();
+    out.line(format!(
+        "{} cable diagnostics (run {}):",
+        state.port,
+        stamp_or_dash(state.run_at)
+    ));
+    out.row(&COLS, &["Pair", "Status", "Length"]);
+    out.row(&COLS, &["----", "---------", "-------"]);
+    for pair in &state.pairs {
+        out.row(
+            &COLS,
+            &[
+                &pair.pair,
+                &pair.state,
+                // A pair the PHY would not measure has no length to
+                // print, which is not the same as a zero-metre run.
+                &if pair.length_m == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{} m", pair.length_m)
+                },
+            ],
+        );
+    }
     out.finish()
 }

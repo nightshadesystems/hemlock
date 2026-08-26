@@ -119,6 +119,68 @@ pub async fn rollback_target(mgmtd: &IpcEndpoint, index: u32) -> Option<String> 
     ))
 }
 
+/// `show interfaces <port> cable-diagnostics [| json]` — replay the
+/// last sweep. The interfaces dispatcher hands the port over already
+/// canonicalized.
+pub async fn show_cable_diagnostics(
+    syncd: &IpcEndpoint,
+    port: &str,
+    json: bool,
+) -> Result<(), String> {
+    let state = fetch::cable_diagnostics(syncd, port)
+        .await
+        .map_err(fmt_err)?;
+    if json {
+        return page_json("cable_diagnostics", &state);
+    }
+    if !state.has_result {
+        return Err(format!("% no cable diagnostics have been run on {port}"));
+    }
+    crate::pager::page(&render::cable_diagnostics(&state));
+    Ok(())
+}
+
+/// `request cable-diagnostics <port>` — run the sweep, then render the
+/// same table the `show` form replays.
+pub async fn request_cable_diagnostics(syncd: &IpcEndpoint, port: &str) -> Result<(), String> {
+    let state = fetch::run_cable_diagnostics(syncd, port)
+        .await
+        .map_err(fmt_err)?;
+    crate::pager::page(&render::cable_diagnostics(&state));
+    Ok(())
+}
+
+/// `request tech-support` — assemble the bundle and say where it
+/// landed. mgmtd does the collecting; this only reports.
+pub async fn request_tech_support(mgmtd: &IpcEndpoint) -> Result<(), String> {
+    println!("collecting tech-support bundle (this takes a moment)...");
+    let (path, size) = fetch::tech_support(mgmtd).await.map_err(fmt_err)?;
+    println!("tech-support bundle written to {path} ({})", bytes(size));
+    Ok(())
+}
+
+/// A byte count in the units an operator reads.
+fn bytes(n: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if n >= MIB {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    } else {
+        format!("{} KiB", n.div_ceil(1024).max(1))
+    }
+}
+
+/// `request certificate regenerate` — replace the web console's
+/// self-signed pair and print the new fingerprint.
+pub async fn request_certificate_regenerate(mgmtd: &IpcEndpoint) -> Result<(), String> {
+    let fingerprint = fetch::regenerate_certificate(mgmtd)
+        .await
+        .map_err(fmt_err)?;
+    println!("web console certificate regenerated");
+    println!("SHA-256 fingerprint: {fingerprint}");
+    println!("(the console restarts to serve it; existing sessions are unaffected)");
+    Ok(())
+}
+
 /// `request reboot [onie-rescue]` — the confirmed reboot verb.
 pub async fn request_reboot(mgmtd: &IpcEndpoint, onie_rescue: bool) -> Result<(), String> {
     fetch::reboot(mgmtd, onie_rescue).await.map_err(fmt_err)?;

@@ -283,6 +283,12 @@ pub struct SaiCapabilities {
     /// ports). Absent means `services { sflow }` fails the commit
     /// rather than silently sampling nothing.
     pub sflow: bool,
+
+    // --- System suite -------------------------------------------------
+    /// Copper cable diagnostics (TDR): the per-pair state and length
+    /// port attributes. Absent means `request cable-diagnostics` fails
+    /// with the platform error instead of reporting nothing found.
+    pub cable_diag: bool,
 }
 
 impl SaiCapabilities {
@@ -315,8 +321,48 @@ impl SaiCapabilities {
             queue_shaper: true,
             wred_queue_stats: true,
             sflow: true,
+            cable_diag: true,
         }
     }
+}
+
+/// What a TDR sweep found on one twisted pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CablePairState {
+    /// Terminated correctly; `length_m` is the cable run.
+    Ok,
+    /// No termination — a break, or nothing plugged in. `length_m` is
+    /// the distance to the fault.
+    Open,
+    /// The two wires of the pair are shorted together.
+    Short,
+    /// The pair is coupled to another one (a split or mis-punched pair).
+    Crosstalk,
+    /// The PHY ran the sweep but would not classify the result.
+    Unknown,
+}
+
+impl CablePairState {
+    /// The operator-facing word, shared by the CLI and the console.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CablePairState::Ok => "ok",
+            CablePairState::Open => "open",
+            CablePairState::Short => "short",
+            CablePairState::Crosstalk => "crosstalk",
+            CablePairState::Unknown => "unknown",
+        }
+    }
+}
+
+/// One pair of a TDR result. Pairs are reported in wire order, so index
+/// 0 is pair A.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CablePair {
+    pub state: CablePairState,
+    /// Metres: the cable run for a terminated pair, the distance to the
+    /// fault otherwise. 0 = the PHY did not measure one.
+    pub length_m: u32,
 }
 
 /// Which global QoS map table an object holds. Hemlock exposes four of
@@ -836,6 +882,14 @@ pub trait SaiBackend: Send {
 
     /// Remove a samplepacket session; ports must be unbound first.
     fn remove_samplepacket(&mut self, session: Oid) -> Result<(), SaiError>;
+
+    /// Run a time-domain reflectometry sweep on a copper port and read
+    /// back the per-pair result. Gated on
+    /// [`SaiCapabilities::cable_diag`].
+    ///
+    /// The sweep interrupts the link for as long as it takes the PHY to
+    /// run it — both front-ends warn and confirm before calling this.
+    fn run_cable_diag(&mut self, port: PortId) -> Result<Vec<CablePair>, SaiError>;
 
     /// Bind (or, with `None`, unbind) a port's *ingress* sampling to a
     /// session. Egress sampling is deliberately not exposed.

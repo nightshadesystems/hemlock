@@ -18,6 +18,9 @@ pub struct Engine {
     store: Store,
     syncd: IpcEndpoint,
     orch: IpcEndpoint,
+    /// Read-only, for the tech-support bundle's environment and
+    /// transceiver dumps.
+    pmon: IpcEndpoint,
     os: OsApplier,
     identity: crate::identityapply::IdentityApplier,
     rsyslog: crate::rsyslogapply::RsyslogApplier,
@@ -39,11 +42,18 @@ struct PendingConfirm {
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
 impl Engine {
-    pub fn new(store: Store, syncd: IpcEndpoint, orch: IpcEndpoint, os: OsApplier) -> Self {
+    pub fn new(
+        store: Store,
+        syncd: IpcEndpoint,
+        orch: IpcEndpoint,
+        pmon: IpcEndpoint,
+        os: OsApplier,
+    ) -> Self {
         Self {
             store,
             syncd,
             orch,
+            pmon,
             os,
             identity: crate::identityapply::IdentityApplier::new(),
             rsyslog: crate::rsyslogapply::RsyslogApplier::new(),
@@ -2018,6 +2028,19 @@ impl MgmtService {
     }
 }
 
+/// The box's own name, for the bundle filename.
+fn hostname() -> String {
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(name) = std::fs::read_to_string(path) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    crate::intents::DEFAULT_HOSTNAME.to_string()
+}
+
 fn internal(err: anyhow::Error) -> Status {
     Status::internal(format!("{err:#}"))
 }
@@ -2188,6 +2211,75 @@ impl pb::mgmt_server::Mgmt for MgmtService {
             )
             .collect();
         Ok(Response::new(pb::ListRollbacksResponse { entries }))
+    }
+
+    async fn tech_support(
+        &self,
+        _request: Request<pb::TechSupportRequest>,
+    ) -> Result<Response<pb::TechSupportResponse>, Status> {
+        // Collect the inputs under the lock, then build outside it: the
+        // bundle shells out to tar and talks to three daemons, and none
+        // of that should hold up a commit.
+        let (running, commits, syncd, orch, pmon) = {
+            let engine = self.engine.lock().await;
+            let running = engine.store.running().map_err(internal)?;
+            let commits: Vec<crate::store::RollbackMeta> =
+                std::iter::once(engine.store.running_meta())
+                    .chain(engine.store.list_rollbacks().into_iter().map(|(_, m)| m))
+                    .collect();
+            (
+                running,
+                commits,
+                engine.syncd.clone(),
+                engine.orch.clone(),
+                engine.pmon.clone(),
+            )
+        };
+        let hostname = hostname();
+        let path = crate::techsupport::build(
+            std::path::Path::new(crate::techsupport::BUNDLE_DIR),
+            &hostname,
+            &running,
+            &commits,
+            &syncd,
+            &orch,
+            &pmon,
+        )
+        .await
+        .map_err(internal)?;
+        let size_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(Response::new(pb::TechSupportResponse {
+            path: path.display().to_string(),
+            size_bytes,
+        }))
+    }
+
+    async fn regenerate_certificate(
+        &self,
+        _request: Request<pb::RegenerateCertificateRequest>,
+    ) -> Result<Response<pb::RegenerateCertificateResponse>, Status> {
+        let state_dir = std::path::Path::new(hemlock_common::cert::WEBD_STATE_DIR);
+        let hostname = hostname();
+        let (cert, _) = hemlock_common::cert::regenerate(state_dir, &hostname)
+            .map_err(|e| Status::failed_precondition(format!("{e:#}")))?;
+        let pem = std::fs::read_to_string(&cert)
+            .map_err(|e| Status::internal(format!("cannot read the new certificate: {e}")))?;
+        let fingerprint = hemlock_common::cert::fingerprint(&pem)
+            .map_err(|e| Status::internal(format!("{e:#}")))?;
+        // Restarting webd cannot happen inside this call: when the
+        // request came from the web console, webd is blocked waiting on
+        // it, and a synchronous restart would deadlock exactly the way
+        // the web-unit change does (see osapply::apply_web). Defer it.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = std::process::Command::new("systemctl")
+                .args(["restart", "hemlock-webd"])
+                .status();
+        });
+        warn!(%fingerprint, "web console certificate regenerated");
+        Ok(Response::new(pb::RegenerateCertificateResponse {
+            fingerprint,
+        }))
     }
 
     async fn get_image_info(

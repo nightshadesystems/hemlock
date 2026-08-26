@@ -613,6 +613,22 @@ impl SyncdService {
 impl SyncdService {
     /// A capability gate: commits that need an absent SAI capability
     /// fail cleanly with the platform error, never silently no-op.
+    /// Is this a twisted-pair port? The manifest names the media
+    /// (`1000BASE-T`, `SFP+`), and only the BASE-T families have pairs
+    /// a TDR sweep can measure.
+    pub(crate) fn port_is_copper(&self, name: &str) -> bool {
+        self.handle
+            .ports
+            .read()
+            .ok()
+            .and_then(|table| {
+                table
+                    .get(name)
+                    .map(|port| media_is_copper(port.def.media.as_deref().unwrap_or_default()))
+            })
+            .unwrap_or(false)
+    }
+
     pub(crate) fn require_capability(&self, supported: bool, family: &str) -> Result<(), Status> {
         if supported {
             Ok(())
@@ -1226,6 +1242,45 @@ fn storm_class_proto(class: hemlock_sai::StormClass) -> pb::StormClass {
 }
 
 /// The group number of a port-channel name (`Port-Channel1` -> 1).
+/// A manifest media string that means twisted-pair copper. The
+/// BASE-T families are the ones with pairs; everything else on a switch
+/// front panel (SFP, SFP+, QSFP, BASE-X) is not.
+pub(crate) fn media_is_copper(media: &str) -> bool {
+    let media = media.to_ascii_uppercase();
+    media.contains("BASE-T") || media.contains("BASET")
+}
+
+/// One TDR result as the wire carries it. `None` = no sweep has run.
+fn cable_diagnostics(
+    port: &str,
+    result: Option<&crate::state::CableDiagResult>,
+) -> pb::CableDiagnostics {
+    let Some(result) = result else {
+        return pb::CableDiagnostics {
+            port: port.to_string(),
+            has_result: false,
+            run_at: 0,
+            pairs: Vec::new(),
+        };
+    };
+    pb::CableDiagnostics {
+        port: port.to_string(),
+        has_result: true,
+        run_at: result.run_at,
+        pairs: result
+            .pairs
+            .iter()
+            .enumerate()
+            .map(|(index, pair)| pb::CablePair {
+                // Pairs come back in wire order, so index 0 is pair A.
+                pair: char::from(b'A' + u8::try_from(index).unwrap_or(0)).to_string(),
+                state: pair.state.as_str().to_string(),
+                length_m: pair.length_m,
+            })
+            .collect(),
+    }
+}
+
 pub(crate) fn lag_group_of(name: &str) -> Option<u16> {
     let digits = name.strip_prefix("Port-Channel")?;
     digits
@@ -1281,6 +1336,7 @@ impl pb::syncd_server::Syncd for SyncdService {
                 queue_shaper: caps.queue_shaper,
                 wred_queue_stats: caps.wred_queue_stats,
                 sflow: caps.sflow,
+                cable_diag: caps.cable_diag,
             }),
         }))
     }
@@ -3916,6 +3972,56 @@ impl pb::syncd_server::Syncd for SyncdService {
         Ok(Response::new(pb::RemoveWredProfileResponse {}))
     }
 
+    async fn run_cable_diagnostics(
+        &self,
+        request: Request<pb::RunCableDiagnosticsRequest>,
+    ) -> Result<Response<pb::CableDiagnostics>, Status> {
+        self.require_capability(self.handle.capabilities.cable_diag, "cable diagnostics")?;
+        let name = request.into_inner().port;
+        let sai_id = self.port_sai_id(&name)?;
+        // Copper only: a TDR sweep measures reflections on twisted
+        // pairs, and a fibre port has none to measure.
+        if !self.port_is_copper(&name) {
+            return Err(Status::failed_precondition(format!(
+                "{name}: cable diagnostics require a copper port"
+            )));
+        }
+        let pairs = self
+            .handle
+            .run_cable_diag(sai_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let run_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let result = crate::state::CableDiagResult { run_at, pairs };
+        if let Ok(mut table) = self.handle.cable_diag.write() {
+            table.insert(name.clone(), result.clone());
+        }
+        Ok(Response::new(cable_diagnostics(&name, Some(&result))))
+    }
+
+    async fn get_cable_diagnostics(
+        &self,
+        request: Request<pb::GetCableDiagnosticsRequest>,
+    ) -> Result<Response<pb::CableDiagnostics>, Status> {
+        let name = request.into_inner().port;
+        // The port has to exist even when no sweep has been run, so a
+        // typo reads as a bad port rather than "nothing found".
+        self.port_sai_id(&name)?;
+        let stored = self
+            .handle
+            .cable_diag
+            .read()
+            .ok()
+            .and_then(|table| table.get(&name).cloned());
+        Ok(Response::new(cable_diagnostics(&name, stored.as_ref())))
+    }
+
     async fn set_sflow_sampling(
         &self,
         request: Request<pb::SetSflowSamplingRequest>,
@@ -5574,6 +5680,78 @@ lanes = [1, 2]
             }))
             .await
             .unwrap();
+    }
+
+    /// A TDR sweep runs on a copper port, is stored for the `show`
+    /// form to replay, and reports whatever the PHY found.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cable_diagnostics_run_and_replay_over_mock_sai() {
+        let platform = test_platform();
+        let mock = hemlock_sai::mock::MockSai::new(platform.ports.clone());
+        let handle = Arc::new(SaiActor::spawn(Box::new(mock), &platform).await.unwrap());
+        let service = SyncdService::new(
+            handle.clone(),
+            Engine::new(300),
+            Arc::default(),
+            Inventory::default(),
+        );
+        // Nothing has been run yet: the port is known, the result is not.
+        let empty = service
+            .get_cable_diagnostics(Request::new(pb::GetCableDiagnosticsRequest {
+                port: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!empty.has_result);
+        assert!(empty.pairs.is_empty());
+
+        let run = service
+            .run_cable_diagnostics(Request::new(pb::RunCableDiagnosticsRequest {
+                port: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(run.has_result);
+        assert_eq!(run.pairs.len(), 4);
+        // Pairs are reported in wire order.
+        let names: Vec<&str> = run.pairs.iter().map(|p| p.pair.as_str()).collect();
+        assert_eq!(names, ["A", "B", "C", "D"]);
+        assert!(run.pairs.iter().all(|p| p.state == "ok"));
+        assert!(run.run_at > 0);
+
+        // The `show` form replays exactly what the sweep found.
+        let replay = service
+            .get_cable_diagnostics(Request::new(pb::GetCableDiagnosticsRequest {
+                port: "Ethernet1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replay.pairs, run.pairs);
+        assert_eq!(replay.run_at, run.run_at);
+
+        // A port that does not exist is a bad argument, not an empty
+        // result.
+        assert!(service
+            .get_cable_diagnostics(Request::new(pb::GetCableDiagnosticsRequest {
+                port: "Ethernet999".into(),
+            }))
+            .await
+            .is_err());
+    }
+
+    /// The media string decides which ports have pairs to measure.
+    #[test]
+    fn only_twisted_pair_media_is_copper() {
+        assert!(media_is_copper("1000BASE-T"));
+        assert!(media_is_copper("10GBASE-T"));
+        assert!(media_is_copper("100base-t"));
+        assert!(!media_is_copper("SFP+"));
+        assert!(!media_is_copper("QSFP28"));
+        assert!(!media_is_copper("1000BASE-X"));
+        assert!(!media_is_copper(""));
     }
 
     /// The sampler is programmed declaratively: one shared session

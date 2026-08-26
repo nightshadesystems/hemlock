@@ -337,6 +337,8 @@ async fn operational(
         "configure",
         "clear",
         "request",
+        "ping",
+        "traceroute",
         "upgrade",
         "bash",
         "exit",
@@ -411,6 +413,10 @@ async fn operational(
             request_command(endpoints, &words[1..]).await?;
             stay(Mode::Operational)
         }
+        tool @ ("ping" | "traceroute") => {
+            diag_command(endpoints, tool, &words[1..]).await?;
+            stay(Mode::Operational)
+        }
         "upgrade" => {
             upgrade_command(endpoints, &words[1..]).await?;
             stay(Mode::Operational)
@@ -473,6 +479,13 @@ async fn operational(
             println!("  show system commits                    commit history (rollback ring)");
             println!("  show system image                      running image, kernel, next boot");
             println!("  request reboot [onie-rescue]           reboot the switch (confirmed)");
+            println!("  request cable-diagnostics <port>       copper TDR sweep (confirmed)");
+            println!("  request tech-support                   collect a support bundle");
+            println!("  request certificate regenerate         new web console TLS pair");
+            println!("  request certificate regenerate         new web console TLS pair");
+            println!("  show interfaces <port> cable-diagnostics   replay the last sweep");
+            println!("  ping <host> [source <interface>]       live passthrough");
+            println!("  traceroute <host> [source <interface>] live passthrough");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -494,11 +507,78 @@ async fn operational(
     }
 }
 
+/// `ping|traceroute <host> [source <interface>]` — live passthrough to
+/// the system tools (see `diag`). The source interface is resolved
+/// against the L3 interfaces the box actually has, so a typo is caught
+/// here rather than by a tool that would bind to nothing.
+async fn diag_command(endpoints: &Endpoints, tool: &str, words: &[&str]) -> Result<(), String> {
+    let usage = format!("{tool} <host> [source <interface>]");
+    let Some(host) = words.first() else {
+        return Err(format!("% Usage: {usage}"));
+    };
+    if matches!(*host, "?" | "help") {
+        println!("{usage}");
+        return Ok(());
+    }
+    let source = match words[1..].split_first() {
+        None => None,
+        Some((word, rest)) => {
+            resolve(word, &["source"])?;
+            let [interface] = rest else {
+                return Err(format!("% Usage: {usage}"));
+            };
+            Some(canonical_l3_interface(endpoints, interface).await?)
+        }
+    };
+    if tool == "ping" {
+        crate::diag::ping(host, source.as_deref())
+    } else {
+        crate::diag::traceroute(host, source.as_deref())
+    }
+}
+
+/// A `source` argument: an SVI, a port-channel, the management port, or
+/// a front-panel port (aliases accepted). The kernel names its netdevs
+/// after the interfaces, so the canonical name is what the tool binds.
+async fn canonical_l3_interface(endpoints: &Endpoints, input: &str) -> Result<String, String> {
+    if let Some(vlan) = vlan_interface(input) {
+        return Ok(vlan);
+    }
+    if let Some(lag) = port_channel_interface(input) {
+        return Ok(lag);
+    }
+    let management = management_interface();
+    if input.eq_ignore_ascii_case(&management) {
+        return Ok(management);
+    }
+    let mut known = syncd_port_names(endpoints).await;
+    known.push(management);
+    canonical_port(input, &known)
+}
+
+/// The port names syncd knows, for interface arguments. Empty when
+/// syncd cannot say — the caller then falls back to its own checks.
+async fn syncd_port_names(endpoints: &Endpoints) -> Vec<String> {
+    let Ok(channel) = endpoints.syncd.connect().await else {
+        return Vec::new();
+    };
+    let mut client = pb::syncd_client::SyncdClient::new(channel);
+    match client.list_ports(pb::ListPortsRequest {}).await {
+        Ok(response) => response
+            .into_inner()
+            .ports
+            .into_iter()
+            .map(|port| port.name)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// `request <reboot> ...` — the operational verbs that *do* something
 /// rather than show it. Every one is admin-only (the shared role table
 /// gates the verb), and the disruptive ones confirm first.
 async fn request_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), String> {
-    const USAGE: &str = "request reboot [onie-rescue]";
+    const USAGE: &str = "request <reboot [onie-rescue] | cable-diagnostics <port>                          | tech-support | certificate regenerate>";
     let Some(first) = words.first() else {
         return Err(format!("% Usage: {USAGE}"));
     };
@@ -506,7 +586,40 @@ async fn request_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), St
         println!("{USAGE}");
         return Ok(());
     }
-    match resolve(first, &["reboot"])? {
+    match resolve(
+        first,
+        &["reboot", "cable-diagnostics", "tech-support", "certificate"],
+    )? {
+        "certificate" => {
+            let Some(word) = words.get(1) else {
+                return Err("% Usage: request certificate regenerate".into());
+            };
+            resolve(word, &["regenerate"])?;
+            if let Some(extra) = words.get(2) {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            crate::system::cmd::request_certificate_regenerate(&endpoints.mgmtd).await
+        }
+        "tech-support" => {
+            if let Some(extra) = words.get(1) {
+                return Err(format!("% Invalid input: {extra:?}"));
+            }
+            crate::system::cmd::request_tech_support(&endpoints.mgmtd).await
+        }
+        "cable-diagnostics" => {
+            let [port] = &words[1..] else {
+                return Err("% Usage: request cable-diagnostics <port>".into());
+            };
+            let known = syncd_port_names(endpoints).await;
+            let port = canonical_port(port, &known)?;
+            if !confirm_yes(&format!(
+                "Run cable diagnostics on {port}? The sweep interrupts the link                  for a few seconds."
+            )) {
+                println!("cancelled");
+                return Ok(());
+            }
+            crate::system::cmd::request_cable_diagnostics(&endpoints.syncd, &port).await
+        }
         "reboot" => {
             let rest = &words[1..];
             let onie_rescue = match rest.split_first() {

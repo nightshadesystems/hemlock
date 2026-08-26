@@ -1,0 +1,29 @@
+{
+  "cable_diagnostics": {
+    "has_result": true,
+    "pairs": [
+      {
+        "length_m": 42,
+        "pair": "A",
+        "state": "ok"
+      },
+      {
+        "length_m": 42,
+        "pair": "B",
+        "state": "ok"
+      },
+      {
+        "length_m": 11,
+        "pair": "C",
+        "state": "open"
+      },
+      {
+        "length_m": 11,
+        "pair": "D",
+        "state": "open"
+      }
+    ],
+    "port": "Ethernet7",
+    "run_at": 1787654550
+  }
+}

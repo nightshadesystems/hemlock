@@ -7,6 +7,14 @@
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=HEMLOCK_SAI_HEADERS");
+    // Copper cable diagnostics arrived in SAI 1.13; the pinned 1.11
+    // headers do not declare the attributes, and their numeric ids are
+    // not ours to guess. The vendor backend compiles the real
+    // implementation only where the selected header set defines them,
+    // and reports the capability absent otherwise — so pinning newer
+    // headers via HEMLOCK_SAI_HEADERS lights the feature up with no
+    // other change.
+    println!("cargo:rustc-check-cfg=cfg(sai_cable_diag)");
     #[cfg(feature = "real-sai")]
     generate_bindings();
 }
@@ -53,9 +61,19 @@ fn generate_bindings() {
         .expect("bindgen over SAI headers");
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let path = out.join("sai_bindings.rs");
     bindings
-        .write_to_file(out.join("sai_bindings.rs"))
+        .write_to_file(&path)
         .expect("write sai_bindings.rs");
+
+    // See main(): the cable-diagnostics implementation is compiled only
+    // against headers that declare both attributes.
+    let generated = std::fs::read_to_string(&path).expect("read sai_bindings.rs");
+    if generated.contains("SAI_PORT_ATTR_CABLE_PAIR_STATE")
+        && generated.contains("SAI_PORT_ATTR_CABLE_PAIR_LENGTH")
+    {
+        println!("cargo:rustc-cfg=sai_cable_diag");
+    }
 }
 
 #[cfg(feature = "real-sai")]

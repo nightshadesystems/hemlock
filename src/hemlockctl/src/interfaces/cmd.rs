@@ -34,15 +34,27 @@ enum Cmd {
     TransceiverEeprom,
     Capabilities,
     Flowcontrol,
-    Negotiation { detail: bool },
-    Phy { detail: bool },
-    Mac { detail: bool },
+    Negotiation {
+        detail: bool,
+    },
+    Phy {
+        detail: bool,
+    },
+    Mac {
+        detail: bool,
+    },
     Switchport,
     Trunk,
     Vlans,
+    /// The system suite's TDR replay; handled by that module, but
+    /// parsed here so it shares the subcommand namespace (and so
+    /// `show interfaces Et1 c` stays ambiguous rather than silently
+    /// picking one).
+    CableDiagnostics,
 }
 
 const SUBCOMMANDS: &[&str] = &[
+    "cable-diagnostics",
     "description",
     "status",
     "counters",
@@ -82,6 +94,10 @@ fn parse(words: &[&str]) -> Result<Cmd, String> {
     };
     let rest = &words[1..];
     Ok(match resolve(first, SUBCOMMANDS)? {
+        "cable-diagnostics" => {
+            no_more(rest)?;
+            Cmd::CableDiagnostics
+        }
         "description" => {
             no_more(rest)?;
             Cmd::Description
@@ -211,6 +227,15 @@ pub async fn run(syncd: &IpcEndpoint, pmon: &IpcEndpoint, args: &[&str]) -> Resu
     }
     let cmd = parse(&words)?;
 
+    if cmd == Cmd::CableDiagnostics {
+        // One port at a time: a sweep is a per-port measurement, and a
+        // range would be a fleet of link interruptions.
+        let [id] = selection.as_deref().unwrap_or_default() else {
+            return Err("% Usage: show interfaces <port> cable-diagnostics".into());
+        };
+        return crate::system::cmd::show_cable_diagnostics(syncd, &id.to_string(), json).await;
+    }
+
     if matches!(
         cmd,
         Cmd::Transceiver
@@ -276,6 +301,8 @@ pub async fn run(syncd: &IpcEndpoint, pmon: &IpcEndpoint, args: &[&str]) -> Resu
         Cmd::Switchport => render::l2::switchport(&interfaces, &ctx),
         Cmd::Trunk => render::l2::trunk(&interfaces, &ctx),
         Cmd::Vlans => render::l2::vlans(&interfaces, &ctx),
+        // Handled above, before the interface fetch.
+        Cmd::CableDiagnostics => unreachable!(),
         Cmd::Transceiver
         | Cmd::TransceiverDetail
         | Cmd::TransceiverProperties

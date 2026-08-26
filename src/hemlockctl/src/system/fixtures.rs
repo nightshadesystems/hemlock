@@ -2,8 +2,8 @@
 //! the spec's Part 1.1 seed.
 
 use super::model::{
-    ActiveSession, Commit, CommitsState, ConfiguredUser, ImageState, LogEntry, LoggingState,
-    UsersState,
+    ActiveSession, CableDiagState, CablePair, Commit, CommitsState, ConfiguredUser, ImageState,
+    LogEntry, LoggingState, UsersState,
 };
 
 /// 2026-08-25 09:12:44 UTC — the seed's first login.
@@ -136,5 +136,27 @@ pub fn image_state() -> ImageState {
         platform: String::new(),
         next_boot: "hemlock-1.4.0".into(),
         onie_rescue_armed: false,
+    }
+}
+
+/// The spec seed: a run with two healthy pairs and a break 11 m out on
+/// the other two — the shape a damaged patch lead makes.
+pub fn cable_diag_state() -> CableDiagState {
+    let pair = |name: &str, state: &str, length_m: u32| CablePair {
+        pair: name.into(),
+        state: state.into(),
+        length_m,
+    };
+    CableDiagState {
+        port: "Ethernet7".into(),
+        has_result: true,
+        // 2026-08-25 10:42:30 UTC.
+        run_at: 1_787_654_550,
+        pairs: vec![
+            pair("A", "ok", 42),
+            pair("B", "ok", 42),
+            pair("C", "open", 11),
+            pair("D", "open", 11),
+        ],
     }
 }

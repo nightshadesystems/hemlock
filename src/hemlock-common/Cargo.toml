@@ -17,6 +17,9 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+# The generated proto types derive Serialize (see build.rs), so any RPC
+# response can be written out as JSON.
+serde = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
 
@@ -25,6 +28,11 @@ hyper-util = { workspace = true }
 # yescrypt hashes Debian trixie writes into /etc/shadow. Both pure Rust.
 sha-crypt = { version = "0.6", features = ["getrandom"] }
 yescrypt = "0.1"
+
+# Self-signed TLS material for the web console (`set system https`), and
+# the SHA-256 fingerprint both consoles report for it.
+rcgen = "0.14"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

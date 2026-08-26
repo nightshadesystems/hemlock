@@ -272,6 +272,128 @@ fn normalize_switchport_leaves(children: &mut [Item]) {
     }
 }
 
+// --------------------------------------------------------- redaction
+
+impl ConfigTree {
+    /// Replace every stored secret with `<hidden>`.
+    ///
+    /// Which leaves are secret is policy, but it is policy every reader
+    /// of a configuration needs — `show configuration`, the web
+    /// console, and the tech-support bundle all have to agree, or one
+    /// of them leaks what the others hide. So the list lives here, with
+    /// the language, and there is exactly one of it.
+    ///
+    /// Today: RADIUS shared keys (`security { dot1x { radius-server
+    /// <ip> { key ... } } }`), SNMP v3 passphrases (`services { snmp {
+    /// user ... } }`) and login password hashes (`system { login {
+    /// user <name> { password-hash ... } } }`).
+    pub fn redact_secrets(&mut self) {
+        redact_secrets_impl(self);
+    }
+}
+
+/// The RADIUS half; the other two families have their own passes.
+fn redact_secrets_impl(tree: &mut ConfigTree) {
+    redact_snmp_users(tree);
+    redact_login_hashes(tree);
+    let Some(security) = tree.items.iter_mut().find_map(|item| match item {
+        Item::Block { name, children, .. } if name == "security" => Some(children),
+        _ => None,
+    }) else {
+        return;
+    };
+    for item in security.iter_mut() {
+        let Item::Block { name, children, .. } = item else {
+            continue;
+        };
+        if name != "dot1x" {
+            continue;
+        }
+        for server in children.iter_mut() {
+            let Item::Block { name, children, .. } = server else {
+                continue;
+            };
+            if name != "radius-server" {
+                continue;
+            }
+            for leaf in children.iter_mut() {
+                if let Item::Leaf { name, values } = leaf {
+                    if name == "key" {
+                        *values = vec!["<hidden>".into()];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `system { login { user <name> { password-hash "$6$..." } } }`: the
+/// crypt string is a secret like any other stored credential, so it
+/// follows the established convention and renders as `<hidden>`. The
+/// ssh keys beside it are public by construction and stay.
+fn redact_login_hashes(tree: &mut ConfigTree) {
+    let Some(system) = tree.items.iter_mut().find_map(|item| match item {
+        Item::Block { name, children, .. } if name == "system" => Some(children),
+        _ => None,
+    }) else {
+        return;
+    };
+    for item in system.iter_mut() {
+        let Item::Block { name, children, .. } = item else {
+            continue;
+        };
+        if name != "login" {
+            continue;
+        }
+        for user in children.iter_mut() {
+            let Item::Block { name, children, .. } = user else {
+                continue;
+            };
+            if name != "user" {
+                continue;
+            }
+            for leaf in children.iter_mut() {
+                if let Item::Leaf { name, values } = leaf {
+                    if name == "password-hash" {
+                        *values = vec!["<hidden>".into()];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `services { snmp { user <name> auth sha <pass> priv aes <pass> } }`:
+/// both passphrases render as `<hidden>`, the protocol keywords stay
+/// so the line still reads as configuration.
+fn redact_snmp_users(tree: &mut ConfigTree) {
+    let Some(services) = tree.items.iter_mut().find_map(|item| match item {
+        Item::Block { name, children, .. } if name == "services" => Some(children),
+        _ => None,
+    }) else {
+        return;
+    };
+    for item in services.iter_mut() {
+        let Item::Block { name, children, .. } = item else {
+            continue;
+        };
+        if name != "snmp" {
+            continue;
+        }
+        for leaf in children.iter_mut() {
+            let Item::Leaf { name, values } = leaf else {
+                continue;
+            };
+            // `<user> auth sha <pass> priv aes <pass>`: the two
+            // passwords sit at index 3 and 6.
+            if name == "user" && values.len() == 7 {
+                values[3] = "<hidden>".into();
+                values[6] = "<hidden>".into();
+            }
+        }
+    }
+}
+
 fn block_in<'a>(items: &'a [Item], name: &str) -> Option<(&'a [String], &'a [Item])> {
     items.iter().find_map(|item| match item {
         Item::Block {

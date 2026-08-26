@@ -72,6 +72,10 @@ fn get_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/system/logging", get(system_logging)),
         ("/api/system/commits", get(system_commits)),
         ("/api/system/image", get(system_image)),
+        (
+            "/api/system/tech-support/download",
+            get(system_tech_support_download),
+        ),
         ("/api/users", get(users)),
         ("/api/config", get(config)),
         ("/api/maintenance", get(maintenance)),
@@ -133,6 +137,14 @@ fn post_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/system/users/edit", post(system_users_edit)),
         ("/api/system/logging/edit", post(system_logging_edit)),
         ("/api/system/rollback", post(system_rollback)),
+        ("/api/system/diag/ping", post(system_diag_ping)),
+        ("/api/system/diag/traceroute", post(system_diag_traceroute)),
+        ("/api/system/diag/cable", post(system_diag_cable)),
+        ("/api/system/tech-support", post(system_tech_support)),
+        (
+            "/api/system/certificate/regenerate",
+            post(system_certificate_regenerate),
+        ),
         ("/api/system/web/edit", post(system_web_edit)),
         ("/api/users/add", post(users_add)),
         ("/api/config/restore", post(config_restore)),
@@ -1138,6 +1150,245 @@ async fn system_image(
         "next_boot": info.next_boot,
         "onie_rescue_armed": info.onie_rescue_armed,
     })))
+}
+
+// ------------------------------------------------------- diagnostics
+
+#[derive(Deserialize)]
+struct DiagRequest {
+    host: String,
+    /// Empty = let the kernel choose.
+    #[serde(default)]
+    source: String,
+}
+
+/// `POST /api/system/diag/ping` and `.../traceroute`.
+///
+/// The console cannot hand a terminal to a child the way the CLI does,
+/// so webd runs the tool to completion with a bounded deadline and
+/// returns the whole output. That is what a browser can render; the CLI
+/// keeps the live form.
+async fn system_diag_ping(
+    _op: Operator,
+    State(_state): State<SharedState>,
+    Json(request): Json<DiagRequest>,
+) -> Response {
+    run_diag("ping", &request, &["-c", "5", "-w", "10"]).await
+}
+
+async fn system_diag_traceroute(
+    _op: Operator,
+    State(_state): State<SharedState>,
+    Json(request): Json<DiagRequest>,
+) -> Response {
+    run_diag("traceroute", &request, &["-w", "2", "-q", "1"]).await
+}
+
+/// A host argument: an IP literal or a plausible hostname. Checked
+/// before a process exists, so nothing shell-shaped reaches an argv.
+fn valid_diag_host(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// A source interface: the kernel names its netdevs after the
+/// interfaces, and only those characters can appear in one.
+fn valid_diag_source(source: &str) -> bool {
+    !source.is_empty()
+        && source.len() <= 32
+        && source
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// How long the console waits for one run before giving up. The bounds
+/// passed to the tools are shorter, so this only fires if a tool hangs.
+const DIAG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn run_diag(tool: &str, request: &DiagRequest, bounds: &[&str]) -> Response {
+    let host = request.host.trim();
+    if !valid_diag_host(host) {
+        return errors(vec![format!("bad host {host:?}")]);
+    }
+    let source = request.source.trim();
+    if !source.is_empty() && !valid_diag_source(source) {
+        return errors(vec![format!("bad source interface {source:?}")]);
+    }
+    let mut args: Vec<String> = bounds.iter().map(|arg| (*arg).to_string()).collect();
+    if !source.is_empty() {
+        // Both tools bind to an interface; only the flag differs.
+        args.push(if tool == "ping" { "-I" } else { "-i" }.to_string());
+        args.push(source.to_string());
+    }
+    args.push(host.to_string());
+
+    let run = tokio::process::Command::new(tool).args(&args).output();
+    let output = match tokio::time::timeout(DIAG_DEADLINE, run).await {
+        Err(_) => return errors(vec![format!("{tool} did not finish in time")]),
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return errors(vec![format!("{tool} is not installed on this switch")])
+        }
+        Ok(Err(err)) => return errors(vec![format!("cannot run {tool}: {err}")]),
+        Ok(Ok(output)) => output,
+    };
+    // A non-zero exit is the tool answering (an unreachable host), not
+    // an API failure, so the output is returned either way.
+    Json(json!({
+        "tool": tool,
+        "host": host,
+        "exit_ok": output.status.success(),
+        "output": format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct CableRequest {
+    port: String,
+    /// False (the default) replays the last sweep; true runs a new one,
+    /// which interrupts the link.
+    #[serde(default)]
+    run: bool,
+}
+
+/// `POST /api/system/diag/cable` — replay or run a TDR sweep.
+async fn system_diag_cable(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(request): Json<CableRequest>,
+) -> Result<Response, ApiError> {
+    let mut client = syncd_client(&state).await?;
+    let result = if request.run {
+        client
+            .run_cable_diagnostics(pb::RunCableDiagnosticsRequest {
+                port: request.port.clone(),
+            })
+            .await
+    } else {
+        client
+            .get_cable_diagnostics(pb::GetCableDiagnosticsRequest {
+                port: request.port.clone(),
+            })
+            .await
+    };
+    match result {
+        Ok(response) => {
+            let response = response.into_inner();
+            Ok(Json(json!({
+                "port": response.port,
+                "has_result": response.has_result,
+                "run_at": response.run_at,
+                "pairs": response.pairs.iter().map(|pair| json!({
+                    "pair": pair.pair,
+                    "state": pair.state,
+                    "length_m": pair.length_m,
+                })).collect::<Vec<_>>(),
+            }))
+            .into_response())
+        }
+        Err(status) => Ok(errors(vec![status.message().to_string()])),
+    }
+}
+
+/// `POST /api/system/tech-support` — build a bundle and say where it
+/// landed, so the console can offer it for download.
+async fn system_tech_support(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Response, ApiError> {
+    let mut client = mgmtd_client(&state).await?;
+    match client.tech_support(pb::TechSupportRequest {}).await {
+        Ok(response) => {
+            let response = response.into_inner();
+            Ok(Json(json!({
+                "path": response.path,
+                "size_bytes": response.size_bytes,
+            }))
+            .into_response())
+        }
+        Err(status) => Ok(errors(vec![status.message().to_string()])),
+    }
+}
+
+/// Where mgmtd writes bundles; mirrored so the download check has
+/// something to compare against.
+const TECH_SUPPORT_DIR: &str = "/var/lib/hemlock";
+
+#[derive(Deserialize)]
+struct TechSupportQuery {
+    path: String,
+}
+
+/// `GET /api/system/tech-support/download?path=` — stream a bundle
+/// mgmtd wrote. The path is checked against the bundle directory and
+/// the filename shape, so this cannot be turned into a general file
+/// reader.
+async fn system_tech_support_download(
+    _op: Operator,
+    State(_state): State<SharedState>,
+    axum::extract::Query(query): axum::extract::Query<TechSupportQuery>,
+) -> Response {
+    let path = std::path::Path::new(&query.path);
+    let inside_bundle_dir = path.parent() == Some(std::path::Path::new(TECH_SUPPORT_DIR));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| {
+            inside_bundle_dir && name.starts_with("tech-support-") && name.ends_with(".tar.gz")
+        });
+    let Some(name) = name else {
+        return errors(vec!["not a tech-support bundle".to_string()]);
+    };
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/gzip".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename={name}"),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => errors(vec![format!("cannot read the bundle: {err}")]),
+    }
+}
+
+/// `POST /api/system/certificate/regenerate` — new TLS pair, new
+/// fingerprint. Sessions survive; webd restarts to serve it.
+async fn system_certificate_regenerate(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Response, ApiError> {
+    let mut client = mgmtd_client(&state).await?;
+    match client
+        .regenerate_certificate(pb::RegenerateCertificateRequest {})
+        .await
+    {
+        Ok(response) => Ok(Json(json!({
+            "fingerprint": response.into_inner().fingerprint,
+            "restarting": true,
+        }))
+        .into_response()),
+        Err(status) => Ok(errors(vec![status.message().to_string()])),
+    }
 }
 
 async fn system_web_edit(

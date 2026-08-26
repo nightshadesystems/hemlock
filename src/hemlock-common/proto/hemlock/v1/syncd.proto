@@ -208,6 +208,16 @@ service Syncd {
   // exporter. The metadata (ingress port, wire length) only exists on
   // the ASIC side, so this is the one packet path that rides gRPC.
   rpc WatchSampledPackets(WatchSampledPacketsRequest) returns (stream SampledPacket);
+
+  // --- Cable diagnostics (copper TDR) -----------------------------------
+  // Run a time-domain reflectometry sweep on one copper port. The sweep
+  // interrupts the link, so both front-ends warn and confirm first.
+  // Fails with the platform error when the SAI has no cable-diagnostics
+  // support, and with a copper-only error on a fibre port.
+  rpc RunCableDiagnostics(RunCableDiagnosticsRequest) returns (CableDiagnostics);
+  // The last sweep run on a port, for the `show` form; `has_result` is
+  // false when none has been run since boot.
+  rpc GetCableDiagnostics(GetCableDiagnosticsRequest) returns (CableDiagnostics);
 }
 
 message GetSwitchInfoRequest {}
@@ -263,6 +273,8 @@ message SwitchCapabilities {
   bool wred_queue_stats = 24;
   // Hardware ingress sampling (sFlow).
   bool sflow = 25;
+  // Copper cable diagnostics (per-pair TDR state and length).
+  bool cable_diag = 26;
 }
 
 message EnsureNeighborRequest {
@@ -1242,6 +1254,34 @@ message GetSflowStateResponse {
   repeated string ports = 3;
   // Samples the punt path has delivered since boot.
   uint64 samples = 4;
+}
+
+message RunCableDiagnosticsRequest {
+  string port = 1;
+}
+
+message GetCableDiagnosticsRequest {
+  string port = 1;
+}
+
+message CableDiagnostics {
+  string port = 1;
+  // False when no sweep has been run on this port since boot (the
+  // `show` form says so rather than printing an empty table).
+  bool has_result = 2;
+  // Unix seconds the sweep ran.
+  int64 run_at = 3;
+  repeated CablePair pairs = 4;
+}
+
+message CablePair {
+  // "A".."D", in wire order.
+  string pair = 1;
+  // "ok" | "open" | "short" | "crosstalk" | "unknown".
+  string state = 2;
+  // Metres: the run for a terminated pair, the distance to the fault
+  // otherwise. 0 = the PHY did not measure one.
+  uint32 length_m = 3;
 }
 
 message WatchSampledPacketsRequest {}

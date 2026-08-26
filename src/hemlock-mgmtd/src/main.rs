@@ -19,6 +19,7 @@ mod service;
 mod sessions;
 mod snmpapply;
 mod store;
+mod techsupport;
 
 use std::sync::Arc;
 
@@ -39,6 +40,11 @@ struct Args {
     /// syncd endpoint to apply config through.
     #[arg(long)]
     syncd: Option<String>,
+
+    /// pmon endpoint, for the environment and transceiver dumps a
+    /// tech-support bundle carries.
+    #[arg(long)]
+    pmon: Option<String>,
 
     /// orch endpoint the protocol families (LACP/STP/snooping) are
     /// pushed through.
@@ -78,6 +84,10 @@ async fn main() -> Result<()> {
         Some(s) => s.parse()?,
         None => Daemon::Orch.default_endpoint(),
     };
+    let pmon: IpcEndpoint = match &args.pmon {
+        Some(s) => s.parse()?,
+        None => Daemon::Pmon.default_endpoint(),
+    };
     info!(state_dir = %args.state_dir.display(), %syncd, %orch, "mgmtd starting");
 
     let management = hemlock_platform::Platform::find("/", &args.platform)
@@ -91,6 +101,7 @@ async fn main() -> Result<()> {
         store,
         syncd,
         orch,
+        pmon,
         osapply::OsApplier::new(management),
     )));
 

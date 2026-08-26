@@ -598,3 +598,19 @@ pub fn name_for(ports: &HashMap<String, PortState>, id: PortId) -> Option<String
         .find(|(_, p)| p.sai_id == id)
         .map(|(name, _)| name.clone())
 }
+
+// ---------------------------------------------------------- cable diag
+
+/// One TDR sweep result, kept so `show interfaces <port>
+/// cable-diagnostics` can replay what the last `request` found. In
+/// memory only: a sweep is a measurement of a moment, and a stale one
+/// surviving a reboot would be worse than none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CableDiagResult {
+    /// Unix seconds the sweep ran.
+    pub run_at: i64,
+    pub pairs: Vec<hemlock_sai::CablePair>,
+}
+
+/// Last sweep per port display name.
+pub type SharedCableDiag = Arc<RwLock<BTreeMap<String, CableDiagResult>>>;

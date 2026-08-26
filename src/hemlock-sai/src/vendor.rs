@@ -17,10 +17,10 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 
 use crate::{
-    ffi, AclAction, AclFamily, AclFields, AclPacketAction, AclStage, FdbAction, FdbEventKind,
-    IpPrefix, Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QosMapType, QueueCounters,
-    RouteTarget, SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, SchedulerSpec,
-    StormClass, StpPortState, SwitchInfo, SwitchInit, TrapKind, WredSpec,
+    ffi, AclAction, AclFamily, AclFields, AclPacketAction, AclStage, CablePair, FdbAction,
+    FdbEventKind, IpPrefix, Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QosMapType,
+    QueueCounters, RouteTarget, SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort,
+    SchedulerSpec, StormClass, StpPortState, SwitchInfo, SwitchInit, TrapKind, WredSpec,
 };
 
 /// SAI profile key/value store handed to the vendor library. Static because
@@ -151,6 +151,35 @@ unsafe extern "C" fn on_port_state_change(
             port: PortId(item.port_id),
             up: item.port_state == ffi::_sai_port_oper_status_t::SAI_PORT_OPER_STATUS_UP,
         });
+    }
+}
+
+/// The two cable-diagnostics port attributes, as the selected headers
+/// number them. Only referenced where they exist (see build.rs), so
+/// there is no id to guess on an older header set.
+#[cfg(sai_cable_diag)]
+const CABLE_PAIR_STATE_ATTR: u32 = ffi::_sai_port_attr_t::SAI_PORT_ATTR_CABLE_PAIR_STATE;
+#[cfg(sai_cable_diag)]
+const CABLE_PAIR_LENGTH_ATTR: u32 = ffi::_sai_port_attr_t::SAI_PORT_ATTR_CABLE_PAIR_LENGTH;
+/// Placeholders for the probe on a header set without the attributes;
+/// the `cfg!` guard beside them means they are never queried.
+#[cfg(not(sai_cable_diag))]
+const CABLE_PAIR_STATE_ATTR: u32 = 0;
+#[cfg(not(sai_cable_diag))]
+const CABLE_PAIR_LENGTH_ATTR: u32 = 0;
+
+/// SAI `sai_port_cable_pair_state_t` as the operator-facing state.
+/// The numbering is the enum order the header declares: OK, OPEN,
+/// SHORT, CROSSTALK.
+#[cfg(sai_cable_diag)]
+fn cable_pair_state(value: i32) -> crate::CablePairState {
+    use crate::CablePairState;
+    match value {
+        0 => CablePairState::Ok,
+        1 => CablePairState::Open,
+        2 => CablePairState::Short,
+        3 => CablePairState::Crosstalk,
+        _ => CablePairState::Unknown,
     }
 }
 
@@ -2657,6 +2686,12 @@ impl SaiBackend for VendorSai {
                 true,
             );
 
+        // Cable diagnostics: both halves of the read must exist, and
+        // the headers must declare them at all (see build.rs).
+        let cable_diag = cfg!(sai_cable_diag)
+            && self.attr_supported(object::SAI_OBJECT_TYPE_PORT, CABLE_PAIR_STATE_ATTR, false)
+            && self.attr_supported(object::SAI_OBJECT_TYPE_PORT, CABLE_PAIR_LENGTH_ATTR, false);
+
         Ok(SaiCapabilities {
             lag: self.attr_supported(
                 object::SAI_OBJECT_TYPE_LAG,
@@ -2708,6 +2743,7 @@ impl SaiBackend for VendorSai {
             queue_shaper,
             wred_queue_stats,
             sflow,
+            cable_diag,
         })
     }
 
@@ -3032,6 +3068,72 @@ impl SaiBackend for VendorSai {
             )?;
         }
         Ok(Oid(oid))
+    }
+
+    /// Read the PHY TDR result back as two parallel lists: the per-pair
+    /// state (an enum list) and the per-pair length in metres.
+    ///
+    /// Compiled only where the selected SAI headers declare the
+    /// attributes — see build.rs. Reading them is a plain
+    /// `get_port_attribute` on a live port: the PHY runs the sweep as a
+    /// side effect of the read, which is why the link drops for the
+    /// duration and both front-ends confirm first.
+    #[cfg(sai_cable_diag)]
+    fn run_cable_diag(&mut self, port: PortId) -> Result<Vec<CablePair>, SaiError> {
+        let oid = self.port_oid(port)?;
+        // SAFETY: valid port api table; the buffers outlive the calls.
+        let get = unsafe {
+            (*self.port_api)
+                .get_port_attribute
+                .ok_or(SaiError::Other("port api lacks get_port_attribute".into()))?
+        };
+        // Four pairs on twisted-pair copper; the lists come back short
+        // when the PHY reports fewer.
+        const PAIRS: usize = 4;
+        let mut states = [0i32; PAIRS];
+        let mut lengths = [0u32; PAIRS];
+
+        let mut state_attr =
+            Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_CABLE_PAIR_STATE);
+        // SAFETY: the list buffer outlives the call.
+        unsafe {
+            state_attr.value.s32list.count = PAIRS as u32;
+            state_attr.value.s32list.list = states.as_mut_ptr();
+            check(
+                "get SAI_PORT_ATTR_CABLE_PAIR_STATE",
+                get(oid, 1, &mut state_attr),
+            )?;
+        }
+        let mut length_attr =
+            Self::zeroed_attr(ffi::_sai_port_attr_t::SAI_PORT_ATTR_CABLE_PAIR_LENGTH);
+        // SAFETY: as above.
+        unsafe {
+            length_attr.value.u32list.count = PAIRS as u32;
+            length_attr.value.u32list.list = lengths.as_mut_ptr();
+            check(
+                "get SAI_PORT_ATTR_CABLE_PAIR_LENGTH",
+                get(oid, 1, &mut length_attr),
+            )?;
+        }
+        // SAFETY: the counts were written back by the calls above.
+        let reported = unsafe { state_attr.value.s32list.count as usize }.min(PAIRS);
+        let measured = unsafe { length_attr.value.u32list.count as usize }.min(PAIRS);
+        Ok((0..reported)
+            .map(|index| CablePair {
+                state: cable_pair_state(states[index]),
+                length_m: if index < measured { lengths[index] } else { 0 },
+            })
+            .collect())
+    }
+
+    /// Without the attributes there is nothing to read: the capability
+    /// probe reports `false`, so this is only reachable if a caller
+    /// ignored it.
+    #[cfg(not(sai_cable_diag))]
+    fn run_cable_diag(&mut self, _port: PortId) -> Result<Vec<CablePair>, SaiError> {
+        Err(SaiError::Other(
+            "cable diagnostics need SAI 1.13 or newer headers".into(),
+        ))
     }
 
     fn remove_samplepacket(&mut self, session: Oid) -> Result<(), SaiError> {

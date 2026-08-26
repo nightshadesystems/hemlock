@@ -10,6 +10,7 @@ use hemlock_common::ipc::{Daemon, IpcEndpoint};
 mod cli;
 mod complete;
 mod config;
+mod diag;
 mod interfaces;
 mod motd;
 mod pager;
