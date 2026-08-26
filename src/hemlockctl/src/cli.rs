@@ -76,9 +76,10 @@ pub(crate) fn resolve<'a>(input: &str, words: &[&'a str]) -> Result<&'a str, Str
 }
 
 pub async fn run(endpoints: Endpoints) -> Result<()> {
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "root".into());
+    // Who we are, and what we may do. Registering the session here is
+    // what puts this login in `show system users`.
+    let identity = crate::session::who_am_i(&endpoints.mgmtd, "cli").await;
+    let user = identity.user.clone();
     let hostname = read_hostname();
 
     let helper_state = Arc::new(Mutex::new(complete::State {
@@ -220,9 +221,10 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
         let _ = rl.add_history_entry(trimmed);
         let words: Vec<&str> = trimmed.split_whitespace().collect();
 
+        crate::session::touch(&endpoints.mgmtd, identity.session_id).await;
         let next = match &mode {
-            Mode::Operational => operational(&endpoints, &words).await,
-            Mode::Config => config(&endpoints, &words).await,
+            Mode::Operational => operational(&endpoints, &identity, &words).await,
+            Mode::Config => config(&endpoints, &identity, &words).await,
         };
         match next {
             Ok(Some(new_mode)) => mode = new_mode,
@@ -230,6 +232,7 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
             Err(message) => println!("{message}"),
         }
     }
+    crate::session::close(&endpoints.mgmtd, identity.session_id).await;
     Ok(())
 }
 
@@ -322,7 +325,11 @@ fn unit_active_state(daemon: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
+async fn operational(
+    endpoints: &Endpoints,
+    identity: &crate::session::Identity,
+    words: &[&str],
+) -> Step {
     // No separate "conf" entry: it is a unique prefix of "configure", so
     // `conf`, `conf t`, even `c` all resolve without an ambiguity error.
     const COMMANDS: &[&str] = &[
@@ -337,7 +344,9 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
         "help",
         "?",
     ];
-    match resolve(words[0], COMMANDS)? {
+    let verb = resolve(words[0], COMMANDS)?;
+    identity.check(verb)?;
+    match verb {
         "show" => {
             show_command(endpoints, &words[1..]).await?;
             stay(Mode::Operational)
@@ -452,6 +461,7 @@ async fn operational(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  show ntp                               NTP client servers and sync");
             println!("  show snmp                              SNMP agent settings and counters");
             println!("  show sflow                             sFlow sampling and export state");
+            println!("  show system users                      configured accounts + live sessions");
             println!("  clear counters [<interface>]           baseline interface counters");
             println!("  clear arp [<ip>]                       flush dynamic ARP entries");
             println!("  clear routing bgp <neighbor|*>         reset BGP sessions");
@@ -562,8 +572,9 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
         "ntp",
         "snmp",
         "sflow",
+        "system",
     ];
-    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|dhcp relay|dhcp server|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow>";
+    const USAGE: &str = "show <interfaces|environment|configuration|version|vlan|mac address-table|storm-control|mirror|port-channel|lacp|spanning-tree|igmp snooping|mld snooping|ip route|ipv6 route|arp|ipv6 neighbors|routing ospf|routing bgp|vrrp|acl|copp|port-security|dot1x|dhcp snooping|dhcp relay|dhcp server|arp inspection|qos maps|qos wred|qos interfaces|lldp|ntp|snmp|sflow|system users>";
     let Some(first) = words.first() else {
         return Err(format!("% Incomplete command: {USAGE}"));
     };
@@ -665,6 +676,7 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
                 crate::services::cmd::show_sflow(&endpoints.orch, &endpoints.syncd, &words[1..])
                     .await
             }
+            "system" => crate::system::cmd::show(&endpoints.mgmtd, &words[1..]).await,
             "monitor" => {
                 // `show monitor session` is the EOS-habitual alias.
                 let Some(keyword) = words.get(1) else {
@@ -679,11 +691,17 @@ async fn show_command(endpoints: &Endpoints, words: &[&str]) -> Result<(), Strin
     run.await
 }
 
-async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
+async fn config(
+    endpoints: &Endpoints,
+    identity: &crate::session::Identity,
+    words: &[&str],
+) -> Step {
     const COMMANDS: &[&str] = &[
         "set", "delete", "show", "commit", "rollback", "discard", "exit", "help", "?",
     ];
-    match resolve(words[0], COMMANDS)? {
+    let verb = resolve(words[0], COMMANDS)?;
+    identity.check(verb)?;
+    match verb {
         "set" => {
             config_edit(endpoints, &words[1..], /* delete = */ false).await?;
             stay(Mode::Config)
@@ -718,7 +736,7 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
                 Some(other) => return Err(format!("% Invalid input: {other:?}")),
                 None => None,
             };
-            match commit(endpoints, confirm).await {
+            match commit(endpoints, identity, confirm).await {
                 Ok(()) => stay(Mode::Config),
                 Err(e) => fail(e),
             }
@@ -778,6 +796,11 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set system name-server <ip>                   up to 3 resolvers");
             println!("  set system domain-name <name>                 resolver search domain");
             println!("  set system banner login <text>                shown before login (ssh + console)");
+            println!("  set system login user <name> role <admin|operator>");
+            println!("  set system login user <name> password <plaintext>   hashed at the prompt");
+            println!("  set system login user <name> password-hash <crypt>  restore path");
+            println!("  set system login user <name> ssh-key <\"key\">        up to 8 keys");
+            println!("  set system web session-timeout <5-1440>       web console idle timeout");
             println!("  set system ssh                                enable the SSH server");
             println!("  set system ssh authentication local           password logins (PAM)");
             println!("  set system http                               web console over HTTP");
@@ -850,7 +873,8 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("                            arp-inspection|lldp|sflow|qos ...]");
             println!("  delete vlans vlan <id> [description|state]");
             println!("  delete system [hostname|timezone|name-server [<ip>]|domain-name|");
-            println!("                 banner login|ssh [authentication]|http|https]");
+            println!("                 banner login|login user <name> [role|password-hash|ssh-key [<key>]]|");
+            println!("                 web|ssh [authentication]|http|https]");
             println!("  delete routing [static [<prefix> [<next-hop>]] | arp [<ip>]]");
             println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
             println!("  delete switching [mac-table|mirror ...]");
@@ -3671,6 +3695,8 @@ async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> R
         "name-server",
         "domain-name",
         "banner",
+        "login",
+        "web",
         "ssh",
         "http",
         "https",
@@ -3679,8 +3705,11 @@ async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> R
         return Err(usage());
     };
     let noun = resolve(first, NOUNS)?;
-    if !matches!(noun, "ssh" | "http" | "https") {
-        return config_system_identity(endpoints, noun, &words[1..], delete).await;
+    match noun {
+        "login" => return config_system_login(endpoints, &words[1..], delete).await,
+        "web" => return config_system_web(endpoints, &words[1..], delete).await,
+        "ssh" | "http" | "https" => {}
+        _ => return config_system_identity(endpoints, noun, &words[1..], delete).await,
     }
     let service = noun;
     let rest = &words[1..];
@@ -3846,7 +3875,7 @@ async fn config_system_identity(
             let address = canonical_ip(address)?;
             let text = candidate_text(endpoints).await.map_err(fmt_err)?;
             let existing = candidate_name_servers(&text);
-            if !existing.iter().any(|s| *s == address) && existing.len() >= MAX_NAME_SERVERS {
+            if !existing.contains(&address) && existing.len() >= MAX_NAME_SERVERS {
                 return Err(format!(
                     "% at most {MAX_NAME_SERVERS} name-servers ({} configured)",
                     existing.len()
@@ -3884,6 +3913,344 @@ async fn config_system_identity(
         }
         _ => unreachable!(),
     }
+    .map_err(fmt_err)
+}
+
+/// Account-name syntax, mirrored from mgmtd for prompt-time feedback.
+fn valid_user_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 32
+        && (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+}
+
+/// The most ssh-keys one account carries.
+const MAX_SSH_KEYS: usize = 8;
+
+/// `authorized_keys` key types, mirrored from mgmtd.
+const SSH_KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+    "rsa-sha2-256",
+    "rsa-sha2-512",
+];
+
+fn valid_ssh_key(key: &str) -> bool {
+    let mut fields = key.split_whitespace();
+    let Some(kind) = fields.next() else {
+        return false;
+    };
+    if !SSH_KEY_TYPES.contains(&kind) {
+        return false;
+    }
+    let Some(body) = fields.next() else {
+        return false;
+    };
+    body.len() >= 16
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+}
+
+/// The `password-hash` leaf value for either spelling.
+///
+/// `password <plaintext>` hashes here and returns only the crypt
+/// string, so the plaintext has no path into the candidate at all —
+/// not through the tree, not through the text mgmtd persists, and not
+/// through the rollback ring.
+fn password_hash_leaf(spelling: &str, value: &str) -> Result<String, String> {
+    if spelling == "password" {
+        hemlock_common::passwd::check_plaintext(value).map_err(|e| format!("% {e}"))?;
+        return hemlock_common::passwd::hash(value).map_err(|e| format!("% {e}"));
+    }
+    if !hemlock_common::passwd::valid_hash(value) {
+        return Err(format!("% {value:?} is not a crypt string"));
+    }
+    Ok(value.to_string())
+}
+
+/// `set|delete system login user <name> [role|password|password-hash|
+/// ssh-key] ...`.
+///
+/// `password <plaintext>` hashes right here: only the crypt string is
+/// ever put in the candidate, so the plaintext never reaches
+/// `candidate.conf`, `show configuration`, the rollback ring, or a
+/// tech-support bundle.
+async fn config_system_login(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = || {
+        format!(
+            "% Usage: {verb} system login user <name> [role <admin|operator> | \
+             password <plaintext> | password-hash <crypt> | ssh-key <\"key\">]"
+        )
+    };
+    let Some(first) = words.first() else {
+        // The lockout guard: dropping the whole login family would
+        // leave the box with no configured way in.
+        return if delete {
+            Err("% system login: at least one admin user with a password is required".into())
+        } else {
+            Err(usage())
+        };
+    };
+    resolve(first, &["user"])?;
+    let Some(name) = words.get(1) else {
+        return Err(usage());
+    };
+    if !valid_user_name(name) {
+        return Err(format!(
+            "% bad user name {name:?} (a-z, 0-9, _ and -, starting with a letter or _, max 32)"
+        ));
+    }
+    let name = (*name).to_string();
+    let rest = &words[2..];
+
+    // `delete system login user <name>` drops the whole account.
+    let Some(leaf) = rest.first() else {
+        return if delete {
+            edit_login_user(endpoints, &name, None).await
+        } else {
+            // Bare `set ... user <name>` creates the account; commit
+            // then insists on a credential.
+            edit_login_user(
+                endpoints,
+                &name,
+                Some(Box::new(|_user: &mut Vec<hemlock_config::Item>| {})),
+            )
+            .await
+        };
+    };
+
+    match resolve(leaf, &["role", "password", "password-hash", "ssh-key"])? {
+        "role" => {
+            if delete {
+                if let Some(extra) = rest.get(1) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_login_user(
+                    endpoints,
+                    &name,
+                    Some(Box::new(|user| ConfigTree::remove_leaf(user, "role"))),
+                )
+                .await;
+            }
+            let Some(role) = rest.get(1).filter(|_| rest.len() == 2) else {
+                return Err(format!(
+                    "% Usage: set system login user {name} role <admin|operator>"
+                ));
+            };
+            let role = resolve(role, hemlock_common::role::ROLES)?.to_string();
+            edit_login_user(
+                endpoints,
+                &name,
+                Some(Box::new(move |user| {
+                    ConfigTree::set_leaf(user, "role", vec![role]);
+                })),
+            )
+            .await
+        }
+        // `password` is a set-time spelling only: it hashes and stores
+        // `password-hash`, so there is nothing named `password` to
+        // delete.
+        leaf @ ("password" | "password-hash") => {
+            if delete {
+                if let Some(extra) = rest.get(1) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_login_user(
+                    endpoints,
+                    &name,
+                    Some(Box::new(|user| {
+                        ConfigTree::remove_leaf(user, "password-hash");
+                    })),
+                )
+                .await;
+            }
+            let Some(value) = rest.get(1).filter(|_| rest.len() == 2) else {
+                return Err(format!(
+                    "% Usage: set system login user {name} {leaf} <{}>",
+                    if leaf == "password" {
+                        "plaintext"
+                    } else {
+                        "crypt"
+                    }
+                ));
+            };
+            let hash = password_hash_leaf(leaf, value)?;
+            edit_login_user(
+                endpoints,
+                &name,
+                Some(Box::new(move |user| {
+                    ConfigTree::set_leaf(user, "password-hash", vec![hash]);
+                })),
+            )
+            .await
+        }
+        "ssh-key" => {
+            let key = rest[1..].join(" ");
+            if delete {
+                // No key given = drop them all.
+                if key.is_empty() {
+                    return edit_login_user(
+                        endpoints,
+                        &name,
+                        Some(Box::new(|user| ConfigTree::remove_leaf(user, "ssh-key"))),
+                    )
+                    .await;
+                }
+                return edit_login_user(
+                    endpoints,
+                    &name,
+                    Some(Box::new(move |user| {
+                        remove_leaf_matching(user, "ssh-key", &[&key]);
+                    })),
+                )
+                .await;
+            }
+            if key.is_empty() {
+                return Err(format!(
+                    "% Usage: set system login user {name} ssh-key <\"key\">"
+                ));
+            }
+            if !valid_ssh_key(&key) {
+                return Err(format!(
+                    "% bad ssh-key (expected `<type> <base64> [comment]`, one of: {})",
+                    SSH_KEY_TYPES.join(", ")
+                ));
+            }
+            let existing = candidate_ssh_keys(
+                &candidate_text(endpoints).await.map_err(fmt_err)?,
+                &name,
+            );
+            if !existing.contains(&key) && existing.len() >= MAX_SSH_KEYS {
+                return Err(format!(
+                    "% at most {MAX_SSH_KEYS} ssh-keys ({} configured)",
+                    existing.len()
+                ));
+            }
+            edit_login_user(
+                endpoints,
+                &name,
+                Some(Box::new(move |user| {
+                    remove_leaf_matching(user, "ssh-key", &[&key]);
+                    push_leaf(user, "ssh-key", vec![key]);
+                })),
+            )
+            .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// The keys one candidate user already carries, in order.
+fn candidate_ssh_keys(text: &str, name: &str) -> Vec<String> {
+    let Ok(tree) = hemlock_config::parse(text) else {
+        return Vec::new();
+    };
+    let Some((_, system)) = tree.block("system") else {
+        return Vec::new();
+    };
+    let Some((_, login)) = ConfigTree::blocks_named(system, "login").next() else {
+        return Vec::new();
+    };
+    let Some((_, user)) = ConfigTree::blocks_named(login, "user").find(|(keys, _)| {
+        keys.first().map(String::as_str) == Some(name)
+    }) else {
+        return Vec::new();
+    };
+    user.iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "ssh-key" => {
+                values.first().cloned()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Apply an edit to one `system { login { user <name> { ... } } }`
+/// block. `None` removes the user; an emptied `login` (and `system`)
+/// block is pruned.
+async fn edit_login_user(
+    endpoints: &Endpoints,
+    name: &str,
+    edit: Option<BlockEdit>,
+) -> Result<(), String> {
+    let name = name.to_string();
+    edit_config(endpoints, move |tree| {
+        let system = tree.block_mut("system");
+        match edit {
+            Some(edit) => {
+                let login = ConfigTree::ensure_block(system, "login", &[]);
+                edit(ConfigTree::ensure_block(login, "user", &[&name]));
+            }
+            None => {
+                if let Some(login) = block_children_mut(system, "login") {
+                    ConfigTree::remove_block(login, "user", &[&name]);
+                    if login.is_empty() {
+                        ConfigTree::remove_block(system, "login", &[]);
+                    }
+                }
+            }
+        }
+        remove_block_if_empty(tree, "system");
+    })
+    .await
+    .map_err(fmt_err)
+}
+
+/// `set|delete system web session-timeout <5-1440>`.
+async fn config_system_web(
+    endpoints: &Endpoints,
+    words: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    let usage = || format!("% Usage: {verb} system web session-timeout <5-1440>");
+    // `delete system web` drops the whole block.
+    let Some(first) = words.first() else {
+        return if delete {
+            edit_system(endpoints, |system| {
+                ConfigTree::remove_block(system, "web", &[]);
+            })
+            .await
+            .map_err(fmt_err)
+        } else {
+            Err(usage())
+        };
+    };
+    resolve(first, &["session-timeout"])?;
+    if delete {
+        if let Some(extra) = words.get(1) {
+            return Err(format!("% Invalid input: {extra:?}"));
+        }
+        return edit_system(endpoints, |system| {
+            ConfigTree::remove_block(system, "web", &[]);
+        })
+        .await
+        .map_err(fmt_err);
+    }
+    let Some(value) = words.get(1).filter(|_| words.len() == 2) else {
+        return Err(usage());
+    };
+    let minutes = int_arg(value, 5..=1440, "session-timeout")?.to_string();
+    edit_system(endpoints, move |system| {
+        let web = ConfigTree::ensure_block(system, "web", &[]);
+        ConfigTree::set_leaf(web, "session-timeout", vec![minutes]);
+    })
+    .await
     .map_err(fmt_err)
 }
 
@@ -6784,18 +7151,27 @@ async fn edit_interface(
     .await
 }
 
-async fn commit(endpoints: &Endpoints, confirm: Option<u32>) -> Result<()> {
+async fn commit(
+    endpoints: &Endpoints,
+    identity: &crate::session::Identity,
+    confirm: Option<u32>,
+) -> Result<()> {
     let mut client = mgmt_client(endpoints).await?;
     let response = client
         .commit(pb::CommitRequest {
             comment: String::new(),
             confirm_timeout_secs: confirm.unwrap_or(0),
+            user: identity.user.clone(),
+            client: "cli".into(),
         })
         .await?
         .into_inner();
     println!("commit {} applied", response.commit_id);
     for change in &response.applied_changes {
         println!("  {change}");
+    }
+    for warning in &response.warnings {
+        println!("{warning}");
     }
     if let Some(secs) = confirm {
         println!("commit-confirm armed: `commit` again or confirm within {secs}s or the config rolls back");
@@ -6866,6 +7242,77 @@ mod tests {
         assert!(!valid_domain_name("bad..name"));
         assert!(!valid_domain_name(""));
         assert!(!valid_domain_name(".leading"));
+    }
+
+    /// `set ... password <plaintext>` hashes at the prompt: what the
+    /// candidate receives is a crypt string, and the plaintext appears
+    /// nowhere in the leaf it produces.
+    #[test]
+    fn passwords_hash_before_they_reach_the_candidate() {
+        let hash = password_hash_leaf("password", "hunter2hunter2").unwrap();
+        assert!(hash.starts_with("$6$") || hash.starts_with("$5$"));
+        assert!(!hash.contains("hunter2hunter2"));
+        assert!(hemlock_common::passwd::verify("hunter2hunter2", &hash));
+
+        // The leaf really is what lands in the tree, still hash-only.
+        let mut tree = hemlock_config::ConfigTree::default();
+        {
+            let system = tree.block_mut("system");
+            let login = ConfigTree::ensure_block(system, "login", &[]);
+            let user = ConfigTree::ensure_block(login, "user", &["cody"]);
+            ConfigTree::set_leaf(user, "password-hash", vec![hash]);
+        }
+        let text = tree.to_text();
+        assert!(!text.contains("hunter2hunter2"), "{text}");
+        assert!(text.contains("password-hash"), "{text}");
+        assert!(!text.contains("\n            password "), "{text}");
+
+        // Too-short plaintext is refused before any hashing happens.
+        assert_eq!(
+            password_hash_leaf("password", "short").unwrap_err(),
+            "% password must be at least 8 characters"
+        );
+        // The restore spelling takes a crypt string verbatim, and only
+        // a crypt string.
+        assert_eq!(
+            password_hash_leaf("password-hash", "$6$abcdefgh$ijklmnop").unwrap(),
+            "$6$abcdefgh$ijklmnop"
+        );
+        assert!(password_hash_leaf("password-hash", "plaintext").is_err());
+    }
+
+    /// The login-user syntax checked at the prompt.
+    #[test]
+    fn login_arguments_validate_at_the_prompt() {
+        assert!(valid_user_name("cody"));
+        assert!(valid_user_name("_svc-2"));
+        assert!(!valid_user_name("Cody"));
+        assert!(!valid_user_name("2fast"));
+        assert!(!valid_user_name(""));
+        assert!(!valid_user_name(&"a".repeat(33)));
+
+        assert!(valid_ssh_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3 cody@mars"
+        ));
+        assert!(valid_ssh_key("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ"));
+        // A deprecated type sshd will not accept is refused here.
+        assert!(!valid_ssh_key("ssh-dss AAAAB3NzaC1kc3MAAACBnope key"));
+        assert!(!valid_ssh_key("ssh-ed25519"));
+        assert!(!valid_ssh_key("ssh-ed25519 short"));
+        assert!(!valid_ssh_key(""));
+    }
+
+    /// One user's keys come back out of the candidate for the cap check.
+    #[test]
+    fn ssh_keys_are_read_back_from_the_candidate() {
+        let text = "system { login { user cody {\n\
+             ssh-key \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3 cody@mars\"\n\
+             ssh-key \"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ cody@phobos\"\n\
+             } user noc { } } }";
+        assert_eq!(candidate_ssh_keys(text, "cody").len(), 2);
+        assert!(candidate_ssh_keys(text, "noc").is_empty());
+        assert!(candidate_ssh_keys(text, "nobody").is_empty());
+        assert!(candidate_ssh_keys("", "cody").is_empty());
     }
 
     /// The resolver cap counts what the candidate already carries.

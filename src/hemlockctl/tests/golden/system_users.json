@@ -1,0 +1,36 @@
+{
+  "system_users": {
+    "configured": [
+      {
+        "auth": "password",
+        "name": "cody",
+        "role": "admin",
+        "ssh_keys": 1
+      },
+      {
+        "auth": "password",
+        "name": "noc",
+        "role": "operator",
+        "ssh_keys": 0
+      }
+    ],
+    "sessions": [
+      {
+        "client": "cli",
+        "from": "10.42.0.100",
+        "idle_secs": 0,
+        "login_time": 1787649164,
+        "role": "admin",
+        "user": "cody"
+      },
+      {
+        "client": "web",
+        "from": "10.42.0.100",
+        "idle_secs": 252,
+        "login_time": 1787648102,
+        "role": "admin",
+        "user": "cody"
+      }
+    ]
+  }
+}

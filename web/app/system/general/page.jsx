@@ -73,6 +73,7 @@ function NameServers({ values, onChange, disabled }) {
 
 export default function SystemGeneralPage() {
   const [state, setState] = useState(null);
+  const [session, setSession] = useState(null);
   const [error, setError] = useState(null);
   const [applied, setApplied] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -95,6 +96,13 @@ export default function SystemGeneralPage() {
       .catch((e) => setError(e.message));
   }, []);
   useEffect(refresh, [refresh]);
+  useEffect(() => {
+    api('/api/session').then(setSession).catch(() => {});
+  }, []);
+
+  // An operator sees the page but cannot commit it; the server refuses
+  // the endpoint either way, this is the affordance.
+  const isAdmin = !session || session.admin;
 
   const field = (key) => (value) => setForm((f) => ({ ...f, [key]: value }));
 
@@ -146,7 +154,8 @@ export default function SystemGeneralPage() {
           variant="primary"
           sm
           loading={busy}
-          disabled={busy || !form || problems.length > 0}
+          disabled={busy || !form || problems.length > 0 || !isAdmin}
+          title={isAdmin ? undefined : 'Operator role: this console is read-only.'}
           onClick={submit}
         >
           Commit

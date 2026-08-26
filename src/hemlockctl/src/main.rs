@@ -18,8 +18,10 @@ mod qos;
 mod routing;
 mod security;
 mod services;
+mod session;
 mod show;
 mod switching;
+mod system;
 mod upgrade;
 
 #[derive(Parser)]
@@ -199,6 +201,28 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         })
         .await;
     };
+    // The scripting form is gated by the same table as the interactive
+    // one: `hemlockctl commit` must not be a way around the role. No
+    // session is registered — a one-shot command is not a login.
+    let privileged_verb = match &command {
+        Command::Load { .. } => Some("set"),
+        Command::Commit { .. } | Command::Confirm => Some("commit"),
+        Command::Rollback { .. } => Some("rollback"),
+        Command::Discard => Some("discard"),
+        Command::Upgrade { .. } => Some("upgrade"),
+        Command::Show { .. }
+        | Command::Platform { .. }
+        | Command::Motd { .. }
+        | Command::Candidate
+        | Command::Rollbacks => None,
+    };
+    if let Some(verb) = privileged_verb {
+        let identity = session::who_am_i(&endpoint(&cli.mgmtd, Daemon::Mgmtd)?, "").await;
+        if let Err(message) = identity.check(verb) {
+            anyhow::bail!("{}", message.trim_start_matches("% "));
+        }
+    }
+
     match command {
         Command::Show { command } => match command {
             ShowCommand::Interfaces { args } => {

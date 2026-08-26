@@ -1,0 +1,11 @@
+Configured users:
+Name    Role      Auth              SSH Keys
+------  --------  ----------------  --------
+cody    admin     password          1
+noc     operator  password          0
+
+Active sessions:
+User    From             Client  Idle      Login Time
+------  ---------------  ------  --------  -------------------
+cody    10.42.0.100      cli     00:00:00  2026-08-25 09:12:44
+cody    10.42.0.100      web     00:04:12  2026-08-25 08:55:02

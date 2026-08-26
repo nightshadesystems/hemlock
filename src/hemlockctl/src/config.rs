@@ -48,12 +48,17 @@ pub async fn commit(endpoint: IpcEndpoint, comment: &str, confirm: Option<u32>) 
         .commit(pb::CommitRequest {
             comment: comment.to_string(),
             confirm_timeout_secs: confirm.unwrap_or(0),
+            user: crate::session::current_user(),
+            client: "cli".into(),
         })
         .await?
         .into_inner();
     println!("commit {} applied", response.commit_id);
     for change in &response.applied_changes {
         println!("  {change}");
+    }
+    for warning in &response.warnings {
+        println!("{warning}");
     }
     if let Some(secs) = confirm {
         println!("commit-confirm armed: run `hemlockctl confirm` within {secs}s or the config rolls back");
@@ -84,6 +89,8 @@ pub async fn rollback(endpoint: IpcEndpoint, revisions_back: u32) -> Result<()> 
         .commit(pb::CommitRequest {
             comment: format!("rollback {revisions_back}"),
             confirm_timeout_secs: 0,
+            user: crate::session::current_user(),
+            client: "cli".into(),
         })
         .await?
         .into_inner();

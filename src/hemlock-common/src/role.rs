@@ -18,7 +18,7 @@
 pub const PERMISSION_DENIED: &str = "% permission denied (operator role)";
 
 /// A login user's privilege level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Role {
     /// Full access: configuration, commits, and every `request` verb.
     Admin,
@@ -116,15 +116,9 @@ pub const ADMIN_WEB_PATHS: &[&str] = &[
     "/api/spanning-tree/edit",
     "/api/storm-control/edit",
     "/api/svis/edit",
-    "/api/system/certificate/regenerate",
-    "/api/system/diag/cable",
-    "/api/system/diag/ping",
-    "/api/system/diag/traceroute",
     "/api/system/identity/edit",
-    "/api/system/logging/edit",
-    "/api/system/rollback",
-    "/api/system/tech-support",
     "/api/system/users/edit",
+    "/api/system/web/edit",
     "/api/upgrade/apply",
     "/api/upgrade/discard",
     "/api/upgrade/upload",

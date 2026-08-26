@@ -16,6 +16,25 @@ service Mgmt {
   // (single slot, no A/B) — mgmtd runs as root, so the CLI and web
   // console both route installs through here. Can take minutes.
   rpc InstallImage(InstallImageRequest) returns (InstallImageResponse);
+
+  // --- Sessions and roles -----------------------------------------------
+  // Who the caller is and what they are allowed to do. Both front-ends
+  // ask once at session start and cache the answer; the role comes from
+  // `system { login { user <name> { role ... } } }`.
+  //
+  // The caller names itself: the daemon sockets are already gated on
+  // the `hemlock` group, and an operator with shell access can run
+  // anything their OS account permits, so roles are a guard rail for
+  // the two consoles rather than a privilege boundary (see
+  // hemlock_common::role).
+  //
+  // A non-empty `client` also registers the session, so `show system
+  // users` can list who is on the box.
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+  // Slide a registered session's idle timer.
+  rpc TouchSession(TouchSessionRequest) returns (TouchSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
 }
 
 enum ConfigSource {
@@ -42,11 +61,18 @@ message CommitRequest {
   // Non-zero enables commit-confirm: auto-rollback unless ConfirmCommit
   // arrives within this many seconds.
   uint32 confirm_timeout_secs = 2;
+  // Who is committing, and from which console ("cli" | "web").
+  // Recorded in the rollback ring and surfaced by `show system commits`.
+  string user = 3;
+  string client = 4;
 }
 
 message CommitResponse {
   uint64 commit_id = 1;
   repeated string applied_changes = 2;
+  // Non-fatal notices for the operator — today, that this commit
+  // changed or removed their own account.
+  repeated string warnings = 3;
 }
 
 message ConfirmCommitRequest {}
@@ -86,4 +112,53 @@ message InstallImageRequest {
 message InstallImageResponse {
   string version = 1;   // from the image header
   string platform = 2;
+}
+
+message WhoAmIRequest {
+  string user = 1;
+  // "cli" | "web"; empty asks for the role without registering a session.
+  string client = 2;
+  // Peer address, or "console" for a local login.
+  string from = 3;
+}
+
+message WhoAmIResponse {
+  string user = 1;
+  string role = 2;          // "admin" | "operator"
+  uint64 session_id = 3;    // 0 when nothing was registered
+  // `system { web { session-timeout } }`, in minutes — the console
+  // reads its own idle timeout from here.
+  uint32 web_session_timeout_mins = 4;
+  // False when the config manages no login users at all, so the role
+  // came from the OS account instead (sudo membership).
+  bool config_managed = 5;
+}
+
+message TouchSessionRequest {
+  uint64 session_id = 1;
+}
+
+message TouchSessionResponse {
+  bool known = 1;
+}
+
+message CloseSessionRequest {
+  uint64 session_id = 1;
+}
+
+message CloseSessionResponse {}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated SessionEntry sessions = 1;
+}
+
+message SessionEntry {
+  string user = 1;
+  string from = 2;
+  string client = 3;   // "cli" | "web"
+  string role = 4;
+  uint64 idle_secs = 5;
+  string login_time = 6;   // RFC 3339
 }

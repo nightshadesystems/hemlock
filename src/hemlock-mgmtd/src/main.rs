@@ -14,6 +14,7 @@ mod identityapply;
 mod intents;
 mod osapply;
 mod service;
+mod sessions;
 mod snmpapply;
 mod store;
 

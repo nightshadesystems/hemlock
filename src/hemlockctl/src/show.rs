@@ -103,7 +103,7 @@ pub async fn environment(endpoint: IpcEndpoint) -> Result<()> {
 /// interface inventory, so every stock port (and the management port from
 /// the platform manifest) renders in curly-brace form even before it has
 /// ever been explicitly configured. Unconfigured leaves are filled from
-/// live state, and a `system` block carries the hostname and login users.
+/// live state, and a `system` block carries the hostname.
 pub async fn configuration(
     syncd: IpcEndpoint,
     mgmtd: IpcEndpoint,
@@ -201,22 +201,18 @@ pub async fn configuration(
         sort_interface_blocks(interfaces);
     }
 
-    // System identity: hostname and login users, filled from the OS when
-    // the running config does not set them.
+    // System identity: the hostname is filled from the OS when the
+    // running config does not set it, so the rendered config always
+    // says what the box is actually called.
+    //
+    // Login users are *not* synthesized from the OS any more: since the
+    // system suite the config is the source of truth for them, and
+    // showing OS accounts as if they were configuration would invite
+    // an operator to save a file that then removes them.
     {
         let system = tree.block_mut("system");
         if ConfigTree::leaf_value(system, "hostname").is_none() {
             ConfigTree::set_leaf(system, "hostname", vec![crate::cli::read_hostname()]);
-        }
-        let logins = os_login_users();
-        if !logins.is_empty() {
-            let users = ConfigTree::ensure_block(system, "users", &[]);
-            for (name, role) in logins {
-                let user = ConfigTree::ensure_block(users, "user", &[name.as_str()]);
-                if ConfigTree::leaf_value(user, "role").is_none() {
-                    ConfigTree::set_leaf(user, "role", vec![role.into()]);
-                }
-            }
         }
     }
 
@@ -247,6 +243,7 @@ pub async fn configuration(
 /// and SNMP v3 passphrases (`services { snmp { user ... } }`).
 fn redact_secrets(tree: &mut hemlock_config::ConfigTree) {
     redact_snmp_users(tree);
+    redact_login_hashes(tree);
     use hemlock_config::Item;
     let Some(security) = tree.items.iter_mut().find_map(|item| match item {
         Item::Block { name, children, .. } if name == "security" => Some(children),
@@ -271,6 +268,43 @@ fn redact_secrets(tree: &mut hemlock_config::ConfigTree) {
             for leaf in children.iter_mut() {
                 if let Item::Leaf { name, values } = leaf {
                     if name == "key" {
+                        *values = vec!["<hidden>".into()];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `system { login { user <name> { password-hash "$6$..." } } }`: the
+/// crypt string is a secret like any other stored credential, so it
+/// follows the established convention and renders as `<hidden>`. The
+/// ssh keys beside it are public by construction and stay.
+fn redact_login_hashes(tree: &mut hemlock_config::ConfigTree) {
+    use hemlock_config::Item;
+    let Some(system) = tree.items.iter_mut().find_map(|item| match item {
+        Item::Block { name, children, .. } if name == "system" => Some(children),
+        _ => None,
+    }) else {
+        return;
+    };
+    for item in system.iter_mut() {
+        let Item::Block { name, children, .. } = item else {
+            continue;
+        };
+        if name != "login" {
+            continue;
+        }
+        for user in children.iter_mut() {
+            let Item::Block { name, children, .. } = user else {
+                continue;
+            };
+            if name != "user" {
+                continue;
+            }
+            for leaf in children.iter_mut() {
+                if let Item::Leaf { name, values } = leaf {
+                    if name == "password-hash" {
                         *values = vec!["<hidden>".into()];
                     }
                 }
@@ -352,53 +386,6 @@ fn sort_interface_blocks(items: &mut [hemlock_config::Item]) {
     items.sort_by_key(key);
 }
 
-/// Human login accounts from the OS: `/etc/passwd` entries in the regular
-/// user UID range with a real shell. Role is `admin` for sudo-group
-/// members, `operator` otherwise. Empty off-switch (no /etc/passwd).
-fn os_login_users() -> Vec<(String, &'static str)> {
-    let Ok(passwd) = std::fs::read_to_string("/etc/passwd") else {
-        return Vec::new();
-    };
-    let sudoers: Vec<String> = std::fs::read_to_string("/etc/group")
-        .ok()
-        .and_then(|groups| {
-            groups.lines().find_map(|line| {
-                let mut fields = line.split(':');
-                (fields.next() == Some("sudo")).then(|| {
-                    fields
-                        .nth(2)
-                        .unwrap_or("")
-                        .split(',')
-                        .map(str::to_string)
-                        .collect()
-                })
-            })
-        })
-        .unwrap_or_default();
-
-    let mut users = Vec::new();
-    for line in passwd.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        let [name, _, uid, _, _, _, shell] = fields.as_slice() else {
-            continue;
-        };
-        let Ok(uid) = uid.parse::<u32>() else {
-            continue;
-        };
-        let real_shell = !shell.ends_with("nologin") && !shell.ends_with("false");
-        if (1000..60000).contains(&uid) && real_shell {
-            let role = if sudoers.iter().any(|s| s == name) {
-                "admin"
-            } else {
-                "operator"
-            };
-            users.push((name.to_string(), role));
-        }
-    }
-    users.sort();
-    users
-}
-
 /// Admin state of a Linux netdev (IFF_UP), from sysfs. `None` when the
 /// device (or sysfs) is unavailable.
 fn os_netdev_is_up(dev: &str) -> Option<bool> {
@@ -451,11 +438,20 @@ mod tests {
         let mut tree = hemlock_config::parse(
             "security { dot1x { radius-server 10.42.0.5 { key \"s3cret\" } } }
              services { snmp { community public
-             user monitor auth sha \"authpass1\" priv aes \"privpass1\" } }",
+             user monitor auth sha \"authpass1\" priv aes \"privpass1\" } }
+             system { login { user cody { role admin
+             password-hash \"$6$rounds=656000$abcdefgh$ijklmnop\"
+             ssh-key \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3 cody@mars\" } } }",
         )
         .unwrap();
         redact_secrets(&mut tree);
         let text = tree.to_text();
+        // The login hash is a stored credential like the rest.
+        assert!(!text.contains("ijklmnop"), "password hash leaked: {text}");
+        assert!(text.contains(r#"password-hash "<hidden>""#), "{text}");
+        // The role and the (public) ssh key still read as config.
+        assert!(text.contains("role admin"), "{text}");
+        assert!(text.contains("AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3"), "{text}");
         assert!(!text.contains("s3cret"), "radius key leaked: {text}");
         assert!(
             !text.contains("authpass1"),

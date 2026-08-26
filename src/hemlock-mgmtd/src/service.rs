@@ -24,6 +24,8 @@ pub struct Engine {
     snmp: crate::snmpapply::SnmpApplier,
     dnsmasq: crate::dnsmasqapply::DnsmasqApplier,
     commit_seq: u64,
+    /// Who is logged in, across both front-ends (see `sessions`).
+    sessions: crate::sessions::Sessions,
     /// Pending commit-confirm: the pre-commit running text to restore if no
     /// confirmation arrives, plus a cancel handle for the timer task.
     pending_confirm: Option<PendingConfirm>,
@@ -47,6 +49,7 @@ impl Engine {
             snmp: crate::snmpapply::SnmpApplier::new(),
             dnsmasq: crate::dnsmasqapply::DnsmasqApplier::new(),
             commit_seq: 0,
+            sessions: crate::sessions::Sessions::new(),
             pending_confirm: None,
         }
     }
@@ -1874,6 +1877,81 @@ impl Engine {
         Ok(applied)
     }
 
+    /// The role an account has, and whether the config is what said so.
+    ///
+    /// The config is the source of truth wherever it manages users. A
+    /// config that manages none at all (every deployment predating the
+    /// system suite) falls back to the OS groups, so the stock `admin`
+    /// account keeps its access without a config change.
+    fn role_of(&self, user: &str) -> (hemlock_common::role::Role, bool) {
+        let login = self
+            .store
+            .running()
+            .ok()
+            .and_then(|text| Self::parse_intents(&text).ok())
+            .map(|intents| intents.login)
+            .unwrap_or_default();
+        match login.get(user) {
+            Some(configured) => (configured.role, true),
+            // A user the config does not name is not config-managed,
+            // even when other users are: their account is the OS's.
+            None => (crate::osapply::os_role(user), false),
+        }
+    }
+
+    /// What this commit does to the committing operator's own account.
+    ///
+    /// Removing or demoting yourself is allowed — a two-admin box has
+    /// to be able to hand over — but the reply says so, because the
+    /// next thing that happens is the loss of access.
+    fn self_change_warnings(&self, user: &str, candidate_text: &str) -> Vec<String> {
+        if user.is_empty() {
+            return Vec::new();
+        }
+        let login_of = |text: &str| {
+            Self::parse_intents(text)
+                .map(|intents| intents.login)
+                .unwrap_or_default()
+        };
+        let running = match self.store.running() {
+            Ok(text) => login_of(&text),
+            Err(_) => return Vec::new(),
+        };
+        let candidate = login_of(candidate_text);
+        // Not config-managed before this commit: nothing was taken away.
+        let Some(before) = running.get(user) else {
+            return Vec::new();
+        };
+        match candidate.get(user) {
+            None => vec![format!(
+                "warning: this commit removes your own account ({user}); \
+                 the current session keeps working until it ends"
+            )],
+            Some(after) if before.role.is_admin() && !after.role.is_admin() => {
+                vec![format!(
+                    "warning: this commit demotes your own account ({user}) to operator"
+                )]
+            }
+            Some(after) if before.password_hash != after.password_hash => {
+                vec![format!(
+                    "warning: this commit changes your own password ({user}); \
+                     the next login needs the new one"
+                )]
+            }
+            Some(_) => Vec::new(),
+        }
+    }
+
+    /// The console idle timeout in minutes, from the running config.
+    fn web_session_timeout(&self) -> u32 {
+        self.store
+            .running()
+            .ok()
+            .and_then(|text| Self::parse_intents(&text).ok())
+            .map(|intents| intents.web.effective_session_timeout())
+            .unwrap_or(crate::intents::DEFAULT_WEB_SESSION_TIMEOUT)
+    }
+
     /// Replay the OS-side families (management address, static routes,
     /// sshd state) from the running config. Independent of syncd, so it
     /// runs once at startup rather than inside the syncd retry loop.
@@ -1963,10 +2041,22 @@ impl pb::mgmt_server::Mgmt for MgmtService {
             .map_err(|e| Status::failed_precondition(format!("candidate invalid: {e:#}")))?;
 
         let pre_commit_running = engine.store.running().map_err(internal)?;
+        // Anything the committing operator should know before the
+        // change lands, computed against the config that is still
+        // running — losing your own admin rights is allowed, but never
+        // silently.
+        let warnings = engine.self_change_warnings(&req.user, &candidate);
         let changes = engine
             .apply_and_persist(&candidate, &req.comment)
             .await
             .map_err(internal)?;
+        // A promotion or demotion reaches the sessions already open,
+        // without waiting for a re-login.
+        if let Ok(intents) = Engine::parse_intents(&candidate) {
+            for (user, configured) in &intents.login {
+                engine.sessions.set_role(user, configured.role);
+            }
+        }
         let commit_id = engine.commit_seq;
         info!(commit_id, changes = changes.len(), "committed");
 
@@ -1999,6 +2089,7 @@ impl pb::mgmt_server::Mgmt for MgmtService {
         Ok(Response::new(pb::CommitResponse {
             commit_id,
             applied_changes: changes,
+            warnings,
         }))
     }
 
@@ -2058,6 +2149,82 @@ impl pb::mgmt_server::Mgmt for MgmtService {
         let engine = self.engine.lock().await;
         engine.store.discard_candidate().map_err(internal)?;
         Ok(Response::new(pb::DiscardResponse {}))
+    }
+
+    async fn who_am_i(
+        &self,
+        request: Request<pb::WhoAmIRequest>,
+    ) -> Result<Response<pb::WhoAmIResponse>, Status> {
+        let req = request.into_inner();
+        if req.user.is_empty() {
+            return Err(Status::invalid_argument("who_am_i needs a user"));
+        }
+        let mut engine = self.engine.lock().await;
+        let (role, config_managed) = engine.role_of(&req.user);
+        let web_session_timeout_mins = engine.web_session_timeout();
+        // An empty client asks for the role only — the one-shot
+        // subcommand path, which has no session to register.
+        let session_id = if req.client.is_empty() {
+            0
+        } else {
+            let from = if req.from.is_empty() {
+                "console"
+            } else {
+                &req.from
+            };
+            engine.sessions.open(&req.user, role, &req.client, from)
+        };
+        Ok(Response::new(pb::WhoAmIResponse {
+            user: req.user,
+            role: role.as_str().to_string(),
+            session_id,
+            web_session_timeout_mins,
+            config_managed,
+        }))
+    }
+
+    async fn touch_session(
+        &self,
+        request: Request<pb::TouchSessionRequest>,
+    ) -> Result<Response<pb::TouchSessionResponse>, Status> {
+        let id = request.into_inner().session_id;
+        let mut engine = self.engine.lock().await;
+        Ok(Response::new(pb::TouchSessionResponse {
+            known: engine.sessions.touch(id),
+        }))
+    }
+
+    async fn close_session(
+        &self,
+        request: Request<pb::CloseSessionRequest>,
+    ) -> Result<Response<pb::CloseSessionResponse>, Status> {
+        let id = request.into_inner().session_id;
+        let mut engine = self.engine.lock().await;
+        engine.sessions.close(id);
+        Ok(Response::new(pb::CloseSessionResponse {}))
+    }
+
+    async fn list_sessions(
+        &self,
+        _request: Request<pb::ListSessionsRequest>,
+    ) -> Result<Response<pb::ListSessionsResponse>, Status> {
+        let mut engine = self.engine.lock().await;
+        let now = std::time::Instant::now();
+        let sessions = engine
+            .sessions
+            .list()
+            .into_iter()
+            .map(|(_, session)| pb::SessionEntry {
+                user: session.user.clone(),
+                from: session.from.clone(),
+                client: session.client.clone(),
+                role: session.role.as_str().to_string(),
+                idle_secs: session.idle(now),
+                login_time: chrono::DateTime::<chrono::Utc>::from(session.login_time)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            })
+            .collect();
+        Ok(Response::new(pb::ListSessionsResponse { sessions }))
     }
 
     async fn install_image(
@@ -2268,6 +2435,74 @@ services { snmp { community public } }"
                 .unwrap()
                 .is_err()
         );
+    }
+
+    /// The commit-confirm acid test for login users: an expiring
+    /// confirm restores the previous account set exactly, and the
+    /// session open on the demoted user survives the round trip (it is
+    /// a live login, not configuration — only its role follows).
+    #[test]
+    fn commit_confirm_restores_the_prior_user_set() {
+        let hash = "$6$abcdefgh$ijklmnop";
+        let other = "$6$qrstuvwx$yzabcdef";
+        let before = intents_of(&format!(
+            "system {{ login {{\n\
+             user cody {{ role admin\npassword-hash \"{hash}\" }}\n\
+             user noc {{ role admin\npassword-hash \"{hash}\" }} }} }}"
+        ));
+        // The commit demotes noc, re-hashes them, and adds jo.
+        let after = intents_of(&format!(
+            "system {{ login {{\n\
+             user cody {{ role admin\npassword-hash \"{hash}\" }}\n\
+             user noc {{ role operator\npassword-hash \"{other}\" }}\n\
+             user jo {{ password-hash \"{hash}\" }} }} }}"
+        ));
+
+        let forward = intents::diff_os(&before, &after);
+        let names: Vec<&str> = forward.users.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["jo", "noc"]);
+
+        // The auto-rollback is the same diff the other way: noc goes
+        // back to admin with the old hash, and jo is removed outright.
+        let back = intents::diff_os(&after, &before);
+        let noc = back
+            .users
+            .iter()
+            .find(|c| c.name == "noc")
+            .expect("noc is restored");
+        let restored = noc.set.as_ref().expect("noc still exists");
+        assert!(restored.role.is_admin());
+        assert_eq!(restored.password_hash.as_deref(), Some(hash));
+        let jo = back
+            .users
+            .iter()
+            .find(|c| c.name == "jo")
+            .expect("jo is rolled back");
+        assert!(jo.set.is_none(), "a user added by the commit is removed");
+
+        // A session on the demoted user is untouched by the rollback
+        // itself; what follows the config is the role it carries, in
+        // both directions.
+        let mut sessions = crate::sessions::Sessions::new();
+        let id = sessions.open(
+            "noc",
+            hemlock_common::role::Role::Admin,
+            "cli",
+            "10.42.0.100",
+        );
+        for (user, configured) in &after.login {
+            sessions.set_role(user, configured.role);
+        }
+        let live = sessions.list();
+        assert_eq!(live.len(), 1, "the session survives the commit");
+        assert_eq!(live[0].0, id);
+        assert!(!live[0].1.role.is_admin(), "the demotion reaches it");
+        for (user, configured) in &before.login {
+            sessions.set_role(user, configured.role);
+        }
+        let live = sessions.list();
+        assert_eq!(live.len(), 1, "the session survives the rollback too");
+        assert!(live[0].1.role.is_admin(), "and gets its role back");
     }
 
     /// Every services family across a commit-confirm cycle: the same

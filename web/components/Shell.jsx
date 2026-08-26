@@ -4,6 +4,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { Header, HeaderAction, Subnav } from '@/components/ds/Header';
 import { VerticalNav } from '@/components/ds/VerticalNav';
+import { Alert } from '@/components/ds/misc';
 
 const TABS = [
   { label: 'Dashboard', href: '/dashboard/' },
@@ -141,6 +142,17 @@ export default function Shell({ children }) {
           </button>
         </div>
         <span className="header-divider"></span>
+        <div className="header-dropdown">
+          <button style={{ cursor: 'default' }} tabIndex={-1}>
+            <span className="hd-text">
+              <span className="hd-label">Signed in</span>
+              <span className="hd-value mono">
+                {session.username}{session.role ? ` · ${session.role}` : ''}
+              </span>
+            </span>
+          </button>
+        </div>
+        <span className="header-divider"></span>
       </Header>
       <Subnav
         items={TABS.map((t) => ({ ...t, active: t === activeTab }))}
@@ -155,7 +167,15 @@ export default function Shell({ children }) {
             onNavigate={(it) => router.push(it.id)}
           />
         )}
-        <main className="content-area">{children}</main>
+        <main className="content-area">
+          {session.admin === false && (
+            <Alert status="info" sm style={{ marginBottom: 16 }}>
+              Signed in as an operator: the console is read-only. An administrator can
+              change your role under System &rsaquo; Users.
+            </Alert>
+          )}
+          {children}
+        </main>
       </div>
     </div>
   );

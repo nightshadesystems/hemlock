@@ -184,7 +184,9 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "ntp",
             "snmp",
             "sflow",
+            "system",
         ],
+        (CliMode::Operational, ["show", "system"]) => &["users"],
         (CliMode::Operational, ["show", "lldp"]) => &["neighbors"],
         (CliMode::Operational, ["show", "lldp", "neighbors"]) => &["detail"],
         (CliMode::Operational, ["show", "qos"]) => &["maps", "wred", "interface", "interfaces"],
@@ -449,10 +451,22 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
             "name-server",
             "domain-name",
             "banner",
+            "login",
+            "web",
             "ssh",
             "http",
             "https",
         ],
+        (CliMode::Config, ["set" | "delete", "system", "login"]) => &["user"],
+        (CliMode::Config, ["set" | "delete", "system", "login", "user"]) => &[ANY],
+        (CliMode::Config, ["set" | "delete", "system", "login", "user", ANY]) => {
+            &["role", "password", "password-hash", "ssh-key"]
+        }
+        (CliMode::Config, ["set", "system", "login", "user", ANY, "role"]) => {
+            &["admin", "operator"]
+        }
+        (CliMode::Config, ["set" | "delete", "system", "web"]) => &["session-timeout"],
+        (CliMode::Config, ["set", "system", "web", "session-timeout"]) => &[NUM],
         (CliMode::Config, ["set" | "delete", "system", "banner"]) => &["login"],
         (CliMode::Config, ["set" | "delete", "system", "timezone"]) => &[TZ],
         (CliMode::Config, ["set" | "delete", "system", "name-server"]) => &[ANY],
@@ -1357,6 +1371,8 @@ mod tests {
                 "name-server".to_string(),
                 "domain-name".to_string(),
                 "banner".to_string(),
+                "login".to_string(),
+                "web".to_string(),
                 "ssh".to_string(),
                 "http".to_string(),
                 "https".to_string()

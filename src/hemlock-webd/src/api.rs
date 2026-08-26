@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::{header, request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::{Json, Router};
 use hemlock_common::ipc::IpcEndpoint;
 use hemlock_common::proto::v1 as pb;
@@ -34,102 +34,126 @@ pub type SharedState = Arc<AppState>;
 
 const SESSION_COOKIE: &str = "hemlock_session";
 
-pub fn router(state: SharedState) -> Router {
-    Router::new()
-        .route("/api/login", post(login))
-        .route("/api/logout", post(logout))
-        .route("/api/session", get(session))
-        .route("/api/interfaces", get(interfaces))
-        .route("/api/interfaces/edit", post(interfaces_edit))
-        .route("/api/vlans", get(vlans))
-        .route("/api/vlans/edit", post(vlans_edit))
-        .route("/api/svis", get(svis))
-        .route("/api/svis/edit", post(svis_edit))
-        .route("/api/lags", get(lags))
-        .route("/api/lags/edit", post(lags_edit))
-        .route("/api/spanning-tree", get(spanning_tree))
-        .route("/api/spanning-tree/edit", post(spanning_tree_edit))
-        .route(
-            "/api/spanning-tree/clear-errdisable",
-            post(clear_errdisable),
-        )
-        .route("/api/mac-table", get(mac_table))
-        .route("/api/mac-table/edit", post(mac_table_edit))
-        .route("/api/mac-table/flush", post(mac_table_flush))
-        .route("/api/snooping", get(snooping))
-        .route("/api/snooping/edit", post(snooping_edit))
-        .route("/api/storm-control", get(storm_control))
-        .route("/api/storm-control/edit", post(storm_control_edit))
-        .route("/api/mirror", get(mirror))
-        .route("/api/mirror/edit", post(mirror_edit))
-        .route("/api/routes", get(routes))
-        .route("/api/routes/static/edit", post(static_routes_edit))
-        .route("/api/arp", get(arp))
-        .route("/api/arp/edit", post(arp_edit))
-        .route("/api/arp/flush", post(arp_flush))
-        .route("/api/ospf", get(ospf))
-        .route("/api/ospf/edit", post(ospf_edit))
-        .route("/api/bgp", get(bgp))
-        .route("/api/bgp/edit", post(bgp_edit))
-        .route("/api/vrrp", get(vrrp))
-        .route("/api/vrrp/edit", post(vrrp_edit))
-        .route("/api/acls", get(acls))
-        .route("/api/acls/edit", post(acls_edit))
-        .route("/api/acls/bindings/edit", post(acl_bindings_edit))
-        .route("/api/acls/clear", post(acls_clear))
-        .route("/api/copp", get(copp))
-        .route("/api/copp/edit", post(copp_edit))
-        .route("/api/copp/clear", post(copp_clear))
-        .route("/api/port-security", get(port_security))
-        .route("/api/port-security/edit", post(port_security_edit))
-        .route("/api/port-security/clear", post(port_security_clear))
-        .route("/api/dot1x", get(dot1x))
-        .route("/api/dot1x/edit", post(dot1x_edit))
-        .route("/api/dot1x/reauth", post(dot1x_reauth))
-        .route("/api/snooping-sec", get(snooping_sec))
-        .route("/api/snooping-sec/edit", post(snooping_sec_edit))
-        .route(
-            "/api/snooping-sec/bindings/clear",
-            post(snooping_sec_bindings_clear),
-        )
-        .route("/api/qos/maps", get(qos_maps))
-        .route("/api/qos/maps/edit", post(qos_maps_edit))
-        .route("/api/qos/wred", get(qos_wred))
-        .route("/api/qos/wred/edit", post(qos_wred_edit))
-        .route("/api/qos/ports", get(qos_ports))
-        .route("/api/qos/ports/edit", post(qos_ports_edit))
-        .route("/api/lldp", get(lldp))
-        .route("/api/lldp/edit", post(lldp_edit))
-        .route("/api/dhcp", get(dhcp))
-        .route("/api/dhcp/relay/edit", post(dhcp_relay_edit))
-        .route("/api/dhcp/server/edit", post(dhcp_server_edit))
-        .route("/api/dhcp/leases/clear", post(dhcp_leases_clear))
-        .route("/api/sflow", get(sflow))
-        .route("/api/sflow/edit", post(sflow_edit))
-        .route("/api/snmp", get(snmp))
-        .route("/api/snmp/edit", post(snmp_edit))
-        .route("/api/ntp", get(ntp))
-        .route("/api/ntp/edit", post(ntp_edit))
-        .route("/api/system", get(system))
-        .route("/api/system/identity", get(system_identity))
-        .route("/api/system/identity/edit", post(system_identity_edit))
-        .route("/api/users", get(users))
-        .route("/api/users/add", post(users_add))
-        .route("/api/config", get(config))
-        .route("/api/config/restore", post(config_restore))
-        .route("/api/maintenance", get(maintenance))
-        .route("/api/reboot", post(reboot))
-        .route("/api/reboot/cancel", post(reboot_cancel))
-        // Firmware images stream straight to disk; lift axum's 2 MB
-        // default body cap for this one route.
-        .route(
+/// Every read-only endpoint: (path, handler). Kept as a table so
+/// the router and the role-gate test read the same list.
+fn get_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
+    vec![
+        ("/api/session", get(session)),
+        ("/api/interfaces", get(interfaces)),
+        ("/api/vlans", get(vlans)),
+        ("/api/svis", get(svis)),
+        ("/api/lags", get(lags)),
+        ("/api/spanning-tree", get(spanning_tree)),
+        ("/api/mac-table", get(mac_table)),
+        ("/api/snooping", get(snooping)),
+        ("/api/storm-control", get(storm_control)),
+        ("/api/mirror", get(mirror)),
+        ("/api/routes", get(routes)),
+        ("/api/arp", get(arp)),
+        ("/api/ospf", get(ospf)),
+        ("/api/bgp", get(bgp)),
+        ("/api/vrrp", get(vrrp)),
+        ("/api/acls", get(acls)),
+        ("/api/copp", get(copp)),
+        ("/api/port-security", get(port_security)),
+        ("/api/dot1x", get(dot1x)),
+        ("/api/snooping-sec", get(snooping_sec)),
+        ("/api/qos/maps", get(qos_maps)),
+        ("/api/qos/wred", get(qos_wred)),
+        ("/api/qos/ports", get(qos_ports)),
+        ("/api/lldp", get(lldp)),
+        ("/api/dhcp", get(dhcp)),
+        ("/api/sflow", get(sflow)),
+        ("/api/snmp", get(snmp)),
+        ("/api/ntp", get(ntp)),
+        ("/api/system", get(system)),
+        ("/api/system/identity", get(system_identity)),
+        ("/api/system/users", get(system_users)),
+        ("/api/users", get(users)),
+        ("/api/config", get(config)),
+        ("/api/maintenance", get(maintenance)),
+    ]
+}
+
+/// Endpoints that change something. Everything here except the two
+/// login paths must appear in `hemlock_common::role::ADMIN_WEB_PATHS`
+/// — `every_post_route_is_gated` is what makes that true.
+fn post_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
+    vec![
+        ("/api/login", post(login)),
+        ("/api/logout", post(logout)),
+        ("/api/interfaces/edit", post(interfaces_edit)),
+        ("/api/vlans/edit", post(vlans_edit)),
+        ("/api/svis/edit", post(svis_edit)),
+        ("/api/lags/edit", post(lags_edit)),
+        ("/api/spanning-tree/edit", post(spanning_tree_edit)),
+        ("/api/spanning-tree/clear-errdisable", post(clear_errdisable)),
+        ("/api/mac-table/edit", post(mac_table_edit)),
+        ("/api/mac-table/flush", post(mac_table_flush)),
+        ("/api/snooping/edit", post(snooping_edit)),
+        ("/api/storm-control/edit", post(storm_control_edit)),
+        ("/api/mirror/edit", post(mirror_edit)),
+        ("/api/routes/static/edit", post(static_routes_edit)),
+        ("/api/arp/edit", post(arp_edit)),
+        ("/api/arp/flush", post(arp_flush)),
+        ("/api/ospf/edit", post(ospf_edit)),
+        ("/api/bgp/edit", post(bgp_edit)),
+        ("/api/vrrp/edit", post(vrrp_edit)),
+        ("/api/acls/edit", post(acls_edit)),
+        ("/api/acls/bindings/edit", post(acl_bindings_edit)),
+        ("/api/acls/clear", post(acls_clear)),
+        ("/api/copp/edit", post(copp_edit)),
+        ("/api/copp/clear", post(copp_clear)),
+        ("/api/port-security/edit", post(port_security_edit)),
+        ("/api/port-security/clear", post(port_security_clear)),
+        ("/api/dot1x/edit", post(dot1x_edit)),
+        ("/api/dot1x/reauth", post(dot1x_reauth)),
+        ("/api/snooping-sec/edit", post(snooping_sec_edit)),
+        ("/api/snooping-sec/bindings/clear", post(snooping_sec_bindings_clear)),
+        ("/api/qos/maps/edit", post(qos_maps_edit)),
+        ("/api/qos/wred/edit", post(qos_wred_edit)),
+        ("/api/qos/ports/edit", post(qos_ports_edit)),
+        ("/api/lldp/edit", post(lldp_edit)),
+        ("/api/dhcp/relay/edit", post(dhcp_relay_edit)),
+        ("/api/dhcp/server/edit", post(dhcp_server_edit)),
+        ("/api/dhcp/leases/clear", post(dhcp_leases_clear)),
+        ("/api/sflow/edit", post(sflow_edit)),
+        ("/api/snmp/edit", post(snmp_edit)),
+        ("/api/ntp/edit", post(ntp_edit)),
+        ("/api/system/identity/edit", post(system_identity_edit)),
+        ("/api/system/users/edit", post(system_users_edit)),
+        ("/api/system/web/edit", post(system_web_edit)),
+        ("/api/users/add", post(users_add)),
+        ("/api/config/restore", post(config_restore)),
+        ("/api/reboot", post(reboot)),
+        ("/api/reboot/cancel", post(reboot_cancel)),
+        // Firmware images stream straight to disk; lift axum default
+        // 2 MB body cap for this one route.
+        (
             "/api/upgrade/upload",
             post(upgrade_upload).layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)),
-        )
-        .route("/api/upgrade/apply", post(upgrade_apply))
-        .route("/api/upgrade/discard", post(upgrade_discard))
-        .with_state(state)
+        ),
+        ("/api/upgrade/apply", post(upgrade_apply)),
+        ("/api/upgrade/discard", post(upgrade_discard)),
+    ]
 }
+
+/// POST endpoints an operator may reach: signing in and out.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PUBLIC_POSTS: &[&str] = &["/api/login", "/api/logout"];
+
+pub fn router(state: SharedState) -> Router {
+    let mut api = Router::new();
+    for (path, handler) in get_routes().into_iter().chain(post_routes()) {
+        api = api.route(path, handler);
+    }
+    api.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        role_gate,
+    ))
+    .with_state(state)
+}
+
 
 // ---------------------------------------------------------------- errors
 
@@ -156,8 +180,8 @@ impl IntoResponse for ApiError {
 
 // ------------------------------------------------------------ auth layer
 
-fn cookie_token(parts: &Parts) -> Option<String> {
-    let cookies = parts.headers.get(header::COOKIE)?.to_str().ok()?;
+fn cookie_token(headers: &header::HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|pair| {
         let (name, value) = pair.trim().split_once('=')?;
         (name == SESSION_COOKIE).then(|| value.to_string())
@@ -165,7 +189,7 @@ fn cookie_token(parts: &Parts) -> Option<String> {
 }
 
 /// Extractor gating every state endpoint on a live session.
-struct Operator(#[allow(dead_code)] String);
+struct Operator(auth::SessionInfo);
 
 impl FromRequestParts<SharedState> for Operator {
     type Rejection = Response;
@@ -174,7 +198,7 @@ impl FromRequestParts<SharedState> for Operator {
         parts: &mut Parts,
         state: &SharedState,
     ) -> Result<Self, Self::Rejection> {
-        cookie_token(parts)
+        cookie_token(&parts.headers)
             .and_then(|token| state.sessions.touch(&token))
             .map(Operator)
             .ok_or_else(|| {
@@ -184,6 +208,37 @@ impl FromRequestParts<SharedState> for Operator {
                 )
                     .into_response()
             })
+    }
+}
+
+/// The role gate, in front of every API route.
+///
+/// Path-based rather than per-handler on purpose: a new privileged
+/// endpoint cannot forget to opt in, because the gate does not consult
+/// the handler at all. The list is
+/// `hemlock_common::role::ADMIN_WEB_PATHS`, shared with the CLI, and
+/// the refusal is the CLI wording verbatim.
+async fn role_gate(
+    State(state): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    if !hemlock_common::role::web_requires_admin(path) {
+        return next.run(request).await;
+    }
+    // An unauthenticated request still answers 401 from the handler
+    // extractor; only a signed-in operator gets the role refusal.
+    let role = cookie_token(request.headers())
+        .and_then(|token| state.sessions.touch(&token))
+        .map(|session| session.role);
+    match role {
+        Some(role) if !role.is_admin() => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": hemlock_common::role::PERMISSION_DENIED })),
+        )
+            .into_response(),
+        _ => next.run(request).await,
     }
 }
 
@@ -245,14 +300,47 @@ struct LoginRequest {
     password: String,
 }
 
-async fn login(State(state): State<SharedState>, Json(req): Json<LoginRequest>) -> Response {
-    match auth::verify(state.dev_auth.as_ref(), &req.username, &req.password).await {
+async fn login(
+    State(state): State<SharedState>,
+    parts: Parts,
+    Json(req): Json<LoginRequest>,
+) -> Response {
+    // The configuration is the source of truth for who may log in and
+    // with what; an account it does not manage falls back to the OS
+    // user database (see auth::check).
+    let account = match running_config(&state.mgmtd).await {
+        Ok(text) => hemlock_config::parse(&text)
+            .ok()
+            .and_then(|tree| auth::config_account(&tree, &req.username)),
+        Err(_) => None,
+    };
+    match auth::verify(
+        state.dev_auth.as_ref(),
+        account.as_ref(),
+        &req.username,
+        &req.password,
+    )
+    .await
+    {
         Ok(()) => {
-            let token = state.sessions.create(&req.username);
-            tracing::info!(username = %req.username, "web login");
+            // mgmtd answers with the authoritative role (including the
+            // OS fallback for accounts the config does not manage) and
+            // the console idle timeout, and registers the session so
+            // `show system users` lists it.
+            let from = peer_address(&parts);
+            let who = who_am_i(&state, &req.username, &from).await;
+            let token = state.sessions.create(
+                auth::SessionInfo {
+                    username: req.username.clone(),
+                    role: who.role,
+                    mgmtd_session_id: who.session_id,
+                },
+                who.timeout_mins,
+            );
+            tracing::info!(username = %req.username, role = %who.role, %from, "web login");
             (
                 [(header::SET_COOKIE, session_cookie(&state, &token, false))],
-                Json(json!({ "username": req.username })),
+                Json(json!({ "username": req.username, "role": who.role.as_str() })),
             )
                 .into_response()
         }
@@ -262,6 +350,76 @@ async fn login(State(state): State<SharedState>, Json(req): Json<LoginRequest>) 
         )
             .into_response(),
     }
+}
+
+/// What mgmtd says about a freshly authenticated login.
+struct WhoAmI {
+    role: hemlock_common::role::Role,
+    session_id: u64,
+    timeout_mins: u32,
+}
+
+/// Ask mgmtd for the role, the console timeout, and a session handle.
+/// An unreachable mgmtd leaves the session read-only: the console can
+/// show nothing useful without it anyway, and failing closed is the
+/// safe direction for a privilege decision.
+async fn who_am_i(state: &AppState, username: &str, from: &str) -> WhoAmI {
+    let fallback = WhoAmI {
+        role: hemlock_common::role::Role::Operator,
+        session_id: 0,
+        timeout_mins: auth::DEFAULT_SESSION_TIMEOUT_MINS,
+    };
+    let Ok(mut client) = mgmtd_client(state).await else {
+        return fallback;
+    };
+    match client
+        .who_am_i(pb::WhoAmIRequest {
+            user: username.to_string(),
+            client: "web".into(),
+            from: from.to_string(),
+        })
+        .await
+    {
+        Ok(response) => {
+            let response = response.into_inner();
+            WhoAmI {
+                role: hemlock_common::role::Role::parse(&response.role).unwrap_or_default(),
+                session_id: response.session_id,
+                timeout_mins: if response.web_session_timeout_mins == 0 {
+                    auth::DEFAULT_SESSION_TIMEOUT_MINS
+                } else {
+                    response.web_session_timeout_mins
+                },
+            }
+        }
+        Err(_) => fallback,
+    }
+}
+
+/// The client address behind the console, for the session list. Uses
+/// the reverse-proxy header when one is present, and otherwise says so
+/// rather than inventing an address (webd binds directly on a switch,
+/// where the header is absent and the peer is not visible to a
+/// handler).
+fn peer_address(parts: &Parts) -> String {
+    for header_name in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(value) = parts.headers.get(header_name) {
+            if let Ok(text) = value.to_str() {
+                if let Some(first) = text.split(',').next() {
+                    let first = first.trim();
+                    if !first.is_empty() {
+                        return first.to_string();
+                    }
+                }
+            }
+        }
+    }
+    parts
+        .headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| "web".into())
 }
 
 fn session_cookie(state: &AppState, token: &str, clear: bool) -> String {
@@ -276,7 +434,19 @@ fn session_cookie(state: &AppState, token: &str, clear: bool) -> String {
 }
 
 async fn logout(State(state): State<SharedState>, parts: Parts) -> Response {
-    if let Some(token) = cookie_token(&parts) {
+    if let Some(token) = cookie_token(&parts.headers) {
+        // Drop it from mgmtd too, so the session list is not left with
+        // a ghost until the stale sweep.
+        let mgmtd_session_id = state.sessions.mgmtd_session_id(&token);
+        if mgmtd_session_id != 0 {
+            if let Ok(mut client) = mgmtd_client(&state).await {
+                let _ = client
+                    .close_session(pb::CloseSessionRequest {
+                        session_id: mgmtd_session_id,
+                    })
+                    .await;
+            }
+        }
         state.sessions.remove(&token);
     }
     (
@@ -286,9 +456,16 @@ async fn logout(State(state): State<SharedState>, parts: Parts) -> Response {
         .into_response()
 }
 
-async fn session(_op: Operator, State(_state): State<SharedState>) -> Response {
-    // Operator resolved the session; echo the username back.
-    Json(json!({ "username": _op.0 })).into_response()
+async fn session(op: Operator, State(_state): State<SharedState>) -> Response {
+    // Operator resolved the session; echo back who it belongs to and
+    // what it may do — the console disables its edit affordances from
+    // this.
+    Json(json!({
+        "username": op.0.username,
+        "role": op.0.role.as_str(),
+        "admin": op.0.role.is_admin(),
+    }))
+    .into_response()
 }
 
 // ----------------------------------------------------------------- state
@@ -454,6 +631,7 @@ async fn vlans(
 /// commit's applied-changes list.
 async fn commit_edit(
     state: &AppState,
+    operator: &auth::SessionInfo,
     comment: &str,
     apply: impl FnOnce(&mut ConfigTree) -> Result<(), String>,
 ) -> Result<Response, ApiError> {
@@ -473,10 +651,11 @@ async fn commit_edit(
         return invalid(vec![message]);
     }
 
+    let tree_text = tree.to_text();
     let mut client = mgmtd_client(state).await?;
     let response = client
         .set_candidate(pb::ConfigText {
-            text: tree.to_text(),
+            text: tree_text.clone(),
         })
         .await
         .map_err(anyhow::Error::from)?
@@ -488,14 +667,24 @@ async fn commit_edit(
         .commit(pb::CommitRequest {
             comment: comment.to_string(),
             confirm_timeout_secs: 0,
+            user: operator.username.clone(),
+            client: "web".into(),
         })
         .await
         .map_err(anyhow::Error::from)?
         .into_inner();
-    tracing::info!(commit_id = commit.commit_id, "web console commit");
+    tracing::info!(commit_id = commit.commit_id, user = %operator.username, "web console commit");
+    // A commit that promotes or demotes an account reaches the console
+    // sessions already open, so the edit affordances follow at once.
+    if let Ok(tree) = hemlock_config::parse(&tree_text) {
+        for (name, role) in crate::system_edit::configured_roles(&tree) {
+            state.sessions.set_role(&name, role);
+        }
+    }
     Ok(Json(json!({
         "commit_id": commit.commit_id,
         "applied": commit.applied_changes,
+        "warnings": commit.warnings,
     }))
     .into_response())
 }
@@ -505,7 +694,7 @@ async fn interfaces_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::edit::InterfaceEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::edit::apply_interface_edit(tree, &edit)
     })
     .await
@@ -567,7 +756,7 @@ async fn svis_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::edit::SviEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::edit::apply_svi_edit(tree, &edit)
     })
     .await
@@ -578,7 +767,7 @@ async fn vlans_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::edit::VlanEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::edit::apply_vlan_edit(tree, &edit)
     })
     .await
@@ -649,8 +838,129 @@ async fn system_identity_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::system_edit::IdentityEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::system_edit::apply_identity_edit(tree, &edit)
+    })
+    .await
+}
+
+/// `GET /api/system/users` — the configured accounts (config) beside
+/// the live sessions (mgmtd's registry), the same two halves
+/// `show system users` prints.
+async fn system_users(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let configured = configured_users_json(&tree);
+
+    let sessions = match mgmtd_client(&state).await {
+        Ok(mut client) => client
+            .list_sessions(pb::ListSessionsRequest {})
+            .await
+            .map(|response| {
+                response
+                    .into_inner()
+                    .sessions
+                    .into_iter()
+                    .map(|session| {
+                        json!({
+                            "user": session.user,
+                            "from": session.from,
+                            "client": session.client,
+                            "role": session.role,
+                            "idle_secs": session.idle_secs,
+                            "login_time": session.login_time,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    Ok(Json(json!({
+        "users": configured,
+        "sessions": sessions,
+        "session_timeout": session_timeout_of(&tree),
+        // The console mirrors the lockout guard, so it needs to know
+        // who still counts as a usable administrator.
+        "admins_with_password": configured
+            .iter()
+            .filter(|user| user["role"] == "admin" && user["auth"] == "password")
+            .count(),
+    })))
+}
+
+/// `system { login { user ... } }` as the grid renders it.
+fn configured_users_json(tree: &ConfigTree) -> Vec<serde_json::Value> {
+    let Some((_, system)) = tree.block("system") else {
+        return Vec::new();
+    };
+    let Some((_, login)) = ConfigTree::blocks_named(system, "login").next() else {
+        return Vec::new();
+    };
+    let mut users: Vec<serde_json::Value> = ConfigTree::blocks_named(login, "user")
+        .filter_map(|(keys, children)| {
+            let name = keys.first()?.clone();
+            let ssh_keys: Vec<String> = children
+                .iter()
+                .filter_map(|item| match item {
+                    hemlock_config::Item::Leaf { name, values } if name == "ssh-key" => {
+                        values.first().cloned()
+                    }
+                    _ => None,
+                })
+                .collect();
+            let has_password = ConfigTree::leaf_value(children, "password-hash").is_some();
+            let auth = match (has_password, ssh_keys.is_empty()) {
+                (true, _) => "password",
+                (false, false) => "ssh-key",
+                (false, true) => "none",
+            };
+            Some(json!({
+                "name": name,
+                // Least privilege: an omitted role is `operator`.
+                "role": ConfigTree::leaf_value(children, "role").unwrap_or("operator"),
+                "auth": auth,
+                // The hash itself never leaves the box.
+                "ssh_keys": ssh_keys,
+            }))
+        })
+        .collect();
+    users.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    users
+}
+
+/// `system { web { session-timeout } }`, or the default.
+fn session_timeout_of(tree: &ConfigTree) -> u32 {
+    tree.block("system")
+        .and_then(|(_, system)| ConfigTree::blocks_named(system, "web").next())
+        .and_then(|(_, web)| ConfigTree::leaf_value(web, "session-timeout"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(auth::DEFAULT_SESSION_TIMEOUT_MINS)
+}
+
+async fn system_users_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::system_edit::UserEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, &_op.0, "web console", |tree| {
+        crate::system_edit::apply_user_edit(tree, &edit)
+    })
+    .await
+}
+
+async fn system_web_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::system_edit::WebEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, &_op.0, "web console", |tree| {
+        crate::system_edit::apply_web_edit(tree, &edit)
     })
     .await
 }
@@ -754,7 +1064,7 @@ async fn lags_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::switching_edit::LagEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::switching_edit::apply_lag_edit(tree, &edit)
     })
     .await
@@ -810,7 +1120,7 @@ async fn spanning_tree_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::switching_edit::StpEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::switching_edit::apply_stp_edit(tree, &edit)
     })
     .await
@@ -900,7 +1210,7 @@ async fn mac_table_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::switching_edit::MacTableEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::switching_edit::apply_mac_table_edit(tree, &edit)
     })
     .await
@@ -982,7 +1292,7 @@ async fn snooping_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::switching_edit::SnoopingEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::switching_edit::apply_snooping_edit(tree, &edit)
     })
     .await
@@ -1040,7 +1350,7 @@ async fn lldp_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::services_edit::LldpEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::services_edit::apply_lldp_edit(tree, &edit)
     })
     .await
@@ -1109,7 +1419,7 @@ async fn dhcp_server_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::services_edit::DhcpServerEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::services_edit::apply_dhcp_server_edit(tree, &edit)
     })
     .await
@@ -1143,7 +1453,7 @@ async fn dhcp_relay_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::services_edit::DhcpRelayEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::services_edit::apply_dhcp_relay_edit(tree, &edit)
     })
     .await
@@ -1196,7 +1506,7 @@ async fn sflow_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::services_edit::SflowEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::services_edit::apply_sflow_edit(tree, &edit)
     })
     .await
@@ -1239,7 +1549,7 @@ async fn snmp_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::services_edit::SnmpEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::services_edit::apply_snmp_edit(tree, &edit)
     })
     .await
@@ -1276,7 +1586,7 @@ async fn ntp_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::services_edit::NtpEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::services_edit::apply_ntp_edit(tree, &edit)
     })
     .await
@@ -1314,7 +1624,7 @@ async fn storm_control_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::switching_edit::StormEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::switching_edit::apply_storm_edit(tree, &edit)
     })
     .await
@@ -1353,7 +1663,7 @@ async fn mirror_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::switching_edit::MirrorEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::switching_edit::apply_mirror_edit(tree, &edit)
     })
     .await
@@ -1520,7 +1830,7 @@ async fn arp_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::routing_edit::ArpEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::routing_edit::apply_arp_edit(tree, &edit)
     })
     .await
@@ -1662,7 +1972,7 @@ async fn ospf_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::routing_edit::OspfEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::routing_edit::apply_ospf_edit(tree, &edit)
     })
     .await
@@ -1741,7 +2051,7 @@ async fn bgp_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::routing_edit::BgpEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::routing_edit::apply_bgp_edit(tree, &edit)
     })
     .await
@@ -1805,7 +2115,7 @@ async fn vrrp_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::routing_edit::VrrpEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::routing_edit::apply_vrrp_edit(tree, &edit)
     })
     .await
@@ -1904,7 +2214,7 @@ async fn qos_maps_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::qos_edit::MapEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::qos_edit::apply_map_edit(tree, &edit)
     })
     .await
@@ -1958,7 +2268,7 @@ async fn qos_wred_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::qos_edit::WredEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::qos_edit::apply_wred_edit(tree, &edit)
     })
     .await
@@ -2022,7 +2332,7 @@ async fn qos_ports_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::qos_edit::PortQosEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::qos_edit::apply_port_qos_edit(tree, &edit)
     })
     .await
@@ -2173,7 +2483,7 @@ async fn acls_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::security_edit::AclEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::security_edit::apply_acl_edit(tree, &edit)
     })
     .await
@@ -2184,7 +2494,7 @@ async fn acl_bindings_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::security_edit::AclBindingEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::security_edit::apply_acl_binding_edit(tree, &edit)
     })
     .await
@@ -2242,7 +2552,7 @@ async fn copp_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::security_edit::CoppEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::security_edit::apply_copp_edit(tree, &edit)
     })
     .await
@@ -2297,7 +2607,7 @@ async fn port_security_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::security_edit::PortSecurityEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::security_edit::apply_port_security_edit(tree, &edit)
     })
     .await
@@ -2414,7 +2724,7 @@ async fn dot1x_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::security_edit::Dot1xEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::security_edit::apply_dot1x_edit(tree, &edit)
     })
     .await
@@ -2571,7 +2881,7 @@ async fn snooping_sec_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::security_edit::SnoopingSecEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::security_edit::apply_snooping_sec_edit(tree, &edit)
     })
     .await
@@ -2606,7 +2916,7 @@ async fn static_routes_edit(
     State(state): State<SharedState>,
     Json(edit): Json<crate::routing_edit::StaticRouteEdit>,
 ) -> Result<Response, ApiError> {
-    commit_edit(&state, "web console", |tree| {
+    commit_edit(&state, &_op.0, "web console", |tree| {
         crate::routing_edit::apply_static_route_edit(tree, &edit)
     })
     .await
@@ -2695,7 +3005,7 @@ async fn config_restore(
         Ok(tree) => tree,
         Err(e) => return Ok(errors(vec![format!("configuration does not parse: {e}")])),
     };
-    commit_edit(&state, "web console restore", |tree| {
+    commit_edit(&state, &_op.0, "web console restore", |tree| {
         *tree = restored;
         tree.normalize_interfaces();
         Ok(())
@@ -2808,6 +3118,55 @@ async fn upgrade_discard(_op: Operator, State(state): State<SharedState>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one test that makes the shared role table load-bearing:
+    /// every endpoint that changes something is either in
+    /// `ADMIN_WEB_PATHS` or one of the two login paths. Adding a POST
+    /// route without gating it fails here rather than shipping open.
+    #[test]
+    fn every_post_route_is_gated() {
+        let ungated: Vec<&str> = post_routes()
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                !hemlock_common::role::web_requires_admin(path) && !PUBLIC_POSTS.contains(path)
+            })
+            .collect();
+        assert!(
+            ungated.is_empty(),
+            "these POST endpoints are not in hemlock_common::role::ADMIN_WEB_PATHS: {ungated:?}"
+        );
+    }
+
+    /// And the reverse: a path in the table that no route serves is a
+    /// stale entry, which quietly weakens the first test.
+    #[test]
+    fn the_role_table_names_no_phantom_endpoints() {
+        let served: Vec<&str> = get_routes()
+            .into_iter()
+            .chain(post_routes())
+            .map(|(path, _)| path)
+            .collect();
+        let phantom: Vec<&&str> = hemlock_common::role::ADMIN_WEB_PATHS
+            .iter()
+            .filter(|path| !served.contains(*path))
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "ADMIN_WEB_PATHS names endpoints webd does not serve: {phantom:?}"
+        );
+    }
+
+    /// Reading is never gated: an operator sees the whole console.
+    #[test]
+    fn no_read_only_route_is_gated() {
+        let gated: Vec<&str> = get_routes()
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| hemlock_common::role::web_requires_admin(path))
+            .collect();
+        assert!(gated.is_empty(), "read-only routes must stay open: {gated:?}");
+    }
 
     #[test]
     fn extracts_service_blocks() {

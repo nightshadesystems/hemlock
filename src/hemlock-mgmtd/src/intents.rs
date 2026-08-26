@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use hemlock_common::link::{self, Duplex};
+use hemlock_common::role::Role;
 use hemlock_config::{ConfigTree, Item};
 
 /// Every intent family extracted from one config tree.
@@ -26,6 +27,10 @@ pub struct Intents {
     /// System identity (`system { hostname | timezone | name-server |
     /// domain-name | banner login }`), rendered into the OS.
     pub identity: IdentityIntent,
+    /// Config-managed login users (`system { login { user <name> {
+    /// ... } } }`), keyed by account name. Empty = the config manages
+    /// no users, and the OS accounts stand as they are.
+    pub login: BTreeMap<String, UserIntent>,
     pub ssh: SshIntent,
     /// Web console listeners (`system { http }` / `system { https }`).
     pub web: WebIntent,
@@ -1057,6 +1062,102 @@ pub fn valid_domain_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 253 && name.split('.').all(valid_hostname_label)
 }
 
+/// One config-managed login user (`system { login { user <name> {
+/// role ...; password-hash ...; ssh-key ... } } }`).
+///
+/// The config is the source of truth: the OS applier creates, updates
+/// and removes the matching account, and both front-ends read the role
+/// from here. What the config never carries is a plaintext password —
+/// `set ... password <plain>` hashes at the prompt, so only the crypt
+/// string is ever stored.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserIntent {
+    /// Least privilege by default: `admin` has to be asked for.
+    pub role: Role,
+    /// SHA-512-crypt string; None = key-only login.
+    pub password_hash: Option<String>,
+    /// `authorized_keys` lines, in config order.
+    pub ssh_keys: Vec<String>,
+}
+
+impl UserIntent {
+    /// How this account authenticates, for `show system users`.
+    pub fn auth_method(&self) -> &'static str {
+        match (self.password_hash.is_some(), self.ssh_keys.is_empty()) {
+            (true, _) => "password",
+            (false, false) => "ssh-key",
+            (false, true) => "none",
+        }
+    }
+}
+
+/// The most keys one account carries. A longer list is a sign the keys
+/// belong in a directory service, not in a switch config.
+pub const MAX_SSH_KEYS: usize = 8;
+
+/// Account names Hemlock never manages: the OS owns them, and handing
+/// one to the config would let a commit lock the box out of itself.
+/// The uid < 1000 sweep at commit time catches the rest.
+pub const RESERVED_USERS: &[&str] = &[
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news", "uucp", "proxy",
+    "www-data", "backup", "list", "irc", "nobody", "systemd-network", "systemd-resolve", "sshd",
+    "messagebus", "frr", "snmp", "dnsmasq", "hemlock",
+];
+
+/// Account-name syntax: `[a-z_][a-z0-9_-]{0,31}` — useradd's own
+/// conservative rule, which also keeps shell metacharacters out of the
+/// applier's argv by construction.
+pub fn valid_user_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 32
+        && (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+}
+
+/// Key types `authorized_keys` accepts. Deliberately modern: DSA is
+/// disabled in OpenSSH by default, so accepting it would store a key
+/// that can never log in.
+pub const SSH_KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+    "rsa-sha2-256",
+    "rsa-sha2-512",
+];
+
+/// Is this an `authorized_keys` line: `<type> <base64> [comment]`?
+/// The base64 body is checked for shape, not decoded — sshd is the one
+/// that has to make sense of the blob.
+pub fn valid_ssh_key(key: &str) -> bool {
+    let mut fields = key.split_whitespace();
+    let Some(kind) = fields.next() else {
+        return false;
+    };
+    if !SSH_KEY_TYPES.contains(&kind) {
+        return false;
+    }
+    let Some(body) = fields.next() else {
+        return false;
+    };
+    body.len() >= 16
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+}
+
+/// Session timeout bounds for the web console, in minutes.
+pub const MIN_WEB_SESSION_TIMEOUT: u32 = 5;
+pub const MAX_WEB_SESSION_TIMEOUT: u32 = 1440;
+/// The idle timeout a console session gets with nothing configured.
+pub const DEFAULT_WEB_SESSION_TIMEOUT: u32 = 30;
+
 /// `system { ssh { ... } }` â€” SSH is on exactly when the block exists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SshIntent {
@@ -1073,11 +1174,20 @@ pub struct SshIntent {
 pub struct WebIntent {
     pub http: bool,
     pub https: bool,
+    /// `system { web { session-timeout <minutes> } }`; None = the
+    /// default. Independent of the listeners: the timeout can be set
+    /// before the console is turned on.
+    pub session_timeout: Option<u32>,
 }
 
 impl WebIntent {
     pub fn enabled(&self) -> bool {
         self.http || self.https
+    }
+
+    /// The idle timeout the console should enforce, in minutes.
+    pub fn effective_session_timeout(&self) -> u32 {
+        self.session_timeout.unwrap_or(DEFAULT_WEB_SESSION_TIMEOUT)
     }
 }
 
@@ -1115,6 +1225,15 @@ pub enum IntentError {
 
     #[error("unknown timezone {0:?}")]
     UnknownTimezone(String),
+
+    #[error("system login: {0}")]
+    BadLogin(String),
+
+    #[error("system login user {name}: {reason}")]
+    BadLoginUser { name: String, reason: String },
+
+    #[error("system web: {0}")]
+    BadWeb(String),
 
     #[error("system ssh: {0}")]
     BadSsh(String),
@@ -3618,11 +3737,20 @@ fn system(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
     let mut identity = IdentityIntent::default();
     for item in items {
         match item {
-            Item::Block { name, keys, .. } => {
+            Item::Block {
+                name,
+                keys,
+                children,
+            } => {
                 if !keys.is_empty() {
                     return Err(bad(format!("unrecognized block {name:?}")));
                 }
                 match name.as_str() {
+                    "login" => intents.login = login(children)?,
+                    // `web` carries the console's session timeout; the
+                    // listener half is block presence (`http`/`https`),
+                    // parsed by `web`.
+                    "web" => intents.web.session_timeout = web_session_timeout(children)?,
                     // Parsed by their own extractors; named here so an
                     // unknown block is still rejected.
                     "ssh" | "http" | "https" => {}
@@ -3699,6 +3827,151 @@ fn system(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
     Ok(())
 }
 
+/// `system { login { user <name> { role ...; password-hash ...;
+/// ssh-key ... } } }`.
+///
+/// The lockout guard lives here: a config that manages users at all
+/// must leave at least one administrator who can actually log in, so a
+/// commit can never take the last way in with it.
+fn login(items: &[Item]) -> Result<BTreeMap<String, UserIntent>, IntentError> {
+    let bad = IntentError::BadLogin;
+    let mut users: BTreeMap<String, UserIntent> = BTreeMap::new();
+    for item in items {
+        let Item::Block {
+            name,
+            keys,
+            children,
+        } = item
+        else {
+            return Err(bad(format!("unrecognized statement {:?}", item.name())));
+        };
+        if name != "user" {
+            return Err(bad(format!("unrecognized block {name:?}")));
+        }
+        let [account] = keys.as_slice() else {
+            return Err(bad("expected `user <name> { ... }`".into()));
+        };
+        if !valid_user_name(account) {
+            return Err(IntentError::BadLoginUser {
+                name: account.clone(),
+                reason: "bad name (a-z, 0-9, _ and -, starting with a letter or _, max 32)".into(),
+            });
+        }
+        if RESERVED_USERS.contains(&account.as_str()) {
+            return Err(IntentError::BadLoginUser {
+                name: account.clone(),
+                reason: "reserved account name".into(),
+            });
+        }
+        let user = user(account, children)?;
+        if users.insert(account.clone(), user).is_some() {
+            return Err(IntentError::BadLoginUser {
+                name: account.clone(),
+                reason: "duplicate user block".into(),
+            });
+        }
+    }
+    if !users
+        .values()
+        .any(|user| user.role.is_admin() && user.password_hash.is_some())
+    {
+        return Err(bad(
+            "at least one admin user with a password is required".into(),
+        ));
+    }
+    Ok(users)
+}
+
+/// One `user <name> { ... }` body.
+fn user(account: &str, items: &[Item]) -> Result<UserIntent, IntentError> {
+    let bad = |reason: String| IntentError::BadLoginUser {
+        name: account.to_string(),
+        reason,
+    };
+    let mut intent = UserIntent::default();
+    for item in items {
+        let Item::Leaf { name, values } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        match name.as_str() {
+            "role" => {
+                let [role] = values.as_slice() else {
+                    return Err(bad("expected `role <admin|operator>`".into()));
+                };
+                intent.role = Role::parse(role)
+                    .ok_or_else(|| bad(format!("bad role {role:?} (admin or operator)")))?;
+            }
+            "password-hash" => {
+                let [hash] = values.as_slice() else {
+                    return Err(bad("expected `password-hash <crypt>`".into()));
+                };
+                if !hemlock_common::passwd::valid_hash(hash) {
+                    return Err(bad("password-hash is not a crypt string".into()));
+                }
+                intent.password_hash = Some(hash.clone());
+            }
+            // Deferred by this suite; named rather than stored in the
+            // clear, which is what an operator typing it would expect
+            // to happen.
+            "password" => {
+                return Err(bad(
+                    "plaintext passwords are never stored; use `set ... password <plain>`, \
+                     which hashes at the prompt"
+                        .into(),
+                ));
+            }
+            "ssh-key" => {
+                let [key] = values.as_slice() else {
+                    return Err(bad("expected `ssh-key <\"key\">`".into()));
+                };
+                if !valid_ssh_key(key) {
+                    return Err(bad(
+                        "ssh-key must be `<type> <base64> [comment]` with a known key type".into(),
+                    ));
+                }
+                if !intent.ssh_keys.contains(key) {
+                    intent.ssh_keys.push(key.clone());
+                }
+            }
+            other => return Err(bad(format!("unrecognized statement {other:?}"))),
+        }
+    }
+    if intent.ssh_keys.len() > MAX_SSH_KEYS {
+        return Err(bad(format!(
+            "at most {MAX_SSH_KEYS} ssh-keys ({} configured)",
+            intent.ssh_keys.len()
+        )));
+    }
+    if intent.password_hash.is_none() && intent.ssh_keys.is_empty() {
+        return Err(bad("needs a password or at least one ssh-key".into()));
+    }
+    Ok(intent)
+}
+
+/// `system { web { session-timeout <minutes> } }`.
+fn web_session_timeout(items: &[Item]) -> Result<Option<u32>, IntentError> {
+    let bad = IntentError::BadWeb;
+    for item in items {
+        let Item::Leaf { name, .. } = item else {
+            return Err(bad(format!("unrecognized block {:?}", item.name())));
+        };
+        if name != "session-timeout" {
+            return Err(bad(format!("unrecognized statement {name:?}")));
+        }
+    }
+    match ConfigTree::leaf_value(items, "session-timeout") {
+        Some(value) => Ok(Some(
+            parse_int(
+                value,
+                MIN_WEB_SESSION_TIMEOUT..=MAX_WEB_SESSION_TIMEOUT,
+                "session-timeout",
+            )
+            .map_err(bad)?,
+        )),
+        None => Ok(None),
+    }
+}
+
 fn ssh(tree: &ConfigTree) -> Result<SshIntent, IntentError> {
     let Some((_, system)) = tree.block("system") else {
         return Ok(SshIntent::default());
@@ -3732,6 +4005,8 @@ fn web(tree: &ConfigTree) -> WebIntent {
     WebIntent {
         http: block("http"),
         https: block("https"),
+        // Filled by the `system` extractor, which walks the block.
+        session_timeout: None,
     }
 }
 
@@ -5283,6 +5558,8 @@ pub struct OsChanges {
     pub vrrp_macvlans: Vec<VrrpMacvlanChange>,
     /// The full wanted identity, present exactly when it changed.
     pub identity: Option<IdentityIntent>,
+    /// Login-account creates, updates and removals.
+    pub users: Vec<UserChange>,
     /// The full wanted SSH state, present exactly when it changed.
     pub ssh: Option<SshIntent>,
     /// The full wanted web console state, present exactly when it changed.
@@ -5300,6 +5577,7 @@ impl OsChanges {
             && self.arp.is_empty()
             && self.vrrp_macvlans.is_empty()
             && self.identity.is_none()
+            && self.users.is_empty()
             && self.ssh.is_none()
             && self.web.is_none()
             && self.ntp.is_none()
@@ -5335,11 +5613,17 @@ impl OsChanges {
                 "ssh disabled".into()
             }
         });
-        let web = self.web.as_ref().map(|w| match (w.http, w.https) {
-            (true, true) => "web ui enabled (http, https)".to_string(),
-            (true, false) => "web ui enabled (http)".to_string(),
-            (false, true) => "web ui enabled (https)".to_string(),
-            (false, false) => "web ui disabled".to_string(),
+        let web = self.web.as_ref().map(|w| {
+            let listeners = match (w.http, w.https) {
+                (true, true) => "web ui enabled (http, https)".to_string(),
+                (true, false) => "web ui enabled (http)".to_string(),
+                (false, true) => "web ui enabled (https)".to_string(),
+                (false, false) => return "web ui disabled".to_string(),
+            };
+            format!(
+                "{listeners}, session timeout {} min",
+                w.effective_session_timeout()
+            )
         });
         let ntp = self.ntp.as_ref().map(|n| {
             if n.servers.is_empty() {
@@ -5356,11 +5640,36 @@ impl OsChanges {
             .chain(self.routes.iter().map(RouteChange::describe))
             .chain(self.arp.iter().map(ArpChange::describe))
             .chain(self.vrrp_macvlans.iter().map(VrrpMacvlanChange::describe))
+            .chain(self.users.iter().map(UserChange::describe))
             .chain(identity)
             .chain(ssh)
             .chain(web)
             .chain(ntp)
             .collect()
+    }
+}
+
+/// One login account's delta: the full wanted state, or `None` to
+/// remove the account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserChange {
+    pub name: String,
+    pub set: Option<UserIntent>,
+}
+
+impl UserChange {
+    pub fn describe(&self) -> String {
+        match &self.set {
+            None => format!("user {} removed", self.name),
+            Some(user) => {
+                let keys = match user.ssh_keys.len() {
+                    0 => String::new(),
+                    1 => ", 1 ssh-key".into(),
+                    n => format!(", {n} ssh-keys"),
+                };
+                format!("user {} ({}, {}{keys})", self.name, user.role, user.auth_method())
+            }
+        }
     }
 }
 
@@ -5570,6 +5879,28 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
 
     if running.identity != candidate.identity {
         changes.identity = Some(candidate.identity.clone());
+    }
+    // Login accounts. A user the config stops naming is removed, but
+    // only when the config was managing users in the first place: an
+    // empty `login` family means "not our accounts", so dropping the
+    // whole block must never sweep the box's OS users away.
+    for (name, wanted) in &candidate.login {
+        if running.login.get(name) != Some(wanted) {
+            changes.users.push(UserChange {
+                name: name.clone(),
+                set: Some(wanted.clone()),
+            });
+        }
+    }
+    if !candidate.login.is_empty() {
+        for name in running.login.keys() {
+            if !candidate.login.contains_key(name) {
+                changes.users.push(UserChange {
+                    name: name.clone(),
+                    set: None,
+                });
+            }
+        }
     }
     if running.ssh != candidate.ssh {
         changes.ssh = Some(candidate.ssh.clone());
@@ -6750,14 +7081,16 @@ interfaces {
             intents_of("system { http { } }").web,
             WebIntent {
                 http: true,
-                https: false
+                https: false,
+                session_timeout: None
             }
         );
         assert_eq!(
             intents_of("system { http { } https { } }").web,
             WebIntent {
                 http: true,
-                https: true
+                https: true,
+                session_timeout: None
             }
         );
         assert!(intents_of("system { https { } }").web.enabled());
@@ -6773,12 +7106,13 @@ interfaces {
             changes.web,
             Some(WebIntent {
                 http: true,
-                https: true
+                https: true,
+                session_timeout: None
             })
         );
         assert_eq!(
             changes.describe(),
-            vec!["web ui enabled (http, https)".to_string()]
+            vec!["web ui enabled (http, https), session timeout 30 min".to_string()]
         );
 
         // Unchanged -> no delta; reverting -> disabled.
@@ -7711,6 +8045,242 @@ system {
             identity.banner_login.as_deref(),
             Some("Authorized access only. All activity is logged.")
         );
+    }
+
+    /// The system suite's login block, round-tripped through the
+    /// serializer and re-extracted.
+    #[test]
+    fn login_seed_round_trips_and_extracts() {
+        let text = r#"
+system {
+    login {
+        user cody {
+            role admin;
+            password-hash "$6$rounds=656000$abcdefgh$ijklmnop";
+            ssh-key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3 cody@mars";
+        }
+        user noc {
+            password-hash "$6$rounds=656000$ijklmnop$qrstuvwx";
+        }
+    }
+}
+"#;
+        let tree = parse(text).unwrap();
+        assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+        let login = extract(&tree).unwrap().login;
+        assert_eq!(login.len(), 2);
+        assert_eq!(login["cody"].role, Role::Admin);
+        assert_eq!(login["cody"].ssh_keys.len(), 1);
+        assert_eq!(login["cody"].auth_method(), "password");
+        // Least privilege: an omitted role is `operator`.
+        assert_eq!(login["noc"].role, Role::Operator);
+        assert!(login["noc"].ssh_keys.is_empty());
+    }
+
+    /// The lockout guard: a config that manages users at all must keep
+    /// one administrator who can log in.
+    #[test]
+    fn login_lockout_guard() {
+        const MESSAGE: &str =
+            "system login: at least one admin user with a password is required";
+        let hash = "$6$abcdefgh$ijklmnop";
+        // Only operators.
+        let text = format!("system {{ login {{ user noc {{ password-hash \"{hash}\" }} }} }}");
+        assert_eq!(
+            extract(&parse(&text).unwrap()).unwrap_err().to_string(),
+            MESSAGE
+        );
+        // An admin with keys but no password cannot answer a console
+        // login, so it does not satisfy the guard.
+        let text = "system { login { user cody { role admin\n\
+             ssh-key \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl3 cody@mars\" } } }";
+        assert_eq!(
+            extract(&parse(text).unwrap()).unwrap_err().to_string(),
+            MESSAGE
+        );
+        // An empty block is not a way around it.
+        assert_eq!(
+            extract(&parse("system { login { } }").unwrap())
+                .unwrap_err()
+                .to_string(),
+            MESSAGE
+        );
+        // One admin with a password is enough.
+        let text = format!(
+            "system {{ login {{ user cody {{ role admin\npassword-hash \"{hash}\" }}\n\
+             user noc {{ password-hash \"{hash}\" }} }} }}"
+        );
+        assert_eq!(extract(&parse(&text).unwrap()).unwrap().login.len(), 2);
+        // No block at all = the config manages no users; the box keeps
+        // whatever OS accounts it has.
+        assert!(extract(&parse("").unwrap()).unwrap().login.is_empty());
+    }
+
+    /// Every per-user rejection in the spec.
+    #[test]
+    fn login_user_validation() {
+        let hash = "$6$abcdefgh$ijklmnop";
+        let admin = format!("user cody {{ role admin\npassword-hash \"{hash}\" }}\n");
+        let with = |body: &str| format!("system {{ login {{ {admin}{body} }} }}");
+
+        // Names follow useradd's rule, and the reserved list is closed.
+        for name in ["Cody", "2fast", "has space", "root", "daemon", "hemlock"] {
+            let text = with(&format!("user \"{name}\" {{ password-hash \"{hash}\" }}"));
+            assert!(
+                matches!(
+                    extract(&parse(&text).unwrap()).unwrap_err(),
+                    IntentError::BadLoginUser { .. }
+                ),
+                "accepted user name {name:?}"
+            );
+        }
+
+        // A user needs credentials by commit time.
+        let text = with("user noc { role operator }");
+        assert_eq!(
+            extract(&parse(&text).unwrap()).unwrap_err().to_string(),
+            "system login user noc: needs a password or at least one ssh-key"
+        );
+
+        // Roles, hashes and keys are all checked.
+        for (body, what) in [
+            ("user noc { role superuser\npassword-hash \"$6$a$b\" }", "role"),
+            ("user noc { password-hash plaintext }", "hash"),
+            ("user noc { ssh-key \"ssh-dss AAAAB3NzaC1kc3MAAACB comment\" }", "key type"),
+            ("user noc { ssh-key \"ssh-ed25519\" }", "key shape"),
+            ("user noc { nonsense 1 }", "statement"),
+        ] {
+            let text = with(body);
+            assert!(
+                matches!(
+                    extract(&parse(&text).unwrap()).unwrap_err(),
+                    IntentError::BadLoginUser { .. }
+                ),
+                "accepted bad {what}"
+            );
+        }
+
+        // A plaintext `password` leaf is refused by name rather than
+        // quietly stored.
+        let text = with("user noc { password hunter2hunter2 }");
+        assert!(extract(&parse(&text).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("plaintext passwords are never stored"));
+
+        // Keys deduplicate and cap at eight.
+        let key = |n: usize| {
+            format!("ssh-key \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0ex4mpl{n} cody@mars\"")
+        };
+        let keys: String = (0..MAX_SSH_KEYS).map(|n| format!("{}\n", key(n))).collect();
+        let text = with(&format!("user noc {{ {keys} }}"));
+        assert_eq!(
+            extract(&parse(&text).unwrap()).unwrap().login["noc"]
+                .ssh_keys
+                .len(),
+            MAX_SSH_KEYS
+        );
+        let text = with(&format!("user noc {{ {keys}{} }}", key(MAX_SSH_KEYS)));
+        assert!(matches!(
+            extract(&parse(&text).unwrap()).unwrap_err(),
+            IntentError::BadLoginUser { .. }
+        ));
+        let text = with(&format!("user noc {{ {}\n{} }}", key(0), key(0)));
+        assert_eq!(
+            extract(&parse(&text).unwrap()).unwrap().login["noc"]
+                .ssh_keys
+                .len(),
+            1
+        );
+    }
+
+    /// Login accounts diff like every other OS-side family, with one
+    /// asymmetry: dropping the whole block never removes accounts.
+    #[test]
+    fn login_diffs_create_update_and_remove() {
+        let hash = "$6$abcdefgh$ijklmnop";
+        let other = "$6$qrstuvwx$yzabcdef";
+        let before = intents_of(&format!(
+            "system {{ login {{ user cody {{ role admin\npassword-hash \"{hash}\" }}\n\
+             user noc {{ password-hash \"{hash}\" }} }} }}"
+        ));
+        // noc is promoted and re-hashed, jo is added, nobody leaves.
+        let after = intents_of(&format!(
+            "system {{ login {{ user cody {{ role admin\npassword-hash \"{hash}\" }}\n\
+             user noc {{ role admin\npassword-hash \"{other}\" }}\n\
+             user jo {{ password-hash \"{hash}\" }} }} }}"
+        ));
+        let changes = diff_os(&before, &after);
+        let names: Vec<&str> = changes.users.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["jo", "noc"]);
+        assert!(changes.users.iter().all(|c| c.set.is_some()));
+        assert!(changes
+            .describe()
+            .contains(&"user noc (admin, password)".to_string()));
+
+        // Dropping a user removes the account.
+        let dropped = intents_of(&format!(
+            "system {{ login {{ user cody {{ role admin\npassword-hash \"{hash}\" }} }} }}"
+        ));
+        let changes = diff_os(&before, &dropped);
+        assert_eq!(changes.users.len(), 1);
+        assert_eq!(changes.users[0].name, "noc");
+        assert!(changes.users[0].set.is_none());
+        assert!(changes
+            .describe()
+            .contains(&"user noc removed".to_string()));
+
+        // Dropping the whole block does not: those accounts stop being
+        // config-managed, they are not deleted.
+        assert!(diff_os(&before, &intents_of("")).users.is_empty());
+        assert!(diff_os(&before, &before).users.is_empty());
+    }
+
+    /// `system { web { session-timeout } }` rides the existing web
+    /// family.
+    #[test]
+    fn web_session_timeout_validation() {
+        assert_eq!(
+            intents_of("system { web { session-timeout 45 } }")
+                .web
+                .session_timeout,
+            Some(45)
+        );
+        assert_eq!(intents_of("").web.effective_session_timeout(), 30);
+        assert_eq!(
+            intents_of("system { web { session-timeout 45 } }")
+                .web
+                .effective_session_timeout(),
+            45
+        );
+        for bad in ["4", "1441", "abc"] {
+            let text = format!("system {{ web {{ session-timeout {bad} }} }}");
+            assert!(
+                matches!(
+                    extract(&parse(&text).unwrap()).unwrap_err(),
+                    IntentError::BadWeb(_)
+                ),
+                "accepted session-timeout {bad}"
+            );
+        }
+        assert!(matches!(
+            extract(&parse("system { web { nonsense 1 } }").unwrap()).unwrap_err(),
+            IntentError::BadWeb(_)
+        ));
+        // The timeout is independent of the listeners, and moving it
+        // shows up as a web change.
+        let changes = diff_os(
+            &intents_of("system { http { } }"),
+            &intents_of("system { http { }\nweb { session-timeout 60 } }"),
+        );
+        assert_eq!(
+            changes.web.as_ref().unwrap().effective_session_timeout(),
+            60
+        );
+        assert!(changes
+            .describe()
+            .iter()
+            .any(|line| line.contains("session timeout 60 min")));
     }
 
     /// Identity: RFC-1123 names, canonicalized resolvers capped at
