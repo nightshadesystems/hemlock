@@ -111,6 +111,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/ntp", get(ntp))
         .route("/api/ntp/edit", post(ntp_edit))
         .route("/api/system", get(system))
+        .route("/api/system/identity", get(system_identity))
+        .route("/api/system/identity/edit", post(system_identity_edit))
         .route("/api/users", get(users))
         .route("/api/users/add", post(users_add))
         .route("/api/config", get(config))
@@ -578,6 +580,77 @@ async fn vlans_edit(
 ) -> Result<Response, ApiError> {
     commit_edit(&state, "web console", |tree| {
         crate::edit::apply_vlan_edit(tree, &edit)
+    })
+    .await
+}
+
+// ------------------------------------------------------- system suite
+
+/// `GET /api/system/identity` — the configured identity plus the two
+/// things the General page cannot derive on its own: the zone names to
+/// offer, and what the OS currently answers (so a pending-but-applied
+/// difference is visible).
+async fn system_identity(
+    _op: Operator,
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let text = running_config(&state.mgmtd).await?;
+    let tree =
+        hemlock_config::parse(&text).map_err(|e| anyhow::anyhow!("parsing running config: {e}"))?;
+    let system = tree.block("system").map(|(_, items)| items).unwrap_or(&[]);
+    let leaf = |name: &str| ConfigTree::leaf_value(system, name).map(str::to_string);
+    let name_servers: Vec<String> = system
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "name-server" => {
+                values.first().cloned()
+            }
+            _ => None,
+        })
+        .collect();
+    let banner = ConfigTree::phrase_values(system, "banner", "login")
+        .and_then(|values| values.first().cloned());
+
+    Ok(Json(json!({
+        "hostname": leaf("hostname"),
+        "timezone": leaf("timezone"),
+        "domain_name": leaf("domain-name"),
+        "name_servers": name_servers,
+        "banner_login": banner,
+        // What the box actually answers right now.
+        "os_hostname": crate::hostname(),
+        "os_timezone": os_timezone(),
+        // The searchable picker offers exactly the installed database.
+        "timezones": hemlock_common::tz::names(),
+    })))
+}
+
+/// The time zone the OS is running in, from the `/etc/localtime`
+/// symlink systemd maintains. Empty when it cannot be read.
+fn os_timezone() -> String {
+    if let Ok(text) = std::fs::read_to_string("/etc/timezone") {
+        let text = text.trim();
+        if !text.is_empty() {
+            return text.to_string();
+        }
+    }
+    let Ok(target) = std::fs::read_link("/etc/localtime") else {
+        return String::new();
+    };
+    let target = target.to_string_lossy().replace('\\', "/");
+    match target.split_once("/zoneinfo/") {
+        Some((_, zone)) => zone.to_string(),
+        None => String::new(),
+    }
+}
+
+async fn system_identity_edit(
+    _op: Operator,
+    State(state): State<SharedState>,
+    Json(edit): Json<crate::system_edit::IdentityEdit>,
+) -> Result<Response, ApiError> {
+    commit_edit(&state, "web console", |tree| {
+        crate::system_edit::apply_identity_edit(tree, &edit)
     })
     .await
 }

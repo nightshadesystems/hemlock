@@ -889,6 +889,7 @@ dependencies = [
  "hyper-util",
  "prost",
  "protoc-bin-vendored",
+ "sha-crypt",
  "tempfile",
  "thiserror",
  "tokio",
@@ -898,6 +899,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "yescrypt",
 ]
 
 [[package]]

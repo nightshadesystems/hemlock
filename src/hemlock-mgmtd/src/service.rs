@@ -19,6 +19,7 @@ pub struct Engine {
     syncd: IpcEndpoint,
     orch: IpcEndpoint,
     os: OsApplier,
+    identity: crate::identityapply::IdentityApplier,
     frr: crate::frrapply::FrrApplier,
     snmp: crate::snmpapply::SnmpApplier,
     dnsmasq: crate::dnsmasqapply::DnsmasqApplier,
@@ -41,6 +42,7 @@ impl Engine {
             syncd,
             orch,
             os,
+            identity: crate::identityapply::IdentityApplier::new(),
             frr: crate::frrapply::FrrApplier::new(),
             snmp: crate::snmpapply::SnmpApplier::new(),
             dnsmasq: crate::dnsmasqapply::DnsmasqApplier::new(),
@@ -736,6 +738,13 @@ impl Engine {
         // the box unreachable until a replay. Fallible first, then the
         // infallible OS pass, then persist.
         self.os.apply(&os_changes);
+
+        // Identity (hostname, timezone, resolver, login banner) rides
+        // the same infallible pass; the OS applier moved the addresses
+        // it may need first.
+        if let Some(identity) = &os_changes.identity {
+            self.identity.apply(identity);
+        }
 
         // FRR rides behind the OS pass (VRRP macvlans must exist before
         // the reload); render-diff gated so unrelated commits leave FRR
@@ -1873,6 +1882,10 @@ impl Engine {
     pub fn replay_os(&self) -> Result<()> {
         let running = Self::parse_intents(&self.store.running()?)?;
         self.os.replay(&running);
+        // Declarative: an absent identity leaf means the default, so
+        // the replay always runs (a hostname the config no longer sets
+        // must go back to `hemlock`).
+        self.identity.apply(&running.identity);
         self.frr.apply(&running);
         self.snmp.apply(&running);
         self.dnsmasq.apply(&running);

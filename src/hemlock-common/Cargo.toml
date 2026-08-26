@@ -20,6 +20,12 @@ prost = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
 
+# Login-user password hashing (`system { login { user ... } }`): the
+# config stores SHA-512-crypt strings, and both front-ends verify the
+# yescrypt hashes Debian trixie writes into /etc/shadow. Both pure Rust.
+sha-crypt = { version = "0.6", features = ["getrandom"] }
+yescrypt = "0.1"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

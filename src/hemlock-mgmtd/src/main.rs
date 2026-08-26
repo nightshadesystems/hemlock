@@ -10,6 +10,7 @@
 
 mod dnsmasqapply;
 mod frrapply;
+mod identityapply;
 mod intents;
 mod osapply;
 mod service;

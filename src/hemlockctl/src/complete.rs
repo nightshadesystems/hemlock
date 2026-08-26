@@ -34,6 +34,8 @@ pub struct State {
     /// DHCP pool and SNMP community names, cached the same way.
     pub pools: Vec<String>,
     pub communities: Vec<String>,
+    /// Installed tzdata zone names, read once at startup.
+    pub timezones: Vec<String>,
 }
 
 pub struct CliHelper {
@@ -68,6 +70,12 @@ const POOL: &str = "\0pool";
 /// Sentinel meaning "an SNMP community name goes here".
 const COMMUNITY: &str = "\0community";
 
+/// Sentinel meaning "a time-zone name goes here". Offers the installed
+/// tzdata (read once at startup — the database does not change under a
+/// running switch), and accepts any token so a name the box does not
+/// carry still reaches the prompt-time rejection with its own message.
+const TZ: &str = "\0tz";
+
 /// The candidate-tree names each name-shaped sentinel offers. Grouped
 /// so the completion entry points keep one argument rather than one per
 /// family.
@@ -77,6 +85,7 @@ pub struct Names {
     pub wreds: Vec<String>,
     pub pools: Vec<String>,
     pub communities: Vec<String>,
+    pub timezones: Vec<String>,
 }
 
 /// The `show interfaces` subcommand words (the interface argument is
@@ -434,7 +443,19 @@ fn next_words(mode: CliMode, path: &[&str]) -> &'static [&'static str] {
         (CliMode::Config, ["set" | "delete", "vlans", "vlan"]) => &[NUM],
         (CliMode::Config, ["set" | "delete", "vlans", "vlan", NUM]) => &["description", "state"],
         (CliMode::Config, ["set", "vlans", "vlan", NUM, "state"]) => &["active", "suspend"],
-        (CliMode::Config, ["set" | "delete", "system"]) => &["ssh", "http", "https"],
+        (CliMode::Config, ["set" | "delete", "system"]) => &[
+            "hostname",
+            "timezone",
+            "name-server",
+            "domain-name",
+            "banner",
+            "ssh",
+            "http",
+            "https",
+        ],
+        (CliMode::Config, ["set" | "delete", "system", "banner"]) => &["login"],
+        (CliMode::Config, ["set" | "delete", "system", "timezone"]) => &[TZ],
+        (CliMode::Config, ["set" | "delete", "system", "name-server"]) => &[ANY],
         (CliMode::Config, ["set" | "delete", "system", "ssh"]) => &["authentication"],
         (CliMode::Config, ["set", "system", "ssh", "authentication"]) => &["local"],
         (CliMode::Config, ["set" | "delete", "routing"]) => {
@@ -821,6 +842,8 @@ fn expand(
         } else if level.contains(&COMMUNITY) && !token.is_empty() {
             resolve_word(token, level.iter().copied().filter(|w| *w != COMMUNITY))
                 .or(Some(COMMUNITY))
+        } else if level.contains(&TZ) && !token.is_empty() {
+            Some(TZ)
         } else if level.contains(&ANY) && !token.is_empty() {
             Some(ANY)
         } else {
@@ -848,6 +871,8 @@ fn expand(
                 names.pools.to_vec()
             } else if *w == COMMUNITY {
                 names.communities.to_vec()
+            } else if *w == TZ {
+                names.timezones.to_vec()
             } else if *w == NUM || *w == ANY {
                 Vec::new() // free-form value; nothing to offer
             } else {
@@ -888,6 +913,7 @@ impl Completer for CliHelper {
                 wreds: state.wreds.clone(),
                 pools: state.pools.clone(),
                 communities: state.communities.clone(),
+                timezones: state.timezones.clone(),
             },
         )
         .into_iter()
@@ -1325,11 +1351,30 @@ mod tests {
         let c = candidates(CliMode::Config, &["set", "system"], "", &ports());
         assert_eq!(
             c,
-            vec!["ssh".to_string(), "http".to_string(), "https".to_string()]
+            vec![
+                "hostname".to_string(),
+                "timezone".to_string(),
+                "name-server".to_string(),
+                "domain-name".to_string(),
+                "banner".to_string(),
+                "ssh".to_string(),
+                "http".to_string(),
+                "https".to_string()
+            ]
         );
         // A shared prefix narrows to the web services.
         let c = candidates(CliMode::Config, &["set", "system"], "ht", &ports());
         assert_eq!(c, vec!["http".to_string(), "https".to_string()]);
+        // `h` alone spans hostname and both web listeners.
+        let c = candidates(CliMode::Config, &["set", "system"], "h", &ports());
+        assert_eq!(
+            c,
+            vec![
+                "hostname".to_string(),
+                "http".to_string(),
+                "https".to_string()
+            ]
+        );
         let c = candidates(CliMode::Config, &["set", "system", "ssh"], "", &ports());
         assert_eq!(c, vec!["authentication".to_string()]);
         let c = candidates(
@@ -1347,6 +1392,50 @@ mod tests {
             &ports(),
         );
         assert!(c.is_empty());
+    }
+
+    /// The identity leaves: `banner` takes exactly `login`, and the
+    /// time zone completes from the installed database cache.
+    #[test]
+    fn system_identity_paths_complete() {
+        let c = candidates(CliMode::Config, &["set", "system", "banner"], "", &ports());
+        assert_eq!(c, vec!["login".to_string()]);
+        // Free text below `banner login`: nothing to offer.
+        assert!(candidates(
+            CliMode::Config,
+            &["set", "system", "banner", "login"],
+            "",
+            &ports()
+        )
+        .is_empty());
+
+        let names = Names {
+            timezones: vec![
+                "America/Detroit".to_string(),
+                "America/Denver".to_string(),
+                "Europe/Berlin".to_string(),
+            ],
+            ..Names::default()
+        };
+        let c = candidates_with_names(
+            CliMode::Config,
+            &["set", "system", "timezone"],
+            "America/De",
+            &ports(),
+            &names,
+        );
+        assert_eq!(
+            c,
+            vec!["America/Detroit".to_string(), "America/Denver".to_string()]
+        );
+        // A resolver address is free text.
+        assert!(candidates(
+            CliMode::Config,
+            &["set", "system", "name-server"],
+            "",
+            &ports()
+        )
+        .is_empty());
     }
 
     #[test]

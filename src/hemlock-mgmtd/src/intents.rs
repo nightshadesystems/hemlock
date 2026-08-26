@@ -23,6 +23,9 @@ pub struct Intents {
     pub ports: BTreeMap<String, InterfaceIntent>,
     /// Management (OS netdev) interfaces, keyed by interface name.
     pub management: BTreeMap<String, MgmtIntent>,
+    /// System identity (`system { hostname | timezone | name-server |
+    /// domain-name | banner login }`), rendered into the OS.
+    pub identity: IdentityIntent,
     pub ssh: SshIntent,
     /// Web console listeners (`system { http }` / `system { https }`).
     pub web: WebIntent,
@@ -983,6 +986,77 @@ pub struct MgmtIntent {
     pub mtu: Option<u32>,
 }
 
+/// The hostname a switch carries with nothing configured — what the
+/// image sets and what the CLI prompt shows out of the box.
+pub const DEFAULT_HOSTNAME: &str = "hemlock";
+
+/// The time zone a switch runs in with nothing configured. UTC keeps
+/// every log line comparable across a fleet until someone says
+/// otherwise.
+pub const DEFAULT_TIMEZONE: &str = "UTC";
+
+/// The most resolvers `systemd-resolved` is given. It walks the list in
+/// order, so a longer one only slows a lookup that is already failing.
+pub const MAX_NAME_SERVERS: usize = 3;
+
+/// System identity: what the box calls itself, what clock it keeps,
+/// who resolves its names, and what it says before a login.
+///
+/// The hostname reaches the CLI prompt and the MOTD for free — both
+/// already read the OS hostname at render time, so the identity
+/// applier setting it is the whole of that plumbing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentityIntent {
+    /// `hostname <name>`; None = the image default.
+    pub hostname: Option<String>,
+    /// `timezone <tz>`; None = UTC.
+    pub timezone: Option<String>,
+    /// `name-server <ip>` in config order, at most [`MAX_NAME_SERVERS`].
+    pub name_servers: Vec<String>,
+    /// `domain-name <name>`: the resolver's search domain and the
+    /// second field of the `/etc/hosts` line.
+    pub domain_name: Option<String>,
+    /// `banner login "<text>"`: `/etc/issue.net` plus sshd's `Banner`.
+    pub banner_login: Option<String>,
+}
+
+impl IdentityIntent {
+    /// The hostname the OS should carry.
+    pub fn effective_hostname(&self) -> &str {
+        self.hostname.as_deref().unwrap_or(DEFAULT_HOSTNAME)
+    }
+
+    /// The time zone the OS should keep.
+    pub fn effective_timezone(&self) -> &str {
+        self.timezone.as_deref().unwrap_or(DEFAULT_TIMEZONE)
+    }
+
+    /// The fully-qualified name, when a domain is configured.
+    pub fn fqdn(&self) -> Option<String> {
+        self.domain_name
+            .as_ref()
+            .map(|domain| format!("{}.{domain}", self.effective_hostname()))
+    }
+}
+
+/// One RFC-1123 label: letters, digits and hyphens, not starting or
+/// ending with a hyphen, at most 63 characters.
+pub fn valid_hostname_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// A dotted domain name: every label RFC-1123, at most 253 characters
+/// overall. A single trailing dot is accepted and kept out of the
+/// label check.
+pub fn valid_domain_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(valid_hostname_label)
+}
+
 /// `system { ssh { ... } }` â€” SSH is on exactly when the block exists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SshIntent {
@@ -1035,6 +1109,12 @@ pub enum IntentError {
 
     #[error("vlan {id}: {reason}")]
     BadVlan { id: String, reason: String },
+
+    #[error("system: {0}")]
+    BadSystem(String),
+
+    #[error("unknown timezone {0:?}")]
+    UnknownTimezone(String),
 
     #[error("system ssh: {0}")]
     BadSsh(String),
@@ -1195,6 +1275,7 @@ pub fn extract(tree: &ConfigTree) -> Result<Intents, IntentError> {
         vlans: vlans(tree)?,
         ..Intents::default()
     };
+    system(tree, &mut intents)?;
     routing(tree, &mut intents)?;
     protocols(tree, &mut intents)?;
     switching(tree, &mut intents)?;
@@ -3525,6 +3606,99 @@ fn vlans(tree: &ConfigTree) -> Result<BTreeMap<u16, VlanIntent>, IntentError> {
     Ok(out)
 }
 
+/// The `system { ... }` block's own families: identity today, with the
+/// service sub-blocks (`ssh`, `http`, `https`) still parsed by their own
+/// extractors. Statements this function does not recognize are rejected
+/// by name, the same as every other family's block.
+fn system(tree: &ConfigTree, intents: &mut Intents) -> Result<(), IntentError> {
+    let Some((_, items)) = tree.block("system") else {
+        return Ok(());
+    };
+    let bad = IntentError::BadSystem;
+    let mut identity = IdentityIntent::default();
+    for item in items {
+        match item {
+            Item::Block { name, keys, .. } => {
+                if !keys.is_empty() {
+                    return Err(bad(format!("unrecognized block {name:?}")));
+                }
+                match name.as_str() {
+                    // Parsed by their own extractors; named here so an
+                    // unknown block is still rejected.
+                    "ssh" | "http" | "https" => {}
+                    other => return Err(bad(format!("unrecognized block {other:?}"))),
+                }
+            }
+            Item::Leaf { name, values } => match name.as_str() {
+                "hostname" => {
+                    let [name] = values.as_slice() else {
+                        return Err(bad("expected `hostname <name>`".into()));
+                    };
+                    if !valid_hostname_label(name) {
+                        return Err(bad(format!(
+                            "bad hostname {name:?} (letters, digits and hyphens, max 63)"
+                        )));
+                    }
+                    identity.hostname = Some(name.clone());
+                }
+                "timezone" => {
+                    let [tz] = values.as_slice() else {
+                        return Err(bad("expected `timezone <tz>`".into()));
+                    };
+                    if !hemlock_common::tz::exists(tz) {
+                        return Err(IntentError::UnknownTimezone(tz.clone()));
+                    }
+                    identity.timezone = Some(tz.clone());
+                }
+                "name-server" => {
+                    let [address] = values.as_slice() else {
+                        return Err(bad("expected `name-server <ip>`".into()));
+                    };
+                    let address: std::net::IpAddr = address
+                        .parse()
+                        .map_err(|_| bad(format!("bad name-server {address:?}")))?;
+                    let address = address.to_string();
+                    if !identity.name_servers.contains(&address) {
+                        identity.name_servers.push(address);
+                    }
+                }
+                "domain-name" => {
+                    let [name] = values.as_slice() else {
+                        return Err(bad("expected `domain-name <name>`".into()));
+                    };
+                    if !valid_domain_name(name) {
+                        return Err(bad(format!("bad domain-name {name:?}")));
+                    }
+                    identity.domain_name = Some(name.clone());
+                }
+                "banner" => {
+                    let [kind, text] = values.as_slice() else {
+                        return Err(bad("expected `banner login <text>`".into()));
+                    };
+                    // Deferred by this suite: only the pre-login banner
+                    // exists, so `motd` is named rather than ignored.
+                    if kind == "motd" {
+                        return Err(bad("only `banner login` is supported".into()));
+                    }
+                    if kind != "login" {
+                        return Err(bad(format!("unrecognized banner {kind:?}")));
+                    }
+                    identity.banner_login = Some(text.clone());
+                }
+                other => return Err(bad(format!("unrecognized statement {other:?}"))),
+            },
+        }
+    }
+    if identity.name_servers.len() > MAX_NAME_SERVERS {
+        return Err(bad(format!(
+            "at most {MAX_NAME_SERVERS} name-servers ({} configured)",
+            identity.name_servers.len()
+        )));
+    }
+    intents.identity = identity;
+    Ok(())
+}
+
 fn ssh(tree: &ConfigTree) -> Result<SshIntent, IntentError> {
     let Some((_, system)) = tree.block("system") else {
         return Ok(SshIntent::default());
@@ -5107,6 +5281,8 @@ pub struct OsChanges {
     /// VRRP macvlan creates/deletes (group config changes ride the FRR
     /// render, not this).
     pub vrrp_macvlans: Vec<VrrpMacvlanChange>,
+    /// The full wanted identity, present exactly when it changed.
+    pub identity: Option<IdentityIntent>,
     /// The full wanted SSH state, present exactly when it changed.
     pub ssh: Option<SshIntent>,
     /// The full wanted web console state, present exactly when it changed.
@@ -5123,12 +5299,30 @@ impl OsChanges {
             && self.routes.is_empty()
             && self.arp.is_empty()
             && self.vrrp_macvlans.is_empty()
+            && self.identity.is_none()
             && self.ssh.is_none()
             && self.web.is_none()
             && self.ntp.is_none()
     }
 
     pub fn describe(&self) -> Vec<String> {
+        let identity = self.identity.as_ref().map(|i| {
+            let mut parts = vec![
+                format!("hostname {}", i.effective_hostname()),
+                format!("timezone {}", i.effective_timezone()),
+            ];
+            if let Some(domain) = &i.domain_name {
+                parts.push(format!("domain {domain}"));
+            }
+            if !i.name_servers.is_empty() {
+                parts.push(format!("name-servers {}", i.name_servers.join(", ")));
+            }
+            parts.push(match &i.banner_login {
+                Some(_) => "login banner set".into(),
+                None => "no login banner".into(),
+            });
+            format!("identity: {}", parts.join(", "))
+        });
         let ssh = self.ssh.as_ref().map(|s| {
             if s.enabled {
                 let auth = if s.auth_local {
@@ -5162,6 +5356,7 @@ impl OsChanges {
             .chain(self.routes.iter().map(RouteChange::describe))
             .chain(self.arp.iter().map(ArpChange::describe))
             .chain(self.vrrp_macvlans.iter().map(VrrpMacvlanChange::describe))
+            .chain(identity)
             .chain(ssh)
             .chain(web)
             .chain(ntp)
@@ -5373,6 +5568,9 @@ pub fn diff_os(running: &Intents, candidate: &Intents) -> OsChanges {
         }
     }
 
+    if running.identity != candidate.identity {
+        changes.identity = Some(candidate.identity.clone());
+    }
     if running.ssh != candidate.ssh {
         changes.ssh = Some(candidate.ssh.clone());
     }
@@ -7486,6 +7684,158 @@ switching {
             extract(&tree),
             Err(IntentError::BadStormControl { .. })
         ));
+    }
+
+    /// The system suite's identity block, round-tripped through the
+    /// serializer and re-extracted.
+    #[test]
+    fn identity_seed_round_trips_and_extracts() {
+        let text = r#"
+system {
+    hostname hemlock-a1;
+    timezone America/Detroit;
+    name-server 10.42.0.5;
+    name-server 10.42.0.6;
+    domain-name nightshade.systems;
+    banner login "Authorized access only. All activity is logged.";
+}
+"#;
+        let tree = parse(text).unwrap();
+        assert_eq!(parse(&tree.to_text()).unwrap(), tree);
+        let identity = extract(&tree).unwrap().identity;
+        assert_eq!(identity.hostname.as_deref(), Some("hemlock-a1"));
+        assert_eq!(identity.timezone.as_deref(), Some("America/Detroit"));
+        assert_eq!(identity.name_servers, ["10.42.0.5", "10.42.0.6"]);
+        assert_eq!(identity.domain_name.as_deref(), Some("nightshade.systems"));
+        assert_eq!(
+            identity.banner_login.as_deref(),
+            Some("Authorized access only. All activity is logged.")
+        );
+    }
+
+    /// Identity: RFC-1123 names, canonicalized resolvers capped at
+    /// three, the tzdata check, and every rejection in the spec.
+    #[test]
+    fn identity_validation() {
+        // Hostnames are single RFC-1123 labels.
+        assert!(intents_of("system { hostname sw-1 }")
+            .identity
+            .hostname
+            .is_some());
+        for bad in ["-lead", "trail-", "has.dot", "under_score", ""] {
+            let text = format!("system {{ hostname \"{bad}\" }}");
+            assert!(
+                matches!(
+                    extract(&parse(&text).unwrap()).unwrap_err(),
+                    IntentError::BadSystem(_)
+                ),
+                "accepted hostname {bad:?}"
+            );
+        }
+        let long = "a".repeat(64);
+        assert!(matches!(
+            extract(&parse(&format!("system {{ hostname {long} }}")).unwrap()).unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+
+        // Domain names are dotted labels.
+        assert!(intents_of("system { domain-name a.b.example }")
+            .identity
+            .domain_name
+            .is_some());
+        assert!(matches!(
+            extract(&parse("system { domain-name \"bad..name\" }").unwrap()).unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+
+        // Resolvers canonicalize, deduplicate and cap at three.
+        let identity = intents_of(
+            "system { name-server 10.42.0.5\nname-server 2001:0db8:0000::1\nname-server 10.42.0.5 }",
+        )
+        .identity;
+        assert_eq!(identity.name_servers, ["10.42.0.5", "2001:db8::1"]);
+        assert!(matches!(
+            extract(
+                &parse(
+                    "system { name-server 10.0.0.1\nname-server 10.0.0.2\nname-server 10.0.0.3\nname-server 10.0.0.4 }"
+                )
+                .unwrap()
+            )
+            .unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+        assert!(matches!(
+            extract(&parse("system { name-server not-an-ip }").unwrap()).unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+
+        // The banner has exactly one spelling.
+        assert!(matches!(
+            extract(&parse("system { banner motd \"hi\" }").unwrap()).unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+        assert!(matches!(
+            extract(&parse("system { banner login }").unwrap()).unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+
+        // Unknown statements and blocks under `system` are named, not
+        // silently ignored.
+        assert!(matches!(
+            extract(&parse("system { nonsense 1 }").unwrap()).unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+        assert!(matches!(
+            extract(&parse("system { radius { } }").unwrap()).unwrap_err(),
+            IntentError::BadSystem(_)
+        ));
+
+        // The tz check runs against the installed database, so the
+        // assertion needs one: a two-zone fixture standing in for
+        // /usr/share/zoneinfo (development hosts have none, and there
+        // every syntactically valid name is accepted on purpose). The
+        // fixture carries the seed's zone so a concurrent test parsing
+        // it still resolves.
+        let zoneinfo = tempfile::tempdir().unwrap();
+        for zone in ["America/Detroit", "Europe/Berlin"] {
+            let path = zoneinfo.path().join(zone);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "TZif").unwrap();
+        }
+        std::env::set_var("HEMLOCK_ZONEINFO_DIR", zoneinfo.path());
+        let accepted = extract(&parse("system { timezone America/Detroit }").unwrap());
+        let rejected = extract(&parse("system { timezone \"America/Marquette\" }").unwrap());
+        std::env::remove_var("HEMLOCK_ZONEINFO_DIR");
+        assert_eq!(
+            accepted.unwrap().identity.timezone.as_deref(),
+            Some("America/Detroit")
+        );
+        assert_eq!(
+            rejected.unwrap_err().to_string(),
+            "unknown timezone \"America/Marquette\""
+        );
+    }
+
+    /// Identity is one OS-side family: any leaf moving pushes the whole
+    /// wanted state, and an unrelated commit leaves it alone.
+    #[test]
+    fn identity_diffs_through_the_os_changes() {
+        let before = intents_of("system { hostname sw1 }");
+        let after = intents_of("system { hostname sw2\nname-server 10.0.0.1 }");
+        let changes = diff_os(&before, &after);
+        let identity = changes.identity.as_ref().unwrap();
+        assert_eq!(identity.effective_hostname(), "sw2");
+        assert_eq!(identity.name_servers, ["10.0.0.1"]);
+        assert!(changes
+            .describe()
+            .iter()
+            .any(|line| line.contains("identity: hostname sw2")));
+
+        assert!(diff_os(&after, &after).identity.is_none());
+        // A removed block diffs back to the defaults, not to nothing.
+        let cleared = diff_os(&after, &intents_of("")).identity.unwrap();
+        assert_eq!(cleared.effective_hostname(), "hemlock");
+        assert_eq!(cleared.effective_timezone(), "UTC");
     }
 
     /// LLDP: defaults on, `disable` as the off switch, timers in

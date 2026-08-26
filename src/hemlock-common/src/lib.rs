@@ -7,7 +7,10 @@ pub mod ipc;
 pub mod link;
 pub mod logging;
 pub mod net;
+pub mod passwd;
+pub mod role;
 pub mod systemd;
+pub mod tz;
 
 pub use error::HemlockError;
 

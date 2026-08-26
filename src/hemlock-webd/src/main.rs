@@ -21,6 +21,7 @@ mod routing_edit;
 mod security_edit;
 mod services_edit;
 mod switching_edit;
+mod system_edit;
 mod tls;
 mod users;
 

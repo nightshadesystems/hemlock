@@ -88,6 +88,9 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
         wreds: Vec::new(),
         pools: Vec::new(),
         communities: Vec::new(),
+        // The installed tz database does not change under a running
+        // switch, so it is read once rather than on the refresh sweep.
+        timezones: hemlock_common::tz::names(),
     }));
     let mut rl: rustyline::Editor<CliHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::new()?;
@@ -199,6 +202,7 @@ pub async fn run(endpoints: Endpoints) -> Result<()> {
                         wreds: state.wreds.clone(),
                         pools: state.pools.clone(),
                         communities: state.communities.clone(),
+                        timezones: state.timezones.clone(),
                     },
                 ),
                 Err(_) => (CliMode::Operational, Vec::new(), complete::Names::default()),
@@ -769,6 +773,11 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("  set protocols lacp system-priority <0-65535>");
             println!("  set switching mac-table [aging-time <s> | static <mac> vlan <id> interface <port>|drop]");
             println!("  set switching mirror session <1-4> [source <port> [rx|tx|both] | destination <port>]");
+            println!("  set system hostname <name>                    RFC-1123 label, max 63");
+            println!("  set system timezone <tz>                      tzdata name, e.g. America/Detroit");
+            println!("  set system name-server <ip>                   up to 3 resolvers");
+            println!("  set system domain-name <name>                 resolver search domain");
+            println!("  set system banner login <text>                shown before login (ssh + console)");
             println!("  set system ssh                                enable the SSH server");
             println!("  set system ssh authentication local           password logins (PAM)");
             println!("  set system http                               web console over HTTP");
@@ -840,7 +849,8 @@ async fn config(endpoints: &Endpoints, words: &[&str]) -> Step {
             println!("                            access-group|port-security|dot1x|dhcp-snooping|");
             println!("                            arp-inspection|lldp|sflow|qos ...]");
             println!("  delete vlans vlan <id> [description|state]");
-            println!("  delete system <ssh|http|https> [authentication]");
+            println!("  delete system [hostname|timezone|name-server [<ip>]|domain-name|");
+            println!("                 banner login|ssh [authentication]|http|https]");
             println!("  delete routing [static [<prefix> [<next-hop>]] | arp [<ip>]]");
             println!("  delete protocols [spanning-tree|igmp-snooping|mld-snooping|lacp ...]");
             println!("  delete switching [mac-table|mirror ...]");
@@ -3601,17 +3611,78 @@ fn parse_vlan_list(text: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// `set|delete system <ssh|http|https> ...` — each service is on
-/// exactly when its `system { <name> }` block exists; commit applies it.
-/// SSH additionally takes `authentication local`; enabling https makes
-/// webd generate a self-signed certificate on first start.
+/// The most resolvers the config accepts — checked at the prompt for
+/// immediate feedback; mgmtd re-validates.
+const MAX_NAME_SERVERS: usize = 3;
+
+/// One RFC-1123 label (a hostname, and each dotted piece of a domain
+/// name) — checked at the prompt; mgmtd re-validates.
+fn valid_hostname_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// A dotted domain name, at most 253 characters, one trailing dot ok.
+fn valid_domain_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(valid_hostname_label)
+}
+
+/// The resolver addresses a candidate already carries, in order — the
+/// prompt cap check.
+fn candidate_name_servers(text: &str) -> Vec<String> {
+    let Ok(tree) = hemlock_config::parse(text) else {
+        return Vec::new();
+    };
+    let Some((_, system)) = tree.block("system") else {
+        return Vec::new();
+    };
+    system
+        .iter()
+        .filter_map(|item| match item {
+            hemlock_config::Item::Leaf { name, values } if name == "name-server" => {
+                values.first().cloned()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `set|delete system <hostname|timezone|name-server|domain-name|
+/// banner login|ssh|http|https> ...`.
+///
+/// The identity leaves land straight in `system { ... }`; each service
+/// is on exactly when its `system { <name> }` block exists, and commit
+/// applies it. SSH additionally takes `authentication local`; enabling
+/// https makes webd generate a self-signed certificate on first start.
 async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> Result<(), String> {
     let verb = if delete { "delete" } else { "set" };
-    let usage = move || format!("% Usage: {verb} system <ssh|http|https> [authentication local]");
+    let usage = move || {
+        format!(
+            "% Usage: {verb} system <hostname|timezone|name-server|domain-name|banner login|ssh|http|https> ..."
+        )
+    };
+    const NOUNS: &[&str] = &[
+        "hostname",
+        "timezone",
+        "name-server",
+        "domain-name",
+        "banner",
+        "ssh",
+        "http",
+        "https",
+    ];
     let Some(first) = words.first() else {
         return Err(usage());
     };
-    let service = resolve(first, &["ssh", "http", "https"])?;
+    let noun = resolve(first, NOUNS)?;
+    if !matches!(noun, "ssh" | "http" | "https") {
+        return config_system_identity(endpoints, noun, &words[1..], delete).await;
+    }
+    let service = noun;
     let rest = &words[1..];
 
     if matches!(service, "http" | "https") {
@@ -3654,6 +3725,7 @@ async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> R
         .map_err(fmt_err);
     }
 
+    let usage = move || format!("% Usage: {verb} system ssh [authentication local]");
     match resolve(rest[0], &["authentication"])? {
         "authentication" => {
             if delete {
@@ -3681,6 +3753,151 @@ async fn config_system(endpoints: &Endpoints, words: &[&str], delete: bool) -> R
         _ => unreachable!(),
     }
     .map_err(fmt_err)
+}
+
+/// The identity half of `set|delete system ...`: hostname, timezone,
+/// resolvers, domain and the login banner. Every value is checked here
+/// for immediate feedback; mgmtd re-validates on commit.
+async fn config_system_identity(
+    endpoints: &Endpoints,
+    noun: &str,
+    rest: &[&str],
+    delete: bool,
+) -> Result<(), String> {
+    let verb = if delete { "delete" } else { "set" };
+    match noun {
+        "hostname" | "domain-name" => {
+            let leaf = noun.to_string();
+            if delete {
+                if let Some(extra) = rest.first() {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_system(endpoints, move |system| {
+                    ConfigTree::remove_leaf(system, &leaf);
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(value) = rest.first().filter(|_| rest.len() == 1) else {
+                return Err(format!("% Usage: set system {noun} <name>"));
+            };
+            let ok = if noun == "hostname" {
+                valid_hostname_label(value)
+            } else {
+                valid_domain_name(value)
+            };
+            if !ok {
+                return Err(format!(
+                    "% bad {noun} {value:?} (letters, digits and hyphens, max 63 per label)"
+                ));
+            }
+            let value = (*value).to_string();
+            edit_system(endpoints, move |system| {
+                ConfigTree::set_leaf(system, &leaf, vec![value]);
+            })
+            .await
+        }
+        "timezone" => {
+            if delete {
+                if let Some(extra) = rest.first() {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_system(endpoints, |system| {
+                    ConfigTree::remove_leaf(system, "timezone");
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(tz) = rest.first().filter(|_| rest.len() == 1) else {
+                return Err("% Usage: set system timezone <tz>".into());
+            };
+            if !hemlock_common::tz::exists(tz) {
+                return Err(format!("% unknown timezone {tz:?}"));
+            }
+            let tz = (*tz).to_string();
+            edit_system(endpoints, move |system| {
+                ConfigTree::set_leaf(system, "timezone", vec![tz]);
+            })
+            .await
+        }
+        "name-server" => {
+            if delete {
+                // No address given = drop the whole resolver list.
+                let Some(address) = rest.first() else {
+                    return edit_system(endpoints, |system| {
+                        ConfigTree::remove_leaf(system, "name-server");
+                    })
+                    .await
+                    .map_err(fmt_err);
+                };
+                if rest.len() > 1 {
+                    return Err(format!("% Invalid input: {:?}", rest[1]));
+                }
+                let address = canonical_ip(address)?;
+                return edit_system(endpoints, move |system| {
+                    remove_leaf_matching(system, "name-server", &[&address]);
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let Some(address) = rest.first().filter(|_| rest.len() == 1) else {
+                return Err("% Usage: set system name-server <ip>".into());
+            };
+            let address = canonical_ip(address)?;
+            let text = candidate_text(endpoints).await.map_err(fmt_err)?;
+            let existing = candidate_name_servers(&text);
+            if !existing.iter().any(|s| *s == address) && existing.len() >= MAX_NAME_SERVERS {
+                return Err(format!(
+                    "% at most {MAX_NAME_SERVERS} name-servers ({} configured)",
+                    existing.len()
+                ));
+            }
+            edit_system(endpoints, move |system| {
+                remove_leaf_matching(system, "name-server", &[&address]);
+                push_leaf(system, "name-server", vec![address]);
+            })
+            .await
+        }
+        "banner" => {
+            let Some(kind) = rest.first() else {
+                return Err(format!("% Usage: {verb} system banner login <text>"));
+            };
+            resolve(kind, &["login"])?;
+            if delete {
+                if let Some(extra) = rest.get(1) {
+                    return Err(format!("% Invalid input: {extra:?}"));
+                }
+                return edit_system(endpoints, |system| {
+                    ConfigTree::remove_leaf(system, "banner");
+                })
+                .await
+                .map_err(fmt_err);
+            }
+            let text = rest[1..].join(" ");
+            if text.is_empty() {
+                return Err("% Usage: set system banner login <text>".into());
+            }
+            edit_system(endpoints, move |system| {
+                ConfigTree::set_phrase(system, "banner", "login", vec![text]);
+            })
+            .await
+        }
+        _ => unreachable!(),
+    }
+    .map_err(fmt_err)
+}
+
+/// [`edit_config`] scoped to the `system { ... }` block, pruning the
+/// block when a delete empties it.
+async fn edit_system(
+    endpoints: &Endpoints,
+    edit: impl FnOnce(&mut Vec<hemlock_config::Item>),
+) -> Result<()> {
+    edit_config(endpoints, |tree| {
+        edit(tree.block_mut("system"));
+        remove_block_if_empty(tree, "system");
+    })
+    .await
 }
 
 /// `set routing static <prefix> <next-hop|drop> [distance <1-255>]` and
@@ -6628,6 +6845,39 @@ fn spawn_shell() {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The identity checks that run at the prompt, before the
+    /// candidate round-trip (mgmtd re-validates all of them).
+    #[test]
+    fn identity_values_validate_at_the_prompt() {
+        assert!(valid_hostname_label("hemlock-a1"));
+        assert!(valid_hostname_label("a"));
+        assert!(valid_hostname_label(&"a".repeat(63)));
+        assert!(!valid_hostname_label(&"a".repeat(64)));
+        assert!(!valid_hostname_label("-lead"));
+        assert!(!valid_hostname_label("trail-"));
+        assert!(!valid_hostname_label("has.dot"));
+        assert!(!valid_hostname_label("under_score"));
+        assert!(!valid_hostname_label(""));
+
+        assert!(valid_domain_name("nightshade.systems"));
+        assert!(valid_domain_name("nightshade.systems."));
+        assert!(valid_domain_name("example"));
+        assert!(!valid_domain_name("bad..name"));
+        assert!(!valid_domain_name(""));
+        assert!(!valid_domain_name(".leading"));
+    }
+
+    /// The resolver cap counts what the candidate already carries.
+    #[test]
+    fn name_servers_are_read_back_from_the_candidate() {
+        let text = "system {\n    hostname sw1\n    name-server 10.0.0.1\n    name-server 10.0.0.2\n}\n";
+        assert_eq!(candidate_name_servers(text), ["10.0.0.1", "10.0.0.2"]);
+        assert!(candidate_name_servers("").is_empty());
+        assert!(candidate_name_servers("system { hostname sw1 }").is_empty());
+        // Unparsable text never panics; it simply counts nothing.
+        assert!(candidate_name_servers("system {").is_empty());
+    }
 
     #[test]
     fn acl_names_validate_at_the_prompt() {
