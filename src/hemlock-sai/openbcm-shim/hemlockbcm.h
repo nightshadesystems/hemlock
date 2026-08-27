@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 2
+#define HEMLOCKBCM_ABI_MINOR 3
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -93,6 +93,10 @@ extern "C" {
 #define HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS (-6)
 #define HEMLOCKBCM_ERR_ITEM_NOT_FOUND (-7)
 #define HEMLOCKBCM_ERR_NOT_IMPLEMENTED (-15)
+
+/* Which fields narrow a flush_fdb call; see that slot. */
+#define HEMLOCKBCM_FLUSH_VLAN 0x1u
+#define HEMLOCKBCM_FLUSH_PORT 0x2u
 
 /* Opaque per-switch handle, created by create_switch. */
 struct hemlockbcm_switch;
@@ -282,8 +286,56 @@ struct hemlockbcm_api {
     int (*set_port_tpid)(struct hemlockbcm_switch *sw, uint32_t logical_port,
                          uint16_t tpid);
 
+    /* --- MAC address table (ABI 1.3) --------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: FDB, LAG, STP, mirroring,
+     * Aging time for dynamic entries, in seconds. 0 disables aging.
+     */
+    int (*set_fdb_aging)(struct hemlockbcm_switch *sw, uint32_t secs);
+
+    /*
+     * Install a static entry for (`vlan_id`, `mac`), replacing any
+     * existing entry for that pair. `discard` non-zero installs a black
+     * hole -- frames to or from that MAC are dropped -- and
+     * `logical_port` is then ignored. Otherwise the entry forwards to
+     * `logical_port`.
+     */
+    int (*add_fdb_entry)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                         const uint8_t mac[6], uint32_t logical_port, int discard);
+    int (*remove_fdb_entry)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                            const uint8_t mac[6]);
+
+    /*
+     * Flush *dynamic* entries; static ones survive. `flags` says which of
+     * `vlan_id` and `logical_port` narrow the flush -- neither is
+     * optional-by-sentinel, because logical port 0 is a real port and
+     * VLAN 0 is not obviously invalid either.
+     */
+    int (*flush_fdb)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                     uint32_t logical_port, uint32_t flags);
+
+    /* Hardware source-MAC learning on a port. */
+    int (*set_port_learning)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                             int learn);
+
+    /*
+     * Cap dynamic learning on a port; `limit` < 0 removes the cap. At the
+     * limit the chip stops learning new source MACs on that port, which
+     * is the enforcement the caller asked for.
+     *
+     * The shim should prefer an over-limit action that punts the
+     * offending frame to the CPU rather than dropping it outright, so
+     * that a later ABI minor can add the FDB-notification slot and turn
+     * those punts into port-security violation events. Until that slot
+     * exists there is no notification path at all: enforcement works,
+     * `SaiEvent::LearnLimitViolation` and `SaiEvent::Fdb` never fire on
+     * this backend, and nothing above should be told otherwise.
+     */
+    int (*set_port_learn_limit)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                int limit);
+
+    /*
+     * Everything below is the rest of phase 6: LAG, STP, mirroring,
      * storm control, ACLs/policers/CoPP, sFlow and QoS. Each lands as one
      * slot appended here plus the matching Rust method, with the minor
      * bumped. Until then Rust reports those families unsupported, which

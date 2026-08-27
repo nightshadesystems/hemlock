@@ -31,6 +31,7 @@
 #define STUB_PORTS 4
 #define STUB_VLANS 8
 #define STUB_DEFAULT_VLAN 1
+#define STUB_FDB 8
 
 /*
  * Enough VLAN state to be worth testing against: which VLANs exist, who
@@ -44,11 +45,30 @@ struct stub_vlan {
     int tagged[STUB_PORTS];
 };
 
+/*
+ * One MAC table entry. `is_static` is the distinction a flush turns on:
+ * the ABI's flush drops dynamic entries and leaves static ones, and only
+ * the stub's `hemlockbcm_stub_learn` hook creates dynamic ones, since on
+ * real hardware the chip does that itself.
+ */
+struct stub_fdb {
+    int used;
+    int is_static;
+    uint16_t vlan_id;
+    uint8_t mac[6];
+    uint32_t logical_port;
+    int discard;
+};
+
 struct hemlockbcm_switch {
     struct hemlockbcm_port ports[STUB_PORTS];
     struct stub_vlan vlans[STUB_VLANS];
+    struct stub_fdb fdb[STUB_FDB];
     uint16_t pvid[STUB_PORTS];
     uint16_t tpid[STUB_PORTS];
+    uint32_t fdb_aging;
+    int learning[STUB_PORTS];
+    int learn_limit[STUB_PORTS];
     hemlockbcm_link_cb link_cb;
     void *link_ctx;
     int created;
@@ -102,6 +122,8 @@ static int stub_create_switch(struct hemlockbcm_switch **out,
         sw->vlans[0].tagged[i] = 0;
         sw->pvid[i] = STUB_DEFAULT_VLAN;
         sw->tpid[i] = 0x8100;
+        sw->learning[i] = 1;    /* learning on, like a chip out of reset */
+        sw->learn_limit[i] = -1;
     }
     sw->created = 1;
     *out = sw;
@@ -436,6 +458,210 @@ HEMLOCKBCM_EXPORT uint16_t hemlockbcm_stub_tpid(struct hemlockbcm_switch *sw,
     return port == NULL ? 0 : sw->tpid[port - sw->ports];
 }
 
+/* --- MAC address table (ABI 1.3) ---------------------------------------- */
+
+static struct stub_fdb *find_fdb(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                 const uint8_t mac[6])
+{
+    size_t i;
+    for (i = 0; i < STUB_FDB; i++) {
+        if (sw->fdb[i].used && sw->fdb[i].vlan_id == vlan_id &&
+            memcmp(sw->fdb[i].mac, mac, 6) == 0) {
+            return &sw->fdb[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_set_fdb_aging(struct hemlockbcm_switch *sw, uint32_t secs)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->fdb_aging = secs;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_add_fdb_entry(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                              const uint8_t mac[6], uint32_t logical_port, int discard)
+{
+    struct stub_fdb *entry;
+    size_t i;
+
+    if (sw == NULL || mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* A forwarding entry needs a real port; a black hole does not. */
+    if (!discard && find_port(sw, logical_port) == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    entry = find_fdb(sw, vlan_id, mac);
+    if (entry == NULL) {
+        for (i = 0; i < STUB_FDB; i++) {
+            if (!sw->fdb[i].used) {
+                entry = &sw->fdb[i];
+                break;
+            }
+        }
+    }
+    if (entry == NULL) {
+        return HEMLOCKBCM_ERR_NO_MEMORY;
+    }
+    /* Overwrites in place, which is the ABI's documented "replaces". */
+    entry->used = 1;
+    entry->is_static = 1;
+    entry->vlan_id = vlan_id;
+    memcpy(entry->mac, mac, 6);
+    entry->logical_port = discard ? 0 : logical_port;
+    entry->discard = discard ? 1 : 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_remove_fdb_entry(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                 const uint8_t mac[6])
+{
+    struct stub_fdb *entry;
+
+    if (sw == NULL || mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    entry = find_fdb(sw, vlan_id, mac);
+    if (entry == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    memset(entry, 0, sizeof(*entry));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_flush_fdb(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                          uint32_t logical_port, uint32_t flags)
+{
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_FDB; i++) {
+        struct stub_fdb *entry = &sw->fdb[i];
+
+        if (!entry->used || entry->is_static) {
+            continue;  /* static entries survive a flush */
+        }
+        if ((flags & HEMLOCKBCM_FLUSH_VLAN) && entry->vlan_id != vlan_id) {
+            continue;
+        }
+        if ((flags & HEMLOCKBCM_FLUSH_PORT) && entry->logical_port != logical_port) {
+            continue;
+        }
+        memset(entry, 0, sizeof(*entry));
+    }
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_set_port_learning(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                  int learn)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->learning[port - sw->ports] = learn ? 1 : 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_set_port_learn_limit(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                     int limit)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->learn_limit[port - sw->ports] = limit;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+/* Seed a dynamic (learned) entry, which no ABI call can create -- the
+ * chip learns those itself. The flush tests need some to flush. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_learn(struct hemlockbcm_switch *sw,
+                                            uint16_t vlan_id, const uint8_t mac[6],
+                                            uint32_t logical_port)
+{
+    size_t i;
+
+    if (sw == NULL || mac == NULL) {
+        return -1;
+    }
+    for (i = 0; i < STUB_FDB; i++) {
+        if (!sw->fdb[i].used) {
+            sw->fdb[i].used = 1;
+            sw->fdb[i].is_static = 0;
+            sw->fdb[i].vlan_id = vlan_id;
+            memcpy(sw->fdb[i].mac, mac, 6);
+            sw->fdb[i].logical_port = logical_port;
+            sw->fdb[i].discard = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* -1 = absent, 0 = present and forwarding, 1 = present and discarding. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_fdb_entry(struct hemlockbcm_switch *sw,
+                                                uint16_t vlan_id, const uint8_t mac[6])
+{
+    struct stub_fdb *entry;
+
+    if (sw == NULL || mac == NULL) {
+        return -1;
+    }
+    entry = find_fdb(sw, vlan_id, mac);
+    return entry == NULL ? -1 : entry->discard;
+}
+
+HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_fdb_count(struct hemlockbcm_switch *sw)
+{
+    uint32_t count = 0;
+    size_t i;
+
+    if (sw != NULL) {
+        for (i = 0; i < STUB_FDB; i++) {
+            count += sw->fdb[i].used ? 1u : 0u;
+        }
+    }
+    return count;
+}
+
+HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_fdb_aging(struct hemlockbcm_switch *sw)
+{
+    return sw == NULL ? 0 : sw->fdb_aging;
+}
+
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_learning(struct hemlockbcm_switch *sw,
+                                               uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+    return port == NULL ? -1 : sw->learning[port - sw->ports];
+}
+
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_learn_limit(struct hemlockbcm_switch *sw,
+                                                  uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+    return port == NULL ? -2 : sw->learn_limit[port - sw->ports];
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -459,6 +685,12 @@ static const struct hemlockbcm_api STUB_API = {
     stub_remove_vlan_member,
     stub_set_port_pvid,
     stub_set_port_tpid,
+    stub_set_fdb_aging,
+    stub_add_fdb_entry,
+    stub_remove_fdb_entry,
+    stub_flush_fdb,
+    stub_set_port_learning,
+    stub_set_port_learn_limit,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

@@ -25,7 +25,8 @@
  * NOT COMPILED BY CI. The SDK is not fetchable in CI and the target is
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
- * (include/bcm/{port,link,stat,error,vlan}.h, include/soc/drv.h) — but
+ * (include/bcm/{port,link,stat,error,vlan,l2,stack}.h, include/soc/drv.h)
+ * — but
  * "checked against the header" is not "compiled", so treat the first
  * build as a review step, not a formality.
  */
@@ -43,8 +44,10 @@
 
 #include <bcm/error.h>
 #include <bcm/init.h>
+#include <bcm/l2.h>
 #include <bcm/link.h>
 #include <bcm/port.h>
+#include <bcm/stack.h>
 #include <bcm/stat.h>
 #include <bcm/types.h>
 #include <bcm/vlan.h>
@@ -66,9 +69,16 @@ extern int sh_process_command(int unit, char *cmd);
 
 struct hemlockbcm_switch {
     int unit;
+    /* The local module id, which qualifies every L2 destination. Read
+     * from the SDK on first use and cached; -1 means "not read yet". */
+    int modid;
     hemlockbcm_link_cb link_cb;
     void *link_ctx;
 };
+
+/* An all-zero MAC, for the match structures where the MAC is not part of
+ * the match. bcm_mac_t is an array type, so this cannot be a literal. */
+static const bcm_mac_t hb_zero_mac = { 0, 0, 0, 0, 0, 0 };
 
 /*
  * The SDK's linkscan callback carries no context pointer, so the one
@@ -209,6 +219,7 @@ static int hb_create_switch(struct hemlockbcm_switch **out,
         return HEMLOCKBCM_ERR_NO_MEMORY;
     }
     sw->unit = HB_UNIT;
+    sw->modid = -1;  /* read lazily; calloc would make it a valid modid 0 */
     hb_switch = sw;
 
     /*
@@ -641,6 +652,162 @@ static int hb_set_port_tpid(struct hemlockbcm_switch *sw, uint32_t logical_port,
     return HB_CALL(bcm_port_tpid_set(sw->unit, (bcm_port_t)logical_port, (uint16)tpid));
 }
 
+/* --- MAC address table (ABI 1.3) ---------------------------------------- */
+
+/*
+ * The local module id, which every L2 entry's destination is qualified
+ * by. Constant for the life of the switch on a single-unit board, so it
+ * is read once at first use rather than on every FDB call.
+ */
+static int hb_modid(struct hemlockbcm_switch *sw, int *out)
+{
+    if (sw->modid < 0) {
+        int modid = 0;
+        int status = HB_CALL(bcm_stk_my_modid_get(sw->unit, &modid));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+        sw->modid = modid;
+    }
+    *out = sw->modid;
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_set_fdb_aging(struct hemlockbcm_switch *sw, uint32_t secs)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* The SDK spells "no aging" as 0 too, so this passes straight through. */
+    return HB_CALL(bcm_l2_age_timer_set(sw->unit, (int)secs));
+}
+
+static int hb_add_fdb_entry(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                            const uint8_t mac[6], uint32_t logical_port, int discard)
+{
+    bcm_l2_addr_t entry;
+    int modid = 0;
+    int status;
+
+    if (sw == NULL || mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_modid(sw, &modid);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    /* bcm_l2_addr_t has three dozen fields, most of them meaningless
+     * here; the SDK's own initializer is the only safe way to fill it. */
+    bcm_l2_addr_t_init(&entry, (const uint8 *)mac, (bcm_vlan_t)vlan_id);
+    entry.flags = BCM_L2_STATIC;
+    if (discard) {
+        /* A black hole, not a forwarding entry: drop frames both to and
+         * from this MAC. The port is meaningless and stays as init left
+         * it. */
+        entry.flags |= BCM_L2_DISCARD_SRC | BCM_L2_DISCARD_DST;
+    } else {
+        entry.port = (bcm_port_t)logical_port;
+        entry.modid = modid;
+    }
+    /* bcm_l2_addr_add overwrites an existing entry for the same
+     * (mac, vid), which is the "replaces" the caller documents. */
+    return HB_CALL(bcm_l2_addr_add(sw->unit, &entry));
+}
+
+static int hb_remove_fdb_entry(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                               const uint8_t mac[6])
+{
+    bcm_mac_t address;
+
+    if (sw == NULL || mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sal_memcpy(address, mac, sizeof(address));
+    return HB_CALL(bcm_l2_addr_delete(sw->unit, address, (bcm_vlan_t)vlan_id));
+}
+
+static int hb_flush_fdb(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                        uint32_t logical_port, uint32_t flags)
+{
+    bcm_l2_addr_t match;
+    uint32 replace_flags = BCM_L2_REPLACE_DELETE;
+    int modid = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * One call covers all four scopes. bcm_l2_replace matches on the
+     * fields its MATCH_* flags name and ignores the rest, so "everything"
+     * is simply no MATCH flags at all. Crucially BCM_L2_REPLACE_
+     * MATCH_STATIC is never set, which is what makes static entries
+     * survive a flush -- the caller's documented rule -- in every scope
+     * rather than only in the ones the by_vlan/by_port helpers cover.
+     */
+    bcm_l2_addr_t_init(&match, hb_zero_mac, BCM_VLAN_INVALID);
+    if (flags & HEMLOCKBCM_FLUSH_VLAN) {
+        match.vid = (bcm_vlan_t)vlan_id;
+        replace_flags |= BCM_L2_REPLACE_MATCH_VLAN;
+    }
+    if (flags & HEMLOCKBCM_FLUSH_PORT) {
+        status = hb_modid(sw, &modid);
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+        match.port = (bcm_port_t)logical_port;
+        match.modid = modid;
+        replace_flags |= BCM_L2_REPLACE_MATCH_DEST;
+    }
+    return HB_CALL(bcm_l2_replace(sw->unit, replace_flags, &match, 0, 0, 0));
+}
+
+static int hb_set_port_learning(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                int learn)
+{
+    /*
+     * ARL is the hardware learning itself; FWD lets a frame whose source
+     * is not yet in the table still be forwarded. Dropping FWD along with
+     * ARL would black-hole traffic on a port whose MACs are configured
+     * statically, which is not what "learning off" means, so FWD stays on
+     * either way.
+     */
+    uint32 flags = learn ? (BCM_PORT_LEARN_ARL | BCM_PORT_LEARN_FWD)
+                         : BCM_PORT_LEARN_FWD;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_port_learn_set(sw->unit, (bcm_port_t)logical_port, flags));
+}
+
+static int hb_set_port_learn_limit(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   int limit)
+{
+    bcm_l2_learn_limit_t config;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    bcm_l2_learn_limit_t_init(&config);
+    config.flags = BCM_L2_LEARN_LIMIT_PORT;
+    config.port = (bcm_port_t)logical_port;
+    if (limit < 0) {
+        /* The SDK's own spelling of "no cap". */
+        config.limit = -1;
+        return HB_CALL(bcm_l2_learn_limit_set(sw->unit, &config));
+    }
+    /*
+     * ACTION_CPU rather than ACTION_DROP: the caller raises a
+     * port-security violation event carrying the offending source MAC,
+     * and it can only do that if the chip hands the frame to the CPU.
+     * Learning still stops at the limit either way.
+     */
+    config.flags |= BCM_L2_LEARN_LIMIT_ACTION_CPU;
+    config.limit = limit;
+    return HB_CALL(bcm_l2_learn_limit_set(sw->unit, &config));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -664,6 +831,12 @@ static const struct hemlockbcm_api HB_API = {
     hb_remove_vlan_member,
     hb_set_port_pvid,
     hb_set_port_tpid,
+    hb_set_fdb_aging,
+    hb_add_fdb_entry,
+    hb_remove_fdb_entry,
+    hb_flush_fdb,
+    hb_set_port_learning,
+    hb_set_port_learn_limit,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

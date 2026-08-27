@@ -65,6 +65,12 @@ const ERR_NOT_IMPLEMENTED: i32 = -15;
 const ERR_ITEM_ALREADY_EXISTS: i32 = -6;
 const ERR_ITEM_NOT_FOUND: i32 = -7;
 
+/// `HEMLOCKBCM_FLUSH_VLAN` / `HEMLOCKBCM_FLUSH_PORT`: which of a
+/// `flush_fdb` call's arguments narrow the flush. Flags rather than
+/// sentinel values because logical port 0 is a real port.
+const FLUSH_VLAN: u32 = 0x1;
+const FLUSH_PORT: u32 = 0x2;
+
 #[repr(C)]
 struct Init {
     config_bcm_path: *const std::os::raw::c_char,
@@ -173,6 +179,18 @@ struct Api {
     remove_vlan_member: Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32) -> Status>,
     set_port_pvid: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16) -> Status>,
     set_port_tpid: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16) -> Status>,
+
+    // --- ABI 1.3: MAC address table ----------------------------------
+    set_fdb_aging: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    add_fdb_entry: Option<
+        unsafe extern "C" fn(*mut ShimSwitch, u16, *const u8, u32, std::os::raw::c_int) -> Status,
+    >,
+    remove_fdb_entry: Option<unsafe extern "C" fn(*mut ShimSwitch, u16, *const u8) -> Status>,
+    flush_fdb: Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32, u32) -> Status>,
+    set_port_learning:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
+    set_port_learn_limit:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
 }
 
 impl Api {
@@ -466,6 +484,17 @@ impl OpenBcmBackend {
         Ok(vlan_id)
     }
 
+    /// A VLAN argument the trait spells `Option<Oid>`, where `None`
+    /// means the default VLAN. Resolving it here rather than in each
+    /// caller keeps "which VLAN did they mean" in one place -- and the
+    /// default is asked of the shim, never assumed.
+    fn vlan_id_or_default(&self, vlan: Option<Oid>) -> Result<u16, SaiError> {
+        match vlan {
+            Some(vlan) => Ok(oid_vlan_id(vlan)),
+            None => self.default_vlan(),
+        }
+    }
+
     /// Shared by `add_vlan_member` and `restore_port_default_vlan`,
     /// which differ only in what they do with the status.
     fn vlan_member_add(&self, vlan_id: u16, port: PortId, tagged: bool) -> Result<(), SaiError> {
@@ -723,8 +752,8 @@ impl SaiBackend for OpenBcmBackend {
         Ok(SaiCapabilities {
             lag: false,
             stp: false,
-            fdb_flush: false,
-            fdb_aging: false,
+            fdb_flush: slot!(self, flush_fdb, "flush_fdb").is_ok(),
+            fdb_aging: slot!(self, set_fdb_aging, "set_fdb_aging").is_ok(),
             l2mc: false,
             storm_control: false,
             mirror: raw.mirror_sessions_max > 0,
@@ -736,7 +765,7 @@ impl SaiBackend for OpenBcmBackend {
             acl_ingress: false,
             acl_egress: false,
             acl_entry_policer: false,
-            port_learn_limit: false,
+            port_learn_limit: slot!(self, set_port_learn_limit, "set_port_learn_limit").is_ok(),
             copp: false,
             buffer_bytes_total: raw.buffer_bytes_total,
             qos_map_ingress: false,
@@ -909,25 +938,73 @@ impl SaiBackend for OpenBcmBackend {
         self.set_port_pvid(port, default)
     }
 
-    fn set_fdb_aging(&mut self, _secs: u32) -> Result<(), SaiError> {
-        unimplemented_slot("set_fdb_aging")
+    // --- MAC address table (ABI 1.3) ---------------------------------
+    //
+    // Entries and enforcement only: there is no FDB *notification* slot
+    // in the ABI yet, so `SaiEvent::Fdb` and
+    // `SaiEvent::LearnLimitViolation` never fire on this backend. The
+    // shim asks the chip to punt over-limit frames to the CPU rather
+    // than drop them, which is what a later minor needs in order to turn
+    // them into events -- but the path stops there for now.
+
+    fn set_fdb_aging(&mut self, secs: u32) -> Result<(), SaiError> {
+        let f = slot!(self, set_fdb_aging, "set_fdb_aging")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("set_fdb_aging", unsafe { f(sw, secs) })
     }
 
     fn add_fdb_entry(
         &mut self,
-        _vlan: Option<Oid>,
-        _mac: [u8; 6],
-        _action: FdbAction,
+        vlan: Option<Oid>,
+        mac: [u8; 6],
+        action: FdbAction,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("add_fdb_entry")
+        let f = slot!(self, add_fdb_entry, "add_fdb_entry")?;
+        let vlan_id = self.vlan_id_or_default(vlan)?;
+        let sw = self.switch()?;
+        let (port, discard) = match action {
+            FdbAction::Forward(port) => (port.0 as u32, 0),
+            // The port is meaningless for a black hole, and the shim
+            // ignores it; pass 0 rather than something that looks real.
+            FdbAction::Drop => (0, 1),
+        };
+        // SAFETY: `mac` is a live 6-byte array for the call's duration.
+        check("add_fdb_entry", unsafe {
+            f(sw, vlan_id, mac.as_ptr(), port, discard)
+        })
     }
 
-    fn remove_fdb_entry(&mut self, _vlan: Option<Oid>, _mac: [u8; 6]) -> Result<(), SaiError> {
-        unimplemented_slot("remove_fdb_entry")
+    fn remove_fdb_entry(&mut self, vlan: Option<Oid>, mac: [u8; 6]) -> Result<(), SaiError> {
+        let f = slot!(self, remove_fdb_entry, "remove_fdb_entry")?;
+        let vlan_id = self.vlan_id_or_default(vlan)?;
+        let sw = self.switch()?;
+        // SAFETY: `mac` is a live 6-byte array for the call's duration.
+        check("remove_fdb_entry", unsafe { f(sw, vlan_id, mac.as_ptr()) })
     }
 
-    fn flush_fdb(&mut self, _vlan: Option<Oid>, _port: Option<PortId>) -> Result<(), SaiError> {
-        unimplemented_slot("flush_fdb")
+    fn flush_fdb(&mut self, vlan: Option<Oid>, port: Option<PortId>) -> Result<(), SaiError> {
+        let f = slot!(self, flush_fdb, "flush_fdb")?;
+        // Which fields narrow the flush is carried in flags, not in
+        // sentinel values: logical port 0 is a real port.
+        let mut flags = 0u32;
+        let vlan_id = match vlan {
+            Some(vlan) => {
+                flags |= FLUSH_VLAN;
+                oid_vlan_id(vlan)
+            }
+            None => 0,
+        };
+        let logical_port = match port {
+            Some(port) => {
+                flags |= FLUSH_PORT;
+                port.0 as u32
+            }
+            None => 0,
+        };
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("flush_fdb", unsafe { f(sw, vlan_id, logical_port, flags) })
     }
 
     fn set_port_storm_control(
@@ -1228,12 +1305,29 @@ impl SaiBackend for OpenBcmBackend {
         unimplemented_slot("bind_queue_wred")
     }
 
-    fn set_port_learn_limit(&mut self, _port: PortId, _limit: Option<u32>) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_learn_limit")
+    fn set_port_learn_limit(&mut self, port: PortId, limit: Option<u32>) -> Result<(), SaiError> {
+        let f = slot!(self, set_port_learn_limit, "set_port_learn_limit")?;
+        let sw = self.switch()?;
+        // The ABI spells "no limit" as a negative, matching the SDK. A
+        // limit larger than i32::MAX is not a real configuration, so it
+        // saturates rather than wrapping into "unlimited".
+        let limit = match limit {
+            Some(limit) => limit.min(i32::MAX as u32) as i32,
+            None => -1,
+        };
+        // SAFETY: plain scalars over the ABI.
+        check("set_port_learn_limit", unsafe {
+            f(sw, port.0 as u32, limit)
+        })
     }
 
-    fn set_port_learning(&mut self, _port: PortId, _learn: bool) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_learning")
+    fn set_port_learning(&mut self, port: PortId, learn: bool) -> Result<(), SaiError> {
+        let f = slot!(self, set_port_learning, "set_port_learning")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("set_port_learning", unsafe {
+            f(sw, port.0 as u32, i32::from(learn))
+        })
     }
 }
 
@@ -1416,12 +1510,11 @@ mod tests {
     }
 
     /// Everything phase 6 has not reached yet takes the same path.
-    /// VLANs have left this list; everything else has not.
+    /// VLANs and the FDB have left this list; everything else has not.
     #[test]
     fn phase_six_families_are_unsupported() {
         let mut b = backend();
         assert!(b.create_lag().unwrap_err().is_unsupported());
-        assert!(b.set_fdb_aging(300).unwrap_err().is_unsupported());
         assert!(b.create_stp_instance().unwrap_err().is_unsupported());
         assert!(b.create_samplepacket(1024).unwrap_err().is_unsupported());
         assert!(b.run_cable_diag(PortId(1)).unwrap_err().is_unsupported());
@@ -1446,13 +1539,16 @@ mod tests {
         assert!(caps.ipv6);
         // No mirror sessions reported => the family is off.
         assert!(!caps.mirror && caps.mirror_sessions_max == 0);
-        // ...but the QinQ slot exists in ABI 1.2, so this one is on --
-        // derived from the vtable, not from a hand-maintained list.
-        assert!(caps.port_tpid);
+        // ...but the slots that do exist read as supported -- derived
+        // from the vtable, not from a hand-maintained list.
+        assert!(caps.port_tpid, "QinQ, ABI 1.2");
+        assert!(
+            caps.fdb_flush && caps.fdb_aging && caps.port_learn_limit,
+            "ABI 1.3"
+        );
         for (name, on) in [
             ("lag", caps.lag),
             ("stp", caps.stp),
-            ("fdb_flush", caps.fdb_flush),
             ("l2mc", caps.l2mc),
             ("storm_control", caps.storm_control),
             ("acl_ingress", caps.acl_ingress),
@@ -1549,6 +1645,12 @@ mod tests {
             remove_vlan_member: None,
             set_port_pvid: None,
             set_port_tpid: None,
+            set_fdb_aging: None,
+            add_fdb_entry: None,
+            remove_fdb_entry: None,
+            flush_fdb: None,
+            set_port_learning: None,
+            set_port_learn_limit: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -1632,6 +1734,12 @@ mod tests {
             "remove_vlan_member",
             "set_port_pvid",
             "set_port_tpid",
+            "set_fdb_aging",
+            "add_fdb_entry",
+            "remove_fdb_entry",
+            "flush_fdb",
+            "set_port_learning",
+            "set_port_learn_limit",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -1688,6 +1796,12 @@ mod tests {
             std::mem::offset_of!(Api, remove_vlan_member),
             std::mem::offset_of!(Api, set_port_pvid),
             std::mem::offset_of!(Api, set_port_tpid),
+            std::mem::offset_of!(Api, set_fdb_aging),
+            std::mem::offset_of!(Api, add_fdb_entry),
+            std::mem::offset_of!(Api, remove_fdb_entry),
+            std::mem::offset_of!(Api, flush_fdb),
+            std::mem::offset_of!(Api, set_port_learning),
+            std::mem::offset_of!(Api, set_port_learn_limit),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -1807,5 +1921,173 @@ mod tests {
     fn the_default_vlan_comes_from_the_shim() {
         let b = backend();
         assert_eq!(b.default_vlan().unwrap(), 1);
+    }
+    // --- MAC address table --------------------------------------------
+
+    const MAC_A: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0a];
+    const MAC_B: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0b];
+    const MAC_C: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0c];
+
+    /// -1 = absent, 0 = forwarding, 1 = discarding.
+    fn stub_fdb(b: &OpenBcmBackend, vlan_id: u16, mac: &[u8; 6]) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u16, *const u8) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_fdb_entry\0").unwrap();
+            f(b.switch, vlan_id, mac.as_ptr())
+        }
+    }
+
+    fn stub_fdb_count(b: &OpenBcmBackend) -> u32 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch) -> u32> =
+                b._library.get(b"hemlockbcm_stub_fdb_count\0").unwrap();
+            f(b.switch)
+        }
+    }
+
+    /// Seed a *dynamic* entry. Nothing in the ABI can create one -- the
+    /// chip learns them -- so the flush tests need this hook.
+    fn stub_learn(b: &OpenBcmBackend, vlan_id: u16, mac: &[u8; 6], port: u32) {
+        let rc = unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u16, *const u8, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_learn\0").unwrap();
+            f(b.switch, vlan_id, mac.as_ptr(), port)
+        };
+        assert_eq!(rc, 0, "stub FDB is full");
+    }
+
+    #[test]
+    fn static_fdb_entries_forward_or_black_hole() {
+        let mut b = backend();
+        b.add_fdb_entry(None, MAC_A, FdbAction::Forward(PortId(2)))
+            .unwrap();
+        assert_eq!(stub_fdb(&b, 1, &MAC_A), 0, "forwarding entry");
+
+        // Same (vlan, mac) again replaces rather than duplicating, which
+        // is what the trait documents.
+        b.add_fdb_entry(None, MAC_A, FdbAction::Drop).unwrap();
+        assert_eq!(stub_fdb(&b, 1, &MAC_A), 1, "now a black hole");
+        assert_eq!(stub_fdb_count(&b), 1, "replaced, not duplicated");
+
+        b.remove_fdb_entry(None, MAC_A).unwrap();
+        assert_eq!(stub_fdb(&b, 1, &MAC_A), -1);
+        // Removing what is not there is a plain not-found: nothing about
+        // the FDB is documented idempotent, so nothing is swallowed.
+        assert!(b.remove_fdb_entry(None, MAC_A).is_err());
+    }
+
+    /// `None` means the default VLAN, and the default comes from the
+    /// shim -- so an entry added with `None` lands in VLAN 1 here and
+    /// would follow config.bcm on a board that moved it.
+    #[test]
+    fn a_none_vlan_means_the_default_vlan() {
+        let mut b = backend();
+        let vlan = b.create_vlan(200).unwrap();
+        b.add_fdb_entry(None, MAC_A, FdbAction::Forward(PortId(1)))
+            .unwrap();
+        b.add_fdb_entry(Some(vlan), MAC_A, FdbAction::Forward(PortId(1)))
+            .unwrap();
+        // The same MAC in two VLANs is two entries, not one.
+        assert_eq!(stub_fdb_count(&b), 2);
+        assert_eq!(stub_fdb(&b, 1, &MAC_A), 0);
+        assert_eq!(stub_fdb(&b, 200, &MAC_A), 0);
+    }
+
+    /// Flush drops dynamic entries and leaves static ones, in every
+    /// scope -- that last part is the bit worth pinning, because the
+    /// obvious SDK helpers make it easy to get right for some scopes and
+    /// wrong for others.
+    #[test]
+    fn flush_scopes_drop_dynamic_entries_and_spare_static_ones() {
+        let mut b = backend();
+        let vlan = b.create_vlan(200).unwrap();
+        b.add_fdb_entry(None, MAC_A, FdbAction::Forward(PortId(1)))
+            .unwrap();
+
+        // Everything.
+        stub_learn(&b, 1, &MAC_B, 1);
+        b.flush_fdb(None, None).unwrap();
+        assert_eq!(stub_fdb(&b, 1, &MAC_B), -1, "dynamic entry flushed");
+        assert_eq!(stub_fdb(&b, 1, &MAC_A), 0, "static entry survives");
+
+        // By VLAN: the other VLAN's entry is untouched.
+        stub_learn(&b, 1, &MAC_B, 1);
+        stub_learn(&b, 200, &MAC_B, 1);
+        b.flush_fdb(Some(vlan), None).unwrap();
+        assert_eq!(stub_fdb(&b, 200, &MAC_B), -1);
+        assert_eq!(stub_fdb(&b, 1, &MAC_B), 0, "a different VLAN");
+
+        // By port: the other port's entry is untouched. A third MAC,
+        // deliberately -- reusing MAC_A here would put a dynamic entry
+        // under the same (vlan, mac) key as the static one and make
+        // every assertion below ambiguous.
+        stub_learn(&b, 1, &MAC_C, 2);
+        b.flush_fdb(None, Some(PortId(2))).unwrap();
+        assert_eq!(stub_fdb(&b, 1, &MAC_C), -1, "learned on port 2");
+        assert_eq!(stub_fdb(&b, 1, &MAC_B), 0, "learned on port 1");
+        assert_eq!(stub_fdb_count(&b), 2, "the static entry and MAC_B");
+
+        // By both, which must intersect rather than union.
+        b.flush_fdb(Some(vlan_oid(1)), Some(PortId(2))).unwrap();
+        assert_eq!(stub_fdb(&b, 1, &MAC_B), 0, "wrong port, so it stays");
+    }
+
+    /// Port 0 is a real logical port, so a flush scoped to it must not
+    /// be read as "no port given". This is why the ABI carries flags
+    /// rather than sentinel values.
+    #[test]
+    fn flushing_port_zero_is_not_flushing_everything() {
+        let mut b = backend();
+        stub_learn(&b, 1, &MAC_A, 1);
+        // Port 0 does not exist on the 4-port stub, so nothing matches
+        // it -- and nothing else may be swept up either.
+        b.flush_fdb(None, Some(PortId(0))).unwrap();
+        assert_eq!(stub_fdb(&b, 1, &MAC_A), 0, "learned on port 1, untouched");
+    }
+
+    /// Read one of the stub's per-port integer hooks.
+    fn stub_port_int(b: &OpenBcmBackend, name: &[u8], port: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32) -> std::os::raw::c_int,
+            > = b._library.get(name).unwrap();
+            f(b.switch, port)
+        }
+    }
+
+    fn stub_fdb_aging(b: &OpenBcmBackend) -> u32 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch) -> u32> =
+                b._library.get(b"hemlockbcm_stub_fdb_aging\0").unwrap();
+            f(b.switch)
+        }
+    }
+
+    #[test]
+    fn learning_aging_and_learn_limits_reach_the_shim() {
+        const LEARNING: &[u8] = b"hemlockbcm_stub_learning\0";
+        const LIMIT: &[u8] = b"hemlockbcm_stub_learn_limit\0";
+        let mut b = backend();
+        assert_eq!(stub_port_int(&b, LEARNING, 1), 1, "on by default");
+        assert_eq!(stub_port_int(&b, LIMIT, 1), -1, "uncapped");
+
+        b.set_port_learning(PortId(1), false).unwrap();
+        assert_eq!(stub_port_int(&b, LEARNING, 1), 0);
+        b.set_port_learn_limit(PortId(1), Some(64)).unwrap();
+        assert_eq!(stub_port_int(&b, LIMIT, 1), 64);
+        // None removes the cap, which the ABI spells as a negative.
+        b.set_port_learn_limit(PortId(1), None).unwrap();
+        assert_eq!(stub_port_int(&b, LIMIT, 1), -1);
+        // A limit past i32 saturates rather than wrapping to "unlimited".
+        b.set_port_learn_limit(PortId(1), Some(u32::MAX)).unwrap();
+        assert_eq!(stub_port_int(&b, LIMIT, 1), i32::MAX);
+
+        assert_eq!(stub_fdb_aging(&b), 0);
+        b.set_fdb_aging(300).unwrap();
+        assert_eq!(stub_fdb_aging(&b), 300);
+        b.set_fdb_aging(0).unwrap();
+        assert_eq!(stub_fdb_aging(&b), 0, "0 disables aging");
     }
 }
