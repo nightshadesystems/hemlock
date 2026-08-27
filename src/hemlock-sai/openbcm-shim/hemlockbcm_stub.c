@@ -35,6 +35,7 @@
 #define STUB_LAGS 2
 #define STUB_STGS 2
 #define STUB_MIRRORS 2
+#define STUB_POLICERS 4
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -60,6 +61,15 @@ struct stub_vlan {
     int lag_tagged[STUB_LAGS];
     /* Exactly one spanning-tree group holds a VLAN at any time. */
     uint32_t stg;
+};
+
+/* A single-rate policer. */
+struct stub_policer {
+    int used;
+    uint32_t id;
+    int pps;
+    uint64_t rate;
+    uint64_t burst;
 };
 
 /* A port's KNET netdev. */
@@ -126,6 +136,7 @@ struct hemlockbcm_switch {
     uint32_t storm_kbps[STUB_PORTS][3];
     struct stub_hostif hostifs[STUB_PORTS];
     int punt_ready;
+    struct stub_policer policers[STUB_POLICERS];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -1390,6 +1401,111 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_punt_ready(struct hemlockbcm_switch *sw)
     return sw == NULL ? 0 : sw->punt_ready;
 }
 
+/* --- Policers (ABI 1.9) --------------------------------------------------- */
+
+static struct stub_policer *find_policer(struct hemlockbcm_switch *sw, uint32_t policer)
+{
+    size_t i;
+    for (i = 0; i < STUB_POLICERS; i++) {
+        if (sw->policers[i].used && sw->policers[i].id == policer) {
+            return &sw->policers[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_policer_create(struct hemlockbcm_switch *sw, int pps, uint64_t rate,
+                               uint64_t burst, uint32_t *policer)
+{
+    size_t i;
+
+    if (sw == NULL || policer == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_POLICERS; i++) {
+        if (!sw->policers[i].used) {
+            memset(&sw->policers[i], 0, sizeof(sw->policers[i]));
+            sw->policers[i].used = 1;
+            sw->policers[i].id = (uint32_t)i + 1;
+            sw->policers[i].pps = pps ? 1 : 0;
+            sw->policers[i].rate = rate;
+            sw->policers[i].burst = burst;
+            *policer = sw->policers[i].id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_policer_set(struct hemlockbcm_switch *sw, uint32_t policer, int pps,
+                            uint64_t rate, uint64_t burst)
+{
+    struct stub_policer *entry;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    entry = find_policer(sw, policer);
+    if (entry == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    entry->pps = pps ? 1 : 0;
+    entry->rate = rate;
+    entry->burst = burst;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_policer_destroy(struct hemlockbcm_switch *sw, uint32_t policer)
+{
+    struct stub_policer *entry;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    entry = find_policer(sw, policer);
+    if (entry == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    memset(entry, 0, sizeof(*entry));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_policer_stats(struct hemlockbcm_switch *sw, uint32_t policer,
+                              uint64_t *conforming, uint64_t *dropped)
+{
+    struct stub_policer *entry;
+
+    if (sw == NULL || conforming == NULL || dropped == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    entry = find_policer(sw, policer);
+    if (entry == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* Synthetic but not arbitrary: derived from the configured rate so
+     * that a test can tell one policer's counters from another's. */
+    *conforming = entry->rate;
+    *dropped = entry->burst;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI: the configured rate, or -1 if there is
+ * no such policer. Sign of the rate carries `pps`. */
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_policer_rate(struct hemlockbcm_switch *sw,
+                                                       uint32_t policer)
+{
+    struct stub_policer *entry;
+
+    if (sw == NULL) {
+        return -1;
+    }
+    entry = find_policer(sw, policer);
+    if (entry == NULL) {
+        return -1;
+    }
+    return entry->pps ? -(int64_t)entry->rate : (int64_t)entry->rate;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1440,6 +1556,10 @@ static const struct hemlockbcm_api STUB_API = {
     stub_storm_control_set,
     stub_host_punt_setup,
     stub_hostif_create,
+    stub_policer_create,
+    stub_policer_set,
+    stub_policer_destroy,
+    stub_policer_stats,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

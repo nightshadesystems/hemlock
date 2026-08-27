@@ -26,7 +26,7 @@
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
  * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
- * rate,knet}.h,
+ * rate,knet,policer}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -50,6 +50,7 @@
 #include <bcm/l2.h>
 #include <bcm/link.h>
 #include <bcm/mirror.h>
+#include <bcm/policer.h>
 #include <bcm/port.h>
 #include <bcm/rate.h>
 #include <bcm/stack.h>
@@ -1444,6 +1445,135 @@ static int hb_hostif_create(struct hemlockbcm_switch *sw, uint32_t logical_port,
     return HEMLOCKBCM_OK;
 }
 
+/* --- Policers (ABI 1.9) --------------------------------------------------- */
+
+/*
+ * The SDK carries rates and bursts as thousands plus a 0..999 remainder,
+ * so an exact value needs both halves. Splitting here rather than
+ * rounding to the nearest thousand matters at the small end: a CoPP
+ * class metered at 100 packets/s would otherwise become 0.
+ */
+static void hb_policer_split(uint64_t value, uint32 *thousands, uint32 *remainder)
+{
+    *thousands = (uint32)(value / 1000u);
+    *remainder = (uint32)(value % 1000u);
+}
+
+static void hb_policer_config(bcm_policer_config_t *cfg, int pps, uint64_t rate,
+                              uint64_t burst)
+{
+    bcm_policer_config_t_init(cfg);
+    /*
+     * Committed mode is a single rate with a single bucket, which is
+     * what the caller's spec describes. Colour-blind because nothing
+     * upstream marks packets before they reach the policer, so treating
+     * an arriving packet as anything but green would meter on a colour
+     * no one set.
+     */
+    cfg->mode = bcmPolicerModeCommitted;
+    cfg->flags = BCM_POLICER_COLOR_BLIND;
+    cfg->flags |= pps ? BCM_POLICER_MODE_PACKETS : BCM_POLICER_MODE_BYTES;
+    /* In byte mode the SDK counts bits, and the caller's burst is in
+     * bytes; in packet mode both are packets. */
+    hb_policer_split(rate, &cfg->ckbits_sec, &cfg->cbits_sec_lower);
+    hb_policer_split(pps ? burst : burst * 8u, &cfg->ckbits_burst,
+                     &cfg->cbits_burst_lower);
+}
+
+static int hb_policer_create(struct hemlockbcm_switch *sw, int pps, uint64_t rate,
+                             uint64_t burst, uint32_t *policer)
+{
+    bcm_policer_config_t cfg;
+    bcm_policer_t created = 0;
+    int status;
+
+    if (sw == NULL || policer == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    hb_policer_config(&cfg, pps, rate, burst);
+    status = HB_CALL(bcm_policer_create(sw->unit, &cfg, &created));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    /* Counting is off by default, and the caller can ask for the counts
+     * at any time, so turn it on with the policer rather than lazily. */
+    status = HB_CALL(bcm_policer_stat_enable_set(sw->unit, created, 1));
+    if (status != HEMLOCKBCM_OK) {
+        (void)bcm_policer_destroy(sw->unit, created);
+        return status;
+    }
+    *policer = (uint32_t)created;
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_policer_set(struct hemlockbcm_switch *sw, uint32_t policer, int pps,
+                          uint64_t rate, uint64_t burst)
+{
+    bcm_policer_config_t cfg;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    hb_policer_config(&cfg, pps, rate, burst);
+    return HB_CALL(bcm_policer_set(sw->unit, (bcm_policer_t)policer, &cfg));
+}
+
+static int hb_policer_destroy(struct hemlockbcm_switch *sw, uint32_t policer)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_policer_destroy(sw->unit, (bcm_policer_t)policer));
+}
+
+static int hb_policer_stats(struct hemlockbcm_switch *sw, uint32_t policer,
+                            uint64_t *conforming, uint64_t *dropped)
+{
+    /*
+     * The chip counts colour *transitions*, not conformance, so these
+     * two numbers are a reading of that matrix rather than a lookup.
+     * Colour-blind committed mode admits every packet as green, so:
+     * green-to-green is what conformed, and green-to-red plus
+     * green-to-drop is what did not. Nothing arrives yellow or red, so
+     * the rest of the matrix stays zero and is not summed.
+     *
+     * This mapping is the one thing in this family that no header
+     * states; if a policer ever reports conforming counts while
+     * visibly dropping, this is the place to look.
+     */
+    static const bcm_policer_stat_t drop_stats[] = {
+        bcmPolicerStatGreenToRedPackets,
+        bcmPolicerStatGreenToDropPackets,
+    };
+    uint64 value;
+    uint64_t total = 0;
+    int status;
+    size_t i;
+
+    if (sw == NULL || conforming == NULL || dropped == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    COMPILER_64_ZERO(value);
+    status = HB_CALL(bcm_policer_stat_get(sw->unit, (bcm_policer_t)policer, 0,
+                                          bcmPolicerStatGreenToGreenPackets, &value));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    *conforming = hb_u64(value);
+
+    for (i = 0; i < sizeof(drop_stats) / sizeof(drop_stats[0]); i++) {
+        COMPILER_64_ZERO(value);
+        status = HB_CALL(bcm_policer_stat_get(sw->unit, (bcm_policer_t)policer, 0,
+                                              drop_stats[i], &value));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+        total += hb_u64(value);
+    }
+    *dropped = total;
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1494,6 +1624,10 @@ static const struct hemlockbcm_api HB_API = {
     hb_storm_control_set,
     hb_host_punt_setup,
     hb_hostif_create,
+    hb_policer_create,
+    hb_policer_set,
+    hb_policer_destroy,
+    hb_policer_stats,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

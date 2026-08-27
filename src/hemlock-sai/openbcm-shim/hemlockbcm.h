@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 8
+#define HEMLOCKBCM_ABI_MINOR 9
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -516,8 +516,37 @@ struct hemlockbcm_api {
     int (*hostif_create)(struct hemlockbcm_switch *sw, uint32_t logical_port,
                          const char *name, uint32_t *hostif);
 
+    /* --- Policers (ABI 1.9) ------------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: ACLs/policers/CoPP,
+     * A single-rate policer: one rate, one burst, everything over it
+     * dropped. `pps` selects packets or bits per second; `rate` and
+     * `burst` are then packets/packets or bits/bytes respectively,
+     * matching what the caller was given rather than what the SDK's
+     * fields are named.
+     *
+     * Conversion to the SDK's kilo-denominated fields happens in the
+     * shim, which is where the exactness matters: it splits each value
+     * into thousands plus a remainder so nothing is rounded away.
+     */
+    int (*policer_create)(struct hemlockbcm_switch *sw, int pps, uint64_t rate,
+                          uint64_t burst, uint32_t *policer);
+    int (*policer_set)(struct hemlockbcm_switch *sw, uint32_t policer, int pps,
+                       uint64_t rate, uint64_t burst);
+    int (*policer_destroy)(struct hemlockbcm_switch *sw, uint32_t policer);
+
+    /*
+     * Conforming and dropped packet counts. Both are read from the
+     * chip's colour-transition counters, and the mapping from those to
+     * "conforming" and "dropped" is the shim's -- see the comment there,
+     * because it is the one part of this family that the header cannot
+     * make self-evident.
+     */
+    int (*policer_stats)(struct hemlockbcm_switch *sw, uint32_t policer,
+                         uint64_t *conforming, uint64_t *dropped);
+
+    /*
+     * Everything below is the rest of phase 6: ACLs, CoPP traps,
      * sFlow and QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which

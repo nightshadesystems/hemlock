@@ -248,6 +248,15 @@ struct Api {
     hostif_create: Option<
         unsafe extern "C" fn(*mut ShimSwitch, u32, *const std::os::raw::c_char, *mut u32) -> Status,
     >,
+
+    // --- ABI 1.9: policers -------------------------------------------
+    policer_create: Option<
+        unsafe extern "C" fn(*mut ShimSwitch, std::os::raw::c_int, u64, u64, *mut u32) -> Status,
+    >,
+    policer_set:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int, u64, u64) -> Status>,
+    policer_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    policer_stats: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut u64, *mut u64) -> Status>,
 }
 
 impl Api {
@@ -337,6 +346,15 @@ fn oid_lag_member(oid: Oid) -> (u32, PortId) {
 const OID_TAG_STP: u64 = 0x05;
 const OID_TAG_MIRROR: u64 = 0x06;
 const OID_TAG_HOSTIF: u64 = 0x07;
+const OID_TAG_POLICER: u64 = 0x08;
+
+fn policer_oid(policer: u32) -> Oid {
+    Oid((OID_TAG_POLICER << 56) | u64::from(policer))
+}
+
+fn oid_policer(oid: Oid) -> u32 {
+    oid.0 as u32
+}
 
 fn hostif_oid(hostif: u32) -> Oid {
     Oid((OID_TAG_HOSTIF << 56) | u64::from(hostif))
@@ -1570,20 +1588,54 @@ impl SaiBackend for OpenBcmBackend {
         unimplemented_slot("acl_available_entries")
     }
 
-    fn create_policer(&mut self, _spec: PolicerSpec) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_policer")
+    // --- Policers (ABI 1.9) -------------------------------------------
+
+    fn create_policer(&mut self, spec: PolicerSpec) -> Result<Oid, SaiError> {
+        let f = slot!(self, policer_create, "policer_create")?;
+        let sw = self.switch()?;
+        let mut policer: u32 = 0;
+        // SAFETY: `policer` is a live u32 the shim writes only on OK.
+        check("policer_create", unsafe {
+            f(sw, i32::from(spec.pps), spec.rate, spec.burst, &mut policer)
+        })?;
+        Ok(policer_oid(policer))
     }
 
-    fn set_policer(&mut self, _policer: Oid, _spec: PolicerSpec) -> Result<(), SaiError> {
-        unimplemented_slot("set_policer")
+    fn set_policer(&mut self, policer: Oid, spec: PolicerSpec) -> Result<(), SaiError> {
+        let f = slot!(self, policer_set, "policer_set")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("policer_set", unsafe {
+            f(
+                sw,
+                oid_policer(policer),
+                i32::from(spec.pps),
+                spec.rate,
+                spec.burst,
+            )
+        })
     }
 
-    fn remove_policer(&mut self, _policer: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_policer")
+    fn remove_policer(&mut self, policer: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, policer_destroy, "policer_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("policer_destroy", unsafe { f(sw, oid_policer(policer)) })
     }
 
-    fn policer_stats(&mut self, _policer: Oid) -> Result<PolicerStats, SaiError> {
-        unimplemented_slot("policer_stats")
+    fn policer_stats(&mut self, policer: Oid) -> Result<PolicerStats, SaiError> {
+        let f = slot!(self, policer_stats, "policer_stats")?;
+        let sw = self.switch()?;
+        let mut conforming: u64 = 0;
+        let mut dropped: u64 = 0;
+        // SAFETY: both out params are live u64s, written only on OK.
+        check("policer_stats", unsafe {
+            f(sw, oid_policer(policer), &mut conforming, &mut dropped)
+        })?;
+        Ok(PolicerStats {
+            conforming,
+            dropped,
+        })
     }
 
     fn create_hostif_trap_group(&mut self, _policer: Option<Oid>) -> Result<Oid, SaiError> {
@@ -2050,6 +2102,10 @@ mod tests {
             storm_control_set: None,
             host_punt_setup: None,
             hostif_create: None,
+            policer_create: None,
+            policer_set: None,
+            policer_destroy: None,
+            policer_stats: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2160,6 +2216,10 @@ mod tests {
             "storm_control_set",
             "host_punt_setup",
             "hostif_create",
+            "policer_create",
+            "policer_set",
+            "policer_destroy",
+            "policer_stats",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2243,6 +2303,10 @@ mod tests {
             std::mem::offset_of!(Api, storm_control_set),
             std::mem::offset_of!(Api, host_punt_setup),
             std::mem::offset_of!(Api, hostif_create),
+            std::mem::offset_of!(Api, policer_create),
+            std::mem::offset_of!(Api, policer_set),
+            std::mem::offset_of!(Api, policer_destroy),
+            std::mem::offset_of!(Api, policer_stats),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -3026,5 +3090,82 @@ mod tests {
         b.create_hostif(PortId(1), &"x".repeat(15)).unwrap();
         // ...and a LAG has no netdev of its own here.
         assert!(b.create_hostif(lag_port(1), "Po1").is_err());
+    }
+    // --- Policers --------------------------------------------------------
+
+    /// The configured rate, negated when the policer meters packets;
+    /// -1 for no such policer (rate 1 in pps would also be -1, so the
+    /// tests avoid that value rather than the hook pretending).
+    fn stub_policer_rate(b: &OpenBcmBackend, policer: Oid) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> i64> =
+                b._library.get(b"hemlockbcm_stub_policer_rate\0").unwrap();
+            f(b.switch, oid_policer(policer))
+        }
+    }
+
+    #[test]
+    fn policers_carry_their_rate_and_units() {
+        let mut b = backend();
+        let bits = b
+            .create_policer(PolicerSpec {
+                pps: false,
+                rate: 10_000_000,
+                burst: 65_536,
+            })
+            .unwrap();
+        let packets = b
+            .create_policer(PolicerSpec {
+                pps: true,
+                rate: 600,
+                burst: 128,
+            })
+            .unwrap();
+        assert_ne!(bits, packets);
+        assert_eq!(stub_policer_rate(&b, bits), 10_000_000);
+        assert_eq!(stub_policer_rate(&b, packets), -600, "metering packets");
+
+        b.set_policer(
+            bits,
+            PolicerSpec {
+                pps: false,
+                rate: 5_000_000,
+                burst: 65_536,
+            },
+        )
+        .unwrap();
+        assert_eq!(stub_policer_rate(&b, bits), 5_000_000);
+
+        b.remove_policer(bits).unwrap();
+        assert_eq!(stub_policer_rate(&b, bits), -1, "gone");
+        assert!(b.remove_policer(bits).is_err());
+    }
+
+    #[test]
+    fn policer_stats_round_trip_both_counters() {
+        let mut b = backend();
+        let policer = b
+            .create_policer(PolicerSpec {
+                pps: true,
+                rate: 400,
+                burst: 40,
+            })
+            .unwrap();
+        let stats = b.policer_stats(policer).unwrap();
+        // The stub derives its counters from the configuration, which is
+        // enough to prove both fields cross the ABI in the right order --
+        // the failure this catches is conforming and dropped swapped.
+        assert_eq!(stats.conforming, 400);
+        assert_eq!(stats.dropped, 40);
+    }
+
+    /// A policer id is its own family and cannot be read as any other.
+    #[test]
+    fn policer_ids_are_their_own_family() {
+        assert_eq!(oid_policer(policer_oid(9)), 9);
+        assert_eq!(oid_lag_vlan_member(policer_oid(9)), None);
+        assert_eq!(lag_tid_of(PortId(policer_oid(9).0)), None);
+        assert_ne!(oid_tag(policer_oid(1).0), oid_tag(stp_oid(1).0));
+        assert_ne!(oid_tag(policer_oid(1).0), oid_tag(mirror_oid(1).0));
     }
 }
