@@ -150,27 +150,17 @@ accton-as4610-54)
         fetch "https://raw.githubusercontent.com/wrightca1/edgenos/master/platform/accton-as4610-54/config/config.bcm" \
               "$PDIR/as4610-54.config.bcm"
 
-        # 10G SFP+ PHY microcode: the BCM84758 pulls it through
-        # request_firmware at PHY init, so it belongs in /lib/firmware in
-        # the image rather than in the platform overlay.
-        FWDIR="$ROOT/vendor/firmware"
-        mkdir -p "$FWDIR"
-        if [ -f "$FWDIR/bcm84758_ucode.bin" ]; then
-            echo "have    bcm84758_ucode.bin"
+        # 10G SFP+ PHY microcode. No separate download and no
+        # request_firmware blob: the SDK carries it as a compiled-in C
+        # array (src/soc/phy/phy84758_ucode.c, ~205 KB, "Version 0128"),
+        # loaded by the SDK's own PHY driver at init. It is guarded by
+        # INCLUDE_PHY_84740, which a default SDK build defines — only a
+        # BCM_PTL_SPT partial-support build could leave it out.
+        UCODE="$OPENBCM_DIR/$OPENBCM_SDK/src/soc/phy/phy84758_ucode.c"
+        if [ -f "$UCODE" ]; then
+            echo "ok      BCM84758 microcode present in the SDK ($(basename "$UCODE"))"
         else
-            cat >&2 <<'EOF'
-warning: bcm84758_ucode.bin is not fetched automatically.
-
-  The BCM84758 microcode is redistributed under Broadcom's firmware terms
-  and is not on a stable public URL. Take it from the board's own ONL or
-  ICOS image (/lib/firmware/), or from the OpenBCM tree's Firmware/
-  directory if your revision carries it, and drop it at:
-
-      vendor/firmware/bcm84758_ucode.bin
-
-  Without it the four SFP+ ports stay down; the 48 copper ports do not
-  need it.
-EOF
+            echo "warning: $UCODE missing — the four SFP+ ports will stay down" >&2
         fi
     fi
 
@@ -178,7 +168,6 @@ EOF
     echo "All vendor artifacts for $PLATFORM are in place:"
     echo "  OpenBCM SDK:   vendor/openbcm/$OPENBCM_SDK ($(cat "$OPENBCM_DIR/.openbcm-commit" 2>/dev/null || echo pinned))"
     echo "  ASIC config:   platforms/$PLATFORM/as4610-54.config.bcm"
-    echo "  SFP+ ucode:    vendor/firmware/bcm84758_ucode.bin (manual, see above)"
     echo
     echo "Then build the datapath shim in the ARM cross container:"
     echo "  vendor/openbcm-shim/build-shim.sh"

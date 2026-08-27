@@ -22,4 +22,3 @@ platforms/**/*.deb
 
 # OpenBCM SDK tree and the shim built from it (fetched, never committed).
 /vendor/openbcm/
-/vendor/firmware/

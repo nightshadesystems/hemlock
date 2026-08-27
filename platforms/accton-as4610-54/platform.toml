@@ -151,8 +151,9 @@ speed_mbps = 10000
 autoneg = false
 alias_prefix = "etp"
 media = "SFP+"
-# config.bcm: port_phy_addr_xe0..3 = 0x40..0x43. Needs bcm84758_ucode
-# (a request_firmware blob, fetched at image build; never committed).
+# config.bcm: port_phy_addr_xe0..3 = 0x40..0x43. Its microcode ships
+# compiled into the SDK (src/soc/phy/phy84758_ucode.c), so there is no
+# firmware file to fetch or stage.
 phy_model = "BCM84758"
 supported_modes = ["1G/full", "10G/full", "auto"]
 lanes = [50, 51, 52, 53]

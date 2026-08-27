@@ -107,6 +107,75 @@ cannot cost you ONIE** — you can always get back in and reinstall. That
 is the single most reassuring fact on this board; the install is not a
 one-shot.
 
+### Salvage what is on `sda` before you wipe it
+
+`sda` still carries whatever NOS shipped on this box, and the install
+zaps it. Nothing there is *required* — the BCM84758 microcode, the one
+artifact that looked unobtainable, turns out to ship compiled into the
+SDK — but a previous NOS's kernel and port map are useful corroboration
+and cost a minute to keep.
+
+```sh
+mkdir -p /tmp/old
+for p in 1 2 3; do
+    mount /dev/sda$p /tmp/old 2>/dev/null || continue
+    echo "=== sda$p ==="; ls /tmp/old
+    find /tmp/old \( -name '*84758*' -o -name '*ucode*' -o -name '*.itb' \
+        -o -name 'config.bcm' -o -name '*portmap*' -o -name '*porttab*' \) 2>/dev/null | head -40
+    umount /tmp/old
+done
+```
+
+If a partition does not appear in the output, its `mount` failed and the
+loop skipped it — busybox will not always guess the filesystem. Name it:
+
+```sh
+for fs in ext4 ext3 ext2; do mount -t $fs /dev/sda3 /tmp/old && break; done
+```
+
+**Getting the files off.** This board has no USB port, so everything
+leaves over the management port. ONIE runs its own DHCP discovery on
+`eth0` and will fight you for the interface, so stop it first:
+
+```sh
+onie-discovery-stop
+ip addr show eth0                      # already have a lease?
+udhcpc -i eth0                         # or: ip addr add <a>/<len> dev eth0
+                                       #     ip link set eth0 up
+ping -c2 <workstation>
+```
+
+Then one archive rather than file-by-file — paths matter for working out
+what came from where:
+
+```sh
+tar czf /tmp/salvage.tgz -C /tmp/old .
+```
+
+and whichever of these the box has (check with
+`which scp tftp nc wget`):
+
+```sh
+scp /tmp/salvage.tgz user@workstation:/tmp/           # dropbear's scp
+tftp -p -l /tmp/salvage.tgz -r salvage.tgz <server>   # busybox tftp put
+nc <workstation> 9000 < /tmp/salvage.tgz              # with `nc -l -p 9000 > salvage.tgz` waiting
+```
+
+ONIE also runs an SSH server — its dropbear host keys are in the U-Boot
+environment — so pulling from the workstation usually works too:
+
+```sh
+scp root@<box>:/tmp/salvage.tgz .
+```
+
+What to keep out of the archive:
+
+| If you find | It goes to | Why it matters |
+|---|---|---|
+| `config.bcm` | compare against `vendor/fetch-vendor.sh`'s copy | Confirms the ASIC property set against *this* unit |
+| a `porttab` / `portmap` | compare against the platform README | Independent confirmation of the faceplate map |
+| a kernel / `.itb` | keep for reference | A known-working iProc kernel for this board |
+
 **Before installing anything**, dry-run the installer and read the
 commands:
 
@@ -120,6 +189,33 @@ previous NOS's layout (256 MB + 128 MB + 7.1 GB) and the first step
 zaps it.
 
 ---
+
+### At the U-Boot prompt
+
+Interrupt the 3-second `bootdelay` with any key. Two things are worth
+answering here, and only here:
+
+```
+bdinfo                          # DRAM start/size — validates the FIT's
+                                # load address (0x61008000) and the
+                                # 0x70000000 scratch the installer uses
+usb start
+usbiddev
+printenv usbdev
+help ext4load                   # does this build have ext4 commands at all?
+ext4ls usb ${usbdev}:3 /        # if these work, ext4 is readable
+ext2ls usb ${usbdev}:3 /        # does the ext2 command read an ext4 fs?
+```
+
+`sda3` is the previous NOS's root and is very likely ext4, which makes
+it the test case. Outcomes:
+
+- **`ext4load` exists** → simplest: the installer can use one ext4
+  partition and drop the separate ext2 boot partition entirely.
+- **`ext2ls` lists an ext4 filesystem** → same conclusion, via the
+  command the stock `nos_bootcmd` already uses.
+- **Neither** → the two-partition split stands, and it was the right
+  call.
 
 ## Gate 2 — The kernel boots
 

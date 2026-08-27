@@ -251,13 +251,10 @@ else
         [ -n "$SHIM_PATH" ] || die "no [sai] shim_path in $PDIR/platform.toml"
         log "installing OpenBCM shim ($SHIM_SO -> $SHIM_PATH)"
         install -D -m 755 "$SHIM_SO" "$ROOTFS$SHIM_PATH"
-        # SFP+ PHY microcode, pulled through request_firmware at PHY init.
-        if [ -f "$ROOT/vendor/firmware/bcm84758_ucode.bin" ]; then
-            install -D -m 644 "$ROOT/vendor/firmware/bcm84758_ucode.bin" \
-                "$ROOTFS/lib/firmware/bcm84758_ucode.bin"
-        else
-            log "WARNING: no bcm84758_ucode.bin staged; the SFP+ ports will stay down"
-        fi
+        # No PHY firmware to stage: the BCM84758 microcode is a
+        # compiled-in C array in the SDK (src/soc/phy/phy84758_ucode.c),
+        # so it is already inside the shim rather than loaded from
+        # /lib/firmware.
     else
         log "installing vendor SAI ($SAI_DEB)"
         cp "$SAI_DEB" "$ROOTFS/tmp/"

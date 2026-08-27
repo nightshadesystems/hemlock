@@ -30,7 +30,7 @@ Run `vendor/fetch-vendor.sh accton-as4610-54` (added in phase 3):
 |---|---|
 | `as4610-54.config.bcm` | edgenos `platform/accton-as4610-54/config/config.bcm` — dumped from the stock Edgecore ICOS/FASTPATH NOS with `bcmsh config show`, so it is the board's authoritative bring-up property set |
 | OpenBCM SDK | `Broadcom-Network-Switching-Software/OpenBCM`, the `sdk-6.5.16/` **directory** on `master` (there is no such branch or tag), sparse-checked out at a pinned commit |
-| `bcm84758_ucode` | 10G SFP+ PHY microcode, a `request_firmware` blob |
+| BCM84758 microcode | Already in the SDK above as `src/soc/phy/phy84758_ucode.c` (~205 KB, "Version 0128"), compiled in behind `INCLUDE_PHY_84740` — no separate download, no `/lib/firmware` file |
 | Helix4 LED program | OpenMDK `board/xgsled/` GE-family reference program |
 | iProc kernel patches | ONL `packages/base/any/kernels/4.14-lts/patches/brcm-iproc-4.14.patch` + the `armhf-iproc-all` config |
 
