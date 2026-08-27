@@ -105,18 +105,35 @@ else
     command -v debootstrap >/dev/null || die "debootstrap not installed"
     command -v mksquashfs >/dev/null || die "squashfs-tools not installed"
 
+    # --- Preflight ---------------------------------------------------------
+    # Everything a real build needs, checked before any of it is done.
+    # debootstrap alone takes minutes; discovering a missing kernel or a
+    # missing cross toolchain afterwards wastes all of it, and the whole
+    # list at once beats finding the prerequisites one failure at a time.
+    MISSING=""
+    want() { # want <description> <test...>
+        local what="$1"; shift
+        "$@" >/dev/null 2>&1 || MISSING="$MISSING
+  - $what"
+    }
+
     if [ "$CROSS" = 1 ]; then
         # Foreign-architecture rootfs: debootstrap unpacks the first
         # stage, then the second stage runs the packages' maintainer
         # scripts *inside* the chroot under qemu-user via binfmt.
-        command -v qemu-arm-static >/dev/null \
-            || [ -x /usr/bin/qemu-arm-static ] \
-            || die "qemu-arm-static not installed (needed for the $DEB_ARCH second stage)
- apt-get install qemu-user-static binfmt-support"
-        [ -e /proc/sys/fs/binfmt_misc/qemu-arm ] \
-            || log "WARNING: binfmt qemu-arm not registered; the second stage may fail"
-        command -v "arm-linux-gnueabihf-gcc" >/dev/null \
-            || die "arm-linux-gnueabihf-gcc not installed (cross toolchain for $DEB_ARCH)"
+        want "qemu-arm-static (apt: qemu-user-static) — the $DEB_ARCH second stage" \
+            test -x /usr/bin/qemu-arm-static
+        want "binfmt qemu-arm registered (apt: binfmt-support)" \
+            test -e /proc/sys/fs/binfmt_misc/qemu-arm
+        want "arm-linux-gnueabihf-gcc (apt: gcc-arm-linux-gnueabihf) — links the daemons" \
+            command -v arm-linux-gnueabihf-gcc
+    fi
+    if [ "$BOOT_STYLE" = "fit" ]; then
+        want "mkimage (apt: u-boot-tools) — builds the FIT" command -v mkimage
+        want "dtc (apt: device-tree-compiler) — compiles the board device tree" \
+            command -v dtc
+        want "a device tree in $PDIR/dts/" \
+            sh -c "ls '$PDIR'/dts/*.dts >/dev/null 2>&1"
     fi
 
     # The datapath library. A SAI platform needs its pinned vendor blob;
@@ -126,20 +143,34 @@ else
     SHIM_SO=""
     if [ "$SAI_BACKEND" = "openbcm" ]; then
         SHIM_SO="$(ls "$ROOT"/vendor/openbcm/out/libhemlockbcm.so* 2>/dev/null | head -1 || true)"
-        [ -n "$SHIM_SO" ] || die \
-            "no libhemlockbcm.so in vendor/openbcm/out/ — build it first:
-   vendor/fetch-vendor.sh $PLATFORM
-   vendor/openbcm-shim/build-shim.sh
- (CI and development never need this: use --dummy-rootfs or --mock)"
+        [ -n "$SHIM_SO" ] || MISSING="$MISSING
+  - vendor/openbcm/out/libhemlockbcm.so — build it with
+    vendor/fetch-vendor.sh $PLATFORM && vendor/openbcm-shim/build-shim.sh"
     else
         # Exact-name glob: libsaibcm-dev_* must never match here.
         SAI_DEB="$(ls "$ROOT"/vendor/sai/libsaibcm_"$SAI_PIN"_*.deb 2>/dev/null | head -1 || true)"
-        [ -n "$SAI_DEB" ] || die \
-            "no libsaibcm .deb matching pin '$SAI_PIN' in vendor/sai/ — see vendor/sai/README.md
- (CI and development never need this: use --dummy-rootfs or mock-sai)"
+        [ -n "$SAI_DEB" ] || MISSING="$MISSING
+  - vendor/sai/libsaibcm_${SAI_PIN}_*.deb — see vendor/sai/README.md"
     fi
-    [ -f "$PDIR/$CONFIG_BCM" ] || die \
-        "$CONFIG_BCM missing from $PDIR — run vendor/fetch-vendor.sh $PLATFORM"
+    [ -f "$PDIR/$CONFIG_BCM" ] || MISSING="$MISSING
+  - $PDIR/$CONFIG_BCM — run vendor/fetch-vendor.sh $PLATFORM"
+
+    # The kernel. x86 rides Debian's own; armhf cannot, because upstream
+    # Linux has no Helix4 support and Debian's armmp kernel will not boot
+    # this board. Resolve it here so its absence is reported with all the
+    # rest rather than after a full debootstrap.
+    KERNEL_DEB=""
+    if [ -z "$KERNEL_PKG" ]; then
+        KERNEL_DEB="$(ls "$ROOT"/vendor/kernel/linux-image-*-hemlock-iproc*_"$DEB_ARCH".deb 2>/dev/null | head -1 || true)"
+        [ -n "$KERNEL_DEB" ] || MISSING="$MISSING
+  - vendor/kernel/linux-image-*-hemlock-iproc*_$DEB_ARCH.deb — the iProc
+    kernel port is tracked in docs/as4610-kernel-port.md and is NOT DONE
+    YET, so a full $CPU_ARCH image cannot be built at all right now"
+    fi
+
+    [ -z "$MISSING" ] || die "a real $CPU_ARCH image needs:$MISSING
+
+ None of this is needed for a structural check: build/mkimage.sh $PLATFORM --dummy-rootfs"
 
     log "debootstrap Debian trixie ($DEB_ARCH)"
     DEBOOTSTRAP_ARGS=(--variant=minbase --arch="$DEB_ARCH"
@@ -158,23 +189,9 @@ else
     fi
 
     # --- Platform kernel ---------------------------------------------------
-    # x86 rides Debian's own kernel. armhf cannot: upstream Linux has no
-    # Helix4 support, so the image needs a kernel Hemlock builds itself.
-    if [ -n "$KERNEL_PKG" ]; then
-        : # already pulled in by packages.list on amd64
-    else
-        KERNEL_DEB="$(ls "$ROOT"/vendor/kernel/linux-image-*-hemlock-iproc*_"$DEB_ARCH".deb 2>/dev/null | head -1 || true)"
-        [ -n "$KERNEL_DEB" ] || die \
-            "no Hemlock iProc kernel package in vendor/kernel/ for $DEB_ARCH.
-
- Upstream Linux has no Helix4 support and Debian's armmp kernel will not
- boot this board, so the image needs a kernel built from the triaged
- iProc patch set. That port is tracked separately:
-
-     docs/as4610-kernel-port.md
-
- Build it, drop the resulting linux-image-*.deb in vendor/kernel/, and
- re-run. (--dummy-rootfs needs none of this.)"
+    # amd64 rides Debian's own (pulled in by packages.list); armhf gets
+    # the Hemlock iProc kernel resolved during preflight.
+    if [ -n "$KERNEL_DEB" ]; then
         log "installing platform kernel $(basename "$KERNEL_DEB")"
         cp "$KERNEL_DEB" "$ROOTFS/tmp/"
         chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$KERNEL_DEB")" \
