@@ -72,6 +72,9 @@ required_modules = [
     # only on the variants that have fans (see the fan note below).
     "accton_as4610_cpld",
     "accton_as4610_psu",
+    "accton_as4610_fan",
+    # Transceiver EEPROMs (platforms/_common/kmod/).
+    "optoe",
 ]
 
 [kernel.module_args]
@@ -276,22 +279,69 @@ presence_attr = "psu_present"
 status_attr = "psu_power_good"
 
 # ---------------------------------------------------------------------------
-# NOT MODELED: fans, pending one register read.
+# Fans: 2, behind the CPLD, via ONL's ported `accton_as4610_fan` driver.
 #
-# ONL's `accton_as4610_fan` is ported (kmod/accton/) and would be
-# addressed as `hwmon = "platform:as4610_fan"` with `rpm_attr` /
-# `pwm_attr` / `pwm_max = 100`. What is not settled is whether THIS BOARD
-# HAS FANS: the CPLD driver registers the `as4610_fan` platform device
-# only for product IDs 30P, 54P and 54T_B, so a plain AS4610-54T (product
-# ID 2) is fanless and the device never appears. Both revisions carry the
-# same "AS4610-54T" label, so the chassis cannot answer it.
+# This board answered product ID 5 = AS4610-54T revision B, which has
+# fans; a plain 54T (ID 2) is fanless and the CPLD driver would never
+# register the platform device these entries name. If this manifest is
+# ever pointed at a non-B 54T, drop this whole block and the fan curve
+# rather than letting pmon report two permanently-failed fans.
 #
-# Gate 1 of docs/as4610-bringup.md reads CPLD register 0x01 to settle it.
-# Until then no fans are declared and `show environment` reports the lm77
-# and no fans, which is true for one of the two revisions and honest for
-# both -- better than declaring fans that read as permanently failed. For
-# the same reason there is no [hardware.thermal.fan_control].
+# The driver registers its hwmon node with no attributes and hangs them
+# off the `as4610_fan` *platform* device instead, which is what the
+# `platform:` form addresses. Attribute names are the driver's own, not
+# hwmon's: `fanN_speed_rpm` (raw tach * 379 * 60 / 2 / 100, computed in
+# the driver) and a duty attribute that takes a percentage, hence
+# pwm_max = 100 rather than the hwmon default of 255.
+#
+# `tach` and `pwm` are unused here -- rpm_attr/pwm_attr override them --
+# but the schema requires them, so they carry the channel each entry
+# would have used.
+#
+# ONE PWM FOR BOTH FANS: CPLD register 0x2b's low nibble drives the pair,
+# so both entries name the same attribute and pmon writes the curve's
+# value twice. Harmless, and truthful about the hardware.
+#
+# No presence_attr. The driver exposes `fanN_fault` (1 = faulted), not
+# presence, and mapping fault onto presence would report a stalled fan as
+# "not installed" and lose the failure. pmon already marks a fan not-ok
+# when its rpm reads 0, which is what a stalled or removed fan does.
 # ---------------------------------------------------------------------------
+
+[[hardware.thermal.fan]]
+name = "FAN-1"
+hwmon = "platform:as4610_fan"
+tach = "fan1"
+pwm = "pwm1"
+rpm_attr = "fan1_speed_rpm"
+pwm_attr = "fan_duty_cycle_percentage"
+pwm_max = 100
+
+[[hardware.thermal.fan]]
+name = "FAN-2"
+hwmon = "platform:as4610_fan"
+tach = "fan2"
+pwm = "pwm2"
+rpm_attr = "fan2_speed_rpm"
+pwm_attr = "fan_duty_cycle_percentage"
+pwm_max = 100
+
+# The board's only sensor drives the curve. Reaching 100% at 50 C keeps
+# full speed well below `board-ambient`'s 55 C warn threshold, so the
+# curve has run out of headroom before pmon starts complaining rather
+# than at the same moment. Both endpoints want revisiting against real
+# thermals at gate 5; until then this errs toward noise, not heat.
+[hardware.thermal.fan_control]
+sensor = "board-ambient"
+interval_secs = 5
+
+[[hardware.thermal.fan_control.curve]]
+temp_c = 30.0
+pwm_percent = 40
+
+[[hardware.thermal.fan_control.curve]]
+temp_c = 50.0
+pwm_percent = 100
 
 # SFP+ cages: optoe2 (SFP-style, 2-wire, EEPROM at 0x50), one per mux
 # channel. The DTS labels these port49..port52, matching the faceplate.

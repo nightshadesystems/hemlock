@@ -98,7 +98,8 @@ next reader does not have to re-derive it:
 | NOS storage | `/dev/sda`, 7.5 GB, `removable = 0`, GPT |
 | Hand-off | `nos_bootcmd`, run by `bootcmd` before `onie_bootcmd`. No `onie-nos-mode` on this ONIE. |
 | i2c adapters | `iproc-smb0`, `iproc-smb1` |
-| Mux channels | buses **10–17** under ONIE's kernel (the manifest declares 2–9; the `BusMap` translates) |
+| Mux channels | see the note below – `/dev/i2c-16` does not exist, so the earlier 10–17 reading needs re-confirming |
+| Product ID | CPLD `0x01` = **`0x05`** = AS4610-54T **revision B**, which has fans |
 | `sda1` / `sda2` / `sda3` | ext3 (`uImage`) / ext3 (`grub-core.img`) / **btrfs** |
 | Kernel load/entry | `0x61008000`, confirmed by the salvaged uImage header *and* its embedded config — see [`as4610-kernel-port.md`](as4610-kernel-port.md) |
 
@@ -109,45 +110,46 @@ cannot cost you ONIE** — you can always get back in and reinstall. That
 is the single most reassuring fact on this board; the install is not a
 one-shot.
 
-### Still open, and answerable from this same ONIE prompt
+### The product ID, and the mux numbering that is still open
 
-The three ONL platform drivers are now ported and committed under
-[`platforms/accton-as4610-54/kmod/`](../platforms/accton-as4610-54/kmod/README.md),
-and the manifest declares the two PSUs. Two facts they need are still
-guesses, and both are one command away:
+The three ONL platform drivers are ported and committed under
+[`platforms/accton-as4610-54/kmod/`](../platforms/accton-as4610-54/kmod/README.md).
+One register settled what they need to know about this chassis:
 
 ```sh
-# 1. Product ID -- does this board have fans?
-#    CPLD is at 0x30 on the iproc-smb0 root (i2c-0 under ONIE).
-i2cget -y -f 0 0x30 0x01
-
-# 2. What is actually on mux channel 6 (bus 16 under ONIE's numbering)?
-i2cdetect -y 16
+i2cget -y -f 0 0x30 0x01        # -> 0x05
 ```
 
-**Why each matters:**
+The low nibble is the product ID: `0` = 30T, `1` = 30P, `2` = 54T,
+`3` = 54P, `5` = 54T **rev B**. ONL's CPLD driver registers the
+`as4610_fan` platform device only for 30P, 54P and 54T_B, so `5` means
+**this board has fans** and the manifest carries two fan entries and a
+curve. A plain 54T (ID 2) is fanless and would need that block removed;
+the chassis label reads "AS4610-54T" either way, which is why the
+register is the only way to tell. While at that prompt,
+`i2cget -y -f 0 0x30 0x11` shows PSU presence/power-good (present = bit
+`i*2`, good = bit `i*2+1`) and the fan fault bits (0x20 / 0x10).
 
-- **Register 0x01, low nibble** is the product ID: `0` = 30T, `1` = 30P,
-  `2` = 54T, `3` = 54P, `5` = 54T rev B. ONL's CPLD driver registers the
-  `as4610_fan` platform device only for 30P, 54P and 54T_B — so a `2`
-  means this board is **fanless** and `[[hardware.thermal.fan]]` should
-  stay out of the manifest permanently, while a `5` means the fan section
-  goes in (`hwmon = "platform:as4610_fan"`, `rpm_attr =
-  "fan1_speed_rpm"`, `pwm_attr = "fan_duty_cycle_percentage"`,
-  `pwm_max = 100`) along with a fan curve. The chassis label reads
-  "AS4610-54T" either way, so this register is the only way to know.
-  While you are there, `i2cget -y -f 0 0x30 0x11` shows PSU
-  presence/power-good (present = bit `i*2`, good = bit `i*2+1`) and the
-  fan fault bits (0x20 / 0x10) — a board with fans installed will not
-  report both faulted.
-- **Channel 6** carries the PSU bays. The manifest puts their EEPROMs at
-  0x50 and 0x51, from edgenos's device tree; ONL's driver carries a stale
-  `normal_i2c` list naming 0x50 and **0x53** instead (unreachable, since
-  that driver has no `.detect` callback, so it was never exercised). If
-  `i2cdetect` disagrees with the DTS, the DTS is what gets corrected.
-  Expect the pmbus devices at 0x58/0x59 in the same scan.
+**Still open: which kernel buses the mux channels are.** `i2cdetect -y 16`
+returns `No such file or directory`, so the "buses 10-17" reading in the
+table above does not hold as recorded -- either the mux never bound under
+ONIE, or `i2c-dev` nodes exist for only some buses. This blocks nothing:
+`BusMap` follows the mux's `channel-N` links at bring-up and translates
+whatever the kernel assigned, and the numbering under the ported 6.1
+kernel is what actually matters, not ONIE's. To settle what ONIE sees:
 
-Both answers are small manifest edits, not code changes.
+```sh
+i2cdetect -l                                   # every adapter and its number
+ls /dev/i2c-*
+ls -l /sys/bus/i2c/devices/*-0070/             # channel-N links, if the mux bound
+```
+
+If the mux did bind, `i2cdetect -y <channel-6 bus>` also confirms the PSU
+bay addresses. The manifest puts their EEPROMs at 0x50/0x51 from
+edgenos's device tree; ONL's driver carries a stale `normal_i2c` list
+naming 0x50 and **0x53** (unreachable -- that driver has no `.detect`
+callback -- so it was never exercised). If a scan disagrees with the DTS,
+the DTS is what gets corrected. Expect pmbus at 0x58/0x59 alongside.
 
 ### Salvage what is on `sda` before you wipe it
 

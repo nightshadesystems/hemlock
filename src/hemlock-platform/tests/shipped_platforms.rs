@@ -147,8 +147,8 @@ fn as4610_declares_an_arm_openbcm_platform() {
     assert!(m.sai.version_pin.is_none() && m.sai.libsai_path.is_none());
 
     // OpenBCM's knet-cb has no psample path, unlike SONiC's fork. The
-    // two accton_* entries are the drivers ported into kmod/accton/;
-    // accton_as4610_fan is deliberately absent (see below).
+    // accton_* entries are the drivers ported into kmod/accton/; optoe
+    // comes from platforms/_common/kmod/.
     assert_eq!(
         m.kernel.required_modules,
         [
@@ -157,6 +157,8 @@ fn as4610_declares_an_arm_openbcm_platform() {
             "linux-bcm-knet",
             "accton_as4610_cpld",
             "accton_as4610_psu",
+            "accton_as4610_fan",
+            "optoe",
         ]
     );
 }
@@ -165,12 +167,17 @@ fn as4610_declares_an_arm_openbcm_platform() {
 /// `psu_power_good` off each PSU's own i2c client rather than a platform
 /// device -- so the attribute names are relative and go through BusMap.
 ///
-/// Fans stay unmodeled until the board's product ID is read: the CPLD
-/// driver only registers the `as4610_fan` platform device on the 30P,
-/// 54P and 54T_B, so a plain 54T has none. Declaring fans that can never
-/// be read would make `show environment` lie.
+/// The fans are the opposite case: their attributes live on the
+/// `as4610_fan` *platform* device, which no `<bus>-<addr>` identity can
+/// name, and they carry the driver's own attribute names on a
+/// percentage-scaled duty control shared by both fans.
+///
+/// The fan entries are only correct because this board reported product
+/// ID 5 (54T rev B). A plain 54T is fanless and the CPLD driver never
+/// registers the platform device, so if this test ever fails after a
+/// hardware swap, the manifest is describing a different board.
 #[test]
-fn as4610_models_psus_from_the_cpld_and_no_fans_yet() {
+fn as4610_models_psus_and_the_rev_b_fans() {
     let p = platform("accton-as4610-54");
     let hw = &p.manifest.hardware;
 
@@ -190,6 +197,39 @@ fn as4610_models_psus_from_the_cpld_and_no_fans_yet() {
         );
     }
 
-    assert!(hw.thermal.fans.is_empty());
-    assert!(hw.thermal.fan_control.is_none());
+    let fans = &hw.thermal.fans;
+    assert_eq!(fans.len(), 2);
+    for (fan, rpm_attr) in fans.iter().zip(["fan1_speed_rpm", "fan2_speed_rpm"]) {
+        assert_eq!(fan.hwmon, "platform:as4610_fan");
+        assert_eq!(fan.rpm_attr.as_deref(), Some(rpm_attr));
+        // One CPLD nibble drives both fans, so both name the same
+        // attribute; it takes a percentage, not hwmon's 0-255.
+        assert_eq!(fan.pwm_attr.as_deref(), Some("fan_duty_cycle_percentage"));
+        assert_eq!(fan.pwm_max, 100);
+        // fanN_fault is a fault bit, not presence; conflating them would
+        // report a stalled fan as absent.
+        assert!(fan.presence_attr.is_none());
+    }
+
+    // The curve must reach full speed before the sensor it reads warns,
+    // or pmon complains while it still has headroom left.
+    let control = hw.thermal.fan_control.as_ref().expect("fan curve");
+    let sensor = hw
+        .thermal
+        .sensors
+        .iter()
+        .find(|s| s.name == control.sensor)
+        .expect("fan_control names a declared sensor");
+    let full_speed = control
+        .curve
+        .iter()
+        .find(|point| point.pwm_percent >= 100)
+        .expect("curve reaches 100%");
+    assert!(
+        full_speed.temp_c < sensor.warn_c,
+        "curve hits 100% at {} C, at or above {:?}'s warn_c {}",
+        full_speed.temp_c,
+        sensor.name,
+        sensor.warn_c
+    );
 }

@@ -5,7 +5,9 @@ committed here — unlike the vendor SAI blobs — because they needed real
 porting to the image kernel and are now maintained with the platform.
 `build/mkimage.sh` builds every subdirectory with a `Makefile` against the
 image kernel and installs the results; `build/kmod-smoke.sh` compile-tests
-the same set in a Debian trixie container.
+the same set in a Debian trixie container. Both also build
+[`platforms/_common/kmod/`](../../_common/kmod/README.md), which is where
+`optoe` moved once a second board needed the identical file.
 
 ## Provenance
 
@@ -14,7 +16,6 @@ the same set in a Debian trixie container.
 | `haliburton/smc.c`, `hlx_gpio_ich.c`, `emc2305.c`, `mc24lc64t.c` | sonic-buildimage `202305`, `platform/broadcom/sonic-platform-modules-cel/haliburton/modules` | E1031 CPLD (SFP presence, LEDs), Rangeley GPIO, fan controller, board EEPROM |
 | `haliburton/dps200.c` | sonic-buildimage `201911` (dropped upstream after that branch) | DPS-200 PSU pmbus driver |
 | `haliburton/pmbus.h` | Linux `v6.12`, `drivers/hwmon/pmbus/pmbus.h` | replaces the 2019 copy dps200.c shipped with |
-| `optoe/optoe.c` | opencomputeproject/oom, `optoe/` | transceiver EEPROM access (built with `-DLATEST_KERNEL`) |
 | `kernel-backports/i2c-mux-pca954x.c`, `max6697.c` | Linux `v6.12` (in-tree drivers) | Debian's amd64 kernel config leaves `CONFIG_I2C_MUX_PCA954x` and `CONFIG_SENSORS_MAX6697` unset, so the stock drivers the i2c topology needs are built out-of-tree, byte-identical to upstream |
 
 ## Local port (Debian 13 / kernel 6.12)

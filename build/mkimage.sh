@@ -307,10 +307,11 @@ else
     fi
     cp "$KMOD_TMP/bde-out/"*.ko "$MODDEST/"
 
-    # Platform driver kbuild dirs committed under <platform>/kmod/
-    # (upstream GPL sources ported to the image kernel; see the README
-    # there for provenance).
-    for src in "$PDIR/kmod"/*/; do
+    # Platform driver kbuild dirs: the ones every board needs, under
+    # platforms/_common/kmod/, then this board's own under
+    # <platform>/kmod/ (upstream GPL sources ported to the image kernel;
+    # see the README in each for provenance).
+    for src in "$ROOT/platforms/_common/kmod"/*/ "$PDIR/kmod"/*/; do
         [ -f "$src/Makefile" ] || continue
         name="$(basename "$src")"
         rm -rf "$KMOD_TMP/$name"
@@ -352,7 +353,7 @@ else
     done
     [ -z "$missing" ] || die \
         "required kernel modules not loadable in the image:$missing
- (sources: vendor/sai/saibcm-modules via fetch-vendor.sh, platforms/$PLATFORM/kmod/)"
+ (sources: vendor/sai/saibcm-modules via fetch-vendor.sh, platforms/_common/kmod/, platforms/$PLATFORM/kmod/)"
 
     # Drop the toolchain again; it has no business on a switch. Then
     # scrub the apt caches the toolchain install left behind — the

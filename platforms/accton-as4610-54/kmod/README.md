@@ -6,7 +6,9 @@ to the image kernel and are now maintained with the platform. This is the
 same arrangement as [`cel-e1031/kmod/`](../../cel-e1031/kmod/README.md);
 `build/mkimage.sh` builds every subdirectory with a `Makefile` against the
 image kernel and installs the results, and `build/kmod-smoke.sh
-accton-as4610-54` compile-tests the same set in a container.
+accton-as4610-54` compile-tests the same set in a container. Both also
+build [`platforms/_common/kmod/`](../../_common/kmod/README.md), which is
+where this board gets `optoe` for its four SFP+ cages.
 
 Porting *kernel-module C* is the one exception to this port's rule of
 referencing vendor data and never carrying vendor code. Everything else
@@ -68,8 +70,10 @@ them would make the port harder to diff against ONL.
 ## What the manifest expects of these
 
 - The CPLD driver must load first: it exports `as4610_54_cpld_read` /
-  `_write` and both other modules resolve against them. `required_modules`
-  lists it first for that reason.
+  `_write` and both other modules link against them. `depmod` records the
+  dependency, so `modprobe` orders it correctly on its own;
+  `required_modules` lists it first as documentation, not as the
+  mechanism.
 - `accton_as4610_psu` puts `psu_present` and `psu_power_good` on each PSU
   client's own sysfs dir, which is why `platform.toml` names them as
   *relative* attributes — pmon resolves them against the bus number the
@@ -77,9 +81,10 @@ them would make the port harder to diff against ONL.
 - `accton_as4610_fan` puts its attributes on the `as4610_fan` **platform**
   device (its hwmon node is empty), which no `<bus>-<addr>` identity can
   name. That is what the manifest's `hwmon = "platform:<name>"` form is
-  for. It is not wired up yet: the CPLD driver registers that device only
-  for product IDs 30P, 54P and 54T_B, so whether this board has fans at
-  all is one register read away — gate 1 of `docs/as4610-bringup.md`.
+  for. The CPLD driver registers that device only for product IDs 30P,
+  54P and 54T_B; this board reports `0x05` (54T rev B), so it does, and
+  the manifest declares both fans. Point this platform at a plain 54T and
+  the fan entries must come out with it.
 
 When bumping either base kernel, re-run `build/kmod-smoke.sh
 accton-as4610-54` and extend the compat above.

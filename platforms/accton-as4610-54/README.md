@@ -135,16 +135,21 @@ close four of the port's open questions.
   be unbound (`48000000.iproc_cmicd` from `iproc_cmic`) before the BDE
   can claim the device. Both live in the `as4610` quirks driver's
   `pre_asic_init`.
-- **Whether this board has fans is one register read away.** ONL's CPLD
-  driver registers the `as4610_fan` platform device only for product IDs
-  30P, 54P and 54T_B — a plain 54T is fanless — and both revisions carry
-  the same "AS4610-54T" label, so the chassis cannot answer it. CPLD
-  register 0x01's low nibble can; gate 1 of the runbook reads it. Until
-  then the manifest declares the `lm77` and the two PSUs and no fans,
-  which is true for one revision and honest for both. The fan driver is
-  ported and ready (`kmod/accton/`), addressed as
-  `hwmon = "platform:as4610_fan"` with `rpm_attr` / `pwm_attr` /
-  `pwm_max = 100` when the answer comes back.
+- **This chassis is a revision B, and revision is what decides whether
+  it has fans.** CPLD register 0x01 reads `0x05` = `PID_AS4610_54T_B`.
+  ONL's CPLD driver registers the `as4610_fan` platform device only for
+  30P, 54P and 54T_B, so a plain 54T (ID 2) is fanless — and both
+  revisions carry the same "AS4610-54T" label, so nothing outside the
+  box distinguishes them. **If this manifest is ever pointed at a non-B
+  54T, delete the `[[hardware.thermal.fan]]` entries and the fan curve**,
+  or pmon will report two permanently-failed fans.
+- **One PWM drives both fans.** CPLD register 0x2b's low nibble is
+  shared, so both fan entries name the same `fan_duty_cycle_percentage`
+  attribute and the curve's value is written twice. The attribute takes
+  a percentage, not hwmon's 0-255, hence `pwm_max = 100`. There is no
+  `presence_attr`: the driver exposes `fanN_fault`, not presence, and
+  mapping one onto the other would report a stalled fan as uninstalled
+  instead of failed.
 - **The RTC is deliberately absent from the topology.** The M41T11 at
   i2c-1 mux ch7 0x68 has a dead battery, which makes the 4.19+ RTC core
   re-arm an already-expired alarm through a muxed i2c read on every pass,

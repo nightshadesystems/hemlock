@@ -38,7 +38,8 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$ROOT:/hemlock" -w /hemlock debian:trixie
 
     # Stage the BDE source if the host repo does not have it yet
     # (kmod-only: no SAI blobs needed to compile modules). Platform
-    # drivers are committed under platforms/<id>/kmod/.
+    # drivers are committed under platforms/_common/kmod/ (every board)
+    # and platforms/<id>/kmod/ (this board).
     [ -d vendor/sai/saibcm-modules ] \
         || sh vendor/fetch-vendor.sh '"$PLATFORM"' --kmod-only
 
@@ -48,7 +49,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$ROOT:/hemlock" -w /hemlock debian:trixie
     bash build/build-bde.sh /tmp/saibcm-modules "$KVER" /tmp/bde-out
 
     fail=0
-    for src in "platforms/'"$PLATFORM"'/kmod"/*/; do
+    for src in "platforms/_common/kmod"/*/ "platforms/'"$PLATFORM"'/kmod"/*/; do
         [ -f "$src/Makefile" ] || continue
         name="$(basename "$src")"
         cp -r "$src" "/tmp/$name"
