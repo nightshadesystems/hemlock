@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 5
+#define HEMLOCKBCM_ABI_MINOR 6
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -434,8 +434,36 @@ struct hemlockbcm_api {
     int (*lag_stp_port_state)(struct hemlockbcm_switch *sw, uint32_t stg,
                               uint32_t tid, int state);
 
+    /* --- Port mirroring (ABI 1.6) ------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: mirroring, storm control,
+     * Local (SPAN) mirroring. A session is an SDK mirror destination and
+     * its id is the destination's own, so as with everything else here
+     * the caller derives its object id and the shim keeps no table.
+     *
+     * `monitor` and the mirrored ports are logical ports. Trunks are not
+     * accepted: the caller rejects a LAG id before it reaches these
+     * slots rather than letting one arrive looking like a port number.
+     */
+
+    int (*mirror_create)(struct hemlockbcm_switch *sw, uint32_t monitor_port,
+                         uint32_t *session);
+    /* Ports must be detached first. */
+    int (*mirror_destroy)(struct hemlockbcm_switch *sw, uint32_t session);
+
+    /*
+     * Point one direction of `logical_port` at `session`, replacing
+     * whatever that direction pointed at before. `egress` selects the
+     * direction; the two are independent.
+     */
+    int (*mirror_port_attach)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint32_t session, int egress);
+    /* Stop mirroring that direction, whatever it was pointed at. */
+    int (*mirror_port_detach)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              int egress);
+
+    /*
+     * Everything below is the rest of phase 6: storm control,
      * ACLs/policers/CoPP, sFlow and QoS. Each lands as one slot appended
      * here plus the matching Rust method, with the minor bumped. Until
      * then Rust reports those families unsupported, which is the truth

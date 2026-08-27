@@ -25,7 +25,7 @@
  * NOT COMPILED BY CI. The SDK is not fetchable in CI and the target is
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
- * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg}.h,
+ * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -47,6 +47,7 @@
 #include <bcm/init.h>
 #include <bcm/l2.h>
 #include <bcm/link.h>
+#include <bcm/mirror.h>
 #include <bcm/port.h>
 #include <bcm/stack.h>
 #include <bcm/stat.h>
@@ -520,7 +521,16 @@ static int hb_capabilities(struct hemlockbcm_switch *sw,
      */
     out->buffer_bytes_total = 4ull * 1024ull * 1024ull;
     out->ecmp_width = 0;
-    out->mirror_sessions_max = 0;
+    /*
+     * The XGS mirror-to-port table depth. The SDK has no call that
+     * reports it, and this number is load-bearing rather than
+     * decorative: syncd refuses a session number above it before
+     * reaching the datapath. Getting it wrong is not dangerous -- the
+     * SDK returns BCM_E_RESOURCE once the table is full either way -- but
+     * too low would refuse sessions the chip would accept, so confirm it
+     * on the hardware and correct this if it disagrees.
+     */
+    out->mirror_sessions_max = 4;
     out->ipv6 = 0;
     return HEMLOCKBCM_OK;
 }
@@ -1224,6 +1234,83 @@ static int hb_lag_stp_port_state(struct hemlockbcm_switch *sw, uint32_t stg,
     return HEMLOCKBCM_OK;
 }
 
+/* --- Port mirroring (ABI 1.6) -------------------------------------------- */
+
+static uint32 hb_mirror_flags(int egress)
+{
+    return egress ? BCM_MIRROR_PORT_EGRESS : BCM_MIRROR_PORT_INGRESS;
+}
+
+static int hb_mirror_create(struct hemlockbcm_switch *sw, uint32_t monitor_port,
+                            uint32_t *session)
+{
+    bcm_mirror_destination_t dest;
+    int status;
+
+    if (sw == NULL || session == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * Mirroring is off until the mode is set, and setting it again is
+     * harmless -- cheaper than tracking whether it has been done, and it
+     * keeps the shim stateless.
+     */
+    status = HB_CALL(bcm_mirror_mode_set(sw->unit, BCM_MIRROR_L2));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    bcm_mirror_destination_t_init(&dest);
+    /* Local SPAN: no flags, destination is a port on this device. */
+    BCM_GPORT_LOCAL_SET(dest.gport, (bcm_port_t)monitor_port);
+    status = HB_CALL(bcm_mirror_destination_create(sw->unit, &dest));
+    if (status == HEMLOCKBCM_OK) {
+        *session = (uint32_t)dest.mirror_dest_id;
+    }
+    return status;
+}
+
+static int hb_mirror_destroy(struct hemlockbcm_switch *sw, uint32_t session)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_mirror_destination_destroy(sw->unit, (bcm_gport_t)session));
+}
+
+static int hb_mirror_port_attach(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 uint32_t session, int egress)
+{
+    uint32 flags = hb_mirror_flags(egress);
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * The SDK's add is genuinely additive -- a port can feed several
+     * destinations at once -- but the ABI here is a set, so clear the
+     * direction first. Deleting when nothing is attached is not an
+     * error.
+     */
+    status = HB_CALL(bcm_mirror_port_dest_delete_all(sw->unit,
+                                                     (bcm_port_t)logical_port, flags));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    return HB_CALL(bcm_mirror_port_dest_add(sw->unit, (bcm_port_t)logical_port, flags,
+                                            (bcm_gport_t)session));
+}
+
+static int hb_mirror_port_detach(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 int egress)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_mirror_port_dest_delete_all(sw->unit, (bcm_port_t)logical_port,
+                                                   hb_mirror_flags(egress)));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1267,6 +1354,10 @@ static const struct hemlockbcm_api HB_API = {
     hb_stp_vlan_set,
     hb_stp_port_state,
     hb_lag_stp_port_state,
+    hb_mirror_create,
+    hb_mirror_destroy,
+    hb_mirror_port_attach,
+    hb_mirror_port_detach,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

@@ -221,6 +221,14 @@ struct Api {
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
     lag_stp_port_state:
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
+
+    // --- ABI 1.6: port mirroring -------------------------------------
+    mirror_create: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut u32) -> Status>,
+    mirror_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    mirror_port_attach:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
+    mirror_port_detach:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
 }
 
 impl Api {
@@ -308,6 +316,15 @@ fn oid_lag_member(oid: Oid) -> (u32, PortId) {
 }
 
 const OID_TAG_STP: u64 = 0x05;
+const OID_TAG_MIRROR: u64 = 0x06;
+
+fn mirror_oid(session: u32) -> Oid {
+    Oid((OID_TAG_MIRROR << 56) | u64::from(session))
+}
+
+fn oid_mirror(oid: Oid) -> u32 {
+    oid.0 as u32
+}
 
 fn stp_oid(stg: u32) -> Oid {
     Oid((OID_TAG_STP << 56) | u64::from(stg))
@@ -572,6 +589,23 @@ impl OpenBcmBackend {
         Ok(vlan_id)
     }
 
+    /// The SDK logical port number behind a `PortId`.
+    ///
+    /// A LAG id is a `PortId` too, and `port.0 as u32` would quietly
+    /// truncate one to its trunk id -- a small number that is a
+    /// perfectly good port on this chip. Every slot that takes a port
+    /// and only a port goes through here, so a LAG id reaching one is an
+    /// error rather than a command against whichever port shares that
+    /// number.
+    fn logical_port(&self, port: PortId) -> Result<u32, SaiError> {
+        match lag_tid_of(port) {
+            Some(_) => Err(SaiError::Other(format!(
+                "{port} is a LAG, and this operation takes a port"
+            ))),
+            None => Ok(port.0 as u32),
+        }
+    }
+
     /// The trunk id behind a LAG's `PortId`. A real port here is a
     /// caller mistake, not something to paper over: passing a logical
     /// port to `remove_lag` would destroy whatever trunk happened to
@@ -765,53 +799,55 @@ impl SaiBackend for OpenBcmBackend {
 
     fn set_port_admin_state(&mut self, port: PortId, up: bool) -> Result<(), SaiError> {
         let f = slot!(self, set_port_admin_state, "set_port_admin_state")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
         check("set_port_admin_state", unsafe {
-            f(sw, port.0 as u32, i32::from(up))
+            f(sw, logical, i32::from(up))
         })
     }
 
     fn set_port_speed(&mut self, port: PortId, speed_mbps: u32) -> Result<(), SaiError> {
         let f = slot!(self, set_port_speed, "set_port_speed")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
-        check("set_port_speed", unsafe {
-            f(sw, port.0 as u32, speed_mbps)
-        })
+        check("set_port_speed", unsafe { f(sw, logical, speed_mbps) })
     }
 
     fn set_port_duplex(&mut self, port: PortId, full: bool) -> Result<(), SaiError> {
         let f = slot!(self, set_port_duplex, "set_port_duplex")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
         check("set_port_duplex", unsafe {
-            f(sw, port.0 as u32, i32::from(full))
+            f(sw, logical, i32::from(full))
         })
     }
 
     fn set_port_autoneg(&mut self, port: PortId, on: bool) -> Result<(), SaiError> {
         let f = slot!(self, set_port_autoneg, "set_port_autoneg")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
-        check("set_port_autoneg", unsafe {
-            f(sw, port.0 as u32, i32::from(on))
-        })
+        check("set_port_autoneg", unsafe { f(sw, logical, i32::from(on)) })
     }
 
     fn set_port_mtu(&mut self, port: PortId, mtu: u32) -> Result<(), SaiError> {
         let f = slot!(self, set_port_mtu, "set_port_mtu")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
-        check("set_port_mtu", unsafe { f(sw, port.0 as u32, mtu) })
+        check("set_port_mtu", unsafe { f(sw, logical, mtu) })
     }
 
     fn port_counters(&mut self, port: PortId) -> Result<PortCounters, SaiError> {
         let f = slot!(self, port_counters, "port_counters")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         let mut raw = ShimCounters::default();
         // SAFETY: `raw` is written only on success.
-        check("port_counters", unsafe { f(sw, port.0 as u32, &mut raw) })?;
+        check("port_counters", unsafe { f(sw, logical, &mut raw) })?;
         Ok(PortCounters {
             in_octets: raw.in_octets,
             in_ucast_pkts: raw.in_ucast_pkts,
@@ -869,7 +905,7 @@ impl SaiBackend for OpenBcmBackend {
             fdb_aging: slot!(self, set_fdb_aging, "set_fdb_aging").is_ok(),
             l2mc: false,
             storm_control: false,
-            mirror: raw.mirror_sessions_max > 0,
+            mirror: slot!(self, mirror_create, "mirror_create").is_ok(),
             mirror_sessions_max: raw.mirror_sessions_max,
             port_tpid: slot!(self, set_port_tpid, "set_port_tpid").is_ok(),
             ecmp_width: raw.ecmp_width,
@@ -1053,6 +1089,7 @@ impl SaiBackend for OpenBcmBackend {
     }
 
     fn remove_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        self.logical_port(port)?;
         let default = self.default_vlan()?;
         // Idempotent per the trait: a port that is already out of the
         // default VLAN is the desired state, not a failure.
@@ -1066,6 +1103,7 @@ impl SaiBackend for OpenBcmBackend {
     }
 
     fn restore_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        self.logical_port(port)?;
         let default = self.default_vlan()?;
         match self.vlan_member_add(default, port, false) {
             Err(SaiError::Status {
@@ -1105,7 +1143,10 @@ impl SaiBackend for OpenBcmBackend {
         let vlan_id = self.vlan_id_or_default(vlan)?;
         let sw = self.switch()?;
         let (port, discard) = match action {
-            FdbAction::Forward(port) => (port.0 as u32, 0),
+            // A LAG destination would need a trunk gport, which this ABI
+            // has no slot for; refuse rather than program whichever port
+            // shares the trunk's number.
+            FdbAction::Forward(port) => (self.logical_port(port)?, 0),
             // The port is meaningless for a black hole, and the shim
             // ignores it; pass 0 rather than something that looks real.
             FdbAction::Drop => (0, 1),
@@ -1139,7 +1180,7 @@ impl SaiBackend for OpenBcmBackend {
         let logical_port = match port {
             Some(port) => {
                 flags |= FLUSH_PORT;
-                port.0 as u32
+                self.logical_port(port)?
             }
             None => 0,
         };
@@ -1161,21 +1202,57 @@ impl SaiBackend for OpenBcmBackend {
         unimplemented_slot("port_storm_drops")
     }
 
-    fn create_mirror_session(&mut self, _monitor: PortId) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_mirror_session")
+    // --- Port mirroring (ABI 1.6) -------------------------------------
+    //
+    // A session is an SDK mirror destination; its id is the
+    // destination's own, derived like every other object id here.
+
+    fn create_mirror_session(&mut self, monitor: PortId) -> Result<Oid, SaiError> {
+        let f = slot!(self, mirror_create, "mirror_create")?;
+        let logical = self.logical_port(monitor)?;
+        let sw = self.switch()?;
+        let mut session: u32 = 0;
+        // SAFETY: `session` is a live u32 the shim writes only on OK.
+        check("mirror_create", unsafe { f(sw, logical, &mut session) })?;
+        Ok(mirror_oid(session))
     }
 
-    fn remove_mirror_session(&mut self, _session: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_mirror_session")
+    fn remove_mirror_session(&mut self, session: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, mirror_destroy, "mirror_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("mirror_destroy", unsafe { f(sw, oid_mirror(session)) })
     }
 
     fn set_port_mirror(
         &mut self,
-        _port: PortId,
-        _ingress: Option<Oid>,
-        _egress: Option<Oid>,
+        port: PortId,
+        ingress: Option<Oid>,
+        egress: Option<Oid>,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_mirror")
+        // The two directions are independent, and each is a set rather
+        // than an addition: attaching replaces whatever that direction
+        // pointed at, `None` clears it.
+        let logical = self.logical_port(port)?;
+        for (session, is_egress) in [(ingress, 0), (egress, 1)] {
+            match session {
+                Some(session) => {
+                    let f = slot!(self, mirror_port_attach, "mirror_port_attach")?;
+                    let sw = self.switch()?;
+                    // SAFETY: plain scalars over the ABI.
+                    check("mirror_port_attach", unsafe {
+                        f(sw, logical, oid_mirror(session), is_egress)
+                    })?;
+                }
+                None => {
+                    let f = slot!(self, mirror_port_detach, "mirror_port_detach")?;
+                    let sw = self.switch()?;
+                    // SAFETY: plain scalars over the ABI.
+                    check("mirror_port_detach", unsafe { f(sw, logical, is_egress) })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn create_samplepacket(&mut self, _rate: u32) -> Result<Oid, SaiError> {
@@ -1200,9 +1277,10 @@ impl SaiBackend for OpenBcmBackend {
 
     fn set_port_tpid(&mut self, port: PortId, tpid: u16) -> Result<(), SaiError> {
         let f = slot!(self, set_port_tpid, "set_port_tpid")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
-        check("set_port_tpid", unsafe { f(sw, port.0 as u32, tpid) })
+        check("set_port_tpid", unsafe { f(sw, logical, tpid) })
     }
 
     // --- Link aggregation (ABI 1.4) ----------------------------------
@@ -1238,6 +1316,7 @@ impl SaiBackend for OpenBcmBackend {
     fn add_lag_member(&mut self, lag: PortId, port: PortId) -> Result<Oid, SaiError> {
         let f = slot!(self, lag_member_add, "lag_member_add")?;
         let tid = self.lag_tid(lag)?;
+        let logical = self.logical_port(port)?;
         // The port stops bridging on its own account: from here its
         // traffic belongs to the trunk. Done before the member exists,
         // so a failure leaves the port in the state it started in.
@@ -1246,7 +1325,7 @@ impl SaiBackend for OpenBcmBackend {
         // Gated closed, per the trait: in the trunk, forwarding nothing
         // until something (LACP, or a static config) opens the gate.
         // SAFETY: plain scalars over the ABI.
-        check("lag_member_add", unsafe { f(sw, tid, port.0 as u32, 0) })?;
+        check("lag_member_add", unsafe { f(sw, tid, logical, 0) })?;
         Ok(lag_member_oid(tid, port))
     }
 
@@ -1258,19 +1337,21 @@ impl SaiBackend for OpenBcmBackend {
             )));
         }
         let f = slot!(self, lag_member_remove, "lag_member_remove")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
-        check("lag_member_remove", unsafe { f(sw, tid, port.0 as u32) })?;
+        check("lag_member_remove", unsafe { f(sw, tid, logical) })?;
         self.restore_port_default_vlan(port)
     }
 
     fn set_lag_member_state(&mut self, member: Oid, enabled: bool) -> Result<(), SaiError> {
         let f = slot!(self, lag_member_state, "lag_member_state")?;
         let (tid, port) = oid_lag_member(member);
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
         check("lag_member_state", unsafe {
-            f(sw, tid, port.0 as u32, i32::from(enabled))
+            f(sw, tid, logical, i32::from(enabled))
         })
     }
 
@@ -1538,6 +1619,7 @@ impl SaiBackend for OpenBcmBackend {
 
     fn set_port_learn_limit(&mut self, port: PortId, limit: Option<u32>) -> Result<(), SaiError> {
         let f = slot!(self, set_port_learn_limit, "set_port_learn_limit")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // The ABI spells "no limit" as a negative, matching the SDK. A
         // limit larger than i32::MAX is not a real configuration, so it
@@ -1547,17 +1629,16 @@ impl SaiBackend for OpenBcmBackend {
             None => -1,
         };
         // SAFETY: plain scalars over the ABI.
-        check("set_port_learn_limit", unsafe {
-            f(sw, port.0 as u32, limit)
-        })
+        check("set_port_learn_limit", unsafe { f(sw, logical, limit) })
     }
 
     fn set_port_learning(&mut self, port: PortId, learn: bool) -> Result<(), SaiError> {
         let f = slot!(self, set_port_learning, "set_port_learning")?;
+        let logical = self.logical_port(port)?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
         check("set_port_learning", unsafe {
-            f(sw, port.0 as u32, i32::from(learn))
+            f(sw, logical, i32::from(learn))
         })
     }
 }
@@ -1767,8 +1848,10 @@ mod tests {
         assert_eq!(caps.buffer_bytes_total, 4 * 1024 * 1024);
         assert_eq!(caps.ecmp_width, 64);
         assert!(caps.ipv6);
-        // No mirror sessions reported => the family is off.
-        assert!(!caps.mirror && caps.mirror_sessions_max == 0);
+        // Mirroring follows its slot; the session count is a
+        // separate fact the shim reports, and syncd validates
+        // against it, so 0 would refuse every session up front.
+        assert!(caps.mirror && caps.mirror_sessions_max == 2);
         // ...but the slots that do exist read as supported -- derived
         // from the vtable, not from a hand-maintained list.
         assert!(caps.port_tpid, "QinQ, ABI 1.2");
@@ -1895,6 +1978,10 @@ mod tests {
             stp_vlan_set: None,
             stp_port_state: None,
             lag_stp_port_state: None,
+            mirror_create: None,
+            mirror_destroy: None,
+            mirror_port_attach: None,
+            mirror_port_detach: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -1998,6 +2085,10 @@ mod tests {
             "stp_vlan_set",
             "stp_port_state",
             "lag_stp_port_state",
+            "mirror_create",
+            "mirror_destroy",
+            "mirror_port_attach",
+            "mirror_port_detach",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2074,6 +2165,10 @@ mod tests {
             std::mem::offset_of!(Api, stp_vlan_set),
             std::mem::offset_of!(Api, stp_port_state),
             std::mem::offset_of!(Api, lag_stp_port_state),
+            std::mem::offset_of!(Api, mirror_create),
+            std::mem::offset_of!(Api, mirror_destroy),
+            std::mem::offset_of!(Api, mirror_port_attach),
+            std::mem::offset_of!(Api, mirror_port_detach),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -2628,5 +2723,104 @@ mod tests {
             oid_tag(stp_oid(1).0),
             oid_tag(lag_member_oid(1, PortId(1)).0)
         );
+    }
+    // --- Port mirroring ------------------------------------------------
+
+    /// The session a direction feeds; 0 = none, -1 = no such port.
+    fn stub_mirror(b: &OpenBcmBackend, port: u32, egress: bool) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *mut ShimSwitch,
+                    u32,
+                    std::os::raw::c_int,
+                ) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_mirror\0").unwrap();
+            f(b.switch, port, i32::from(egress))
+        }
+    }
+
+    /// The two directions are independent, and each is a set: attaching
+    /// replaces, `None` clears. The SDK's own call is additive, so
+    /// "replaces" is something the shim has to do rather than get.
+    #[test]
+    fn port_mirroring_sets_each_direction_independently() {
+        let mut b = backend();
+        let one = b.create_mirror_session(PortId(3)).unwrap();
+        let two = b.create_mirror_session(PortId(4)).unwrap();
+        assert_ne!(one, two);
+
+        b.set_port_mirror(PortId(1), Some(one), None).unwrap();
+        assert_eq!(stub_mirror(&b, 1, false), oid_mirror(one) as i32);
+        assert_eq!(stub_mirror(&b, 1, true), 0, "egress untouched");
+
+        b.set_port_mirror(PortId(1), Some(two), Some(one)).unwrap();
+        assert_eq!(
+            stub_mirror(&b, 1, false),
+            oid_mirror(two) as i32,
+            "replaced"
+        );
+        assert_eq!(stub_mirror(&b, 1, true), oid_mirror(one) as i32);
+
+        // A session with ports still attached cannot be removed.
+        assert!(b.remove_mirror_session(one).is_err());
+        b.set_port_mirror(PortId(1), None, None).unwrap();
+        assert_eq!(stub_mirror(&b, 1, false), 0);
+        assert_eq!(stub_mirror(&b, 1, true), 0);
+        b.remove_mirror_session(one).unwrap();
+        b.remove_mirror_session(two).unwrap();
+    }
+
+    /// Clearing a direction that is already clear is not an error: the
+    /// caller reaches this whenever it rewrites one direction and leaves
+    /// the other alone.
+    #[test]
+    fn detaching_an_unmirrored_direction_is_not_an_error() {
+        let mut b = backend();
+        b.set_port_mirror(PortId(1), None, None).unwrap();
+        assert_eq!(stub_mirror(&b, 1, false), 0);
+    }
+
+    /// A LAG id is a `PortId`, and truncating one to `u32` yields its
+    /// trunk id -- a small number that is a perfectly good port here.
+    /// Every port-only slot rejects it instead.
+    ///
+    /// The second LAG is deliberate: trunk 1 truncates to logical port
+    /// 1, which exists. A test using trunk 0 would pass whether or not
+    /// the guard were there, because the stub has no port 0 to hit.
+    #[test]
+    fn a_lag_id_is_refused_where_a_port_is_required() {
+        let mut b = backend();
+        let _first = b.create_lag().unwrap();
+        let lag = b.create_lag().unwrap();
+        assert_eq!(lag_tid_of(lag), Some(1), "collides with logical port 1");
+
+        b.set_port_learning(PortId(1), true).unwrap();
+        b.set_port_tpid(PortId(1), 0x8100).unwrap();
+
+        assert!(b.set_port_admin_state(lag, true).is_err());
+        assert!(b.set_port_speed(lag, 1000).is_err());
+        assert!(b.set_port_learning(lag, false).is_err());
+        assert!(b.set_port_tpid(lag, 0x88a8).is_err());
+        assert!(b.create_mirror_session(lag).is_err());
+        assert!(b.set_port_mirror(lag, None, None).is_err());
+        assert!(b.port_counters(lag).is_err());
+        assert!(b.set_port_learn_limit(lag, Some(8)).is_err());
+        assert!(b.remove_port_default_vlan(lag).is_err());
+        // An FDB entry pointing at a LAG would need a trunk gport, which
+        // the ABI has no slot for; refused rather than mis-programmed.
+        assert!(b
+            .add_fdb_entry(None, MAC_A, FdbAction::Forward(lag))
+            .is_err());
+        assert!(b.flush_fdb(None, Some(lag)).is_err());
+        // ...and the port that joins a LAG has to be a real one.
+        assert!(b.add_lag_member(lag, lag).is_err());
+
+        // Port 1 is what every one of those would have hit. It did not.
+        assert_eq!(stub_port_int(&b, b"hemlockbcm_stub_learning\0", 1), 1);
+        assert_eq!(stub_port_int(&b, b"hemlockbcm_stub_learn_limit\0", 1), -1);
+        assert_eq!(stub_tpid(&b, 1), 0x8100);
+        assert_eq!(stub_mirror(&b, 1, false), 0);
+        assert_eq!(stub_member(&b, 1, 1), 0, "still in the default VLAN");
     }
 }

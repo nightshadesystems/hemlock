@@ -34,6 +34,7 @@
 #define STUB_FDB 8
 #define STUB_LAGS 2
 #define STUB_STGS 2
+#define STUB_MIRRORS 2
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -59,6 +60,13 @@ struct stub_vlan {
     int lag_tagged[STUB_LAGS];
     /* Exactly one spanning-tree group holds a VLAN at any time. */
     uint32_t stg;
+};
+
+/* A local (SPAN) mirror session. */
+struct stub_mirror {
+    int used;
+    uint32_t session;
+    uint32_t monitor;
 };
 
 /* A spanning-tree group other than the default one. */
@@ -103,6 +111,10 @@ struct hemlockbcm_switch {
     struct stub_fdb fdb[STUB_FDB];
     struct stub_lag lags[STUB_LAGS];
     struct stub_stg stgs[STUB_STGS];
+    struct stub_mirror mirrors[STUB_MIRRORS];
+    /* The session each direction of each port feeds; 0 = none. */
+    uint32_t mirror_in[STUB_PORTS];
+    uint32_t mirror_out[STUB_PORTS];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -274,7 +286,7 @@ static int stub_capabilities(struct hemlockbcm_switch *sw,
     memset(out, 0, sizeof(*out));
     out->buffer_bytes_total = 4u * 1024u * 1024u;  /* Helix4's 4 MB */
     out->ecmp_width = 64;
-    out->mirror_sessions_max = 0;                  /* phase 6 */
+    out->mirror_sessions_max = STUB_MIRRORS;                  /* phase 6 */
     out->ipv6 = 1;
     return HEMLOCKBCM_OK;
 }
@@ -1150,6 +1162,128 @@ HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_vlan_stg(struct hemlockbcm_switch *sw
     return vlan == NULL ? 0 : vlan->stg;
 }
 
+/* --- Port mirroring (ABI 1.6) -------------------------------------------- */
+
+static struct stub_mirror *find_mirror(struct hemlockbcm_switch *sw, uint32_t session)
+{
+    size_t i;
+    for (i = 0; i < STUB_MIRRORS; i++) {
+        if (sw->mirrors[i].used && sw->mirrors[i].session == session) {
+            return &sw->mirrors[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_mirror_create(struct hemlockbcm_switch *sw, uint32_t monitor_port,
+                              uint32_t *session)
+{
+    size_t i;
+
+    if (sw == NULL || session == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (find_port(sw, monitor_port) == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_MIRRORS; i++) {
+        if (!sw->mirrors[i].used) {
+            memset(&sw->mirrors[i], 0, sizeof(sw->mirrors[i]));
+            sw->mirrors[i].used = 1;
+            /* Session ids start at 1: a real destination id is an opaque
+             * gport and 0 is not special, but nothing here needs 0 and
+             * leaving it out makes an unattached direction easy to
+             * spell in the hooks below. */
+            sw->mirrors[i].session = (uint32_t)i + 1;
+            sw->mirrors[i].monitor = monitor_port;
+            *session = sw->mirrors[i].session;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_mirror_destroy(struct hemlockbcm_switch *sw, uint32_t session)
+{
+    struct stub_mirror *mirror;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    mirror = find_mirror(sw, session);
+    if (mirror == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (sw->mirror_in[i] == session || sw->mirror_out[i] == session) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* detach the ports first */
+        }
+    }
+    memset(mirror, 0, sizeof(*mirror));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_mirror_port_attach(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   uint32_t session, int egress)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (find_mirror(sw, session) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* A set, not an addition: whatever the direction pointed at before
+     * is replaced. */
+    if (egress) {
+        sw->mirror_out[port - sw->ports] = session;
+    } else {
+        sw->mirror_in[port - sw->ports] = session;
+    }
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_mirror_port_detach(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   int egress)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Detaching a direction that is already clear is not an error. */
+    if (egress) {
+        sw->mirror_out[port - sw->ports] = 0;
+    } else {
+        sw->mirror_in[port - sw->ports] = 0;
+    }
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI: the session a direction points at, or
+ * 0 for none, or -1 for no such port. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_mirror(struct hemlockbcm_switch *sw,
+                                             uint32_t logical_port, int egress)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+
+    if (sw == NULL || port == NULL) {
+        return -1;
+    }
+    return (int)(egress ? sw->mirror_out[port - sw->ports]
+                        : sw->mirror_in[port - sw->ports]);
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1193,6 +1327,10 @@ static const struct hemlockbcm_api STUB_API = {
     stub_stp_vlan_set,
     stub_stp_port_state,
     stub_lag_stp_port_state,
+    stub_mirror_create,
+    stub_mirror_destroy,
+    stub_mirror_port_attach,
+    stub_mirror_port_detach,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)
