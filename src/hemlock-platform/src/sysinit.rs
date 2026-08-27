@@ -482,7 +482,21 @@ impl Sysfs {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 report.created.push(label);
             }
-            for (channel, actual) in self.mux_child_buses(parent, mux.address) {
+            let children = self.mux_child_buses(parent, mux.address);
+            if children.is_empty() {
+                // Without the links there is nothing to translate, so
+                // every device on this mux falls back to the manifest's
+                // declared number -- which is a guess, and on this board
+                // a wrong one. Loud, because the symptom otherwise is
+                // devices that just never appear.
+                warn!(
+                    mux = %mux.name,
+                    parent,
+                    address = format_args!("0x{:02x}", mux.address),
+                    "mux exposes no channel-N links; bus numbers stay as declared"
+                );
+            }
+            for (channel, actual) in children {
                 if channel < mux.channels {
                     report.buses.insert(mux.child_bus_base + channel, actual);
                 }
@@ -895,6 +909,29 @@ mod tests {
 
     /// The E1031 case: the kernel numbering already matches the manifest,
     /// so the map records no divergence and every path is unchanged.
+    /// A mux that exposes no `channel-N` links leaves every bus number
+    /// at its declared value, and the first device on that mux then aims
+    /// at a bus the kernel never created. Observed for real: the AS4610's
+    /// ONIE runs 3.2.69, which predates the symlinks `i2c-mux.c` creates
+    /// today, so its `pca954x` bound and enumerated eight child buses
+    /// (i2c-10..17) with nothing linking them back to the mux. Both
+    /// kernels Hemlock ships do create them, so this is the degraded
+    /// path: it warns, then fails naming the bus it could not find,
+    /// rather than quietly reporting a switch with no sensors.
+    #[test]
+    fn a_mux_without_channel_links_cannot_place_its_devices() {
+        let (dir, sysfs) = fake_sysfs(&[(1, "SMBus iSMT adapter"), (10, "ch0")]);
+        // No fake_mux_channels() call: the mux dir has no channel-N.
+        std::fs::create_dir_all(dir.path().join("sys/bus/i2c/devices/1-0073")).unwrap();
+        let err = sysfs
+            .instantiate_i2c(&e1031_like_topology())
+            .expect_err("declared bus 2 does not exist; the kernel used 10");
+        assert!(
+            matches!(err, SysinitError::I2c { bus: 2, .. }),
+            "error should name the declared bus it could not find: {err}"
+        );
+    }
+
     #[test]
     fn matching_kernel_numbering_is_a_no_op() {
         let (dir, sysfs) = fake_sysfs(&[(1, "SMBus iSMT adapter"), (2, "ch0")]);

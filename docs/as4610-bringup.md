@@ -98,7 +98,8 @@ next reader does not have to re-derive it:
 | NOS storage | `/dev/sda`, 7.5 GB, `removable = 0`, GPT |
 | Hand-off | `nos_bootcmd`, run by `bootcmd` before `onie_bootcmd`. No `onie-nos-mode` on this ONIE. |
 | i2c adapters | `iproc-smb0`, `iproc-smb1` |
-| Mux channels | see the note below – `/dev/i2c-16` does not exist, so the earlier 10–17 reading needs re-confirming |
+| Mux channels | buses **10–17** (chan_id 0–7 of `i2c-1-mux`), not the 2–9 the manifest declares |
+| Mux `channel-N` links | **absent** under ONIE — its 3.2.69 kernel predates them; see below |
 | Product ID | CPLD `0x01` = **`0x05`** = AS4610-54T **revision B**, which has fans |
 | `sda1` / `sda2` / `sda3` | ext3 (`uImage`) / ext3 (`grub-core.img`) / **btrfs** |
 | Kernel load/entry | `0x61008000`, confirmed by the salvaged uImage header *and* its embedded config — see [`as4610-kernel-port.md`](as4610-kernel-port.md) |
@@ -130,26 +131,43 @@ register is the only way to tell. While at that prompt,
 `i2cget -y -f 0 0x30 0x11` shows PSU presence/power-good (present = bit
 `i*2`, good = bit `i*2+1`) and the fan fault bits (0x20 / 0x10).
 
-**Still open: which kernel buses the mux channels are.** `i2cdetect -y 16`
-returns `No such file or directory`, so the "buses 10-17" reading in the
-table above does not hold as recorded -- either the mux never bound under
-ONIE, or `i2c-dev` nodes exist for only some buses. This blocks nothing:
-`BusMap` follows the mux's `channel-N` links at bring-up and translates
-whatever the kernel assigned, and the numbering under the ported 6.1
-kernel is what actually matters, not ONIE's. To settle what ONIE sees:
+**The mux channels are buses 10-17, and `BusMap` cannot see it here.**
+`i2cdetect -l` shows `i2c-10` through `i2c-17` as `i2c-1-mux (chan_id
+0..7)`, so the numbering really does diverge from the manifest's declared
+2-9 -- exactly what the declared->actual translation exists for. Two
+things about ONIE get in the way of confirming it the normal way:
+
+- `i2cdetect -y 16` fails because **`/dev/i2c-16` does not exist**: ONIE
+  creates nodes only for `i2c-0..3`, so the child buses have no character
+  device even though the adapters are registered. `mknod /dev/i2c-16 c 89
+  16` gives you one, after which the channel can be scanned.
+- `ls /sys/bus/i2c/devices/1-0070/` shows **no `channel-N` symlinks** --
+  only `driver`, `modalias`, `name`, `subsystem`, `uevent`. Those links
+  are how `BusMap` learns the mapping, and ONIE's 3.2.69 kernel predates
+  `i2c-mux.c` creating them. Verified that both kernels Hemlock ships do:
+  `channel-%u` is present in `i2c-mux.ko` on Debian 6.1 (the AS4610 image
+  kernel) and 6.12 (the E1031's).
+
+So ONIE cannot validate the translation, and the numbering under the
+ported 6.1 kernel is what actually matters. What this *did* surface is a
+gap now fixed in `sysinit`: a mux that yields no channel links used to
+leave every bus at its declared number in silence. It now warns, and the
+first device on that mux fails naming the bus it could not find, instead
+of a switch that boots reporting no sensors.
+
+**Scan channel 6 to confirm the PSU bay addresses**, once you have a
+device node for it:
 
 ```sh
-i2cdetect -l                                   # every adapter and its number
-ls /dev/i2c-*
-ls -l /sys/bus/i2c/devices/*-0070/             # channel-N links, if the mux bound
+mknod /dev/i2c-16 c 89 16
+i2cdetect -y 16
 ```
 
-If the mux did bind, `i2cdetect -y <channel-6 bus>` also confirms the PSU
-bay addresses. The manifest puts their EEPROMs at 0x50/0x51 from
-edgenos's device tree; ONL's driver carries a stale `normal_i2c` list
-naming 0x50 and **0x53** (unreachable -- that driver has no `.detect`
-callback -- so it was never exercised). If a scan disagrees with the DTS,
-the DTS is what gets corrected. Expect pmbus at 0x58/0x59 alongside.
+The manifest puts the PSU EEPROMs at 0x50/0x51 from edgenos's device
+tree; ONL's driver carries a stale `normal_i2c` list naming 0x50 and
+**0x53** (unreachable -- that driver has no `.detect` callback -- so it
+was never exercised). If the scan disagrees with the DTS, the DTS is what
+gets corrected. Expect pmbus at 0x58/0x59 alongside.
 
 ### Salvage what is on `sda` before you wipe it
 
