@@ -146,9 +146,50 @@ fn as4610_declares_an_arm_openbcm_platform() {
     // There is no armhf libsaibcm; carrying a SAI pin would imply one.
     assert!(m.sai.version_pin.is_none() && m.sai.libsai_path.is_none());
 
-    // OpenBCM's knet-cb has no psample path, unlike SONiC's fork.
+    // OpenBCM's knet-cb has no psample path, unlike SONiC's fork. The
+    // two accton_* entries are the drivers ported into kmod/accton/;
+    // accton_as4610_fan is deliberately absent (see below).
     assert_eq!(
         m.kernel.required_modules,
-        ["linux-kernel-bde", "linux-user-bde", "linux-bcm-knet"]
+        [
+            "linux-kernel-bde",
+            "linux-user-bde",
+            "linux-bcm-knet",
+            "accton_as4610_cpld",
+            "accton_as4610_psu",
+        ]
     );
+}
+
+/// PSU state comes from ONL's ported driver, which hangs `psu_present` /
+/// `psu_power_good` off each PSU's own i2c client rather than a platform
+/// device -- so the attribute names are relative and go through BusMap.
+///
+/// Fans stay unmodeled until the board's product ID is read: the CPLD
+/// driver only registers the `as4610_fan` platform device on the 30P,
+/// 54P and 54T_B, so a plain 54T has none. Declaring fans that can never
+/// be read would make `show environment` lie.
+#[test]
+fn as4610_models_psus_from_the_cpld_and_no_fans_yet() {
+    let p = platform("accton-as4610-54");
+    let hw = &p.manifest.hardware;
+
+    let names: Vec<&str> = hw.psus.iter().map(|psu| psu.name.as_str()).collect();
+    assert_eq!(names, ["PSU-1", "PSU-2"]);
+    for (psu, address) in hw.psus.iter().zip([0x50, 0x51]) {
+        assert_eq!(psu.address, address);
+        // Mux channel 6, per the manifest's child_bus_base of 2.
+        assert_eq!(format!("{}", psu.bus), "8");
+        assert_eq!(psu.presence_attr.as_deref(), Some("psu_present"));
+        assert_eq!(psu.status_attr.as_deref(), Some("psu_power_good"));
+        assert!(
+            psu.presence_attr
+                .as_deref()
+                .is_some_and(|attr| !attr.starts_with('/')),
+            "relative, so BusMap can renumber the mux child bus"
+        );
+    }
+
+    assert!(hw.thermal.fans.is_empty());
+    assert!(hw.thermal.fan_control.is_none());
 }

@@ -5,7 +5,7 @@
 //! hardware and the mock used in CI and development.
 
 use hemlock_platform::schema::{FanDef, Psu, ThermalSensor, Transceiver};
-use hemlock_platform::sysinit::BusMap;
+use hemlock_platform::sysinit::{hwmon_device_dir, BusMap};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HwError {
@@ -122,14 +122,17 @@ impl SysfsBackend {
         })
     }
 
-    /// Resolve `<bus>-<addr>` + channel to the hwmon attribute file, e.g.
+    /// Resolve a `hwmon` identity + channel to the attribute file, e.g.
     /// `/sys/bus/i2c/devices/11-001a/hwmon/hwmon3/temp3_input`. The hwmonN
     /// index varies per boot, hence the scan. Old-style hwmon drivers (the
-    /// haliburton emc2305 port) create their attributes directly on the
-    /// i2c device dir and register an empty hwmon node, so the device dir
-    /// itself is the fallback.
+    /// haliburton emc2305 port, ONL's AS4610 fan driver) create their
+    /// attributes directly on the device dir and register an empty hwmon
+    /// node, so the device dir itself is the fallback.
+    ///
+    /// `device` is an i2c client identity or a `platform:`-prefixed
+    /// platform device name; see [`hwmon_device_dir`].
     fn hwmon_attr(device: &str, attr: &str) -> Result<String, HwError> {
-        let dev_dir = format!("/sys/bus/i2c/devices/{device}");
+        let dev_dir = hwmon_device_dir(device);
         let base = format!("{dev_dir}/hwmon");
         if let Ok(entries) = std::fs::read_dir(&base) {
             for entry in entries.flatten() {
@@ -203,19 +206,6 @@ impl HwBackend for SysfsBackend {
     }
 
     fn psu_status(&self, psu: &Psu) -> Result<(bool, bool), HwError> {
-        // Prefer the platform's dedicated presence/power-good attributes
-        // (CPLD-backed, valid even when the pmbus device never probed).
-        if let Some(prs) = &psu.presence_attr {
-            let present = Self::read_u64(prs)? != 0;
-            if !present {
-                return Ok((false, false));
-            }
-            if let Some(status) = &psu.status_attr {
-                return Ok((true, Self::read_u64(status)? != 0));
-            }
-        }
-        // Fallback: pmbus driver bound => device dir exists; a readable
-        // status/power attribute means the PSU answers on the bus.
         // An unresolvable bus (a root the manifest never declared) is a
         // lint error; here it just means the PSU cannot be read.
         let Some(bus) = self.buses.resolve_ref(&psu.bus) else {
@@ -223,6 +213,20 @@ impl HwBackend for SysfsBackend {
         };
         let device = format!("{bus}-{:04x}", psu.address);
         let dir = format!("/sys/bus/i2c/devices/{device}");
+        // Prefer the platform's dedicated presence/power-good attributes
+        // (CPLD-backed, valid even when the pmbus device never probed).
+        if let Some(prs) = &psu.presence_attr {
+            let present = Self::read_u64(&psu_attr_path(&dir, prs))? != 0;
+            if !present {
+                return Ok((false, false));
+            }
+            if let Some(status) = &psu.status_attr {
+                let path = psu_attr_path(&dir, status);
+                return Ok((true, Self::read_u64(&path)? != 0));
+            }
+        }
+        // Fallback: pmbus driver bound => device dir exists; a readable
+        // status/power attribute means the PSU answers on the bus.
         if !std::path::Path::new(&dir).exists() {
             return Ok((false, false));
         }
@@ -244,6 +248,22 @@ impl HwBackend for SysfsBackend {
             Err(_) => return Ok(None),
         };
         Ok(Some(parse_sfp_eeprom(&bytes)))
+    }
+}
+
+/// Where a PSU's `presence_attr` / `status_attr` lives.
+///
+/// An absolute path addresses a device elsewhere in sysfs -- the E1031
+/// reads both from its SMC platform device. A bare attribute name is
+/// relative to the PSU's own i2c device dir, which is how ONL's AS4610
+/// PSU driver exposes `psu_present` / `psu_power_good`; that form goes
+/// through [`BusMap`], so it survives the kernel renumbering the mux
+/// child buses.
+fn psu_attr_path(dir: &str, attr: &str) -> String {
+    if attr.starts_with('/') {
+        attr.to_string()
+    } else {
+        format!("{dir}/{attr}")
     }
 }
 
@@ -567,5 +587,34 @@ mod tests {
     fn zero_optical_power_floors_at_minus_40_dbm() {
         assert_eq!(power_dbm(0), -40.0);
         assert!((power_dbm(10000) - 0.0).abs() < 0.001); // 1 mW = 0 dBm
+    }
+
+    /// The E1031 reads PSU presence from a platform device elsewhere in
+    /// sysfs; the AS4610's driver puts the same two bits on the PSU's own
+    /// i2c client, named relatively so BusMap can renumber the bus.
+    #[test]
+    fn psu_attributes_are_absolute_or_relative_to_the_psu() {
+        assert_eq!(
+            psu_attr_path("/sys/bus/i2c/devices/8-0050", "psu_present"),
+            "/sys/bus/i2c/devices/8-0050/psu_present"
+        );
+        assert_eq!(
+            psu_attr_path(
+                "/sys/bus/i2c/devices/8-0050",
+                "/sys/devices/platform/e1031.smc/psuL_prs"
+            ),
+            "/sys/devices/platform/e1031.smc/psuL_prs"
+        );
+    }
+
+    /// A `platform:` hwmon identity resolves to the platform device dir,
+    /// which is where ONL's AS4610 fan driver puts its attributes.
+    #[test]
+    fn hwmon_identities_address_i2c_clients_and_platform_devices() {
+        assert_eq!(hwmon_device_dir("23-004d"), "/sys/bus/i2c/devices/23-004d");
+        assert_eq!(
+            hwmon_device_dir("platform:as4610_fan"),
+            "/sys/devices/platform/as4610_fan"
+        );
     }
 }

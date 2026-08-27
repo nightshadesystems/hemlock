@@ -109,6 +109,46 @@ cannot cost you ONIE** — you can always get back in and reinstall. That
 is the single most reassuring fact on this board; the install is not a
 one-shot.
 
+### Still open, and answerable from this same ONIE prompt
+
+The three ONL platform drivers are now ported and committed under
+[`platforms/accton-as4610-54/kmod/`](../platforms/accton-as4610-54/kmod/README.md),
+and the manifest declares the two PSUs. Two facts they need are still
+guesses, and both are one command away:
+
+```sh
+# 1. Product ID -- does this board have fans?
+#    CPLD is at 0x30 on the iproc-smb0 root (i2c-0 under ONIE).
+i2cget -y -f 0 0x30 0x01
+
+# 2. What is actually on mux channel 6 (bus 16 under ONIE's numbering)?
+i2cdetect -y 16
+```
+
+**Why each matters:**
+
+- **Register 0x01, low nibble** is the product ID: `0` = 30T, `1` = 30P,
+  `2` = 54T, `3` = 54P, `5` = 54T rev B. ONL's CPLD driver registers the
+  `as4610_fan` platform device only for 30P, 54P and 54T_B — so a `2`
+  means this board is **fanless** and `[[hardware.thermal.fan]]` should
+  stay out of the manifest permanently, while a `5` means the fan section
+  goes in (`hwmon = "platform:as4610_fan"`, `rpm_attr =
+  "fan1_speed_rpm"`, `pwm_attr = "fan_duty_cycle_percentage"`,
+  `pwm_max = 100`) along with a fan curve. The chassis label reads
+  "AS4610-54T" either way, so this register is the only way to know.
+  While you are there, `i2cget -y -f 0 0x30 0x11` shows PSU
+  presence/power-good (present = bit `i*2`, good = bit `i*2+1`) and the
+  fan fault bits (0x20 / 0x10) — a board with fans installed will not
+  report both faulted.
+- **Channel 6** carries the PSU bays. The manifest puts their EEPROMs at
+  0x50 and 0x51, from edgenos's device tree; ONL's driver carries a stale
+  `normal_i2c` list naming 0x50 and **0x53** instead (unreachable, since
+  that driver has no `.detect` callback, so it was never exercised). If
+  `i2cdetect` disagrees with the DTS, the DTS is what gets corrected.
+  Expect the pmbus devices at 0x58/0x59 in the same scan.
+
+Both answers are small manifest edits, not code changes.
+
 ### Salvage what is on `sda` before you wipe it
 
 `sda` still carries whatever NOS shipped on this box, and the install
@@ -346,10 +386,11 @@ i2cdetect -y 0
 i2cget -y -f 0 0x30 0x07
 ```
 
-**If it cannot find the i2c root:** the manifest names the root
-`cpld-bus`, matched as the *first* adapter called `iproc-smbus`. If the
-SoC controllers enumerate in the other order, swap the `instance` values
-in `[[hardware.i2c.root]]`. Confirm with:
+**If it cannot find the i2c root:** the manifest matches `cpld-bus` to
+the adapter named `iproc-smb0` and `mux-bus` to `iproc-smb1`. Those names
+were read off the box under ONIE 2016.05; if the ported 6.1 kernel's
+driver names them differently, correct `adapter` in
+`[[hardware.i2c.root]]`. Confirm with:
 
 ```sh
 for a in /sys/bus/i2c/devices/i2c-*; do echo "$a: $(cat $a/name)"; done

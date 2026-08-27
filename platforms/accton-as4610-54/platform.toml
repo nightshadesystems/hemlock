@@ -62,7 +62,17 @@ led_program = "helix4-led.hex"
 # Listing psample here would fail the image build's loadability gate for
 # nothing. (Consequence for phase 6: sFlow has no psample punt path on
 # this platform; the shim delivers sampled packets itself.)
-required_modules = ["linux-kernel-bde", "linux-user-bde", "linux-bcm-knet"]
+required_modules = [
+    "linux-kernel-bde",
+    "linux-user-bde",
+    "linux-bcm-knet",
+    # Accton platform modules (kmod/accton/). The CPLD driver exports the
+    # register accessors the other two call, so it must load first; its
+    # probe is also what registers the `as4610_fan` platform device, and
+    # only on the variants that have fans (see the fan note below).
+    "accton_as4610_cpld",
+    "accton_as4610_psu",
+]
 
 [kernel.module_args]
 # dmasize=8M is edgenos's value for this board — a quarter of the E1031's
@@ -170,8 +180,8 @@ sdk_names = ["xe0", "xe1", "xe2", "xe3"]
 #                  ch6    psu eeproms @0x50/0x51, pmbus @0x58/0x59
 #                  ch7    lm77 @0x48, board eeprom @0x50, RTC @0x68
 #
-# Both roots are SoC controllers registering as "iproc-smbus"
-# (xgs_iproc_smbus.c), so they are told apart by instance, not by name.
+# The two SoC controllers register one name each -- see the adapter names
+# read off the box, below -- so they are told apart by name, not instance.
 #
 # The DTS instantiates all of this in-tree today; Hemlock's DTS keeps only
 # the two controllers and lets pmon create the rest, so the numbering
@@ -235,25 +245,52 @@ warn_c = 55.0
 crit_c = 65.0
 
 # ---------------------------------------------------------------------------
-# NOT YET MODELED: fans and PSUs.
+# PSUs: two bays, read through ONL's ported `accton_as4610_psu` driver
+# (kmod/accton/). Each bay's EEPROM is an i2c client on mux channel 6, and
+# the driver hangs `psu_present` / `psu_power_good` off that client's own
+# sysfs dir, decoding them from CPLD register 0x11 (present = bit i*2,
+# power-good = bit i*2+1). Those are relative attribute names, so pmon
+# resolves them against the PSU's resolved device dir and they survive the
+# kernel numbering the mux children differently than declared.
 #
-# The board has 2 fans and 2 PSUs, both read through the CPLD at
-# i2c-0 0x30 (ONL: fan tach 0x2c/0x2d with rpm = raw*379*60/2/100, fan PWM
-# 0x2b low nibble, PSU present/power-good bits in 0x11). pmon reads fans
-# and PSU state from *sysfs*, so which attributes exist here depends on an
-# open question in docs/as4610-54-port.md: whether to port ONL's
-# accton_as4610_{cpld,fan,psu}.c into kmod/ (the cel-e1031 smc.c
-# precedent) or teach pmon to talk to the CPLD directly.
+# Addresses come from edgenos's device tree, like the rest of the topology
+# above; ONL's driver carries a stale `normal_i2c` list naming 0x50/0x53,
+# but that list was never reachable (no `.detect` callback) and the DTS is
+# the board-specific source. Confirm with i2cdetect on channel 6 at gate 1.
+# ---------------------------------------------------------------------------
+
+[[hardware.psu]]
+name = "PSU-1"
+bus = 8
+address = 0x50
+driver = "as4610_psu1"
+presence_attr = "psu_present"
+status_attr = "psu_power_good"
+
+[[hardware.psu]]
+name = "PSU-2"
+bus = 8
+address = 0x51
+driver = "as4610_psu2"
+presence_attr = "psu_present"
+status_attr = "psu_power_good"
+
+# ---------------------------------------------------------------------------
+# NOT MODELED: fans, pending one register read.
 #
-# Until that is settled these sections stay absent rather than guessing at
-# attribute names, so `show environment` reports the sensor above and no
-# fans — which is true — instead of inventing readings. Note that ONL's
-# fan driver registers hwmon on a *platform* device with non-standard
-# attribute names (`fan1_speed_rpm`, `fan_duty_cycle_percentage`), which
-# the manifest's `hwmon = "<bus>-<addr>"` form cannot address; adopting it
-# needs one more schema field. There is deliberately no
-# [hardware.thermal.fan_control] either: a fan curve with no fans to drive
-# would be a lie.
+# ONL's `accton_as4610_fan` is ported (kmod/accton/) and would be
+# addressed as `hwmon = "platform:as4610_fan"` with `rpm_attr` /
+# `pwm_attr` / `pwm_max = 100`. What is not settled is whether THIS BOARD
+# HAS FANS: the CPLD driver registers the `as4610_fan` platform device
+# only for product IDs 30P, 54P and 54T_B, so a plain AS4610-54T (product
+# ID 2) is fanless and the device never appears. Both revisions carry the
+# same "AS4610-54T" label, so the chassis cannot answer it.
+#
+# Gate 1 of docs/as4610-bringup.md reads CPLD register 0x01 to settle it.
+# Until then no fans are declared and `show environment` reports the lm77
+# and no fans, which is true for one of the two revisions and honest for
+# both -- better than declaring fans that read as permanently failed. For
+# the same reason there is no [hardware.thermal.fan_control].
 # ---------------------------------------------------------------------------
 
 # SFP+ cages: optoe2 (SFP-style, 2-wire, EEPROM at 0x50), one per mux

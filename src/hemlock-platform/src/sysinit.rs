@@ -251,6 +251,10 @@ impl BusMap {
     /// field, e.g. `"23-004d"`), keeping the address half verbatim.
     /// Anything not in that shape is passed through untouched.
     pub fn resolve_hwmon(&self, hwmon: &str) -> String {
+        // A platform device has no bus number to translate.
+        if hwmon.starts_with(PLATFORM_HWMON_PREFIX) {
+            return hwmon.to_string();
+        }
         match hwmon.split_once('-') {
             Some((bus, addr)) => match bus.parse::<u32>() {
                 Ok(declared) => format!("{}-{addr}", self.resolve(declared)),
@@ -268,6 +272,26 @@ impl BusMap {
             .filter(|(declared, actual)| declared != actual)
             .map(|(declared, actual)| (*declared, *actual))
             .collect()
+    }
+}
+
+/// Prefix marking a manifest `hwmon` identity as a *platform* device
+/// rather than an i2c client: `platform:as4610_fan` addresses
+/// `/sys/devices/platform/as4610_fan`.
+pub const PLATFORM_HWMON_PREFIX: &str = "platform:";
+
+/// The sysfs directory a manifest `hwmon` identity names.
+///
+/// The usual form is an i2c client identity (`23-004d` ->
+/// `/sys/bus/i2c/devices/23-004d`). Some vendor drivers instead hang
+/// their attributes off a platform device with an empty hwmon node --
+/// ONL's AS4610 fan driver registers `as4610_fan` that way -- and those
+/// are named with the `platform:` prefix. The bus number in the i2c form
+/// is the manifest's *declared* one, so resolve through [`BusMap`] first.
+pub fn hwmon_device_dir(hwmon: &str) -> String {
+    match hwmon.strip_prefix(PLATFORM_HWMON_PREFIX) {
+        Some(name) => format!("/sys/devices/platform/{name}"),
+        None => format!("/sys/bus/i2c/devices/{hwmon}"),
     }
 }
 
@@ -855,6 +879,17 @@ mod tests {
         // Not a <bus>-<addr> identity: untouched rather than mangled.
         assert_eq!(map.resolve_hwmon("hwmon0"), "hwmon0");
         assert_eq!(map.resolve_hwmon("e1031.smc-fan"), "e1031.smc-fan");
+        // A platform device has no bus number to translate, and its dir
+        // is not under /sys/bus/i2c.
+        assert_eq!(
+            map.resolve_hwmon("platform:as4610_fan"),
+            "platform:as4610_fan"
+        );
+        assert_eq!(
+            hwmon_device_dir("platform:as4610_fan"),
+            "/sys/devices/platform/as4610_fan"
+        );
+        assert_eq!(hwmon_device_dir("7-004d"), "/sys/bus/i2c/devices/7-004d");
         assert_eq!(map.divergences(), vec![(2, 7)]);
     }
 

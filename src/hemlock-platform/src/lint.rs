@@ -10,6 +10,7 @@ use std::fmt;
 
 use crate::quirks;
 use crate::schema::{AsicAttach, BusRef, SaiBackendKind, DEFAULT_ROOT_NAME, KNOWN_CPU_ARCHES};
+use crate::sysinit::PLATFORM_HWMON_PREFIX;
 use crate::Platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,10 +424,16 @@ pub fn lint(platform: &Platform) -> LintReport {
                 fan.name
             ));
         }
+        check_hwmon_id(&fan.hwmon, &format!("fan {:?}", fan.name), &mut report);
     }
 
     let sensor_names: HashSet<&str> = hw.thermal.sensors.iter().map(|s| s.name.as_str()).collect();
     for s in &hw.thermal.sensors {
+        check_hwmon_id(
+            &s.hwmon,
+            &format!("thermal sensor {:?}", s.name),
+            &mut report,
+        );
         if s.warn_c >= s.crit_c {
             report.error(format!(
                 "thermal sensor {:?}: warn_c {} must be below crit_c {}",
@@ -494,6 +501,36 @@ pub fn lint(platform: &Platform) -> LintReport {
     }
 
     report
+}
+
+/// A `hwmon` field names either an i2c client (`<bus>-<addr>`, the usual
+/// case) or a platform device (`platform:<name>`, for vendor drivers that
+/// hang their attributes off one -- ONL's AS4610 fan driver). Anything
+/// else silently resolves to a path that will never exist, so it is
+/// rejected here rather than at 3am on a switch.
+fn check_hwmon_id(hwmon: &str, what: &str, report: &mut LintReport) {
+    if let Some(name) = hwmon.strip_prefix(PLATFORM_HWMON_PREFIX) {
+        if name.is_empty() || name.contains('/') {
+            report.error(format!(
+                "{what}: hwmon {hwmon:?} needs a device name after \"platform:\""
+            ));
+        }
+        return;
+    }
+    let valid = match hwmon.split_once('-') {
+        Some((bus, addr)) => {
+            !bus.is_empty()
+                && bus.bytes().all(|b| b.is_ascii_digit())
+                && !addr.is_empty()
+                && addr.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        None => false,
+    };
+    if !valid {
+        report.error(format!(
+            "{what}: hwmon {hwmon:?} must be an i2c identity (\"23-004d\") or \"platform:<name>\""
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -833,6 +870,30 @@ pwm_max = 0
         let report = lint(&platform_from(&base(fan)));
         assert!(!report.passed());
         assert!(messages(&report).contains("pwm_max"));
+    }
+
+    /// The AS4610 fan driver hangs its attributes off a platform device,
+    /// which no `<bus>-<addr>` identity can name; `platform:` does. A
+    /// typo in either form is an error, not a path that never resolves.
+    #[test]
+    fn hwmon_names_an_i2c_client_or_a_platform_device() {
+        let fan = |hwmon: &str| {
+            let template = r#"
+[[hardware.thermal.fan]]
+name = "FAN-1"
+hwmon = "HWMON"
+tach = "fan1"
+pwm = "pwm1"
+"#;
+            template.replace("HWMON", hwmon)
+        };
+        assert!(lint(&platform_from(&base(&fan("platform:as4610_fan")))).passed());
+        assert!(lint(&platform_from(&base(&fan("0-0030")))).passed());
+
+        for bad in ["as4610_fan", "platform:", "bus-0030", "0-00zz"] {
+            let report = lint(&platform_from(&base(&fan(bad))));
+            assert!(!report.passed(), "hwmon {bad:?} should not lint clean");
+        }
     }
 
     #[test]

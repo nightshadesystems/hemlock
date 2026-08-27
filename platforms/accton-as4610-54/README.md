@@ -22,6 +22,14 @@ So the datapath is Hemlock's own C shim (`libhemlockbcm.so`) over the
 source-available OpenBCM SDK, behind the same `SaiBackend` trait every
 other platform uses. Nothing above `hemlock-sai` can tell the difference.
 
+## Kernel modules
+
+Three ONL drivers are ported and committed under
+[`kmod/accton/`](kmod/README.md) — the CPLD, the fans and the PSUs —
+following the `cel-e1031` precedent. Kernel-module C is the one exception
+to this port's rule of referencing vendor data and never carrying vendor
+code; everything else about the board is data in `platform.toml`.
+
 ## Vendor files (not committed)
 
 Run `vendor/fetch-vendor.sh accton-as4610-54` (added in phase 3):
@@ -93,12 +101,12 @@ i2c-1 (SoC)  pca9548 @0x70 -> buses 2-9
                ch7    lm77 @0x48, board eeprom 24c04 @0x50, RTC @0x68
 ```
 
-Both roots are SoC controllers that register as `iproc-smbus`
-(`xgs_iproc_smbus.c`), so the manifest tells them apart by `instance`
-rather than by adapter name.
+The two SoC controllers register as `iproc-smb0` and `iproc-smb1` (read
+off the box under ONIE), one name each, so the manifest names them
+directly and leaves `instance` at 0.
 
-CPLD register map, from ONL's
-`accton_as4610_{cpld,fan,psu}.c` and edgenos's `platform.py`:
+CPLD register map, from the three ONL drivers now ported into
+[`kmod/accton/`](kmod/README.md) and edgenos's `platform.py`:
 
 | Register | Meaning |
 |---|---|
@@ -106,6 +114,10 @@ CPLD register map, from ONL's
 | `0x2b` | Fan PWM, low nibble; duty % = `(n*125 + 5) / 10` |
 | `0x2c`, `0x2d` | Fan 2 / fan 1 tach; rpm = `raw * 379 * 60 / 2 / 100` |
 | `0x07`, `0x08`, `0x0d`, `0x19`, `0x1b` | External-PHY reset deassert (see below) |
+| `0x01` | Product ID in the low nibble: 0 = 30T, 1 = 30P, 2 = 54T, 3 = 54P, 5 = 54T rev B |
+| `0x02`, `0x03`, `0x21` | SFP+/QSFP presence, rx_los and tx_fault |
+| `0x0b` | CPLD version |
+| `0x2a` | QSFP reset (the CPLD driver clears it at probe) |
 
 ## Bring-up
 
@@ -123,16 +135,16 @@ close four of the port's open questions.
   be unbound (`48000000.iproc_cmicd` from `iproc_cmic`) before the BDE
   can claim the device. Both live in the `as4610` quirks driver's
   `pre_asic_init`.
-- **Fans and PSUs are not modeled yet.** Both are read through the CPLD,
-  and pmon reads fans and PSU state from sysfs — so which attributes
-  exist depends on an unresolved question in the port spec: port ONL's
-  three kernel modules into `kmod/` (the `cel-e1031` `smc.c` precedent)
-  or teach pmon to talk to the CPLD directly. Until that is settled the
-  manifest declares the `lm77` sensor and no fans, which is true, rather
-  than inventing attribute names. Note ONL's fan driver registers hwmon
-  on a *platform* device with non-standard attribute names
-  (`fan1_speed_rpm`, `fan_duty_cycle_percentage`), which the manifest's
-  `hwmon = "<bus>-<addr>"` form cannot address.
+- **Whether this board has fans is one register read away.** ONL's CPLD
+  driver registers the `as4610_fan` platform device only for product IDs
+  30P, 54P and 54T_B — a plain 54T is fanless — and both revisions carry
+  the same "AS4610-54T" label, so the chassis cannot answer it. CPLD
+  register 0x01's low nibble can; gate 1 of the runbook reads it. Until
+  then the manifest declares the `lm77` and the two PSUs and no fans,
+  which is true for one revision and honest for both. The fan driver is
+  ported and ready (`kmod/accton/`), addressed as
+  `hwmon = "platform:as4610_fan"` with `rpm_attr` / `pwm_attr` /
+  `pwm_max = 100` when the answer comes back.
 - **The RTC is deliberately absent from the topology.** The M41T11 at
   i2c-1 mux ch7 0x68 has a dead battery, which makes the 4.19+ RTC core
   re-arm an already-expired alarm through a muxed i2c read on every pass,
