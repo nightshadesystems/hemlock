@@ -32,6 +32,7 @@
 #define STUB_VLANS 8
 #define STUB_DEFAULT_VLAN 1
 #define STUB_FDB 8
+#define STUB_LAGS 2
 
 /*
  * Enough VLAN state to be worth testing against: which VLANs exist, who
@@ -41,8 +42,32 @@
  */
 struct stub_vlan {
     uint16_t vlan_id;               /* 0 = free slot */
-    uint32_t members[STUB_PORTS];   /* logical port, 0 = free */
+    /* An explicit used flag rather than "port 0 means empty": logical
+     * port 0 is a real port on this hardware, and a sentinel here would
+     * report the first free slot as a member of it. */
+    int member_used[STUB_PORTS];
+    uint32_t members[STUB_PORTS];
     int tagged[STUB_PORTS];
+    /* Trunk members of the VLAN. Separate from the port members because
+     * the hardware reaches a trunk through a different call, and because
+     * trunk id 0 is valid and so cannot double as "empty". */
+    int lag_used[STUB_LAGS];
+    uint32_t lags[STUB_LAGS];
+    int lag_tagged[STUB_LAGS];
+};
+
+/*
+ * A trunk. Members stay in it whether or not they are forwarding, so
+ * that a gated-closed member still picks up the trunk's ingress
+ * classification -- which is exactly what `pvid` here exists to test.
+ */
+struct stub_lag {
+    int used;
+    uint32_t tid;
+    int member_used[STUB_PORTS];
+    uint32_t members[STUB_PORTS];
+    int member_enabled[STUB_PORTS];
+    uint16_t pvid;                  /* 0 = never set */
 };
 
 /*
@@ -64,6 +89,7 @@ struct hemlockbcm_switch {
     struct hemlockbcm_port ports[STUB_PORTS];
     struct stub_vlan vlans[STUB_VLANS];
     struct stub_fdb fdb[STUB_FDB];
+    struct stub_lag lags[STUB_LAGS];
     uint16_t pvid[STUB_PORTS];
     uint16_t tpid[STUB_PORTS];
     uint32_t fdb_aging;
@@ -118,6 +144,7 @@ static int stub_create_switch(struct hemlockbcm_switch **out,
      * matching PVID, which is where a real chip comes up too. */
     sw->vlans[0].vlan_id = STUB_DEFAULT_VLAN;
     for (i = 0; i < STUB_PORTS; i++) {
+        sw->vlans[0].member_used[i] = 1;
         sw->vlans[0].members[i] = sw->ports[i].logical_port;
         sw->vlans[0].tagged[i] = 0;
         sw->pvid[i] = STUB_DEFAULT_VLAN;
@@ -270,7 +297,7 @@ static int vlan_member_index(const struct stub_vlan *vlan, uint32_t logical)
 {
     size_t i;
     for (i = 0; i < STUB_PORTS; i++) {
-        if (vlan->members[i] == logical) {
+        if (vlan->member_used[i] && vlan->members[i] == logical) {
             return (int)i;
         }
     }
@@ -281,7 +308,7 @@ static int vlan_has_members(const struct stub_vlan *vlan)
 {
     size_t i;
     for (i = 0; i < STUB_PORTS; i++) {
-        if (vlan->members[i] != 0) {
+        if (vlan->member_used[i]) {
             return 1;
         }
     }
@@ -353,7 +380,8 @@ static int stub_add_vlan_member(struct hemlockbcm_switch *sw, uint16_t vlan_id,
         return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
     }
     for (i = 0; i < STUB_PORTS; i++) {
-        if (vlan->members[i] == 0) {
+        if (!vlan->member_used[i]) {
+            vlan->member_used[i] = 1;
             vlan->members[i] = logical_port;
             vlan->tagged[i] = tagged ? 1 : 0;
             return HEMLOCKBCM_OK;
@@ -382,6 +410,7 @@ static int stub_remove_vlan_member(struct hemlockbcm_switch *sw, uint16_t vlan_i
     if (index < 0) {
         return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
     }
+    vlan->member_used[index] = 0;
     vlan->members[index] = 0;
     vlan->tagged[index] = 0;
     return HEMLOCKBCM_OK;
@@ -662,6 +691,271 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_learn_limit(struct hemlockbcm_switch *sw,
     return port == NULL ? -2 : sw->learn_limit[port - sw->ports];
 }
 
+/* --- Link aggregation (ABI 1.4) ----------------------------------------- */
+
+static struct stub_lag *find_lag(struct hemlockbcm_switch *sw, uint32_t tid)
+{
+    size_t i;
+    for (i = 0; i < STUB_LAGS; i++) {
+        if (sw->lags[i].used && sw->lags[i].tid == tid) {
+            return &sw->lags[i];
+        }
+    }
+    return NULL;
+}
+
+static int lag_member_index(const struct stub_lag *lag, uint32_t logical_port)
+{
+    size_t i;
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (lag->member_used[i] && lag->members[i] == logical_port) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int stub_lag_create(struct hemlockbcm_switch *sw, uint32_t *tid)
+{
+    size_t i;
+
+    if (sw == NULL || tid == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_LAGS; i++) {
+        if (!sw->lags[i].used) {
+            memset(&sw->lags[i], 0, sizeof(sw->lags[i]));
+            sw->lags[i].used = 1;
+            /* Trunk ids start at 0 on real hardware, so 0 is a valid
+             * trunk and must not read as "no trunk" anywhere above. */
+            sw->lags[i].tid = (uint32_t)i;
+            *tid = sw->lags[i].tid;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_lag_destroy(struct hemlockbcm_switch *sw, uint32_t tid)
+{
+    struct stub_lag *lag;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    lag = find_lag(sw, tid);
+    if (lag == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (lag->member_used[i]) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* members must be gone first */
+        }
+    }
+    memset(lag, 0, sizeof(*lag));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_lag_member_add(struct hemlockbcm_switch *sw, uint32_t tid,
+                               uint32_t logical_port, int enabled)
+{
+    struct stub_lag *lag;
+    size_t i;
+
+    if (sw == NULL || find_port(sw, logical_port) == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    lag = find_lag(sw, tid);
+    if (lag == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    if (lag_member_index(lag, logical_port) >= 0) {
+        return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
+    }
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (!lag->member_used[i]) {
+            lag->member_used[i] = 1;
+            lag->members[i] = logical_port;
+            lag->member_enabled[i] = enabled ? 1 : 0;
+            /* A member joining picks up the trunk's ingress
+             * classification, the same way lag_set_pvid applies it to
+             * the members already there. */
+            if (lag->pvid != 0) {
+                struct hemlockbcm_port *port = find_port(sw, logical_port);
+                sw->pvid[port - sw->ports] = lag->pvid;
+            }
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_lag_member_remove(struct hemlockbcm_switch *sw, uint32_t tid,
+                                  uint32_t logical_port)
+{
+    struct stub_lag *lag;
+    int index;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    lag = find_lag(sw, tid);
+    if (lag == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    index = lag_member_index(lag, logical_port);
+    if (index < 0) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    lag->member_used[index] = 0;
+    lag->members[index] = 0;
+    lag->member_enabled[index] = 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_lag_member_state(struct hemlockbcm_switch *sw, uint32_t tid,
+                                 uint32_t logical_port, int enabled)
+{
+    struct stub_lag *lag;
+    int index;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    lag = find_lag(sw, tid);
+    if (lag == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    index = lag_member_index(lag, logical_port);
+    if (index < 0) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    lag->member_enabled[index] = enabled ? 1 : 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_lag_vlan_member_add(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                    uint32_t tid, int tagged)
+{
+    struct stub_vlan *vlan;
+    size_t i;
+
+    if (sw == NULL || find_lag(sw, tid) == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_LAGS; i++) {
+        if (vlan->lag_used[i] && vlan->lags[i] == tid) {
+            return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
+        }
+    }
+    for (i = 0; i < STUB_LAGS; i++) {
+        if (!vlan->lag_used[i]) {
+            vlan->lag_used[i] = 1;
+            vlan->lags[i] = tid;
+            vlan->lag_tagged[i] = tagged ? 1 : 0;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_lag_vlan_member_remove(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                       uint32_t tid)
+{
+    struct stub_vlan *vlan;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_LAGS; i++) {
+        if (vlan->lag_used[i] && vlan->lags[i] == tid) {
+            vlan->lag_used[i] = 0;
+            vlan->lags[i] = 0;
+            vlan->lag_tagged[i] = 0;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+}
+
+static int stub_lag_set_pvid(struct hemlockbcm_switch *sw, uint32_t tid, uint16_t vlan_id)
+{
+    struct stub_lag *lag;
+    size_t i;
+
+    if (sw == NULL || vlan_id == 0 || vlan_id > 4094) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    lag = find_lag(sw, tid);
+    if (lag == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    lag->pvid = vlan_id;
+    /* Applied to every member, gated-closed ones included -- which is
+     * why a gated member stays in the trunk rather than leaving it. */
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (lag->member_used[i]) {
+            struct hemlockbcm_port *port = find_port(sw, lag->members[i]);
+            if (port != NULL) {
+                sw->pvid[port - sw->ports] = vlan_id;
+            }
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+/* -1 = not a member, 0 = member gated closed, 1 = member forwarding. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_lag_member(struct hemlockbcm_switch *sw,
+                                                 uint32_t tid, uint32_t logical_port)
+{
+    struct stub_lag *lag;
+    int index;
+
+    if (sw == NULL) {
+        return -1;
+    }
+    lag = find_lag(sw, tid);
+    if (lag == NULL) {
+        return -1;
+    }
+    index = lag_member_index(lag, logical_port);
+    return index < 0 ? -1 : lag->member_enabled[index];
+}
+
+/* -1 = not a member, 0 = untagged, 1 = tagged. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_vlan_lag(struct hemlockbcm_switch *sw,
+                                               uint16_t vlan_id, uint32_t tid)
+{
+    struct stub_vlan *vlan;
+    size_t i;
+
+    if (sw == NULL) {
+        return -1;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return -1;
+    }
+    for (i = 0; i < STUB_LAGS; i++) {
+        if (vlan->lag_used[i] && vlan->lags[i] == tid) {
+            return vlan->lag_tagged[i];
+        }
+    }
+    return -1;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -691,6 +985,14 @@ static const struct hemlockbcm_api STUB_API = {
     stub_flush_fdb,
     stub_set_port_learning,
     stub_set_port_learn_limit,
+    stub_lag_create,
+    stub_lag_destroy,
+    stub_lag_member_add,
+    stub_lag_member_remove,
+    stub_lag_member_state,
+    stub_lag_vlan_member_add,
+    stub_lag_vlan_member_remove,
+    stub_lag_set_pvid,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

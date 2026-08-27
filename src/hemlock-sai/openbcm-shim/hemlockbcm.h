@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 3
+#define HEMLOCKBCM_ABI_MINOR 4
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -334,10 +334,58 @@ struct hemlockbcm_api {
     int (*set_port_learn_limit)(struct hemlockbcm_switch *sw, uint32_t logical_port,
                                 int limit);
 
+    /* --- Link aggregation (ABI 1.4) ---------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: LAG, STP, mirroring,
-     * storm control, ACLs/policers/CoPP, sFlow and QoS. Each lands as one
-     * slot appended here plus the matching Rust method, with the minor
+     * A LAG is a hardware trunk, identified by the SDK's trunk id. As
+     * with VLANs, the caller derives its object ids from the trunk id
+     * and the member port, so nothing is remembered on this side.
+     *
+     * Members stay in the trunk whether or not they are forwarding: the
+     * collect/distribute gate is a per-member attribute, not membership.
+     * That matters because a gated-closed member must still pick up the
+     * LAG's VLAN configuration, and it can only do so if the shim can
+     * still see it.
+     */
+
+    int (*lag_create)(struct hemlockbcm_switch *sw, uint32_t *tid);
+    /* Members must already be gone; the SDK enforces it. */
+    int (*lag_destroy)(struct hemlockbcm_switch *sw, uint32_t tid);
+
+    /* Add `logical_port` to the trunk. `enabled` = 0 adds it gated
+     * closed: in the trunk, carrying its configuration, forwarding
+     * nothing in either direction. */
+    int (*lag_member_add)(struct hemlockbcm_switch *sw, uint32_t tid,
+                          uint32_t logical_port, int enabled);
+    int (*lag_member_remove)(struct hemlockbcm_switch *sw, uint32_t tid,
+                             uint32_t logical_port);
+    /* The collect/distribute gate on an existing member. */
+    int (*lag_member_state)(struct hemlockbcm_switch *sw, uint32_t tid,
+                            uint32_t logical_port, int enabled);
+
+    /*
+     * VLAN membership for a trunk rather than a port. Separate slots
+     * rather than a flag on the port ones, because the hardware reaches
+     * a trunk through a different call entirely and because widening an
+     * existing slot's meaning would be a major-version change.
+     */
+    int (*lag_vlan_member_add)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                               uint32_t tid, int tagged);
+    int (*lag_vlan_member_remove)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                  uint32_t tid);
+
+    /*
+     * PVID for a trunk. Ingress classification is a property of the
+     * receiving port, so unlike membership this has no trunk-wide form
+     * in the hardware: the shim applies it to every member, including
+     * gated-closed ones, and to members added later via `lag_member_add`.
+     */
+    int (*lag_set_pvid)(struct hemlockbcm_switch *sw, uint32_t tid, uint16_t vlan_id);
+
+    /*
+     * Everything below is the rest of phase 6: STP, mirroring, storm
+     * control, ACLs/policers/CoPP, sFlow and QoS. Each lands as one slot
+     * appended here plus the matching Rust method, with the minor
      * bumped. Until then Rust reports those families unsupported, which
      * is the truth and which both consoles already handle.
      */

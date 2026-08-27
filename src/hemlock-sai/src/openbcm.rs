@@ -191,6 +191,19 @@ struct Api {
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
     set_port_learn_limit:
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
+
+    // --- ABI 1.4: link aggregation -----------------------------------
+    lag_create: Option<unsafe extern "C" fn(*mut ShimSwitch, *mut u32) -> Status>,
+    lag_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    lag_member_add:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
+    lag_member_remove: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
+    lag_member_state:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
+    lag_vlan_member_add:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32, std::os::raw::c_int) -> Status>,
+    lag_vlan_member_remove: Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32) -> Status>,
+    lag_set_pvid: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16) -> Status>,
 }
 
 impl Api {
@@ -238,6 +251,54 @@ fn member_oid(vlan_id: u16, port: PortId) -> Oid {
 
 fn oid_member(oid: Oid) -> (u16, PortId) {
     (((oid.0 >> 32) & 0xffff) as u16, PortId(oid.0 & 0xffff_ffff))
+}
+
+/// The discriminator byte. Compared for equality, never masked: the tags
+/// are a numbering, not a bit set, and `0x03 & 0x04 == 0` is luck rather
+/// than design.
+fn oid_tag(raw: u64) -> u64 {
+    raw >> 56
+}
+
+/// A LAG's `PortId`, tagged so it can never be mistaken for a logical
+/// port. The trait passes LAG ids to calls that also take real ports, so
+/// this discriminator is load-bearing rather than decorative.
+const PORT_TAG_LAG: u64 = 0x10;
+const OID_TAG_LAG_MEMBER: u64 = 0x03;
+const OID_TAG_LAG_VLAN_MEMBER: u64 = 0x04;
+
+fn lag_port(tid: u32) -> PortId {
+    PortId((PORT_TAG_LAG << 56) | u64::from(tid))
+}
+
+/// The trunk id behind a LAG's `PortId`, or `None` for a real port.
+fn lag_tid_of(port: PortId) -> Option<u32> {
+    (oid_tag(port.0) == PORT_TAG_LAG).then_some(port.0 as u32)
+}
+
+fn lag_member_oid(tid: u32, port: PortId) -> Oid {
+    Oid((OID_TAG_LAG_MEMBER << 56) | (u64::from(tid) << 32) | (port.0 & 0xffff_ffff))
+}
+
+fn oid_lag_member(oid: Oid) -> (u32, PortId) {
+    // 24 bits for the trunk, not 32: bits 56..64 are the tag, and a
+    // 32-bit mask here would hand the caller the tag back as part of the
+    // trunk id. Trunk ids are chip-table indices, far inside 24 bits.
+    (
+        ((oid.0 >> 32) & 0x00ff_ffff) as u32,
+        PortId(oid.0 & 0xffff_ffff),
+    )
+}
+
+fn lag_vlan_member_oid(vlan_id: u16, tid: u32) -> Oid {
+    Oid((OID_TAG_LAG_VLAN_MEMBER << 56) | (u64::from(vlan_id) << 32) | u64::from(tid))
+}
+
+/// `Some((vlan, trunk))` when this id names a trunk's VLAN membership
+/// rather than a port's.
+fn oid_lag_vlan_member(oid: Oid) -> Option<(u16, u32)> {
+    (oid_tag(oid.0) == OID_TAG_LAG_VLAN_MEMBER)
+        .then_some((((oid.0 >> 32) & 0xffff) as u16, oid.0 as u32))
 }
 
 /// Map a shim status onto the error type the rest of Hemlock understands.
@@ -482,6 +543,14 @@ impl OpenBcmBackend {
         // SAFETY: `vlan_id` is a live u16 the shim writes only on OK.
         check("default_vlan", unsafe { f(sw, &mut vlan_id) })?;
         Ok(vlan_id)
+    }
+
+    /// The trunk id behind a LAG's `PortId`. A real port here is a
+    /// caller mistake, not something to paper over: passing a logical
+    /// port to `remove_lag` would destroy whatever trunk happened to
+    /// share that number.
+    fn lag_tid(&self, lag: PortId) -> Result<u32, SaiError> {
+        lag_tid_of(lag).ok_or_else(|| SaiError::Other(format!("{lag} is not a LAG")))
     }
 
     /// A VLAN argument the trait spells `Option<Oid>`, where `None`
@@ -750,7 +819,7 @@ impl SaiBackend for OpenBcmBackend {
         // says. Phase 6 turns these on one at a time by filling slots in,
         // so the flags cannot drift from the implementation.
         Ok(SaiCapabilities {
-            lag: false,
+            lag: slot!(self, lag_create, "lag_create").is_ok(),
             stp: false,
             fdb_flush: slot!(self, flush_fdb, "flush_fdb").is_ok(),
             fdb_aging: slot!(self, set_fdb_aging, "set_fdb_aging").is_ok(),
@@ -893,16 +962,44 @@ impl SaiBackend for OpenBcmBackend {
 
     fn add_vlan_member(&mut self, vlan: Oid, port: PortId, tagged: bool) -> Result<Oid, SaiError> {
         let vlan_id = oid_vlan_id(vlan);
+        // A LAG is a member in its own right on this hardware, reached
+        // through a different call than a port.
+        if let Some(tid) = lag_tid_of(port) {
+            let f = slot!(self, lag_vlan_member_add, "lag_vlan_member_add")?;
+            let sw = self.switch()?;
+            // SAFETY: plain scalars over the ABI.
+            check("lag_vlan_member_add", unsafe {
+                f(sw, vlan_id, tid, i32::from(tagged))
+            })?;
+            return Ok(lag_vlan_member_oid(vlan_id, tid));
+        }
         self.vlan_member_add(vlan_id, port, tagged)?;
         Ok(member_oid(vlan_id, port))
     }
 
     fn remove_vlan_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        // The id says which kind of membership it is; there is nothing
+        // to look up.
+        if let Some((vlan_id, tid)) = oid_lag_vlan_member(member) {
+            let f = slot!(self, lag_vlan_member_remove, "lag_vlan_member_remove")?;
+            let sw = self.switch()?;
+            // SAFETY: plain scalars over the ABI.
+            return check("lag_vlan_member_remove", unsafe { f(sw, vlan_id, tid) });
+        }
         let (vlan_id, port) = oid_member(member);
         self.vlan_member_remove(vlan_id, port)
     }
 
     fn set_port_pvid(&mut self, port: PortId, vlan_number: u16) -> Result<(), SaiError> {
+        // Ingress classification belongs to the receiving port, so a
+        // trunk has no single place to put it: the shim applies it to
+        // every member, gated-closed ones included.
+        if let Some(tid) = lag_tid_of(port) {
+            let f = slot!(self, lag_set_pvid, "lag_set_pvid")?;
+            let sw = self.switch()?;
+            // SAFETY: plain scalars over the ABI.
+            return check("lag_set_pvid", unsafe { f(sw, tid, vlan_number) });
+        }
         let f = slot!(self, set_port_pvid, "set_port_pvid")?;
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
@@ -1064,24 +1161,73 @@ impl SaiBackend for OpenBcmBackend {
         check("set_port_tpid", unsafe { f(sw, port.0 as u32, tpid) })
     }
 
+    // --- Link aggregation (ABI 1.4) ----------------------------------
+    //
+    // A LAG is a hardware trunk, and its ids are derived like the VLAN
+    // ones: the LAG's `PortId` carries its trunk id, a member's `Oid`
+    // carries (trunk, port). Nothing is remembered on this side.
+    //
+    // The trait promises that a LAG's id is accepted wherever a port is,
+    // which OpenBCM does not offer directly -- so `add_vlan_member`,
+    // `remove_vlan_member` and `set_port_pvid` look at the id and
+    // dispatch to the trunk-shaped slots. That check is what
+    // `is_lag_port` is for, and it is why LAG ids are tagged rather than
+    // being small integers that could collide with a logical port.
+
     fn create_lag(&mut self) -> Result<PortId, SaiError> {
-        unimplemented_slot("create_lag")
+        let f = slot!(self, lag_create, "lag_create")?;
+        let sw = self.switch()?;
+        let mut tid: u32 = 0;
+        // SAFETY: `tid` is a live u32 the shim writes only on OK.
+        check("lag_create", unsafe { f(sw, &mut tid) })?;
+        Ok(lag_port(tid))
     }
 
-    fn remove_lag(&mut self, _lag: PortId) -> Result<(), SaiError> {
-        unimplemented_slot("remove_lag")
+    fn remove_lag(&mut self, lag: PortId) -> Result<(), SaiError> {
+        let f = slot!(self, lag_destroy, "lag_destroy")?;
+        let tid = self.lag_tid(lag)?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("lag_destroy", unsafe { f(sw, tid) })
     }
 
-    fn add_lag_member(&mut self, _lag: PortId, _port: PortId) -> Result<Oid, SaiError> {
-        unimplemented_slot("add_lag_member")
+    fn add_lag_member(&mut self, lag: PortId, port: PortId) -> Result<Oid, SaiError> {
+        let f = slot!(self, lag_member_add, "lag_member_add")?;
+        let tid = self.lag_tid(lag)?;
+        // The port stops bridging on its own account: from here its
+        // traffic belongs to the trunk. Done before the member exists,
+        // so a failure leaves the port in the state it started in.
+        self.remove_port_default_vlan(port)?;
+        let sw = self.switch()?;
+        // Gated closed, per the trait: in the trunk, forwarding nothing
+        // until something (LACP, or a static config) opens the gate.
+        // SAFETY: plain scalars over the ABI.
+        check("lag_member_add", unsafe { f(sw, tid, port.0 as u32, 0) })?;
+        Ok(lag_member_oid(tid, port))
     }
 
-    fn remove_lag_member(&mut self, _member: Oid, _port: PortId) -> Result<(), SaiError> {
-        unimplemented_slot("remove_lag_member")
+    fn remove_lag_member(&mut self, member: Oid, port: PortId) -> Result<(), SaiError> {
+        let (tid, member_port) = oid_lag_member(member);
+        if member_port != port {
+            return Err(SaiError::Other(format!(
+                "LAG member {member} fronts {member_port}, not {port}"
+            )));
+        }
+        let f = slot!(self, lag_member_remove, "lag_member_remove")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("lag_member_remove", unsafe { f(sw, tid, port.0 as u32) })?;
+        self.restore_port_default_vlan(port)
     }
 
-    fn set_lag_member_state(&mut self, _member: Oid, _enabled: bool) -> Result<(), SaiError> {
-        unimplemented_slot("set_lag_member_state")
+    fn set_lag_member_state(&mut self, member: Oid, enabled: bool) -> Result<(), SaiError> {
+        let f = slot!(self, lag_member_state, "lag_member_state")?;
+        let (tid, port) = oid_lag_member(member);
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("lag_member_state", unsafe {
+            f(sw, tid, port.0 as u32, i32::from(enabled))
+        })
     }
 
     fn create_stp_instance(&mut self) -> Result<Oid, SaiError> {
@@ -1510,11 +1656,10 @@ mod tests {
     }
 
     /// Everything phase 6 has not reached yet takes the same path.
-    /// VLANs and the FDB have left this list; everything else has not.
+    /// VLANs, the FDB and LAGs have left this list; the rest has not.
     #[test]
     fn phase_six_families_are_unsupported() {
         let mut b = backend();
-        assert!(b.create_lag().unwrap_err().is_unsupported());
         assert!(b.create_stp_instance().unwrap_err().is_unsupported());
         assert!(b.create_samplepacket(1024).unwrap_err().is_unsupported());
         assert!(b.run_cable_diag(PortId(1)).unwrap_err().is_unsupported());
@@ -1546,8 +1691,8 @@ mod tests {
             caps.fdb_flush && caps.fdb_aging && caps.port_learn_limit,
             "ABI 1.3"
         );
+        assert!(caps.lag, "ABI 1.4");
         for (name, on) in [
-            ("lag", caps.lag),
             ("stp", caps.stp),
             ("l2mc", caps.l2mc),
             ("storm_control", caps.storm_control),
@@ -1651,6 +1796,14 @@ mod tests {
             flush_fdb: None,
             set_port_learning: None,
             set_port_learn_limit: None,
+            lag_create: None,
+            lag_destroy: None,
+            lag_member_add: None,
+            lag_member_remove: None,
+            lag_member_state: None,
+            lag_vlan_member_add: None,
+            lag_vlan_member_remove: None,
+            lag_set_pvid: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -1740,6 +1893,14 @@ mod tests {
             "flush_fdb",
             "set_port_learning",
             "set_port_learn_limit",
+            "lag_create",
+            "lag_destroy",
+            "lag_member_add",
+            "lag_member_remove",
+            "lag_member_state",
+            "lag_vlan_member_add",
+            "lag_vlan_member_remove",
+            "lag_set_pvid",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -1802,6 +1963,14 @@ mod tests {
             std::mem::offset_of!(Api, flush_fdb),
             std::mem::offset_of!(Api, set_port_learning),
             std::mem::offset_of!(Api, set_port_learn_limit),
+            std::mem::offset_of!(Api, lag_create),
+            std::mem::offset_of!(Api, lag_destroy),
+            std::mem::offset_of!(Api, lag_member_add),
+            std::mem::offset_of!(Api, lag_member_remove),
+            std::mem::offset_of!(Api, lag_member_state),
+            std::mem::offset_of!(Api, lag_vlan_member_add),
+            std::mem::offset_of!(Api, lag_vlan_member_remove),
+            std::mem::offset_of!(Api, lag_set_pvid),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -2089,5 +2258,160 @@ mod tests {
         assert_eq!(stub_fdb_aging(&b), 300);
         b.set_fdb_aging(0).unwrap();
         assert_eq!(stub_fdb_aging(&b), 0, "0 disables aging");
+    }
+    // --- Link aggregation ---------------------------------------------
+
+    /// -1 = not a member, 0 = member gated closed, 1 = member forwarding.
+    fn stub_lag_member(b: &OpenBcmBackend, tid: u32, port: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_lag_member\0").unwrap();
+            f(b.switch, tid, port)
+        }
+    }
+
+    /// -1 = not a member, 0 = untagged, 1 = tagged.
+    fn stub_vlan_lag(b: &OpenBcmBackend, vlan_id: u16, tid: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u16, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_vlan_lag\0").unwrap();
+            f(b.switch, vlan_id, tid)
+        }
+    }
+
+    /// A member joins gated closed and leaves the default VLAN, which is
+    /// what the trait promises: in the trunk, carrying its config,
+    /// forwarding nothing until something opens the gate.
+    #[test]
+    fn lag_members_join_gated_closed_and_leave_the_bridge() {
+        let mut b = backend();
+        let lag = b.create_lag().unwrap();
+        let tid = lag_tid_of(lag).expect("a LAG id");
+        assert_eq!(
+            stub_member(&b, 1, 1),
+            0,
+            "port 1 starts in the default VLAN"
+        );
+
+        let member = b.add_lag_member(lag, PortId(1)).unwrap();
+        assert_eq!(stub_lag_member(&b, tid, 1), 0, "in the trunk, gated closed");
+        assert_eq!(stub_member(&b, 1, 1), -1, "and out of the default VLAN");
+
+        b.set_lag_member_state(member, true).unwrap();
+        assert_eq!(stub_lag_member(&b, tid, 1), 1, "gate open");
+        b.set_lag_member_state(member, false).unwrap();
+        assert_eq!(stub_lag_member(&b, tid, 1), 0, "gate closed again");
+
+        // A LAG with members cannot be destroyed.
+        assert!(b.remove_lag(lag).is_err());
+        b.remove_lag_member(member, PortId(1)).unwrap();
+        assert_eq!(stub_lag_member(&b, tid, 1), -1);
+        assert_eq!(stub_member(&b, 1, 1), 0, "standalone bridging restored");
+        b.remove_lag(lag).unwrap();
+    }
+
+    /// The member id names the port it fronts, so a mismatched pair is
+    /// caught here rather than removing some other port from the trunk.
+    #[test]
+    fn a_lag_member_id_must_match_the_port_it_fronts() {
+        let mut b = backend();
+        let lag = b.create_lag().unwrap();
+        let member = b.add_lag_member(lag, PortId(1)).unwrap();
+        assert!(b.remove_lag_member(member, PortId(2)).is_err());
+        assert_eq!(
+            stub_lag_member(&b, lag_tid_of(lag).unwrap(), 1),
+            0,
+            "still a member"
+        );
+    }
+
+    /// A LAG id is accepted wherever a port is, which the hardware does
+    /// not offer directly -- these calls dispatch on the id's tag.
+    #[test]
+    fn a_lag_is_a_vlan_member_in_its_own_right() {
+        let mut b = backend();
+        let lag = b.create_lag().unwrap();
+        let tid = lag_tid_of(lag).unwrap();
+        let vlan = b.create_vlan(100).unwrap();
+
+        let member = b.add_vlan_member(vlan, lag, true).unwrap();
+        assert_eq!(stub_vlan_lag(&b, 100, tid), 1, "tagged trunk member");
+        // ...and it is a *trunk* membership, not a port one that happened
+        // to use the LAG's number as a port.
+        assert_eq!(stub_member(&b, 100, tid), -1);
+
+        b.remove_vlan_member(member).unwrap();
+        assert_eq!(stub_vlan_lag(&b, 100, tid), -1);
+
+        // Ports and LAGs coexist in the same VLAN, told apart by the id.
+        b.add_vlan_member(vlan, PortId(1), false).unwrap();
+        b.add_vlan_member(vlan, lag, false).unwrap();
+        assert_eq!(stub_member(&b, 100, 1), 0);
+        assert_eq!(stub_vlan_lag(&b, 100, tid), 0);
+    }
+
+    /// The reason gated-closed members stay in the trunk: ingress
+    /// classification is per receiving port, so a LAG's PVID has to
+    /// reach every member -- including ones not yet forwarding, and ones
+    /// that join afterwards.
+    #[test]
+    fn a_lag_pvid_reaches_every_member_gated_or_not() {
+        let mut b = backend();
+        let lag = b.create_lag().unwrap();
+        b.create_vlan(100).unwrap();
+        let member = b.add_lag_member(lag, PortId(1)).unwrap();
+
+        b.set_port_pvid(lag, 100).unwrap();
+        assert_eq!(
+            stub_pvid(&b, 1),
+            100,
+            "gated-closed member still classified"
+        );
+
+        // Opening the gate changes nothing about classification.
+        b.set_lag_member_state(member, true).unwrap();
+        assert_eq!(stub_pvid(&b, 1), 100);
+
+        // A port joining later inherits it too.
+        b.add_lag_member(lag, PortId(2)).unwrap();
+        assert_eq!(stub_pvid(&b, 2), 100, "inherited on join");
+    }
+
+    /// LAG ids are tagged so they can never be read as logical ports,
+    /// and the three id families never overlap.
+    #[test]
+    fn lag_ids_cannot_be_confused_with_ports_or_other_objects() {
+        assert_eq!(lag_tid_of(PortId(1)), None, "a real port is not a LAG");
+        assert_eq!(lag_tid_of(lag_port(0)), Some(0), "trunk 0 is a real trunk");
+        assert_eq!(lag_tid_of(lag_port(7)), Some(7));
+
+        assert_eq!(
+            oid_lag_member(lag_member_oid(3, PortId(50))),
+            (3, PortId(50))
+        );
+        assert_eq!(
+            oid_lag_vlan_member(lag_vlan_member_oid(100, 3)),
+            Some((100, 3))
+        );
+        // A port's VLAN membership must not be read as a trunk's.
+        assert_eq!(oid_lag_vlan_member(member_oid(100, PortId(3))), None);
+        assert_eq!(oid_lag_vlan_member(vlan_oid(100)), None);
+
+        // Every tag distinct, which is what makes the dispatch safe.
+        let tags = [
+            oid_tag(vlan_oid(1).0),
+            oid_tag(member_oid(1, PortId(1)).0),
+            oid_tag(lag_member_oid(1, PortId(1)).0),
+            oid_tag(lag_vlan_member_oid(1, 1).0),
+            oid_tag(lag_port(1).0),
+        ];
+        for (i, tag) in tags.iter().enumerate() {
+            assert!(
+                !tags[..i].contains(tag),
+                "tag {tag:#x} is used by two id families"
+            );
+        }
     }
 }

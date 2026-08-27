@@ -25,7 +25,8 @@
  * NOT COMPILED BY CI. The SDK is not fetchable in CI and the target is
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
- * (include/bcm/{port,link,stat,error,vlan,l2,stack}.h, include/soc/drv.h)
+ * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk}.h,
+ * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
  * build as a review step, not a formality.
@@ -49,6 +50,7 @@
 #include <bcm/port.h>
 #include <bcm/stack.h>
 #include <bcm/stat.h>
+#include <bcm/trunk.h>
 #include <bcm/types.h>
 #include <bcm/vlan.h>
 
@@ -808,6 +810,213 @@ static int hb_set_port_learn_limit(struct hemlockbcm_switch *sw, uint32_t logica
     return HB_CALL(bcm_l2_learn_limit_set(sw->unit, &config));
 }
 
+/* --- Link aggregation (ABI 1.4) ----------------------------------------- */
+
+/*
+ * Every member operation is read-modify-write of the whole member array
+ * via bcm_trunk_get/bcm_trunk_set, rather than bcm_trunk_member_add and
+ * its siblings. Those incremental calls are newer than this SDK's ESW
+ * devices and return BCM_E_UNAVAIL on some of them; get/set is the path
+ * every XGS device has always had. It also preserves bcm_trunk_info_t
+ * (the port-selection criteria) instead of guessing at it, since the
+ * struct comes back from the read.
+ */
+#define HB_TRUNK_MAX_MEMBERS 8
+
+/* A member that is in the trunk but forwarding nothing, in either
+ * direction: the 802.3ad collect/distribute gate held closed. */
+#define HB_TRUNK_GATED (BCM_TRUNK_MEMBER_INGRESS_DISABLE | BCM_TRUNK_MEMBER_EGRESS_DISABLE)
+
+/* Read a trunk's info and members. */
+static int hb_trunk_read(struct hemlockbcm_switch *sw, uint32_t tid,
+                         bcm_trunk_info_t *info, bcm_trunk_member_t *members,
+                         int *count)
+{
+    return HB_CALL(bcm_trunk_get(sw->unit, (bcm_trunk_t)tid, info,
+                                 HB_TRUNK_MAX_MEMBERS, members, count));
+}
+
+/* Index of `logical_port` in a member array, or -1. */
+static int hb_trunk_index(const bcm_trunk_member_t *members, int count,
+                          uint32_t logical_port)
+{
+    bcm_gport_t want;
+    int i;
+
+    BCM_GPORT_LOCAL_SET(want, (bcm_port_t)logical_port);
+    for (i = 0; i < count; i++) {
+        if (members[i].gport == want) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int hb_lag_create(struct hemlockbcm_switch *sw, uint32_t *tid)
+{
+    bcm_trunk_t created = 0;
+    int status;
+
+    if (sw == NULL || tid == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = HB_CALL(bcm_trunk_create(sw->unit, 0, &created));
+    if (status == HEMLOCKBCM_OK) {
+        *tid = (uint32_t)created;
+    }
+    return status;
+}
+
+static int hb_lag_destroy(struct hemlockbcm_switch *sw, uint32_t tid)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_trunk_destroy(sw->unit, (bcm_trunk_t)tid));
+}
+
+static int hb_lag_member_add(struct hemlockbcm_switch *sw, uint32_t tid,
+                             uint32_t logical_port, int enabled)
+{
+    bcm_trunk_info_t info;
+    bcm_trunk_member_t members[HB_TRUNK_MAX_MEMBERS];
+    int count = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_trunk_read(sw, tid, &info, members, &count);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    if (hb_trunk_index(members, count, logical_port) >= 0) {
+        return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
+    }
+    if (count >= HB_TRUNK_MAX_MEMBERS) {
+        return HEMLOCKBCM_ERR_NO_MEMORY;
+    }
+    bcm_trunk_member_t_init(&members[count]);
+    BCM_GPORT_LOCAL_SET(members[count].gport, (bcm_port_t)logical_port);
+    members[count].flags = enabled ? 0 : HB_TRUNK_GATED;
+    count++;
+    return HB_CALL(bcm_trunk_set(sw->unit, (bcm_trunk_t)tid, &info, count, members));
+}
+
+static int hb_lag_member_remove(struct hemlockbcm_switch *sw, uint32_t tid,
+                                uint32_t logical_port)
+{
+    bcm_trunk_info_t info;
+    bcm_trunk_member_t members[HB_TRUNK_MAX_MEMBERS];
+    int count = 0;
+    int index;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_trunk_read(sw, tid, &info, members, &count);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    index = hb_trunk_index(members, count, logical_port);
+    if (index < 0) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* Close the gap; the array's order carries no meaning. */
+    members[index] = members[count - 1];
+    count--;
+    return HB_CALL(bcm_trunk_set(sw->unit, (bcm_trunk_t)tid, &info, count, members));
+}
+
+static int hb_lag_member_state(struct hemlockbcm_switch *sw, uint32_t tid,
+                               uint32_t logical_port, int enabled)
+{
+    bcm_trunk_info_t info;
+    bcm_trunk_member_t members[HB_TRUNK_MAX_MEMBERS];
+    int count = 0;
+    int index;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_trunk_read(sw, tid, &info, members, &count);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    index = hb_trunk_index(members, count, logical_port);
+    if (index < 0) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    members[index].flags = enabled ? 0 : HB_TRUNK_GATED;
+    return HB_CALL(bcm_trunk_set(sw->unit, (bcm_trunk_t)tid, &info, count, members));
+}
+
+static int hb_lag_vlan_member_add(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                  uint32_t tid, int tagged)
+{
+    bcm_gport_t gport;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    BCM_GPORT_TRUNK_SET(gport, (bcm_trunk_t)tid);
+    /* The port form of this uses two bitmaps; the gport form takes the
+     * untagged decision as a flag on the one call. */
+    return HB_CALL(bcm_vlan_gport_add(sw->unit, (bcm_vlan_t)vlan_id, gport,
+                                      tagged ? 0 : BCM_VLAN_GPORT_ADD_UNTAGGED));
+}
+
+static int hb_lag_vlan_member_remove(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                     uint32_t tid)
+{
+    bcm_gport_t gport;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    BCM_GPORT_TRUNK_SET(gport, (bcm_trunk_t)tid);
+    return HB_CALL(bcm_vlan_gport_delete(sw->unit, (bcm_vlan_t)vlan_id, gport));
+}
+
+static int hb_lag_set_pvid(struct hemlockbcm_switch *sw, uint32_t tid, uint16_t vlan_id)
+{
+    bcm_trunk_info_t info;
+    bcm_trunk_member_t members[HB_TRUNK_MAX_MEMBERS];
+    int count = 0;
+    int status;
+    int i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_trunk_read(sw, tid, &info, members, &count);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    /*
+     * Ingress classification belongs to the receiving port, so there is
+     * no trunk-wide form of it: apply it to every member. Gated-closed
+     * members are in the array too, which is why they stay in the trunk
+     * rather than being removed from it.
+     */
+    for (i = 0; i < count; i++) {
+        bcm_port_t port;
+
+        if (!BCM_GPORT_IS_LOCAL(members[i].gport)) {
+            continue;  /* not a local port; nothing to classify here */
+        }
+        port = BCM_GPORT_LOCAL_GET(members[i].gport);
+        status = HB_CALL(bcm_port_untagged_vlan_set(sw->unit, port,
+                                                    (bcm_vlan_t)vlan_id));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -837,6 +1046,14 @@ static const struct hemlockbcm_api HB_API = {
     hb_flush_fdb,
     hb_set_port_learning,
     hb_set_port_learn_limit,
+    hb_lag_create,
+    hb_lag_destroy,
+    hb_lag_member_add,
+    hb_lag_member_remove,
+    hb_lag_member_state,
+    hb_lag_vlan_member_add,
+    hb_lag_vlan_member_remove,
+    hb_lag_set_pvid,
     /* Remaining phase 6 slots are appended below this line. */
 };
 
