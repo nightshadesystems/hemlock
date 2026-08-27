@@ -108,8 +108,10 @@ async fn main() -> Result<()> {
 
     let backend: Arc<dyn HwBackend> = if args.mock {
         Arc::new(hw::MockBackend::new(35.0))
-    } else if args.auto_mock && !hemlock_platform::sysinit::broadcom_asic_present() {
-        warn!("--auto-mock: no Broadcom PCI device visible; using the mock hardware backend");
+    } else if args.auto_mock
+        && !hemlock_platform::sysinit::asic_present(platform.manifest.platform.asic_attach)
+    {
+        warn!("--auto-mock: no switch ASIC visible; using the mock hardware backend");
         Arc::new(hw::MockBackend::new(35.0))
     } else {
         // Real switch: bring-up failures are fatal and crash-loop loudly

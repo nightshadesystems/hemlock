@@ -1798,6 +1798,25 @@ fn init_switch(
                 def.lanes
             );
         };
+        // Where the manifest names the vendor SDK's own port name and the
+        // backend reports one, they must agree. The two are independent
+        // facts — a hand-copied faceplate map and what the SDK says — so
+        // a disagreement means the port table is wrong, and the failure
+        // mode it prevents is silently mis-cabling a rack. Backends whose
+        // ports have no SDK name (SAI identifies ports by object id)
+        // report None and are not checked.
+        if let (Some(expected), Some(actual)) =
+            (def.sdk_name.as_deref(), backend.sai_port_name(sai_port.id))
+        {
+            if expected != actual {
+                bail!(
+                    "manifest port {} expects SDK port {expected:?} but the backend reports \
+                     {actual:?} for logical port {} — the port map is wrong",
+                    def.name,
+                    sai_port.id
+                );
+            }
+        }
         ports.insert(
             def.name.clone(),
             PortState {

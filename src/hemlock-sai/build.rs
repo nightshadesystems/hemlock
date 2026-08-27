@@ -17,6 +17,76 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(sai_cable_diag)");
     #[cfg(feature = "real-sai")]
     generate_bindings();
+    #[cfg(feature = "openbcm")]
+    build_openbcm_stub();
+}
+
+/// Build the test stub shim into a shared library under OUT_DIR.
+///
+/// The real `libhemlockbcm.so` is built inside a Broadcom OpenBCM tree
+/// with an ARM cross toolchain, so CI can never produce one. The stub
+/// implements the same ABI over a fake switch, and the `openbcm` module's
+/// tests dlopen it — which is what keeps the Rust half of the boundary
+/// (version handshake, vtable marshalling, NULL slots) honest without
+/// hardware. Its path is handed to the tests as HEMLOCK_OPENBCM_STUB.
+///
+/// Note this is a *cdylib built by hand*: `cc` builds static archives, so
+/// the objects are compiled with it and then linked into a shared object
+/// by the same compiler driver.
+#[cfg(feature = "openbcm")]
+fn build_openbcm_stub() {
+    use std::path::PathBuf;
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let shim_dir = manifest_dir.join("openbcm-shim");
+    let source = shim_dir.join("hemlockbcm_stub.c");
+    let header = shim_dir.join("hemlockbcm.h");
+    println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed={}", header.display());
+
+    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let lib_name = if cfg!(windows) {
+        "hemlockbcm_stub.dll"
+    } else if cfg!(target_os = "macos") {
+        "libhemlockbcm_stub.dylib"
+    } else {
+        "libhemlockbcm_stub.so"
+    };
+    let lib_path = out.join(lib_name);
+
+    let mut build = cc::Build::new();
+    build.file(&source).include(&shim_dir).warnings(true);
+    let compiler = build
+        .try_get_compiler()
+        .expect("a C compiler for the openbcm test stub");
+
+    let mut command = compiler.to_command();
+    if compiler.is_like_msvc() {
+        command
+            .arg("/LD")
+            .arg(&source)
+            .arg(format!("/I{}", shim_dir.display()))
+            .arg(format!("/Fe{}", lib_path.display()))
+            .arg(format!("/Fo{}\\", out.display()));
+    } else {
+        command
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg("-I")
+            .arg(&shim_dir)
+            .arg(&source)
+            .arg("-o")
+            .arg(&lib_path);
+    }
+    let status = command
+        .status()
+        .expect("spawning the C compiler for the openbcm test stub");
+    assert!(status.success(), "building the openbcm test stub failed");
+
+    println!(
+        "cargo:rustc-env=HEMLOCK_OPENBCM_STUB={}",
+        lib_path.display()
+    );
 }
 
 #[cfg(feature = "real-sai")]

@@ -1,0 +1,241 @@
+/*
+ * hemlockbcm.h — the libhemlockbcm ABI.
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) Nightshade Systems. Part of Hemlock; MIT like the rest of
+ * Hemlock's own code. The shim that implements this header is built inside
+ * a Broadcom OpenBCM tree on the operator's machine and is never shipped
+ * from this repository.
+ *
+ * ---------------------------------------------------------------------
+ *
+ * This file is the whole contract between Hemlock and the OpenBCM SDK.
+ *
+ * Hemlock drives Broadcom XGS ASICs through SAI. The AS4610-54T cannot:
+ * its host CPU is an on-die ARM Cortex-A9 and no libsaibcm is published
+ * for armhf. So for that board — and only where the same is true — the
+ * datapath is a thin C shim built inside the SDK's own tree, exporting
+ * the small, versioned ABI below. `OpenBcmBackend` in
+ * src/hemlock-sai/src/openbcm.rs dlopens it and implements `SaiBackend`
+ * over it, so nothing above hemlock-sai can tell the two apart.
+ *
+ * The slots mirror the `SaiBackend` trait, in trait order. Deliberately
+ * *not* SAI: this is the surface Hemlock actually uses, which is a small
+ * fraction of SAI's, and keeping it that way is the point.
+ *
+ * Versioning
+ * ----------
+ *   MAJOR  bumps on any incompatible change: a slot's signature or
+ *          semantics changes, or a slot is removed or reordered. Rust
+ *          refuses to load a shim whose major differs from the one the
+ *          platform manifest pins (`[sai] abi_major`).
+ *   MINOR  bumps when slots are appended to the end of the struct. Rust
+ *          accepts any minor and uses `struct_size` to know how much of
+ *          the vtable is really there.
+ *
+ * A NULL slot is legal and means "not implemented on this platform".
+ * Rust turns it into the same not-implemented error a SAI missing an
+ * object family returns, so `capabilities()` stays truthful and both
+ * consoles degrade the way they already do. Phase 6 fills slots in one
+ * at a time; until then most of them are NULL by design.
+ *
+ * Ownership and threading
+ * -----------------------
+ * Every call is synchronous and blocking, made from Hemlock's single SAI
+ * actor thread — the same single-threaded access pattern the vendor SAI
+ * gets. The exception is the event callback, which the shim may invoke
+ * from its own thread; Rust forwards those into a channel.
+ *
+ * Strings the shim returns point into shim-owned storage that must stay
+ * valid until the next call on the same switch. Rust copies immediately.
+ */
+
+#ifndef HEMLOCKBCM_H
+#define HEMLOCKBCM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define HEMLOCKBCM_ABI_MAJOR 1
+#define HEMLOCKBCM_ABI_MINOR 0
+
+/*
+ * Symbol visibility. The real shim is an ELF .so, where the entry point
+ * is exported by default; this exists so the test stub also builds with
+ * MSVC on a developer's machine, which exports nothing unless told.
+ *
+ * Always "export", never "import": nothing links against this header —
+ * the Rust side transcribes the ABI by hand and resolves the symbol with
+ * dlopen — so there is no consumer side to get wrong.
+ */
+#if defined(_MSC_VER)
+#define HEMLOCKBCM_EXPORT __declspec(dllexport)
+#elif defined(__GNUC__)
+#define HEMLOCKBCM_EXPORT __attribute__((visibility("default")))
+#else
+#define HEMLOCKBCM_EXPORT
+#endif
+
+/*
+ * Status codes. Zero is success; negative values mirror the SAI status
+ * codes Hemlock already classifies, so a shim failure and a vendor-SAI
+ * failure reach the operator as the same kind of error.
+ */
+#define HEMLOCKBCM_OK               0
+#define HEMLOCKBCM_ERR_FAILURE     (-1)
+#define HEMLOCKBCM_ERR_NOT_SUPPORTED (-2)
+#define HEMLOCKBCM_ERR_NO_MEMORY   (-3)
+#define HEMLOCKBCM_ERR_INVALID_PARAM (-5)
+#define HEMLOCKBCM_ERR_ITEM_NOT_FOUND (-7)
+#define HEMLOCKBCM_ERR_NOT_IMPLEMENTED (-15)
+
+/* Opaque per-switch handle, created by create_switch. */
+struct hemlockbcm_switch;
+
+/* Longest SDK port name the shim will report, including the NUL. */
+#define HEMLOCKBCM_PORT_NAME_MAX 16
+
+/* What create_switch needs. Mirrors hemlock_sai::SwitchInit. */
+struct hemlockbcm_init {
+    /* Absolute path to the board's config.bcm (the SDK reads it from the
+     * process working directory otherwise, which Hemlock does not rely
+     * on). NUL-terminated. */
+    const char *config_bcm_path;
+    /* Switch source MAC, resolved by syncd from the ONIE syseeprom or
+     * the management netdev. All-zero means "the shim picks". */
+    uint8_t src_mac[6];
+    /* Non-zero enables the SDK's diagnostic shell on the process's
+     * stdin/stdout. Bench bring-up only. */
+    int diag_shell;
+};
+
+/*
+ * One front-panel port as the SDK sees it.
+ *
+ * `logical_port` is the SDK's own logical port number and is the join key
+ * Hemlock's manifest `lanes` list carries. `name` is the SDK's name for
+ * the same port ("ge25", "xe0"); syncd asserts it against the manifest's
+ * `sdk_names`, so a mistranscribed port map fails at startup instead of
+ * quietly mis-cabling a rack. Report both — they are two independent
+ * facts and the check is only worth anything while they stay that way.
+ */
+struct hemlockbcm_port {
+    uint32_t logical_port;
+    char name[HEMLOCKBCM_PORT_NAME_MAX];
+    uint32_t speed_mbps;
+    int admin_up;
+    int oper_up;
+};
+
+/* Cumulative port counters. Mirrors hemlock_sai::PortCounters; a counter
+ * the chip does not keep is reported as 0. */
+struct hemlockbcm_port_counters {
+    uint64_t in_octets, in_ucast_pkts, in_mcast_pkts, in_bcast_pkts;
+    uint64_t in_discards, in_errors, in_crc_errors, in_alignment_errors;
+    uint64_t in_symbol_errors, in_runts, in_giants, in_pause;
+    uint64_t out_octets, out_ucast_pkts, out_mcast_pkts, out_bcast_pkts;
+    uint64_t out_discards, out_errors, out_pause;
+    uint64_t collisions, late_collisions, deferred;
+    /* RMON frame-size bins:
+     * 64 / 65-127 / 128-255 / 256-511 / 512-1023 / 1024-1522 / 1523-max */
+    uint64_t rx_bins[7];
+    uint64_t tx_bins[7];
+};
+
+/* What this platform's datapath actually supports. Mirrors the fields of
+ * hemlock_sai::SaiCapabilities that a non-SAI backend can answer; the
+ * rest Rust derives from which vtable slots are non-NULL. */
+struct hemlockbcm_capabilities {
+    uint64_t buffer_bytes_total;   /* shared packet buffer, 0 = unknown */
+    uint32_t ecmp_width;           /* widest next-hop group, 0 = none */
+    uint32_t mirror_sessions_max;  /* 0 = no mirroring */
+    int ipv6;
+};
+
+/* Port oper-status change, delivered from the shim's own thread. */
+typedef void (*hemlockbcm_link_cb)(void *context, uint32_t logical_port, int up);
+
+/*
+ * The vtable. Append-only: new slots go at the end and bump the minor.
+ *
+ * Every function returns a HEMLOCKBCM_* status unless noted. Out
+ * parameters are written only on HEMLOCKBCM_OK.
+ */
+struct hemlockbcm_api {
+    /* sizeof(struct hemlockbcm_api) as the shim was compiled. Rust uses
+     * it to know which trailing slots exist. MUST be first. */
+    size_t struct_size;
+    uint32_t abi_major;
+    uint32_t abi_minor;
+
+    /* --- lifecycle ------------------------------------------------- */
+
+    /* Attach the device, run the SDK's init, and return a handle.
+     * Called exactly once. */
+    int (*create_switch)(struct hemlockbcm_switch **out,
+                         const struct hemlockbcm_init *init);
+    /* Detach and free. The handle is invalid afterwards. */
+    int (*destroy_switch)(struct hemlockbcm_switch *sw);
+    /* Register the oper-status callback. `context` is passed back
+     * verbatim. Passing NULL unregisters. */
+    int (*set_link_callback)(struct hemlockbcm_switch *sw,
+                             hemlockbcm_link_cb cb, void *context);
+
+    /* --- ports ----------------------------------------------------- */
+
+    /* Enumerate front-panel ports. On entry *count is the capacity of
+     * `ports`; on return it is the number written. If the capacity is
+     * too small, write nothing, set *count to the number required and
+     * return HEMLOCKBCM_ERR_NO_MEMORY. Calling with ports=NULL and
+     * *count=0 is the way to ask for the count. */
+    int (*ports)(struct hemlockbcm_switch *sw,
+                 struct hemlockbcm_port *ports, size_t *count);
+    int (*set_port_admin_state)(struct hemlockbcm_switch *sw,
+                                uint32_t logical_port, int up);
+    /* Line rate in Mb/s. Only meaningful with autoneg off; the caller
+     * orders autoneg, then speed, then duplex. */
+    int (*set_port_speed)(struct hemlockbcm_switch *sw,
+                          uint32_t logical_port, uint32_t speed_mbps);
+    /* Forced duplex; 0 = half. */
+    int (*set_port_duplex)(struct hemlockbcm_switch *sw,
+                           uint32_t logical_port, int full);
+    int (*set_port_autoneg)(struct hemlockbcm_switch *sw,
+                            uint32_t logical_port, int on);
+    /* L2 MTU in frame bytes, excluding the FCS. */
+    int (*set_port_mtu)(struct hemlockbcm_switch *sw,
+                        uint32_t logical_port, uint32_t mtu);
+    int (*port_counters)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                         struct hemlockbcm_port_counters *out);
+
+    /* --- capabilities ---------------------------------------------- */
+
+    int (*capabilities)(struct hemlockbcm_switch *sw,
+                        struct hemlockbcm_capabilities *out);
+
+    /*
+     * Everything below is phase 6: FDB, LAG, STP, mirroring, storm
+     * control, ACLs/policers/CoPP, sFlow and QoS. Each lands as one slot
+     * appended here plus the matching Rust method, with the minor bumped.
+     * Until then Rust reports those families unsupported, which is the
+     * truth and which both consoles already handle.
+     */
+};
+
+/*
+ * The only exported symbol.
+ *
+ * Returns NULL if the shim cannot satisfy `want_major` — the shim, not
+ * Rust, decides whether it can, so a future shim may serve more than one
+ * major from one binary.
+ */
+HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* HEMLOCKBCM_H */

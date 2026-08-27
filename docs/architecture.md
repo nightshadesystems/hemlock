@@ -1,9 +1,10 @@
 # Hemlock architecture
 
 Hemlock is a Rust network operating system for whitebox switches. It drives
-Broadcom XGS ASICs exclusively through the vendor's SAI library — never the
-raw Broadcom SDK, OpenNSL, or switchdev — on a Debian 13 base with systemd,
-installed via per-platform ONIE images.
+Broadcom XGS ASICs through the vendor's SAI library — never OpenNSL or
+switchdev, and never the raw Broadcom SDK except where no SAI exists for
+the board's CPU architecture (see "The SAI layer") — on a Debian 13 base
+with systemd, installed via per-platform ONIE images.
 
 This document describes the system: platform layer, SAI layer, the
 daemons, the configuration model, and the image/installer pipeline.
@@ -13,9 +14,10 @@ daemons, the configuration model, and the image/installer pipeline.
 1. **Platform = data, not code.** A switch model is one directory under
    `platforms/` holding a `platform.toml` manifest plus vendor data files.
    Boards built from existing driver primitives require zero Rust changes.
-2. **`hemlock-syncd` is platform-agnostic.** It receives a `libsai.so` path
-   and a `config.bcm` path resolved from the manifest and knows nothing else
-   about the board.
+2. **`hemlock-syncd` is platform-agnostic.** It receives a datapath
+   library path and a `config.bcm` path resolved from the manifest and
+   knows nothing else about the board — not even which of the two
+   backends is under the trait.
 3. **SAI version pinning is per-platform, never global.** Each manifest pins
    its vendor SAI package (`sai.version_pin`) and the matching API header
    set (`sai.api_headers`); the build pipeline bundles the right blob and
@@ -68,7 +70,7 @@ daemons, the configuration model, and the image/installer pipeline.
 |---|---|---|
 | `hemlock-common` | lib | Error conventions, tracing init, IPC endpoints, generated gRPC types (all `Serialize`, so any RPC response can be dumped as JSON); the shared login pieces — `role` (the one privileged-operation table both front-ends enforce), `passwd`, `tz`, `cert` |
 | `hemlock-platform` | lib | Manifest schema, loader, port-table expansion, lint, `PlatformQuirks` |
-| `hemlock-sai` | lib | `SaiBackend` trait; `mock-sai` (default) and `real-sai` (bindgen + dlopen) backends |
+| `hemlock-sai` | lib | `SaiBackend` trait; `mock-sai` (default), `real-sai` (bindgen + dlopen) and `openbcm` (Hemlock's own shim ABI, for boards with no SAI for their CPU) backends |
 | `hemlock-syncd` | bin | The only ASIC owner: switch create, port bring-up, port state gRPC |
 | `hemlock-pmon` | bin | Manifest-driven environment monitoring + fan control |
 | `hemlock-mgmtd` | bin | Candidate/running, commit, commit-confirm, rollback ring; the login-session registry both consoles register with; the journal tail, image info, reboot and tech-support bundle |
@@ -192,6 +194,57 @@ when unsupported, never silently no-op. The services suite added
 `sflow` (both halves: the samplepacket object and the port attribute
 that binds it), so `services { sflow }` on a platform without a
 sampler fails the commit rather than sampling nothing.
+
+**The OpenBCM backend** (`openbcm` feature) is the one place the "SAI
+only" rule bends, and it bends without moving the seam. The AS4610-54T's
+host CPU is an on-die ARM Cortex-A9 and no `libsaibcm` is published for
+armhf — SONiC's `sai.mk` builds `_amd64.deb` only — so that board has no
+SAI to drive. Rather than teach anything above `hemlock-sai` about it,
+`[sai] backend = "openbcm"` selects a *second concrete backend* behind
+the same trait: a thin C shim built inside the OpenBCM SDK's own tree,
+dlopened through an ABI Hemlock owns
+(`src/hemlock-sai/openbcm-shim/hemlockbcm.h`, MIT, committed). syncd,
+orch, mgmtd, webd and hemlockctl are unchanged and cannot tell which
+backend is underneath.
+
+The ABI mirrors the `SaiBackend` method set rather than SAI — it is the
+surface Hemlock actually uses, a small fraction of SAI's — and is
+versioned by two rules:
+
+- **Major** bumps on any incompatible change: a slot's signature or
+  semantics changes, or a slot is removed or reordered. A shim whose
+  major differs is refused at load, and so is a manifest pinning a major
+  this binary was not compiled against — the marshalling would be wrong
+  either way.
+- **Minor** bumps when slots are *appended*. Any minor loads, and the
+  vtable's leading `struct_size` says how much of it is real, so a shim
+  built from an older header stays usable.
+
+**A NULL slot is legal** and means "not implemented on this platform".
+It becomes the same `NOT_IMPLEMENTED` status a SAI missing an object
+family returns, which `SaiError::is_unsupported` already classifies — so
+`capabilities()` reports the truth and both consoles degrade exactly as
+they do on a thin SAI. That is what lets the backend land in stages:
+today it implements switch create, port enumeration, admin state, the
+link parameters, counters and the capability probe, and every other
+family answers unsupported until the shim grows the slot. Capabilities
+are derived from the vtable rather than asserted, so a flag cannot claim
+a family the shim does not implement.
+
+The shim itself can only be built with an ARM cross toolchain against the
+SDK, so CI never sees it. What CI does exercise is the whole Rust half:
+`build.rs` compiles a stub shim (`hemlockbcm_stub.c`) from source into
+`OUT_DIR`, and the backend's tests dlopen it and round-trip every
+implemented method, the version handshake, and the NULL-slot path. The
+stub deliberately leaves two slots NULL so that path is covered.
+
+One more thing rides this backend: OpenBCM identifies ports by SDK
+logical port number *and* by name (`ge25`, `xe0`), and the manifest
+carries both (`lanes` and `sdk_names`). syncd asserts them against each
+other during port correlation, so a mistranscribed faceplate map fails at
+startup instead of quietly mis-cabling a rack. `SaiBackend::sai_port_name`
+returns `None` on backends whose ports have no such name, and those are
+not checked.
 
 **Mock backend** (`mock-sai`, default feature): pure Rust, constructed from
 the platform port table. Links follow admin state and emit the same

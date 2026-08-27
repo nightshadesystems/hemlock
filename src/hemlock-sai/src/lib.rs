@@ -15,6 +15,9 @@
 #[cfg(feature = "mock-sai")]
 pub mod mock;
 
+#[cfg(feature = "openbcm")]
+pub mod openbcm;
+
 #[cfg(feature = "real-sai")]
 mod ffi;
 #[cfg(feature = "real-sai")]
@@ -106,6 +109,9 @@ pub enum RouteTarget {
 pub struct SwitchInit {
     /// Vendor library to load (real backend only).
     pub libsai_path: PathBuf,
+    /// Hemlock's OpenBCM shim to load (openbcm backend only). Absent on
+    /// every SAI platform, which is all of them but the Helix4/ARM ones.
+    pub shim_path: Option<PathBuf>,
     /// ASIC init config handed to the vendor library via the SAI profile
     /// (`SAI_INIT_CONFIG_FILE`).
     pub config_bcm_path: PathBuf,
@@ -682,6 +688,18 @@ pub trait SaiBackend: Send {
 
     /// Enumerate the ports the switch created from its init config.
     fn ports(&mut self) -> Result<Vec<SaiPort>, SaiError>;
+
+    /// The vendor SDK's own name for a port (`ge25`, `xe0`), when the
+    /// backend has one. syncd asserts it against the manifest's
+    /// `sdk_names` at startup, so a mistranscribed port map fails loudly
+    /// on first boot instead of quietly mis-cabling a rack.
+    ///
+    /// Backends whose ports have no such name — SAI identifies ports by
+    /// object id and lane set — return `None` and are not checked.
+    /// Valid after [`Self::ports`].
+    fn sai_port_name(&self, _port: PortId) -> Option<String> {
+        None
+    }
 
     fn set_port_admin_state(&mut self, port: PortId, up: bool) -> Result<(), SaiError>;
 

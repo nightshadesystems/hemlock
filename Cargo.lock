@@ -1040,6 +1040,7 @@ name = "hemlock-sai"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "cc",
  "hemlock-common",
  "hemlock-platform",
  "libloading",

@@ -215,12 +215,17 @@ fn build_backend(
     // With the ASIC present, every failure (missing modules, missing
     // real-sai feature, SAI init) stays fatal — mock ports on a real
     // switch would look healthy while forwarding nothing.
+    let attach = platform.manifest.platform.asic_attach;
     let mock = mock
         || (auto_mock && {
-            let no_asic = !hemlock_platform::sysinit::broadcom_asic_present();
+            // How to look for the ASIC depends on how it is attached; on
+            // an on-die CMIC there is no PCI device to find, and probing
+            // the wrong bus would mock a live switch.
+            let no_asic = !hemlock_platform::sysinit::asic_present(attach);
             if no_asic {
                 tracing::warn!(
-                    "--auto-mock: no Broadcom PCI device visible; using the mock SAI backend"
+                    attach = attach.as_str(),
+                    "--auto-mock: no switch ASIC visible; using the mock SAI backend"
                 );
             }
             no_asic
@@ -234,17 +239,73 @@ fn build_backend(
         )));
     }
 
-    // The OpenBCM backend is selected by the manifest but does not exist
-    // until phase 2; say so rather than falling through to the SAI path
-    // and failing to dlopen a library this platform never had.
-    if platform.manifest.sai.backend == hemlock_platform::schema::SaiBackendKind::Openbcm {
-        bail!(
-            "platform {} selects the openbcm backend, which this build does not have \
-             (use --mock)",
-            platform.manifest.platform.id
-        );
+    // Real hardware from here on. Which datapath library drives it is the
+    // manifest's call; everything above this function sees only the trait.
+    match platform.manifest.sai.backend {
+        hemlock_platform::schema::SaiBackendKind::Openbcm => build_openbcm_backend(platform),
+        hemlock_platform::schema::SaiBackendKind::Sai => build_sai_backend(platform, diag_shell),
     }
+}
 
+/// The OpenBCM backend: Hemlock's own shim over the SDK, for boards with
+/// no SAI for their CPU architecture. See docs/as4610-54-port.md.
+#[allow(unused_variables)]
+fn build_openbcm_backend(platform: &Platform) -> Result<Box<dyn SaiBackend>> {
+    #[cfg(feature = "openbcm")]
+    {
+        hemlock_platform::sysinit::load_kernel_modules(&platform.manifest.kernel)?;
+        if platform.manifest.platform.asic_family == "broadcom-xgs" {
+            hemlock_platform::sysinit::ensure_bde_dev_nodes()?;
+        }
+
+        // Both are lint-required for this backend; a manifest that got
+        // past lint without them would otherwise dlopen an empty path.
+        let Some(shim_path) = platform.manifest.sai.shim_path.clone() else {
+            bail!(
+                "platform {} declares no sai.shim_path (required for the openbcm backend)",
+                platform.manifest.platform.id
+            );
+        };
+        let Some(abi_major) = platform.manifest.sai.abi_major else {
+            bail!(
+                "platform {} declares no sai.abi_major (required for the openbcm backend)",
+                platform.manifest.platform.id
+            );
+        };
+
+        let src_mac = hemlock_platform::sysinit::Sysfs::real().base_mac(&platform.manifest);
+        let init = hemlock_sai::SwitchInit {
+            libsai_path: std::path::PathBuf::new(),
+            shim_path: Some(shim_path),
+            config_bcm_path: platform.config_bcm_path(),
+            profile: Vec::new(),
+            src_mac,
+            diag_shell: false,
+        };
+        if !init.config_bcm_path.exists() {
+            bail!(
+                "config.bcm not found at {} — vendor data files are not committed; \
+                 run vendor/fetch-vendor.sh {} (or pass --mock)",
+                init.config_bcm_path.display(),
+                platform.manifest.platform.id
+            );
+        }
+        Ok(Box::new(hemlock_sai::openbcm::OpenBcmBackend::new(
+            &init, abi_major,
+        )?))
+    }
+    #[cfg(not(feature = "openbcm"))]
+    bail!(
+        "platform {} selects the openbcm backend, but this hemlock-syncd was built \
+         without the openbcm feature; only --mock is available",
+        platform.manifest.platform.id
+    );
+}
+
+/// The vendor SAI backend: the default, and every platform but the
+/// Helix4/ARM ones.
+#[allow(unused_variables)]
+fn build_sai_backend(platform: &Platform, diag_shell: bool) -> Result<Box<dyn SaiBackend>> {
     #[cfg(feature = "real-sai")]
     {
         // Real hardware prerequisites: kernel modules (BDE pair + platform
@@ -282,6 +343,7 @@ fn build_backend(
         };
         let init = hemlock_sai::SwitchInit {
             libsai_path,
+            shim_path: None,
             config_bcm_path: platform.config_bcm_path(),
             profile: platform
                 .manifest

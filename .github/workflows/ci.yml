@@ -36,6 +36,13 @@ jobs:
       # headers, even though it can only run on hardware with a vendor blob.
       - run: cargo clippy -p hemlock-sai --features real-sai --all-targets -- -D warnings
       - run: cargo build -p hemlock-syncd --features real-sai
+      # The openbcm backend needs no vendor artifacts at all: its ABI is
+      # our own committed header, and its tests dlopen a stub shim built
+      # from source here. So unlike real-sai it is fully *tested* in CI,
+      # not merely compiled.
+      - run: cargo clippy -p hemlock-sai --features openbcm --all-targets -- -D warnings
+      - run: cargo test -p hemlock-sai --features openbcm
+      - run: cargo build -p hemlock-syncd --features openbcm
       # Definition-of-done gates: every shipped platform must lint.
       - name: Lint platform manifests
         run: |

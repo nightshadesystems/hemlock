@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
-use crate::schema::{BusRef, I2cSection, KernelSection, Manifest, DEFAULT_ROOT_NAME};
+use crate::schema::{AsicAttach, BusRef, I2cSection, KernelSection, Manifest, DEFAULT_ROOT_NAME};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SysinitError {
@@ -38,21 +38,51 @@ pub enum SysinitError {
     },
 }
 
-/// Whether a Broadcom (PCI vendor 0x14e4) device is visible on the PCI
-/// bus. The cheapest "is the switch ASIC actually in this box" probe:
-/// used by `--auto-mock` to pick the mock backend under QEMU or on bench
-/// machines without touching kernel modules. A Broadcom NIC also matches,
-/// but the boxes Hemlock targets pair those with a Broadcom ASIC anyway.
-pub fn broadcom_asic_present() -> bool {
-    let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        std::fs::read_to_string(entry.path().join("vendor"))
-            .map(|v| v.trim() == "0x14e4")
-            .unwrap_or(false)
-    })
+/// Whether the switch ASIC is actually in this box.
+///
+/// The cheapest such probe, used by `--auto-mock` to pick the mock
+/// backend under QEMU or on a bench machine without touching kernel
+/// modules. How to look depends on how the CPU reaches the ASIC, which
+/// the manifest declares:
+///
+/// * [`AsicAttach::Pcie`] — a Broadcom (vendor `0x14e4`) PCI device. A
+///   Broadcom NIC also matches, but the boxes Hemlock targets pair those
+///   with a Broadcom ASIC anyway.
+/// * [`AsicAttach::Soc`] — an on-die CMIC on the SoC bus, which has no
+///   PCI device at all: look for the `iproc_cmicd` platform device
+///   instead. Probing PCI on such a board reports "no ASIC" on live
+///   hardware, and `--auto-mock` would then mock a real switch — which
+///   is the exact failure the probe exists to prevent.
+pub fn asic_present(attach: AsicAttach) -> bool {
+    match attach {
+        AsicAttach::Pcie => {
+            let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                std::fs::read_to_string(entry.path().join("vendor"))
+                    .map(|v| v.trim() == "0x14e4")
+                    .unwrap_or(false)
+            })
+        }
+        // Matched by suffix so the board's base address (`48000000` on
+        // the AS4610) stays out of Hemlock's code.
+        AsicAttach::Soc => {
+            let Ok(entries) = std::fs::read_dir("/sys/bus/platform/devices") else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(SOC_CMIC_DEVICE_SUFFIX)
+            })
+        }
+    }
 }
+
+/// The platform-device name suffix an XGS iProc CMICd registers under.
+const SOC_CMIC_DEVICE_SUFFIX: &str = ".iproc_cmicd";
 
 /// Load every module in `[kernel] required_modules`, with any
 /// `[kernel.module_args]` parameters. `modprobe` is idempotent (params

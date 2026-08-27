@@ -15,6 +15,11 @@ mock-sai = []
 # Real vendor backend: bindgen over the vendored SAI headers + dlopen of
 # libsai.so at runtime. Requires libclang at build time; Linux only at runtime.
 real-sai = ["dep:libloading", "dep:bindgen"]
+# OpenBCM backend: dlopen of libhemlockbcm.so, whose ABI is our own
+# committed header (openbcm-shim/hemlockbcm.h) — no bindgen and no
+# libclang. Needs a C compiler to build the test stub. For platforms with
+# `[sai] backend = "openbcm"`; see docs/as4610-54-port.md.
+openbcm = ["dep:libloading", "dep:cc"]
 
 [dependencies]
 hemlock-common = { workspace = true }
@@ -26,6 +31,7 @@ libloading = { workspace = true, optional = true }
 
 [build-dependencies]
 bindgen = { workspace = true, optional = true }
+cc = { workspace = true, optional = true }
 
 [lints]
 workspace = true
