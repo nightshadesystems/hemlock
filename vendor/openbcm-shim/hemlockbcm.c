@@ -26,7 +26,7 @@
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
  * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
- * rate}.h,
+ * rate,knet}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -46,6 +46,7 @@
 
 #include <bcm/error.h>
 #include <bcm/init.h>
+#include <bcm/knet.h>
 #include <bcm/l2.h>
 #include <bcm/link.h>
 #include <bcm/mirror.h>
@@ -75,6 +76,9 @@ extern int sh_process_command(int unit, char *cmd);
 
 struct hemlockbcm_switch {
     int unit;
+    /* The switch MAC, kept from create_switch: KNET netdevs need one and
+     * there is nowhere else to get it at hostif_create time. */
+    uint8_t src_mac[6];
     /* The local module id, which qualifies every L2 destination. Read
      * from the SDK on first use and cached; -1 means "not read yet". */
     int modid;
@@ -226,6 +230,7 @@ static int hb_create_switch(struct hemlockbcm_switch **out,
     }
     sw->unit = HB_UNIT;
     sw->modid = -1;  /* read lazily; calloc would make it a valid modid 0 */
+    memcpy(sw->src_mac, init->src_mac, sizeof(sw->src_mac));
     hb_switch = sw;
 
     /*
@@ -1367,6 +1372,78 @@ static int hb_storm_control_set(struct hemlockbcm_switch *sw, uint32_t logical_p
                                           kbps, burst));
 }
 
+/* --- Host interfaces (ABI 1.8) ------------------------------------------- */
+
+/* Per-port filters sit above the priority a future catch-all would use;
+ * 0 is the highest and is left free deliberately. */
+#define HB_KNET_PRIORITY_PORT 1
+
+static int hb_host_punt_setup(struct hemlockbcm_switch *sw)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * Clears any netifs and filters a previous run left in the kernel
+     * module, which is what makes creating them again idempotent across
+     * a syncd restart. The KNET modules outlive the process.
+     */
+    return HB_CALL(bcm_knet_init(sw->unit));
+}
+
+static int hb_hostif_create(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                            const char *name, uint32_t *hostif)
+{
+    bcm_knet_netif_t netif;
+    bcm_knet_filter_t filter;
+    int status;
+
+    if (sw == NULL || name == NULL || hostif == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+
+    bcm_knet_netif_t_init(&netif);
+    /* TX_LOCAL_PORT: what the kernel writes to this netdev leaves on the
+     * physical port, bypassing lookup -- which is what a protocol stack
+     * sending its own BPDUs and LACPDUs needs. */
+    netif.type = BCM_KNET_NETIF_T_TX_LOCAL_PORT;
+    netif.port = (bcm_port_t)logical_port;
+    sal_memcpy(netif.mac_addr, sw->src_mac, sizeof(netif.mac_addr));
+    /* The SDK's buffer is 16 bytes and the caller promises at most 15
+     * characters, so this cannot truncate; the bound is belt and braces. */
+    snprintf(netif.name, sizeof(netif.name), "%s", name);
+    status = HB_CALL(bcm_knet_netif_create(sw->unit, &netif));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+
+    bcm_knet_filter_t_init(&filter);
+    filter.type = BCM_KNET_FILTER_T_RX_PKT;
+    filter.priority = HB_KNET_PRIORITY_PORT;
+    filter.dest_type = BCM_KNET_DEST_T_NETIF;
+    filter.dest_id = netif.id;
+    filter.match_flags = BCM_KNET_FILTER_M_INGPORT;
+    filter.m_ingport = (bcm_port_t)logical_port;
+    /*
+     * Strip the VLAN tag on the way up. The chip presents punted frames
+     * with the internal tag it classified them into, which for an access
+     * port is a tag that was never on the wire -- so leaving it on would
+     * hand the stack a frame the peer never sent. Visible immediately at
+     * bring-up: tcpdump on the netdev shows a tag that should not be
+     * there, or a missing one if this is wrong in the other direction.
+     */
+    filter.flags = BCM_KNET_FILTER_F_STRIP_TAG;
+    snprintf(filter.desc, sizeof(filter.desc), "%s", name);
+    status = HB_CALL(bcm_knet_filter_create(sw->unit, &filter));
+    if (status != HEMLOCKBCM_OK) {
+        /* Do not leave a netdev with nothing feeding it. */
+        (void)bcm_knet_netif_destroy(sw->unit, netif.id);
+        return status;
+    }
+    *hostif = (uint32_t)netif.id;
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1415,6 +1492,8 @@ static const struct hemlockbcm_api HB_API = {
     hb_mirror_port_attach,
     hb_mirror_port_detach,
     hb_storm_control_set,
+    hb_host_punt_setup,
+    hb_hostif_create,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

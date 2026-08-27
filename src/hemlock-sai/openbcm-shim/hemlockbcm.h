@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 7
+#define HEMLOCKBCM_ABI_MINOR 8
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -484,6 +484,37 @@ struct hemlockbcm_api {
      */
     int (*storm_control_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
                              int storm_class, uint32_t kbps);
+
+    /* --- Host interfaces (ABI 1.8) ------------------------------------ */
+
+    /*
+     * The CPU punt path. SAI models this as one wildcard hostif table
+     * entry that delivers every trapped packet on its ingress port's
+     * netdev, plus a NETDEV hostif object per port. KNET has no such
+     * wildcard: delivery is decided by per-filter matches, so "the
+     * ingress port's netdev" is expressed as one ingress-port filter per
+     * netdev, installed by `hostif_create`.
+     *
+     * `host_punt_setup` therefore initialises the KNET subsystem and
+     * nothing else. It is not a no-op dressed up as work: the init is
+     * what clears netifs and filters left behind by a previous run, so
+     * calling it before any `hostif_create` is what makes a syncd
+     * restart idempotent.
+     */
+    int (*host_punt_setup)(struct hemlockbcm_switch *sw);
+
+    /*
+     * A netdev for `logical_port`, plus the filter that delivers that
+     * port's punted traffic to it. `name` is NUL-terminated and at most
+     * 15 characters, which is both what the kernel accepts and what SAI
+     * documents. Returns an opaque handle.
+     *
+     * There is no destroy: the caller creates these once per port at
+     * start-up and never removes one, and `host_punt_setup` clears the
+     * previous run's.
+     */
+    int (*hostif_create)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                         const char *name, uint32_t *hostif);
 
     /*
      * Everything below is the rest of phase 6: ACLs/policers/CoPP,

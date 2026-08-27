@@ -242,6 +242,12 @@ struct Api {
     // --- ABI 1.7: storm control --------------------------------------
     storm_control_set:
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int, u32) -> Status>,
+
+    // --- ABI 1.8: host interfaces ------------------------------------
+    host_punt_setup: Option<unsafe extern "C" fn(*mut ShimSwitch) -> Status>,
+    hostif_create: Option<
+        unsafe extern "C" fn(*mut ShimSwitch, u32, *const std::os::raw::c_char, *mut u32) -> Status,
+    >,
 }
 
 impl Api {
@@ -330,6 +336,11 @@ fn oid_lag_member(oid: Oid) -> (u32, PortId) {
 
 const OID_TAG_STP: u64 = 0x05;
 const OID_TAG_MIRROR: u64 = 0x06;
+const OID_TAG_HOSTIF: u64 = 0x07;
+
+fn hostif_oid(hostif: u32) -> Oid {
+    Oid((OID_TAG_HOSTIF << 56) | u64::from(hostif))
+}
 
 fn mirror_oid(session: u32) -> Oid {
     Oid((OID_TAG_MIRROR << 56) | u64::from(session))
@@ -952,12 +963,41 @@ impl SaiBackend for OpenBcmBackend {
     // CoPP, sFlow, QoS.
     // -----------------------------------------------------------------
 
+    // --- Host interfaces (ABI 1.8) ------------------------------------
+    //
+    // SAI models the punt path as a wildcard hostif table entry that
+    // delivers on the ingress port's netdev, plus a NETDEV object per
+    // port. KNET has no wildcard -- delivery follows per-filter matches
+    // -- so the wildcard's meaning is carried by one ingress-port filter
+    // per netdev, which `create_hostif` installs alongside the netdev.
+
     fn setup_host_punt(&mut self) -> Result<(), SaiError> {
-        unimplemented_slot("setup_host_punt")
+        let f = slot!(self, host_punt_setup, "host_punt_setup")?;
+        let sw = self.switch()?;
+        // SAFETY: no arguments beyond the handle.
+        check("host_punt_setup", unsafe { f(sw) })
     }
 
-    fn create_hostif(&mut self, _port: PortId, _name: &str) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_hostif")
+    fn create_hostif(&mut self, port: PortId, name: &str) -> Result<Oid, SaiError> {
+        let f = slot!(self, hostif_create, "hostif_create")?;
+        let logical = self.logical_port(port)?;
+        // The kernel's own limit, and SAI documents the same one. Checked
+        // here rather than truncated: a silently shortened netdev name
+        // would collide with another port's.
+        if name.is_empty() || name.len() > 15 {
+            return Err(SaiError::Other(format!(
+                "host interface name {name:?} must be 1..=15 characters"
+            )));
+        }
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| SaiError::Other(format!("NUL in host interface name {name:?}")))?;
+        let sw = self.switch()?;
+        let mut hostif: u32 = 0;
+        // SAFETY: `c_name` outlives the call; `hostif` is written on OK.
+        check("hostif_create", unsafe {
+            f(sw, logical, c_name.as_ptr(), &mut hostif)
+        })?;
+        Ok(hostif_oid(hostif))
     }
 
     fn create_router_interface(&mut self, _port: PortId) -> Result<Oid, SaiError> {
@@ -2008,6 +2048,8 @@ mod tests {
             mirror_port_attach: None,
             mirror_port_detach: None,
             storm_control_set: None,
+            host_punt_setup: None,
+            hostif_create: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2116,6 +2158,8 @@ mod tests {
             "mirror_port_attach",
             "mirror_port_detach",
             "storm_control_set",
+            "host_punt_setup",
+            "hostif_create",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2197,6 +2241,8 @@ mod tests {
             std::mem::offset_of!(Api, mirror_port_attach),
             std::mem::offset_of!(Api, mirror_port_detach),
             std::mem::offset_of!(Api, storm_control_set),
+            std::mem::offset_of!(Api, host_punt_setup),
+            std::mem::offset_of!(Api, hostif_create),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -2922,5 +2968,63 @@ mod tests {
             .port_storm_drops(PortId(1), StormClass::Broadcast)
             .unwrap_err();
         assert!(err.is_unsupported(), "{err:?}");
+    }
+    // --- Host interfaces -----------------------------------------------
+
+    fn stub_hostif(b: &OpenBcmBackend, port: u32) -> String {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32) -> *const std::os::raw::c_char,
+            > = b._library.get(b"hemlockbcm_stub_hostif\0").unwrap();
+            std::ffi::CStr::from_ptr(f(b.switch, port))
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    #[test]
+    fn host_interfaces_are_netdevs_bound_to_their_port() {
+        let mut b = backend();
+        b.setup_host_punt().unwrap();
+
+        let one = b.create_hostif(PortId(1), "Ethernet1").unwrap();
+        let two = b.create_hostif(PortId(2), "Ethernet2").unwrap();
+        assert_ne!(one, two);
+        assert_eq!(stub_hostif(&b, 1), "Ethernet1");
+        assert_eq!(stub_hostif(&b, 2), "Ethernet2");
+        assert_eq!(stub_hostif(&b, 3), "", "a port with no netdev");
+
+        // One netdev per port; a second is a mistake, not a rename.
+        assert!(b.create_hostif(PortId(1), "Ethernet1b").is_err());
+    }
+
+    /// The punt setup clears what a previous run left behind, which is
+    /// what makes creating the netdevs again idempotent across a syncd
+    /// restart -- the KNET modules outlive the process.
+    #[test]
+    fn punt_setup_clears_a_previous_run() {
+        let mut b = backend();
+        b.setup_host_punt().unwrap();
+        b.create_hostif(PortId(1), "Ethernet1").unwrap();
+        assert_eq!(stub_hostif(&b, 1), "Ethernet1");
+
+        b.setup_host_punt().unwrap();
+        assert_eq!(stub_hostif(&b, 1), "", "cleared");
+        b.create_hostif(PortId(1), "Ethernet1").unwrap();
+    }
+
+    /// A netdev name is checked, never truncated: the kernel caps it at
+    /// 15 characters, and quietly shortening one would collide with
+    /// another port's netdev.
+    #[test]
+    fn an_overlong_host_interface_name_is_refused() {
+        let mut b = backend();
+        b.setup_host_punt().unwrap();
+        assert!(b.create_hostif(PortId(1), "").is_err());
+        assert!(b.create_hostif(PortId(1), "EthernetLongName1").is_err());
+        assert!(b.create_hostif(PortId(1), &"x".repeat(16)).is_err());
+        b.create_hostif(PortId(1), &"x".repeat(15)).unwrap();
+        // ...and a LAG has no netdev of its own here.
+        assert!(b.create_hostif(lag_port(1), "Po1").is_err());
     }
 }

@@ -62,6 +62,13 @@ struct stub_vlan {
     uint32_t stg;
 };
 
+/* A port's KNET netdev. */
+struct stub_hostif {
+    int used;
+    uint32_t id;
+    char name[16];
+};
+
 /* A local (SPAN) mirror session. */
 struct stub_mirror {
     int used;
@@ -117,6 +124,8 @@ struct hemlockbcm_switch {
     uint32_t mirror_out[STUB_PORTS];
     /* Metered rate per port per storm class; 0 = no limit. */
     uint32_t storm_kbps[STUB_PORTS][3];
+    struct stub_hostif hostifs[STUB_PORTS];
+    int punt_ready;
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -1318,6 +1327,69 @@ HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_storm(struct hemlockbcm_switch *sw,
     return (int64_t)sw->storm_kbps[port - sw->ports][storm_class];
 }
 
+/* --- Host interfaces (ABI 1.8) ------------------------------------------- */
+
+static int stub_host_punt_setup(struct hemlockbcm_switch *sw)
+{
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Clears the previous run's, like bcm_knet_init does. */
+    for (i = 0; i < STUB_PORTS; i++) {
+        memset(&sw->hostifs[i], 0, sizeof(sw->hostifs[i]));
+    }
+    sw->punt_ready = 1;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_hostif_create(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              const char *name, uint32_t *hostif)
+{
+    struct hemlockbcm_port *port;
+    size_t index;
+
+    if (sw == NULL || name == NULL || hostif == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (strlen(name) > 15) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    index = (size_t)(port - sw->ports);
+    if (sw->hostifs[index].used) {
+        return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
+    }
+    sw->hostifs[index].used = 1;
+    sw->hostifs[index].id = (uint32_t)index + 1;
+    snprintf(sw->hostifs[index].name, sizeof(sw->hostifs[index].name), "%s", name);
+    *hostif = sw->hostifs[index].id;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+/* The netdev name for a port, or "" if it has none. */
+HEMLOCKBCM_EXPORT const char *hemlockbcm_stub_hostif(struct hemlockbcm_switch *sw,
+                                                     uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+
+    if (sw == NULL || port == NULL || !sw->hostifs[port - sw->ports].used) {
+        return "";
+    }
+    return sw->hostifs[port - sw->ports].name;
+}
+
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_punt_ready(struct hemlockbcm_switch *sw)
+{
+    return sw == NULL ? 0 : sw->punt_ready;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1366,6 +1438,8 @@ static const struct hemlockbcm_api STUB_API = {
     stub_mirror_port_attach,
     stub_mirror_port_detach,
     stub_storm_control_set,
+    stub_host_punt_setup,
+    stub_hostif_create,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)
