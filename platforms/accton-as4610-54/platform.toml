@@ -46,6 +46,11 @@ abi_major = 1
 # Dumped from the stock ICOS NOS on this board (`bcmsh config show`) and
 # carried by edgenos; placed by vendor/fetch-vendor.sh, never committed.
 config_bcm = "as4610-54.config.bcm"
+# The Helix4 LED-processor program (OpenMDK's GE-family reference), as
+# ASCII hex. Without it the external LED latches power up driving every
+# port LED solid on. Purely cosmetic: the shim loads it at switch create
+# and a failure is logged, never fatal. Fetched, never committed.
+led_program = "helix4-led.hex"
 
 [kernel]
 # The BDE pair plus KNET, built from OpenBCM's own GPL kernel modules

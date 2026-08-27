@@ -220,8 +220,17 @@ pub fn lint(platform: &Platform) -> LintReport {
             m.sai.config_bcm
         ));
     }
+    // The LED program is a datapath artifact the shim loads, so it only
+    // means anything on the openbcm backend.
+    if m.sai.led_program.is_some() && m.sai.backend != SaiBackendKind::Openbcm {
+        report.error("sai.led_program applies only to backend \"openbcm\"");
+    }
+
     // Vendor data files are never committed; missing ones are warnings.
-    for file in std::iter::once(&m.sai.config_bcm).chain(m.sai.extra_files.iter()) {
+    for file in std::iter::once(&m.sai.config_bcm)
+        .chain(m.sai.extra_files.iter())
+        .chain(m.sai.led_program.iter())
+    {
         if file.has_root() {
             report.error(format!("sai file {file:?} must be a relative path"));
         } else if !platform.dir.join(file).exists() {

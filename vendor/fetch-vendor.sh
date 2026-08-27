@@ -98,6 +98,92 @@ cel-e1031)
     echo "  (mkimage.sh builds both module sets into the image and fails"
     echo "   if any [kernel] required_modules would not be loadable)"
     ;;
+accton-as4610-54)
+    # This board has no SAI: no libsaibcm is published for armhf (SONiC's
+    # sai.mk builds _amd64.deb only, and the package server 404s on
+    # _armhf/_arm64). Its datapath is Hemlock's own shim over the
+    # source-available OpenBCM SDK — so what gets fetched here is an SDK
+    # tree, not a vendor blob. See docs/as4610-54-port.md.
+    OPENBCM_DIR="$ROOT/vendor/openbcm"
+    # sdk-6.5.16 is a DIRECTORY on master, not a branch or a tag. Pin the
+    # commit so a rebuild is reproducible; bcm56340_a0 (Helix4) and the
+    # iproc-4_4 target are both present at this revision.
+    OPENBCM_COMMIT="${OPENBCM_COMMIT:-master}"
+    OPENBCM_SDK="sdk-6.5.16"
+
+    if [ -d "$OPENBCM_DIR/$OPENBCM_SDK" ]; then
+        echo "have    $OPENBCM_SDK/"
+    else
+        echo "clone   OpenBCM/$OPENBCM_SDK (sparse; this is a large tree)"
+        tmp="$(mktemp -d)"
+        git clone -q --filter=blob:none --sparse \
+            https://github.com/Broadcom-Network-Switching-Software/OpenBCM.git "$tmp"
+        [ "$OPENBCM_COMMIT" = "master" ] || git -C "$tmp" checkout -q "$OPENBCM_COMMIT"
+        git -C "$tmp" sparse-checkout set "$OPENBCM_SDK"
+        mkdir -p "$OPENBCM_DIR"
+        cp -r "$tmp/$OPENBCM_SDK" "$OPENBCM_DIR/$OPENBCM_SDK"
+        git -C "$tmp" rev-parse HEAD > "$OPENBCM_DIR/.openbcm-commit"
+        rm -rf "$tmp"
+        echo "pinned  $(cat "$OPENBCM_DIR/.openbcm-commit")"
+    fi
+
+    # Verify the chip is actually in this tree before anyone spends an
+    # hour building it. The SDK's README advertises only the TD/TH
+    # families, but that is a *support* statement: make/Make.local.template
+    # says the default build includes every chip in the release.
+    if [ -f "$OPENBCM_DIR/$OPENBCM_SDK/src/soc/mcm/bcm56340_a0.c" ]; then
+        echo "ok      bcm56340_a0 (Helix4) present in $OPENBCM_SDK"
+    else
+        echo "error: bcm56340_a0 not found in $OPENBCM_SDK — wrong SDK revision?" >&2
+        exit 1
+    fi
+    if [ -d "$OPENBCM_DIR/$OPENBCM_SDK/systems/linux/user/iproc-4_4" ]; then
+        echo "ok      iproc-4_4 build target present"
+    else
+        echo "error: iproc-4_4 target missing from $OPENBCM_SDK" >&2
+        exit 1
+    fi
+
+    if [ "$KMOD_ONLY" = 0 ]; then
+        # ASIC init config, dumped from this board's stock ICOS NOS and
+        # carried by the edgenos reference.
+        fetch "https://raw.githubusercontent.com/wrightca1/edgenos/master/platform/accton-as4610-54/config/config.bcm" \
+              "$PDIR/as4610-54.config.bcm"
+
+        # 10G SFP+ PHY microcode: the BCM84758 pulls it through
+        # request_firmware at PHY init, so it belongs in /lib/firmware in
+        # the image rather than in the platform overlay.
+        FWDIR="$ROOT/vendor/firmware"
+        mkdir -p "$FWDIR"
+        if [ -f "$FWDIR/bcm84758_ucode.bin" ]; then
+            echo "have    bcm84758_ucode.bin"
+        else
+            cat >&2 <<'EOF'
+warning: bcm84758_ucode.bin is not fetched automatically.
+
+  The BCM84758 microcode is redistributed under Broadcom's firmware terms
+  and is not on a stable public URL. Take it from the board's own ONL or
+  ICOS image (/lib/firmware/), or from the OpenBCM tree's Firmware/
+  directory if your revision carries it, and drop it at:
+
+      vendor/firmware/bcm84758_ucode.bin
+
+  Without it the four SFP+ ports stay down; the 48 copper ports do not
+  need it.
+EOF
+        fi
+    fi
+
+    echo
+    echo "All vendor artifacts for $PLATFORM are in place:"
+    echo "  OpenBCM SDK:   vendor/openbcm/$OPENBCM_SDK ($(cat "$OPENBCM_DIR/.openbcm-commit" 2>/dev/null || echo pinned))"
+    echo "  ASIC config:   platforms/$PLATFORM/as4610-54.config.bcm"
+    echo "  SFP+ ucode:    vendor/firmware/bcm84758_ucode.bin (manual, see above)"
+    echo
+    echo "Then build the datapath shim in the ARM cross container:"
+    echo "  vendor/openbcm-shim/build-shim.sh"
+    echo "(the SDK's own libraries for iproc-4_4 must be built first)"
+    ;;
 *)
     echo "error: no fetch recipe for $PLATFORM (add one to this script)" >&2
     exit 1

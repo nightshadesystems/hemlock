@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 0
+#define HEMLOCKBCM_ABI_MINOR 1
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -215,6 +215,23 @@ struct hemlockbcm_api {
 
     int (*capabilities)(struct hemlockbcm_switch *sw,
                         struct hemlockbcm_capabilities *out);
+
+    /* --- board bring-up (ABI 1.1) ----------------------------------- */
+
+    /*
+     * Load the chip's LED-processor program and start it.
+     *
+     * `hex` is the program as an ASCII hex string, exactly the argument
+     * the SDK's `led prog` diag command takes. The shim loads it, enables
+     * linkscan-driven auto updates and starts the M0.
+     *
+     * Cosmetic: without it the LED latches power up driving every port
+     * LED solid on, which is ugly but harmless, so the caller logs a
+     * failure and carries on. Appended in ABI 1.1 — a shim built against
+     * 1.0 simply reports the smaller `struct_size` and the caller skips
+     * this slot.
+     */
+    int (*load_led_program)(struct hemlockbcm_switch *sw, const char *hex);
 
     /*
      * Everything below is phase 6: FDB, LAG, STP, mirroring, storm

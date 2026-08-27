@@ -277,6 +277,12 @@ fn build_openbcm_backend(platform: &Platform) -> Result<Box<dyn SaiBackend>> {
         let init = hemlock_sai::SwitchInit {
             libsai_path: std::path::PathBuf::new(),
             shim_path: Some(shim_path),
+            led_program_path: platform
+                .manifest
+                .sai
+                .led_program
+                .as_ref()
+                .map(|p| platform.dir.join(p)),
             config_bcm_path: platform.config_bcm_path(),
             profile: Vec::new(),
             src_mac,
@@ -344,6 +350,7 @@ fn build_sai_backend(platform: &Platform, diag_shell: bool) -> Result<Box<dyn Sa
         let init = hemlock_sai::SwitchInit {
             libsai_path,
             shim_path: None,
+            led_program_path: None,
             config_bcm_path: platform.config_bcm_path(),
             profile: platform
                 .manifest

@@ -151,6 +151,13 @@ pub struct SaiSection {
     pub abi_major: Option<u32>,
     /// ASIC init config, relative to the platform directory.
     pub config_bcm: PathBuf,
+    /// The chip LED-processor program as an ASCII hex file, relative to
+    /// the platform directory (`openbcm` backend only). Loaded once at
+    /// switch create; cosmetic, so an absent or broken one is logged and
+    /// the datapath still comes up. Like every vendor data file it is
+    /// fetched, never committed.
+    #[serde(default)]
+    pub led_program: Option<PathBuf>,
     /// Additional vendor data files (LED microcode etc.), relative paths.
     #[serde(default)]
     pub extra_files: Vec<PathBuf>,

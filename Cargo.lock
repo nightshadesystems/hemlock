@@ -1044,6 +1044,7 @@ dependencies = [
  "hemlock-common",
  "hemlock-platform",
  "libloading",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

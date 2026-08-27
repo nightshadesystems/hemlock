@@ -149,6 +149,13 @@ struct Api {
     port_counters: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut ShimCounters) -> Status>,
 
     capabilities: Option<unsafe extern "C" fn(*mut ShimSwitch, *mut ShimCapabilities) -> Status>,
+
+    // --- ABI 1.1 -----------------------------------------------------
+    // Appended, not inserted. A shim built against 1.0 reports the
+    // smaller `struct_size` and `has()` refuses to read this far, which
+    // is the whole point of the minor-version rule.
+    load_led_program:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, *const std::os::raw::c_char) -> Status>,
 }
 
 impl Api {
@@ -211,6 +218,18 @@ type c_int_alias = std::os::raw::c_int;
 
 // ---------------------------------------------------------------------------
 
+/// Every call on a slot follows the same shape: check it exists (both
+/// non-NULL and within the shim's reported `struct_size`), then call it.
+/// Spelled once here rather than in each of the methods.
+macro_rules! slot {
+    ($self:expr, $field:ident, $call:literal) => {{
+        match $self.api.$field {
+            Some(f) if $self.api.has(std::mem::offset_of!(Api, $field)) => Ok(f),
+            _ => unimplemented_slot($call),
+        }
+    }};
+}
+
 /// `SaiBackend` over a dlopened `libhemlockbcm.so`.
 pub struct OpenBcmBackend {
     /// Kept alive for as long as any pointer into it is used; dropping it
@@ -219,6 +238,7 @@ pub struct OpenBcmBackend {
     api: &'static Api,
     switch: *mut ShimSwitch,
     shim_path: PathBuf,
+    led_program_path: Option<PathBuf>,
     config_bcm_path: PathBuf,
     src_mac: Option<[u8; 6]>,
     diag_shell: bool,
@@ -317,6 +337,7 @@ impl OpenBcmBackend {
             api,
             switch: std::ptr::null_mut(),
             shim_path,
+            led_program_path: init.led_program_path.clone(),
             config_bcm_path: init.config_bcm_path.clone(),
             src_mac: init.src_mac,
             diag_shell: init.diag_shell,
@@ -324,6 +345,50 @@ impl OpenBcmBackend {
             event_ctx: Arc::new(EventContext { tx }),
             port_names: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Load and start the chip's LED-processor program, if the platform
+    /// ships one and the shim implements the slot.
+    ///
+    /// Every failure path here is a warning: LEDs are cosmetic, and a
+    /// switch that forwards with the wrong lights on is enormously better
+    /// than one that refuses to start over them. The `has()` check is
+    /// what lets a shim built against ABI 1.0 — before this slot existed
+    /// — keep working.
+    fn load_led_program(&mut self) {
+        let Some(path) = self.led_program_path.clone() else {
+            return;
+        };
+        let Ok(load) = slot!(self, load_led_program, "load_led_program") else {
+            tracing::warn!(
+                abi_minor = self.api.abi_minor,
+                "shim has no load_led_program slot; port LEDs will be left as the \
+                 latches powered up"
+            );
+            return;
+        };
+        let Ok(switch) = self.switch() else { return };
+
+        let hex = match std::fs::read_to_string(&path) {
+            Ok(text) => text.split_whitespace().collect::<String>(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "LED program unreadable");
+                return;
+            }
+        };
+        if hex.is_empty() {
+            tracing::warn!(path = %path.display(), "LED program file is empty");
+            return;
+        }
+        let Ok(text) = CString::new(hex) else {
+            tracing::warn!(path = %path.display(), "LED program contains a NUL");
+            return;
+        };
+        // SAFETY: `text` outlives the call; the shim copies what it needs.
+        match check("load_led_program", unsafe { load(switch, text.as_ptr()) }) {
+            Ok(()) => tracing::info!(path = %path.display(), "LED program loaded"),
+            Err(e) => tracing::warn!(error = %e, "LED program load failed (LEDs only)"),
+        }
     }
 
     fn switch(&self) -> Result<*mut ShimSwitch, SaiError> {
@@ -352,17 +417,6 @@ impl Drop for OpenBcmBackend {
         }
         self.switch = std::ptr::null_mut();
     }
-}
-
-/// Every call on a slot follows the same shape: check it exists, call it,
-/// map the status. Spelled once here rather than in each of the methods.
-macro_rules! slot {
-    ($self:expr, $field:ident, $call:literal) => {{
-        match $self.api.$field {
-            Some(f) if $self.api.has(std::mem::offset_of!(Api, $field)) => Ok(f),
-            _ => unimplemented_slot($call),
-        }
-    }};
 }
 
 impl SaiBackend for OpenBcmBackend {
@@ -404,6 +458,11 @@ impl SaiBackend for OpenBcmBackend {
         } else {
             tracing::warn!("OpenBCM shim has no set_link_callback; link state will not update");
         }
+
+        // The chip's LED processor. Purely cosmetic — without it the LED
+        // latches power up driving every port LED solid on — so nothing
+        // here is allowed to fail the switch.
+        self.load_led_program();
 
         // OpenBCM has no SAI object ids: the switch is unit 0 and there
         // is one 802.1Q VLAN table, so the "default VLAN oid" that FDB
@@ -1085,6 +1144,7 @@ mod tests {
         crate::SwitchInit {
             libsai_path: PathBuf::new(),
             shim_path: Some(shim),
+            led_program_path: None,
             config_bcm_path: PathBuf::from("/nonexistent/config.bcm"),
             profile: Vec::new(),
             src_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
@@ -1284,6 +1344,72 @@ mod tests {
         // second stub: the check is on the value the shim reports.
         let minimum = std::mem::size_of::<usize>() + 2 * std::mem::size_of::<u32>();
         assert!(std::mem::size_of::<Api>() > minimum);
+    }
+
+    /// The LED program reaches the shim, whitespace-stripped, when the
+    /// platform ships one.
+    #[test]
+    fn the_led_program_reaches_the_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("led.hex");
+        // Vendor hex files wrap across lines; the shim wants one string.
+        std::fs::write(&path, "021d2860 e167bc06\ne190d219\n").unwrap();
+
+        let mut init = init_for(stub_path());
+        init.led_program_path = Some(path);
+        let mut b = OpenBcmBackend::new(&init, ABI_MAJOR).unwrap();
+        b.create_switch().unwrap();
+
+        // Ask the stub what it was handed.
+        let loaded = unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn() -> *const std::os::raw::c_char> =
+                b._library.get(b"hemlockbcm_stub_led_program\0").unwrap();
+            std::ffi::CStr::from_ptr(f()).to_string_lossy().into_owned()
+        };
+        assert_eq!(loaded, "021d2860e167bc06e190d219");
+    }
+
+    /// LEDs are cosmetic: nothing about them may fail the switch.
+    #[test]
+    fn a_broken_led_program_does_not_fail_create_switch() {
+        let mut init = init_for(stub_path());
+        init.led_program_path = Some(PathBuf::from("/no/such/led.hex"));
+        let mut b = OpenBcmBackend::new(&init, ABI_MAJOR).unwrap();
+        assert!(b.create_switch().is_ok());
+        // And the switch is fully usable afterwards.
+        assert_eq!(b.ports().unwrap().len(), 4);
+    }
+
+    /// The minor-version rule: a shim built against an older header
+    /// reports a shorter `struct_size`, and slots past its end must read
+    /// as absent rather than being called through a dangling offset.
+    #[test]
+    fn struct_size_gates_slots_appended_by_a_later_minor() {
+        let b = OpenBcmBackend::new(&init_for(stub_path()), ABI_MAJOR).unwrap();
+        let led = std::mem::offset_of!(Api, load_led_program);
+        // The stub is built from the current header, so it has the slot.
+        assert!(b.api.has(led));
+
+        // A 1.0-sized vtable stops just before it.
+        let one_zero = Api {
+            struct_size: led,
+            abi_major: ABI_MAJOR,
+            abi_minor: 0,
+            create_switch: None,
+            destroy_switch: None,
+            set_link_callback: None,
+            ports: None,
+            set_port_admin_state: None,
+            set_port_speed: None,
+            set_port_duplex: None,
+            set_port_autoneg: None,
+            set_port_mtu: None,
+            port_counters: None,
+            capabilities: None,
+            load_led_program: None,
+        };
+        assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
+        assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
     }
 
     /// The layout facts a hand-transcribed ABI could get wrong. If the

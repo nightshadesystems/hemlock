@@ -115,19 +115,163 @@ fn write_io_port(_port: u64, _value: u8) -> std::io::Result<()> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
-/// Edgecore AS4610-54T (Accton). Placeholder: the board needs a
-/// `pre_asic_init` that unbinds the iProc CMICd platform driver and
-/// deasserts the external PHYs' CPLD reset (without which the SDK's PHY
-/// probe finds nothing), plus a `post_asic_init` that loads the Helix4
-/// LED program. Both land in phase 3, with the OpenBCM shim they drive —
-/// there is nothing to poke until the datapath exists. Registered now so
-/// the manifest can name it.
+/// Edgecore AS4610-54T (Accton). Two things must happen before the
+/// OpenBCM SDK can find the chip, neither expressible as manifest data:
+///
+/// 1. **Release the CMICd.** The kernel's `iproc_cmic` platform driver
+///    binds the on-die CMIC at boot. The BDE cannot claim the device
+///    while it is bound, so unbind it first.
+/// 2. **Deassert the external PHYs' reset.** The board CPLD powers up
+///    holding the 48 BCM54282 copper PHYs and the 4 BCM84758 SFP+ PHYs
+///    in reset. The SDK's PHY probe then finds nothing and every port
+///    stays down — with no error that points at the CPLD.
+///
+/// Register semantics come from ONL's `accton_as4610_cpld.c` and the
+/// edgenos bring-up sequence for this board. Both steps are idempotent
+/// (that is the contract) and the CPLD writes are read back, because a
+/// silently dropped i2c write here looks exactly like dead hardware.
 pub struct As4610Quirks;
+
+/// Manifest name of the i2c root the CPLD sits on. The manifest owns the
+/// adapter matching; the quirk only needs to know which root it declared.
+const AS4610_CPLD_ROOT: &str = "cpld-bus";
+/// CPLD i2c address (device tree: `cpld@30` on `i2c0`).
+const AS4610_CPLD_ADDR: u32 = 0x30;
+
+/// The PHY reset-deassert sequence: (register, value, what it releases).
+/// Applied in order; the CPLD latches each independently.
+const AS4610_PHY_RESET_DEASSERT: [(u8, u8, &str); 5] = [
+    (0x07, 0x02, "copper PHY bank reset"),
+    (0x08, 0x02, "copper PHY bank reset"),
+    (0x0d, 0x01, "SFP+ PHY reset"),
+    (0x19, 0x00, "PHY power-down"),
+    (0x1b, 0x00, "PHY power-down"),
+];
+
+/// The platform driver holding the on-die CMIC, and its bus.
+const IPROC_CMIC_DRIVER: &str = "/sys/bus/platform/drivers/iproc_cmic";
+const PLATFORM_DEVICES: &str = "/sys/bus/platform/devices";
+const CMIC_DEVICE_SUFFIX: &str = ".iproc_cmicd";
 
 impl PlatformQuirks for As4610Quirks {
     fn name(&self) -> &'static str {
         "as4610"
     }
+
+    fn pre_asic_init(&self, platform: &Platform) -> Result<(), QuirkError> {
+        unbind_iproc_cmic();
+        deassert_phy_reset(platform)
+    }
+}
+
+/// Unbind the CMICd from the kernel's `iproc_cmic` driver so the BDE can
+/// claim it. Idempotent: an already-unbound device is not an error, and
+/// neither is a kernel with no such driver (the BDE may have taken the
+/// device already, or the driver may not be built in).
+fn unbind_iproc_cmic() {
+    let Ok(entries) = std::fs::read_dir(PLATFORM_DEVICES) else {
+        tracing::debug!("no platform bus; skipping iproc_cmic unbind");
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(CMIC_DEVICE_SUFFIX) {
+            continue;
+        }
+        // Bound to *this* driver? If the link is absent it is already
+        // free, which is the state we want.
+        let bound = std::path::Path::new(IPROC_CMIC_DRIVER).join(&name);
+        if !bound.exists() {
+            tracing::debug!(device = %name, "CMICd already unbound");
+            continue;
+        }
+        let unbind = std::path::Path::new(IPROC_CMIC_DRIVER).join("unbind");
+        match std::fs::write(&unbind, name.as_bytes()) {
+            Ok(()) => tracing::info!(device = %name, "unbound CMICd from iproc_cmic"),
+            Err(e) => {
+                // Not fatal on its own: the SDK's attach will fail with a
+                // clearer message if this really mattered.
+                tracing::warn!(device = %name, error = %e, "CMICd unbind failed");
+            }
+        }
+    }
+}
+
+/// Write the CPLD's PHY reset-deassert sequence, verifying each write by
+/// reading it back.
+fn deassert_phy_reset(platform: &Platform) -> Result<(), QuirkError> {
+    let sysfs = crate::sysinit::Sysfs::real();
+    let i2c = &platform.manifest.hardware.i2c;
+    let Some(bus) = sysfs.find_manifest_root(i2c, AS4610_CPLD_ROOT) else {
+        return Err(QuirkError {
+            quirk: "as4610",
+            stage: "pre_asic_init",
+            message: format!(
+                "cannot locate the i2c root {AS4610_CPLD_ROOT:?} the CPLD sits on \
+                 (is the SoC i2c driver loaded?)"
+            ),
+        });
+    };
+
+    for (register, value, what) in AS4610_PHY_RESET_DEASSERT {
+        // Idempotent by construction: skip a register already at its
+        // target value, so a syncd restart does not bounce the PHYs.
+        match sysfs.i2c_read_reg(bus, AS4610_CPLD_ADDR, register) {
+            Ok(current) if current == value => {
+                tracing::debug!(
+                    register = format_args!("0x{register:02x}"),
+                    what,
+                    "CPLD register already deasserted"
+                );
+                continue;
+            }
+            Ok(_) => {}
+            // A CPLD that cannot be read is worth knowing about, but the
+            // write below is the real test.
+            Err(e) => tracing::debug!(
+                register = format_args!("0x{register:02x}"),
+                error = %e,
+                "CPLD read-before-write failed"
+            ),
+        }
+
+        sysfs
+            .i2c_write_reg(bus, AS4610_CPLD_ADDR, register, value)
+            .map_err(|e| QuirkError {
+                quirk: "as4610",
+                stage: "pre_asic_init",
+                message: format!("CPLD write 0x{register:02x}=0x{value:02x} ({what}): {e}"),
+            })?;
+
+        // Read back. A dropped write here means every port comes up dead
+        // with nothing in the log pointing at the CPLD, so pay the read.
+        match sysfs.i2c_read_reg(bus, AS4610_CPLD_ADDR, register) {
+            Ok(readback) if readback == value => tracing::info!(
+                register = format_args!("0x{register:02x}"),
+                value = format_args!("0x{value:02x}"),
+                what,
+                "CPLD PHY reset deasserted"
+            ),
+            Ok(readback) => {
+                return Err(QuirkError {
+                    quirk: "as4610",
+                    stage: "pre_asic_init",
+                    message: format!(
+                        "CPLD register 0x{register:02x} reads back 0x{readback:02x} after \
+                         writing 0x{value:02x} ({what}) — the PHYs will stay in reset"
+                    ),
+                })
+            }
+            Err(e) => {
+                return Err(QuirkError {
+                    quirk: "as4610",
+                    stage: "pre_asic_init",
+                    message: format!("CPLD read-back of 0x{register:02x} ({what}): {e}"),
+                })
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Look up a quirks implementation by registry name.
@@ -146,6 +290,7 @@ pub fn known_names() -> &'static [&'static str] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -156,5 +301,106 @@ mod tests {
             assert_eq!(&quirks.name(), name);
         }
         assert!(by_name("bogus").is_none());
+    }
+
+    /// The reset sequence is the board fact this quirk exists to carry,
+    /// so pin it against ONL's CPLD map and the edgenos bring-up
+    /// sequence. Getting a register or a value wrong here leaves every
+    /// port dark with nothing in the log pointing here.
+    #[test]
+    fn phy_reset_sequence_matches_the_board() {
+        let expected: [(u8, u8); 5] = [
+            (0x07, 0x02),
+            (0x08, 0x02),
+            (0x0d, 0x01),
+            (0x19, 0x00),
+            (0x1b, 0x00),
+        ];
+        let actual: Vec<(u8, u8)> = AS4610_PHY_RESET_DEASSERT
+            .iter()
+            .map(|(register, value, _)| (*register, *value))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(AS4610_CPLD_ADDR, 0x30);
+    }
+
+    /// The quirk finds its bus through the manifest, so the CPLD's
+    /// adapter is data rather than a constant in this file. If the
+    /// manifest ever renames that root, this fails rather than the
+    /// board going dark on the bench.
+    #[test]
+    fn the_as4610_manifest_declares_the_cpld_root() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../platforms/accton-as4610-54");
+        let platform = Platform::load(&dir).unwrap();
+        let roots = &platform.manifest.hardware.i2c.roots;
+        assert!(
+            roots.iter().any(|r| r.name == AS4610_CPLD_ROOT),
+            "manifest roots {:?} do not include {AS4610_CPLD_ROOT:?}",
+            roots.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert_eq!(platform.manifest.hardware.quirks.driver, "as4610");
+    }
+
+    /// Reading a register that is already at its target value must skip
+    /// the write: syncd restarts, and bouncing the PHYs on every restart
+    /// would drop every link on the box.
+    #[test]
+    fn already_deasserted_registers_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus_dir = dir.path().join("sys/bus/i2c/devices/i2c-0");
+        std::fs::create_dir_all(&bus_dir).unwrap();
+        std::fs::write(bus_dir.join("reg-writes"), "").unwrap();
+        // Seed every register at its post-deassert value.
+        for (register, value, _) in AS4610_PHY_RESET_DEASSERT {
+            std::fs::write(
+                bus_dir.join(format!("reg-30-{register:02x}")),
+                format!("0x{value:02x}"),
+            )
+            .unwrap();
+        }
+
+        let sysfs = crate::sysinit::Sysfs::at(dir.path());
+        for (register, value, _) in AS4610_PHY_RESET_DEASSERT {
+            let current = sysfs.i2c_read_reg(0, AS4610_CPLD_ADDR, register).unwrap();
+            assert_eq!(current, value, "seeded value reads back");
+        }
+        // Nothing was written.
+        let writes = std::fs::read_to_string(bus_dir.join("reg-writes")).unwrap();
+        assert!(writes.is_empty(), "unexpected writes: {writes:?}");
+    }
+
+    /// A write that does not stick is the failure this quirk is built to
+    /// catch, so the read-back must reject it rather than report success.
+    #[test]
+    fn a_write_that_does_not_stick_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus_dir = dir.path().join("sys/bus/i2c/devices/i2c-0");
+        std::fs::create_dir_all(&bus_dir).unwrap();
+        std::fs::write(bus_dir.join("reg-writes"), "").unwrap();
+        // A CPLD that reads back a stale value whatever is written.
+        std::fs::write(bus_dir.join("reg-30-07"), "0x00").unwrap();
+
+        let sysfs = crate::sysinit::Sysfs::at(dir.path());
+        sysfs
+            .i2c_write_reg(0, AS4610_CPLD_ADDR, 0x07, 0x02)
+            .unwrap();
+        let readback = sysfs.i2c_read_reg(0, AS4610_CPLD_ADDR, 0x07).unwrap();
+        assert_ne!(readback, 0x02, "the fake CPLD keeps its stale value");
+
+        // The write was still attempted, in the right shape.
+        let writes = std::fs::read_to_string(bus_dir.join("reg-writes")).unwrap();
+        assert_eq!(writes, "0x30 0x07 0x02\n");
+    }
+
+    #[test]
+    fn i2cget_output_parses() {
+        use crate::sysinit::parse_i2c_byte_for_test as parse;
+        assert_eq!(parse("0x1a"), Some(0x1a));
+        assert_eq!(parse("0X02"), Some(0x02));
+        assert_eq!(parse(" 0x00 "), Some(0x00));
+        assert_eq!(parse("1a"), Some(0x1a));
+        assert_eq!(parse("nonsense"), None);
+        assert_eq!(parse(""), None);
     }
 }

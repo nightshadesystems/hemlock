@@ -112,6 +112,10 @@ pub struct SwitchInit {
     /// Hemlock's OpenBCM shim to load (openbcm backend only). Absent on
     /// every SAI platform, which is all of them but the Helix4/ARM ones.
     pub shim_path: Option<PathBuf>,
+    /// The chip LED-processor program, as an ASCII hex file (openbcm
+    /// backend only). Loaded right after the switch is created. Cosmetic:
+    /// a failure is logged, never fatal.
+    pub led_program_path: Option<PathBuf>,
     /// ASIC init config handed to the vendor library via the SAI profile
     /// (`SAI_INIT_CONFIG_FILE`).
     pub config_bcm_path: PathBuf,

@@ -179,6 +179,23 @@ fn parse_mac_text(text: &str) -> Option<[u8; 6]> {
     parts.next().is_none().then_some(mac)
 }
 
+/// Test-visible alias for [`parse_i2c_byte`], so the quirks module can
+/// pin the parsing its CPLD read-back depends on.
+#[cfg(test)]
+pub fn parse_i2c_byte_for_test(text: &str) -> Option<u8> {
+    parse_i2c_byte(text)
+}
+
+/// `i2cget` prints `0x1a`; accept a bare hex byte too.
+fn parse_i2c_byte(text: &str) -> Option<u8> {
+    let text = text.trim();
+    let digits = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
+    match digits {
+        Some(hex) => u8::from_str_radix(hex, 16).ok(),
+        None => u8::from_str_radix(text, 16).ok(),
+    }
+}
+
 /// A MAC usable as the switch source address: unicast and non-zero. A
 /// blank EEPROM reads as zeros; treat that as "not found" so resolution
 /// can fall through to the next source.
@@ -557,6 +574,117 @@ impl Sysfs {
     fn netdev_mac(&self, dev: &str) -> Option<[u8; 6]> {
         let path = self.root.join("sys/class/net").join(dev).join("address");
         parse_mac_text(&std::fs::read_to_string(path).ok()?)
+    }
+
+    /// Locate a named root adapter declared by a manifest's i2c section,
+    /// without instantiating anything. syncd needs this for quirks that
+    /// poke a CPLD before the datapath exists — pmon owns topology
+    /// instantiation, and it has not run yet at that point.
+    pub fn find_manifest_root(&self, i2c: &I2cSection, name: &str) -> Option<u32> {
+        if name == DEFAULT_ROOT_NAME {
+            if let Some(prefix) = &i2c.root_adapter {
+                return self.find_root_adapter(prefix).ok();
+            }
+        }
+        let root = i2c.roots.iter().find(|r| r.name == name)?;
+        self.find_root_adapter_instance(&root.adapter, root.instance)
+            .ok()
+    }
+
+    /// One SMBus byte-data register write (`i2cset -y -f bus addr reg
+    /// value`). `-f` because these targets deliberately have no driver
+    /// bound: the CPLD is ours to poke, not the kernel's.
+    pub fn i2c_write_reg(
+        &self,
+        bus: u32,
+        address: u32,
+        register: u8,
+        value: u8,
+    ) -> Result<(), SysinitError> {
+        // Fake-sysfs tests have no bus; record the intent instead, the
+        // way raw_write does.
+        if self.root != Path::new("/") {
+            let path = self
+                .i2c_dev_dir()
+                .join(format!("i2c-{bus}"))
+                .join("reg-writes");
+            let mut log = std::fs::read_to_string(&path).unwrap_or_default();
+            log.push_str(&format!("0x{address:02x} 0x{register:02x} 0x{value:02x}\n"));
+            return std::fs::write(&path, log).map_err(|e| SysinitError::I2c {
+                action: "i2c_write_reg",
+                bus,
+                detail: e.to_string(),
+            });
+        }
+        let output = std::process::Command::new("i2cset")
+            .args([
+                "-y",
+                "-f",
+                &bus.to_string(),
+                &format!("0x{address:02x}"),
+                &format!("0x{register:02x}"),
+                &format!("0x{value:02x}"),
+            ])
+            .output()
+            .map_err(|source| SysinitError::Spawn {
+                command: format!("i2cset bus {bus}"),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(SysinitError::I2c {
+                action: "i2c_write_reg",
+                bus,
+                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// One SMBus byte-data register read (`i2cget -y -f bus addr reg`).
+    pub fn i2c_read_reg(&self, bus: u32, address: u32, register: u8) -> Result<u8, SysinitError> {
+        if self.root != Path::new("/") {
+            // Tests drive the value through a file per register.
+            let path = self
+                .i2c_dev_dir()
+                .join(format!("i2c-{bus}"))
+                .join(format!("reg-{address:02x}-{register:02x}"));
+            let text = std::fs::read_to_string(&path).map_err(|e| SysinitError::I2c {
+                action: "i2c_read_reg",
+                bus,
+                detail: e.to_string(),
+            })?;
+            return parse_i2c_byte(text.trim()).ok_or_else(|| SysinitError::I2c {
+                action: "i2c_read_reg",
+                bus,
+                detail: format!("unparsable {text:?}"),
+            });
+        }
+        let output = std::process::Command::new("i2cget")
+            .args([
+                "-y",
+                "-f",
+                &bus.to_string(),
+                &format!("0x{address:02x}"),
+                &format!("0x{register:02x}"),
+            ])
+            .output()
+            .map_err(|source| SysinitError::Spawn {
+                command: format!("i2cget bus {bus}"),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(SysinitError::I2c {
+                action: "i2c_read_reg",
+                bus,
+                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        parse_i2c_byte(&text).ok_or_else(|| SysinitError::I2c {
+            action: "i2c_read_reg",
+            bus,
+            detail: format!("unparsable i2cget output {text:?}"),
+        })
     }
 
     /// Raw pre-init write via i2cset (block mode, force — the target has no

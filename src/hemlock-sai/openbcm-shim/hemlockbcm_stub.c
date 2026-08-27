@@ -186,6 +186,24 @@ static int stub_capabilities(struct hemlockbcm_switch *sw,
     return HEMLOCKBCM_OK;
 }
 
+/* ABI 1.1. Records the program so the Rust tests can prove it arrived. */
+static char stub_led_program[512];
+
+static int stub_load_led_program(struct hemlockbcm_switch *sw, const char *hex)
+{
+    if (sw == NULL || hex == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    snprintf(stub_led_program, sizeof(stub_led_program), "%s", hex);
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI. */
+HEMLOCKBCM_EXPORT const char *hemlockbcm_stub_led_program(void)
+{
+    return stub_led_program;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -201,6 +219,7 @@ static const struct hemlockbcm_api STUB_API = {
     NULL,  /* set_port_mtu: deliberately absent (NULL-slot coverage) */
     stub_port_counters,
     stub_capabilities,
+    stub_load_led_program,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

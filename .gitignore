@@ -19,3 +19,7 @@ platforms/**/*.deb
 # Local state from dev runs
 /.hemlock-state/
 
+
+# OpenBCM SDK tree and the shim built from it (fetched, never committed).
+/vendor/openbcm/
+/vendor/firmware/
