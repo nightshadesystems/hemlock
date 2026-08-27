@@ -273,28 +273,13 @@ impl ShimAclFields {
 }
 
 /// The ABI's action code for one action set.
-///
-/// A counter or a per-entry policer is refused rather than dropped on
-/// the floor: both are separate objects this ABI does not carry yet, and
-/// installing the rule without them would silently lose the operator's
-/// `log` or `police` clause while reporting success.
-fn acl_action(action: &AclAction) -> Result<std::os::raw::c_int, SaiError> {
-    if action.counter.is_some() {
-        return Err(SaiError::Other(
-            "ACL match counters are not implemented on this backend yet".into(),
-        ));
-    }
-    if action.policer.is_some() {
-        return Err(SaiError::Other(
-            "per-entry ACL policers are not implemented on this backend yet".into(),
-        ));
-    }
-    Ok(match action.action {
+fn acl_action(action: &AclAction) -> std::os::raw::c_int {
+    match action.action {
         AclPacketAction::Forward => ACL_FORWARD,
         AclPacketAction::Drop => ACL_DROP,
         AclPacketAction::Trap => ACL_TRAP,
         AclPacketAction::Copy => ACL_COPY,
-    })
+    }
 }
 
 /// Opaque switch handle.
@@ -436,6 +421,12 @@ struct Api {
     acl_entry_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
     acl_available:
         Option<unsafe extern "C" fn(*mut ShimSwitch, std::os::raw::c_int, *mut u32) -> Status>,
+
+    // --- ABI 1.11: ACL counters and per-entry policers ---------------
+    acl_counter_create: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut u32) -> Status>,
+    acl_counter_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    acl_counter_get: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut u64) -> Status>,
+    acl_entry_attach: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, u32) -> Status>,
 }
 
 impl Api {
@@ -528,6 +519,15 @@ const OID_TAG_HOSTIF: u64 = 0x07;
 const OID_TAG_POLICER: u64 = 0x08;
 const OID_TAG_ACL_TABLE: u64 = 0x09;
 const OID_TAG_ACL_ENTRY: u64 = 0x0a;
+const OID_TAG_ACL_COUNTER: u64 = 0x0b;
+
+fn acl_counter_oid(counter: u32) -> Oid {
+    Oid((OID_TAG_ACL_COUNTER << 56) | u64::from(counter))
+}
+
+fn oid_acl_counter(oid: Oid) -> u32 {
+    oid.0 as u32
+}
 
 fn acl_table_oid(table: u32) -> Oid {
     Oid((OID_TAG_ACL_TABLE << 56) | u64::from(table))
@@ -872,6 +872,45 @@ impl OpenBcmBackend {
         }
     }
 
+    /// Set an ACL entry's counter and policer, detaching either with
+    /// `None`. One call for both, because the entry's action set is
+    /// replaced as a unit and splitting them would make the order
+    /// between the two significant.
+    fn attach_acl_objects(
+        &self,
+        entry: Oid,
+        counter: Option<Oid>,
+        policer: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        // Always call when the slot exists, including with neither
+        // object: this is a set, and "attach nothing" is how an update
+        // that dropped its `log` clause detaches the old counter.
+        // Skipping it here left the previous attachment in place.
+        let f = match slot!(self, acl_entry_attach, "acl_entry_attach") {
+            Ok(f) => f,
+            // A shim without the slot can still serve rules that ask for
+            // neither; one that asks for either gets the real error.
+            Err(e) => {
+                return if counter.is_none() && policer.is_none() {
+                    Ok(())
+                } else {
+                    Err(e)
+                };
+            }
+        };
+        let sw = self.switch()?;
+        // 0 is the ABI's "no object", and no id this backend mints is 0.
+        // SAFETY: plain scalars over the ABI.
+        check("acl_entry_attach", unsafe {
+            f(
+                sw,
+                oid_acl_entry(entry),
+                counter.map_or(0, oid_acl_counter),
+                policer.map_or(0, oid_policer),
+            )
+        })
+    }
+
     /// An STP argument the trait spells `Option<Oid>`, where `None`
     /// means the default instance -- which the shim reports rather than
     /// this side assuming the SDK's usual value of 1.
@@ -1160,7 +1199,7 @@ impl SaiBackend for OpenBcmBackend {
             my_mac: false,
             acl_ingress: slot!(self, acl_entry_create, "acl_entry_create").is_ok(),
             acl_egress: slot!(self, acl_entry_create, "acl_entry_create").is_ok(),
-            acl_entry_policer: false,
+            acl_entry_policer: slot!(self, acl_entry_attach, "acl_entry_attach").is_ok(),
             port_learn_limit: slot!(self, set_port_learn_limit, "set_port_learn_limit").is_ok(),
             copp: false,
             buffer_bytes_total: raw.buffer_bytes_total,
@@ -1783,10 +1822,11 @@ impl SaiBackend for OpenBcmBackend {
         action: &AclAction,
     ) -> Result<Oid, SaiError> {
         let f = slot!(self, acl_entry_create, "acl_entry_create")?;
-        // Both of these can refuse, and both do so before anything
-        // reaches the chip.
+        // Refuses before anything reaches the chip if the match is one
+        // this datapath cannot express.
         let shim_fields = ShimAclFields::build(fields)?;
-        let action = acl_action(action)?;
+        let attachments = (action.counter, action.policer);
+        let action = acl_action(action);
         let sw = self.switch()?;
         let mut entry: u32 = 0;
         // SAFETY: `shim_fields` outlives the call; `entry` is written on OK.
@@ -1800,17 +1840,31 @@ impl SaiBackend for OpenBcmBackend {
                 &mut entry,
             )
         })?;
-        Ok(acl_entry_oid(entry))
+        let entry = acl_entry_oid(entry);
+        // The counter and policer are separate objects, so attaching
+        // them is a second call. A failure here leaves a rule that
+        // matches and acts but does not count, which is worse than no
+        // rule: unwind it rather than report success.
+        if let Err(e) = self.attach_acl_objects(entry, attachments.0, attachments.1) {
+            let _ = self.remove_acl_entry(entry);
+            return Err(e);
+        }
+        Ok(entry)
     }
 
     fn set_acl_entry_action(&mut self, entry: Oid, action: &AclAction) -> Result<(), SaiError> {
         let f = slot!(self, acl_entry_action_set, "acl_entry_action_set")?;
-        let action = acl_action(action)?;
+        let attachments = (action.counter, action.policer);
+        let action = acl_action(action);
         let sw = self.switch()?;
         // SAFETY: plain scalars over the ABI.
         check("acl_entry_action_set", unsafe {
             f(sw, oid_acl_entry(entry), action)
-        })
+        })?;
+        // The action set is replaced as a unit, and the attachments are
+        // part of it: an update that dropped the `log` clause has to
+        // detach the counter too, which is what passing None does.
+        self.attach_acl_objects(entry, attachments.0, attachments.1)
     }
 
     fn remove_acl_entry(&mut self, entry: Oid) -> Result<(), SaiError> {
@@ -1860,19 +1914,36 @@ impl SaiBackend for OpenBcmBackend {
         Ok(entries)
     }
 
-    fn create_acl_counter(&mut self, _table: Oid) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_acl_counter")
+    fn create_acl_counter(&mut self, table: Oid) -> Result<Oid, SaiError> {
+        let f = slot!(self, acl_counter_create, "acl_counter_create")?;
+        let sw = self.switch()?;
+        let mut counter: u32 = 0;
+        // SAFETY: `counter` is a live u32 the shim writes only on OK.
+        check("acl_counter_create", unsafe {
+            f(sw, oid_acl_table(table), &mut counter)
+        })?;
+        Ok(acl_counter_oid(counter))
     }
 
-    fn remove_acl_counter(&mut self, _counter: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_acl_counter")
+    fn remove_acl_counter(&mut self, counter: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, acl_counter_destroy, "acl_counter_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("acl_counter_destroy", unsafe {
+            f(sw, oid_acl_counter(counter))
+        })
     }
 
-    fn get_acl_counter(&mut self, _counter: Oid) -> Result<u64, SaiError> {
-        unimplemented_slot("get_acl_counter")
+    fn get_acl_counter(&mut self, counter: Oid) -> Result<u64, SaiError> {
+        let f = slot!(self, acl_counter_get, "acl_counter_get")?;
+        let sw = self.switch()?;
+        let mut packets: u64 = 0;
+        // SAFETY: `packets` is a live u64 the shim writes only on OK.
+        check("acl_counter_get", unsafe {
+            f(sw, oid_acl_counter(counter), &mut packets)
+        })?;
+        Ok(packets)
     }
-
-    // --- Policers (ABI 1.9) -------------------------------------------
 
     fn create_policer(&mut self, spec: PolicerSpec) -> Result<Oid, SaiError> {
         let f = slot!(self, policer_create, "policer_create")?;
@@ -2260,9 +2331,7 @@ mod tests {
         assert!(caps.stp, "ABI 1.5");
         assert!(caps.storm_control, "ABI 1.7");
         assert!(caps.acl_ingress && caps.acl_egress, "ABI 1.10");
-        // ...but per-entry policers are a separate slot that does
-        // not exist yet, so that one stays off.
-        assert!(!caps.acl_entry_policer);
+        assert!(caps.acl_entry_policer, "ABI 1.11");
         for (name, on) in [
             ("l2mc", caps.l2mc),
             ("copp", caps.copp),
@@ -2397,6 +2466,10 @@ mod tests {
             acl_entry_action_set: None,
             acl_entry_destroy: None,
             acl_available: None,
+            acl_counter_create: None,
+            acl_counter_destroy: None,
+            acl_counter_get: None,
+            acl_entry_attach: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2519,6 +2592,10 @@ mod tests {
             "acl_entry_action_set",
             "acl_entry_destroy",
             "acl_available",
+            "acl_counter_create",
+            "acl_counter_destroy",
+            "acl_counter_get",
+            "acl_entry_attach",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2614,6 +2691,10 @@ mod tests {
             std::mem::offset_of!(Api, acl_entry_action_set),
             std::mem::offset_of!(Api, acl_entry_destroy),
             std::mem::offset_of!(Api, acl_available),
+            std::mem::offset_of!(Api, acl_counter_create),
+            std::mem::offset_of!(Api, acl_counter_destroy),
+            std::mem::offset_of!(Api, acl_counter_get),
+            std::mem::offset_of!(Api, acl_entry_attach),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -3611,7 +3692,7 @@ mod tests {
         );
     }
 
-    /// Four things this backend cannot express. Each is refused, and
+    /// Three things this backend cannot express. Each is refused, and
     /// none is quietly approximated -- an ACL that silently matches
     /// something other than what was asked for is worse than one that
     /// fails to install.
@@ -3647,21 +3728,6 @@ mod tests {
             ..Default::default()
         };
         b.create_acl_entry(table, 100, &single, &deny()).unwrap();
-
-        // A counter or a policer the ABI does not carry yet: installing
-        // the rule without them would lose the operator's log or police
-        // clause while reporting success.
-        let counted = AclAction {
-            counter: Some(Oid(1)),
-            ..deny()
-        };
-        assert!(b.create_acl_entry(table, 100, &single, &counted).is_err());
-        let policed = AclAction {
-            policer: Some(Oid(1)),
-            ..deny()
-        };
-        assert!(b.create_acl_entry(table, 100, &single, &policed).is_err());
-        assert!(b.set_acl_entry_action(Oid(1), &policed).is_err());
     }
 
     #[test]
@@ -3685,5 +3751,115 @@ mod tests {
 
         b.remove_acl_entry(entry).unwrap();
         assert_eq!(b.acl_available_entries(AclStage::Ingress).unwrap(), before);
+    }
+    /// The entry's (counter, policer) pair, or -1 for no such entry.
+    fn stub_acl_attach(b: &OpenBcmBackend, entry: Oid) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> i64> =
+                b._library.get(b"hemlockbcm_stub_acl_attach\0").unwrap();
+            f(b.switch, oid_acl_entry(entry))
+        }
+    }
+
+    fn attached(counter: Option<Oid>, policer: Option<Oid>) -> i64 {
+        ((counter.map_or(0, oid_acl_counter) as i64) << 32) | policer.map_or(0, oid_policer) as i64
+    }
+
+    #[test]
+    fn acl_entries_carry_a_counter_and_a_policer() {
+        let mut b = backend();
+        let table = b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+        let counter = b.create_acl_counter(table).unwrap();
+        let policer = b
+            .create_policer(PolicerSpec {
+                pps: true,
+                rate: 100,
+                burst: 10,
+            })
+            .unwrap();
+
+        let logged = AclAction {
+            counter: Some(counter),
+            policer: Some(policer),
+            ..deny()
+        };
+        let entry = b
+            .create_acl_entry(table, 100, &AclFields::default(), &logged)
+            .unwrap();
+        assert_eq!(
+            stub_acl_attach(&b, entry),
+            attached(Some(counter), Some(policer))
+        );
+        assert_eq!(b.get_acl_counter(counter).unwrap(), 100);
+
+        // A counter an entry still references cannot go.
+        assert!(b.remove_acl_counter(counter).is_err());
+
+        // Dropping the log clause detaches the counter: the action set
+        // is replaced as a unit, so an update that no longer asks for a
+        // counter must not leave the old one attached.
+        b.set_acl_entry_action(entry, &deny()).unwrap();
+        assert_eq!(stub_acl_attach(&b, entry), attached(None, None));
+        b.remove_acl_counter(counter).unwrap();
+    }
+
+    /// A rule that matches and acts but silently does not count is worse
+    /// than no rule, so a failed attach unwinds the entry rather than
+    /// reporting success.
+    #[test]
+    fn a_failed_attachment_unwinds_the_entry() {
+        let mut b = backend();
+        let table = b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+        let before = b.acl_available_entries(AclStage::Ingress).unwrap();
+
+        // A counter id that names nothing: the entry installs, the
+        // attach fails, and the entry must not survive.
+        let bogus = AclAction {
+            counter: Some(acl_counter_oid(99)),
+            ..deny()
+        };
+        assert!(b
+            .create_acl_entry(table, 100, &AclFields::default(), &bogus)
+            .is_err());
+        assert_eq!(
+            b.acl_available_entries(AclStage::Ingress).unwrap(),
+            before,
+            "the half-built entry was removed"
+        );
+    }
+
+    /// Counters belong to the table they count in, because the chip
+    /// allocates them per group.
+    #[test]
+    fn acl_counters_belong_to_their_table() {
+        let mut b = backend();
+        let table = b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+        let one = b.create_acl_counter(table).unwrap();
+        let two = b.create_acl_counter(table).unwrap();
+        assert_ne!(one, two);
+        assert_ne!(
+            b.get_acl_counter(one).unwrap(),
+            b.get_acl_counter(two).unwrap(),
+            "distinct counters, distinct counts"
+        );
+
+        assert!(b.create_acl_counter(acl_table_oid(99)).is_err());
+        b.remove_acl_counter(one).unwrap();
+        assert!(b.get_acl_counter(one).is_err());
+    }
+
+    /// Counter ids are their own family.
+    #[test]
+    fn acl_counter_ids_are_their_own_family() {
+        assert_eq!(oid_acl_counter(acl_counter_oid(3)), 3);
+        assert_ne!(oid_tag(acl_counter_oid(1).0), oid_tag(acl_entry_oid(1).0));
+        assert_ne!(oid_tag(acl_counter_oid(1).0), oid_tag(acl_table_oid(1).0));
+        assert_ne!(oid_tag(acl_counter_oid(1).0), oid_tag(policer_oid(1).0));
     }
 }

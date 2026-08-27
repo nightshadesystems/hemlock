@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 10
+#define HEMLOCKBCM_ABI_MINOR 11
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -635,9 +635,40 @@ struct hemlockbcm_api {
     /* Free TCAM entries at a stage, for utilisation reporting. */
     int (*acl_available)(struct hemlockbcm_switch *sw, int egress, uint32_t *entries);
 
+    /* --- ACL counters and per-entry policers (ABI 1.11) --------------- */
+
     /*
-     * Everything below is the rest of phase 6: ACL counters and
-     * per-entry policers, CoPP traps, sFlow and QoS. Each lands as one slot appended here plus the
+     * A counter belongs to the table it counts in: the chip allocates
+     * counters per group, so one cannot be moved between tables and the
+     * table has to be named at create time.
+     *
+     * Counting is packets, not bytes. The caller's `show acl` reports
+     * matches, and asking the chip for both would spend two counter
+     * slots to answer one question.
+     */
+    int (*acl_counter_create)(struct hemlockbcm_switch *sw, uint32_t table,
+                              uint32_t *counter);
+    /* No entry may still reference it. */
+    int (*acl_counter_destroy)(struct hemlockbcm_switch *sw, uint32_t counter);
+    int (*acl_counter_get)(struct hemlockbcm_switch *sw, uint32_t counter,
+                           uint64_t *packets);
+
+    /*
+     * Attach or replace an entry's counter and policer. Passing 0 for
+     * either detaches it, which is safe because neither a counter id nor
+     * a policer id of 0 is one this ABI ever hands out.
+     *
+     * Both together, in one call, because an entry's action set is
+     * replaced as a unit: `acl_entry_action_set` clears the actions and
+     * rebuilds them, and leaving the attachments to a separate call
+     * would make the order between them significant.
+     */
+    int (*acl_entry_attach)(struct hemlockbcm_switch *sw, uint32_t entry,
+                            uint32_t counter, uint32_t policer);
+
+    /*
+     * Everything below is the rest of phase 6: CoPP traps, sFlow and
+     * QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.

@@ -38,6 +38,7 @@
 #define STUB_POLICERS 4
 #define STUB_ACL_TABLES 2
 #define STUB_ACL_ENTRIES 8
+#define STUB_ACL_COUNTERS 4
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -79,7 +80,17 @@ struct stub_acl_entry {
     uint32_t table;
     uint32_t priority;
     int action;
+    uint32_t counter;               /* 0 = none */
+    uint32_t policer;               /* 0 = none */
     struct hemlockbcm_acl_fields fields;
+};
+
+/* A match counter, which belongs to one table. */
+struct stub_acl_counter {
+    int used;
+    uint32_t id;
+    uint32_t table;
+    uint64_t packets;
 };
 
 /* A single-rate policer. */
@@ -158,6 +169,7 @@ struct hemlockbcm_switch {
     struct stub_policer policers[STUB_POLICERS];
     struct stub_acl_table acl_tables[STUB_ACL_TABLES];
     struct stub_acl_entry acl_entries[STUB_ACL_ENTRIES];
+    struct stub_acl_counter acl_counters[STUB_ACL_COUNTERS];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -1759,6 +1771,120 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_acl_bound(struct hemlockbcm_switch *sw,
     return found->bound[port - sw->ports];
 }
 
+/* --- ACL counters and per-entry policers (ABI 1.11) ----------------------- */
+
+static struct stub_acl_counter *find_acl_counter(struct hemlockbcm_switch *sw,
+                                                 uint32_t counter)
+{
+    size_t i;
+    for (i = 0; i < STUB_ACL_COUNTERS; i++) {
+        if (sw->acl_counters[i].used && sw->acl_counters[i].id == counter) {
+            return &sw->acl_counters[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_acl_counter_create(struct hemlockbcm_switch *sw, uint32_t table,
+                                   uint32_t *counter)
+{
+    size_t i;
+
+    if (sw == NULL || counter == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (find_acl_table(sw, table) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_ACL_COUNTERS; i++) {
+        if (!sw->acl_counters[i].used) {
+            memset(&sw->acl_counters[i], 0, sizeof(sw->acl_counters[i]));
+            sw->acl_counters[i].used = 1;
+            sw->acl_counters[i].id = (uint32_t)i + 1;
+            sw->acl_counters[i].table = table;
+            /* Distinct per counter so a test can tell them apart. */
+            sw->acl_counters[i].packets = 100ull * (i + 1);
+            *counter = sw->acl_counters[i].id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_acl_counter_destroy(struct hemlockbcm_switch *sw, uint32_t counter)
+{
+    struct stub_acl_counter *found;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_acl_counter(sw, counter);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_ACL_ENTRIES; i++) {
+        if (sw->acl_entries[i].used && sw->acl_entries[i].counter == counter) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* still referenced */
+        }
+    }
+    memset(found, 0, sizeof(*found));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_acl_counter_get(struct hemlockbcm_switch *sw, uint32_t counter,
+                                uint64_t *packets)
+{
+    struct stub_acl_counter *found;
+
+    if (sw == NULL || packets == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_acl_counter(sw, counter);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    *packets = found->packets;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_acl_entry_attach(struct hemlockbcm_switch *sw, uint32_t entry,
+                                 uint32_t counter, uint32_t policer)
+{
+    struct stub_acl_entry *found;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_acl_entry(sw, entry);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    if (counter != 0 && find_acl_counter(sw, counter) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    if (policer != 0 && find_policer(sw, policer) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* A set: 0 detaches, and neither id is ever 0. */
+    found->counter = counter;
+    found->policer = policer;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI: the entry's (counter, policer) pair
+ * packed into one value, or -1 if there is no such entry. */
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_acl_attach(struct hemlockbcm_switch *sw,
+                                                     uint32_t entry)
+{
+    struct stub_acl_entry *found = sw == NULL ? NULL : find_acl_entry(sw, entry);
+
+    if (found == NULL) {
+        return -1;
+    }
+    return ((int64_t)found->counter << 32) | (int64_t)found->policer;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1821,6 +1947,10 @@ static const struct hemlockbcm_api STUB_API = {
     stub_acl_entry_action_set,
     stub_acl_entry_destroy,
     stub_acl_available,
+    stub_acl_counter_create,
+    stub_acl_counter_destroy,
+    stub_acl_counter_get,
+    stub_acl_entry_attach,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

@@ -1912,6 +1912,115 @@ static int hb_acl_available(struct hemlockbcm_switch *sw, int egress, uint32_t *
     return HEMLOCKBCM_OK;
 }
 
+/* --- ACL counters and per-entry policers (ABI 1.11) ----------------------- */
+
+static int hb_acl_counter_create(struct hemlockbcm_switch *sw, uint32_t table,
+                                 uint32_t *counter)
+{
+    bcm_field_stat_t stats[1];
+    int stat_id = 0;
+    int status;
+
+    if (sw == NULL || counter == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Packets only; see the header for why not both. */
+    stats[0] = bcmFieldStatPackets;
+    status = HB_CALL(bcm_field_stat_create(sw->unit, (bcm_field_group_t)table, 1, stats,
+                                           &stat_id));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    *counter = (uint32_t)stat_id;
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_acl_counter_destroy(struct hemlockbcm_switch *sw, uint32_t counter)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_field_stat_destroy(sw->unit, (int)counter));
+}
+
+static int hb_acl_counter_get(struct hemlockbcm_switch *sw, uint32_t counter,
+                              uint64_t *packets)
+{
+    uint64 value;
+    int status;
+
+    if (sw == NULL || packets == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    COMPILER_64_ZERO(value);
+    status = HB_CALL(bcm_field_stat_get(sw->unit, (int)counter, bcmFieldStatPackets,
+                                        &value));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    *packets = hb_u64(value);
+    return HEMLOCKBCM_OK;
+}
+
+/*
+ * The policer level. The chip supports a hierarchy of meters per entry;
+ * Hemlock's model is one policer per rule, so everything sits at the
+ * first level.
+ */
+#define HB_ACL_POLICER_LEVEL 0
+
+static int hb_acl_entry_attach(struct hemlockbcm_switch *sw, uint32_t entry,
+                               uint32_t counter, uint32_t policer)
+{
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * Detach first in both cases, so this is a set rather than an
+     * accumulation. Detaching what is not attached is not an error here:
+     * the caller reaches this on every action update, most of which
+     * change neither attachment.
+     */
+    (void)bcm_field_entry_policer_detach(sw->unit, (bcm_field_entry_t)entry,
+                                         HB_ACL_POLICER_LEVEL);
+    if (policer != 0) {
+        status = HB_CALL(bcm_field_entry_policer_attach(sw->unit,
+                                                        (bcm_field_entry_t)entry,
+                                                        HB_ACL_POLICER_LEVEL,
+                                                        (bcm_policer_t)policer));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+    }
+
+    /*
+     * Counters detach by id, not wholesale, so the current one has to be
+     * read back before it can be replaced -- there is no detach_all for
+     * statistics the way there is for policers.
+     */
+    {
+        int current = 0;
+
+        if (bcm_field_entry_stat_get(sw->unit, (bcm_field_entry_t)entry, &current)
+                == BCM_E_NONE
+            && current != (int)counter) {
+            (void)bcm_field_entry_stat_detach(sw->unit, (bcm_field_entry_t)entry,
+                                              current);
+        }
+    }
+    if (counter != 0) {
+        status = HB_CALL(bcm_field_entry_stat_attach(sw->unit, (bcm_field_entry_t)entry,
+                                                     (int)counter));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+    }
+    /* Attachments are TCAM-visible state like the actions are. */
+    return HB_CALL(bcm_field_entry_install(sw->unit, (bcm_field_entry_t)entry));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1974,6 +2083,10 @@ static const struct hemlockbcm_api HB_API = {
     hb_acl_entry_action_set,
     hb_acl_entry_destroy,
     hb_acl_available,
+    hb_acl_counter_create,
+    hb_acl_counter_destroy,
+    hb_acl_counter_get,
+    hb_acl_entry_attach,
     /* Remaining phase 6 slots are appended below this line. */
 };
 
