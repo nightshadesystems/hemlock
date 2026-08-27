@@ -368,7 +368,7 @@ pub struct Disk {
     pub model: String,
 }
 
-pub fn list_disks(boot_style: BootStyle) -> Vec<Disk> {
+pub fn list_disks() -> Vec<Disk> {
     let Ok(entries) = std::fs::read_dir("/sys/block") else {
         return Vec::new();
     };
@@ -379,17 +379,18 @@ pub fn list_disks(boot_style: BootStyle) -> Vec<Disk> {
             continue;
         }
         let sys = entry.path();
+        // Removable means the USB stick the ONIE installer is running
+        // from, which must never be offered as a target.
+        //
+        // The AS4610 looked like it might need an exception — U-Boot
+        // reaches its NOS storage with `usb start && usbiddev`, so the
+        // target is USB-attached — but the board says otherwise: `sda`
+        // (7.5 GB) reports `removable = 0` like any fixed disk. The
+        // filter is right on both boot styles.
         let removable = std::fs::read_to_string(sys.join("removable"))
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
-        // Removable normally means the USB stick the ONIE installer is
-        // running from, which must never be offered as a target. But the
-        // AS4610's NOS storage is itself USB-attached — its U-Boot boots
-        // the NOS with `usb start && usbiddev` — so on a FIT board a
-        // removable device may be the *only* correct answer, and hiding
-        // it would leave the operator an empty list. Offer them there and
-        // let the size and model in the picker do the disambiguating.
-        if removable && boot_style != BootStyle::Fit {
+        if removable {
             continue;
         }
         let sectors: u64 = std::fs::read_to_string(sys.join("size"))
@@ -553,18 +554,11 @@ mod tests {
         }
     }
 
-    /// The x86 installer must never offer the USB stick it is running
-    /// from. A FIT board's NOS storage is itself USB-attached, so there
-    /// the filter has to relax or the picker comes up empty.
+    /// Enumeration reads the real `/sys/block`, so all this can assert
+    /// is that it is safe on any host, with or without one.
     #[test]
-    fn removable_devices_are_offered_only_where_they_can_be_the_target() {
-        // list_disks reads the real /sys/block, so this asserts the
-        // policy rather than the enumeration: Grub filters, Fit does not.
-        assert_ne!(BootStyle::Grub, BootStyle::Fit);
-        for style in [BootStyle::Grub, BootStyle::Fit] {
-            // Must not panic on any host, with or without /sys/block.
-            let _ = list_disks(style);
-        }
+    fn disk_enumeration_is_safe_everywhere() {
+        let _ = list_disks();
     }
 
     /// ...and the x86 install is unchanged by any of it.

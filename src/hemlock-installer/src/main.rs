@@ -120,7 +120,7 @@ fn run() -> Result<()> {
         (Some(disk), _) => disk.clone(),
         (None, true) => bail!("--non-interactive requires --disk"),
         (None, false) => {
-            let disks = install::list_disks(boot_style);
+            let disks = install::list_disks();
             match tui::select_disk(&disks, &platform_id)? {
                 Some(disk) => disk.device,
                 None => {

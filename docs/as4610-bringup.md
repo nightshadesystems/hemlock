@@ -83,16 +83,41 @@ cat /etc/onie/installer.conf 2>/dev/null || true   # console dev/speed
 - `machine.conf` → confirms the exact `onie_machine` string the installer
   matches on. A mismatch means every install refuses without `--force`.
 
-**Before installing anything**, dry-run the installer against what you
-found and read the commands:
+### What the board answered (captured 2026-08, ONIE 2016.05)
+
+Already folded into the manifest and the installer, recorded here so the
+next reader does not have to re-derive it:
+
+| Fact | Value |
+|---|---|
+| ONIE platform | `arm-accton_as4610_54-r0` — **underscores** |
+| Console | `ttyS0` @ 115200 = Hemlock's default, no `boot.env` |
+| Management netdev | `eth0`, `b8:6a:97:3b:8e:40` |
+| MTD | 8 MB SPI-NOR only: `uboot`, `shmoo`, `uboot-env`, `onie`. **No NAND.** |
+| UBI | zero devices |
+| NOS storage | `/dev/sda`, 7.5 GB, `removable = 0`, GPT |
+| Hand-off | `nos_bootcmd`, run by `bootcmd` before `onie_bootcmd`. No `onie-nos-mode` on this ONIE. |
+| i2c adapters | `iproc-smb0`, `iproc-smb1` |
+| Mux channels | buses **10–17** under ONIE's kernel (the manifest declares 2–9; the `BusMap` translates) |
+
+**ONIE is in SPI-NOR, not on `/dev/sda`.** `mtd3` is the 7 MB `onie`
+partition and U-Boot boots it straight out of flash
+(`cp.b $onie_start $loadaddr`). So **erasing or mis-partitioning `sda`
+cannot cost you ONIE** — you can always get back in and reinstall. That
+is the single most reassuring fact on this board; the install is not a
+one-shot.
+
+**Before installing anything**, dry-run the installer and read the
+commands:
 
 ```sh
-./hemlock-installer --payload . --disk /dev/mtdX --dry-run --non-interactive
+./hemlock-installer --payload . --disk /dev/sda --dry-run --non-interactive
 ```
 
-It prints every command without running one. Check the UBI sequence
-against the real `/proc/mtd` **before** the first real install — the
-first step erases the NAND, and a wrong partition there costs you ONIE.
+It prints every command without running one. Check the partition
+sequence against `/proc/partitions` first — `sda` already carries a
+previous NOS's layout (256 MB + 128 MB + 7.1 GB) and the first step
+zaps it.
 
 ---
 
