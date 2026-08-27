@@ -153,6 +153,45 @@ so do it early.
 | `mtd/maps/xgs-iproc-flash.c` | 184 | `m25p80` + `brcmnand` cover the flash |
 | `arch/arm/boot/compressed/*.S` backports | ~500 | 4.14-era; present in 6.1 |
 
+## The board's memory map, confirmed
+
+Salvaged off `sda1` before the install wiped it: the previous NOS's
+`uImage` — "Broadcom Linux" 3.6.5, built 2016-08-08 — with an
+`IKCONFIG`-embedded kernel config. A kernel that demonstrably booted
+this board, which makes its memory map authoritative rather than
+inferred:
+
+| Constant | Value |
+|---|---|
+| `CONFIG_BCM_RAM_BASE` | `0x60000000` |
+| `CONFIG_BCM_RAM_START_RESERVED_SIZE` | `0x200000` (2 MB) |
+| `CONFIG_BCM_PARAMS_PHYS` | `0x61000000` |
+| `CONFIG_BCM_ZRELADDR` | **`0x61008000`** |
+| `CONFIG_CMDLINE` | `console=ttyS0,9600n8 maxcpus=2 mem=2000M` |
+
+The uImage header carries the same load and entry address,
+`0x61008000`. That is **three independent confirmations** — the uImage
+header, this config, and edgenos's `build-fit-4610.sh` — of the value
+`build/mkimage.sh` bakes into the FIT. It is not a guess.
+
+Two more things fall out of it:
+
+- **`maxcpus=2 mem=2000M`** is the vendor's own command line, matching
+  the commented-out `bootargs` in edgenos's device tree. If SMP bring-up
+  misbehaves, `maxcpus=1` is a deviation from a known-good value, not a
+  shot in the dark.
+- **The built-in console default is 9600**, though
+  `CONFIG_CMDLINE_FROM_BOOTLOADER=y` means U-Boot's `115200` wins in
+  practice (and `/proc/cmdline` on the box confirms 115200). Edgecore
+  evidently ships some units at 9600 — the same trap the E1031 sets — so
+  if a future unit boots silently, try 9600 before suspecting the image.
+
+What the config does **not** transfer is its driver selections. It is
+`CONFIG_ARCH_IPROC` / `CONFIG_MACH_IPROC` — Broadcom's own 3.6.5 tree —
+whereas the port targets ONL's `CONFIG_ARCH_XGS_IPROC` lineage on 6.1.
+The symbol names differ and the two are not interchangeable; only the
+memory map above is a durable, lineage-independent fact.
+
 ## Deliverables
 
 - `platforms/accton-as4610-54/dts/` — the AS4610 board DTS (RTC node

@@ -99,6 +99,8 @@ next reader does not have to re-derive it:
 | Hand-off | `nos_bootcmd`, run by `bootcmd` before `onie_bootcmd`. No `onie-nos-mode` on this ONIE. |
 | i2c adapters | `iproc-smb0`, `iproc-smb1` |
 | Mux channels | buses **10–17** under ONIE's kernel (the manifest declares 2–9; the `BusMap` translates) |
+| `sda1` / `sda2` / `sda3` | ext3 (`uImage`) / ext3 (`grub-core.img`) / **btrfs** |
+| Kernel load/entry | `0x61008000`, confirmed by the salvaged uImage header *and* its embedded config — see [`as4610-kernel-port.md`](as4610-kernel-port.md) |
 
 **ONIE is in SPI-NOR, not on `/dev/sda`.** `mtd3` is the 7 MB `onie`
 partition and U-Boot boots it straight out of flash
@@ -133,6 +135,18 @@ loop skipped it — busybox will not always guess the filesystem. Name it:
 for fs in ext4 ext3 ext2; do mount -t $fs /dev/sda3 /tmp/old && break; done
 ```
 
+On this board that still fails: `sda3` is **btrfs**, which ONIE's 3.2.69
+kernel cannot mount. Take the head of the partition instead and identify
+it off the box — 4 MB is plenty, and beats pulling 7 GB blind:
+
+```sh
+dd if=/dev/sda3 bs=1M count=4 of=/tmp/salvage/sda3-head.bin
+```
+
+(btrfs puts its superblock at offset `0x10000` with the magic
+`_BHRfS_M` at `0x10040`; ext* put theirs at `0x400` with `0xEF53` at
+`0x438`.)
+
 **Getting the files off.** This board has no USB port, so everything
 leaves over the management port. ONIE runs its own DHCP discovery on
 `eth0` and will fight you for the interface, so stop it first:
@@ -162,11 +176,35 @@ nc <workstation> 9000 < /tmp/salvage.tgz              # with `nc -l -p 9000 > sa
 ```
 
 ONIE also runs an SSH server — its dropbear host keys are in the U-Boot
-environment — so pulling from the workstation usually works too:
+environment — so pulling from the workstation is usually easiest. This
+ONIE is from 2016 and offers only `ssh-rsa` / `ssh-dss` host keys, which
+OpenSSH 8.8+ refuses by default:
+
+```
+Unable to negotiate ... no matching host key type found.
+Their offer: ssh-rsa,ssh-dss
+```
+
+Opt back in, and force the legacy SCP protocol (`-O`) because dropbear
+of that era has no sftp-server for modern scp to talk to:
 
 ```sh
-scp root@<box>:/tmp/salvage.tgz .
+scp -O -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+    root@<box>:/tmp/salvage.tgz .
 ```
+
+If it then complains about key exchange or ciphers rather than host
+keys, widen those too:
+
+```sh
+scp -O -o HostKeyAlgorithms=+ssh-rsa \
+    -o KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1 \
+    -o Ciphers=+aes128-cbc,3des-cbc -o MACs=+hmac-sha1 \
+    root@<box>:/tmp/salvage.tgz .
+```
+
+These are deliberately weak algorithms; they are appropriate for a
+one-off transfer off a switch sitting on a bench, and nowhere else.
 
 What to keep out of the archive:
 
@@ -174,7 +212,7 @@ What to keep out of the archive:
 |---|---|---|
 | `config.bcm` | compare against `vendor/fetch-vendor.sh`'s copy | Confirms the ASIC property set against *this* unit |
 | a `porttab` / `portmap` | compare against the platform README | Independent confirmation of the faceplate map |
-| a kernel / `.itb` | keep for reference | A known-working iProc kernel for this board |
+| a kernel / `.itb` | `docs/as4610-kernel-port.md` | A known-working iProc kernel — its `IKCONFIG` config is where this board's memory map was confirmed |
 
 **Before installing anything**, dry-run the installer and read the
 commands:
