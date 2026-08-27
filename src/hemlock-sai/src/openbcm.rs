@@ -58,6 +58,13 @@ const PORT_NAME_MAX: usize = 16;
 /// family reach the operator identically.
 const ERR_NOT_IMPLEMENTED: i32 = -15;
 
+/// `HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS` / `..._ITEM_NOT_FOUND`, the same
+/// numbers as `SAI_STATUS_ITEM_ALREADY_EXISTS` / `..._ITEM_NOT_FOUND`.
+/// Several trait methods are specified as idempotent, and these are what
+/// "it was already like that" looks like coming back from a shim.
+const ERR_ITEM_ALREADY_EXISTS: i32 = -6;
+const ERR_ITEM_NOT_FOUND: i32 = -7;
+
 #[repr(C)]
 struct Init {
     config_bcm_path: *const std::os::raw::c_char,
@@ -156,6 +163,16 @@ struct Api {
     // is the whole point of the minor-version rule.
     load_led_program:
         Option<unsafe extern "C" fn(*mut ShimSwitch, *const std::os::raw::c_char) -> Status>,
+
+    // --- ABI 1.2: L2 VLANs -------------------------------------------
+    default_vlan: Option<unsafe extern "C" fn(*mut ShimSwitch, *mut u16) -> Status>,
+    create_vlan: Option<unsafe extern "C" fn(*mut ShimSwitch, u16) -> Status>,
+    remove_vlan: Option<unsafe extern "C" fn(*mut ShimSwitch, u16) -> Status>,
+    add_vlan_member:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32, std::os::raw::c_int) -> Status>,
+    remove_vlan_member: Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32) -> Status>,
+    set_port_pvid: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16) -> Status>,
+    set_port_tpid: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16) -> Status>,
 }
 
 impl Api {
@@ -165,6 +182,44 @@ impl Api {
     fn has(&self, offset: usize) -> bool {
         offset + std::mem::size_of::<usize>() <= self.struct_size
     }
+}
+
+// ---------------------------------------------------------------------------
+// Object ids.
+//
+// SAI mints opaque ids and remembers what they mean; OpenBCM has no such
+// concept, so Hemlock derives them from the facts instead of keeping a
+// side table. A VLAN's id is its 802.1Q number; a membership's is the
+// (vlan, port) pair it names. Two consequences worth stating: the ids are
+// stable across a syncd restart without any state to reload, and a
+// membership id can be taken apart again, which is what
+// `remove_vlan_member` needs since the trait hands back only the id.
+//
+// The tag in the high bits is not decoration: `Oid` is one type across
+// every object family, and a VLAN oid and a future FDB oid must not
+// collide. It also makes a mixed-up id fail an assertion in tests rather
+// than silently address VLAN 5.
+// ---------------------------------------------------------------------------
+
+/// Discriminator in bits 56..64, so the payload has the low 56 bits.
+const OID_TAG_VLAN: u64 = 0x01 << 56;
+const OID_TAG_VLAN_MEMBER: u64 = 0x02 << 56;
+
+fn vlan_oid(vlan_id: u16) -> Oid {
+    Oid(OID_TAG_VLAN | u64::from(vlan_id))
+}
+
+fn oid_vlan_id(oid: Oid) -> u16 {
+    oid.0 as u16
+}
+
+/// `vlan_id` in bits 32..48, logical port in the low 32.
+fn member_oid(vlan_id: u16, port: PortId) -> Oid {
+    Oid(OID_TAG_VLAN_MEMBER | (u64::from(vlan_id) << 32) | (port.0 & 0xffff_ffff))
+}
+
+fn oid_member(oid: Oid) -> (u16, PortId) {
+    (((oid.0 >> 32) & 0xffff) as u16, PortId(oid.0 & 0xffff_ffff))
 }
 
 /// Map a shim status onto the error type the rest of Hemlock understands.
@@ -397,6 +452,38 @@ impl OpenBcmBackend {
         } else {
             Ok(self.switch)
         }
+    }
+
+    /// The chip's default VLAN. Asked of the shim rather than assumed to
+    /// be 1: `config.bcm` can move it, and a wrong guess would quietly
+    /// strand every access port.
+    fn default_vlan(&self) -> Result<u16, SaiError> {
+        let f = slot!(self, default_vlan, "default_vlan")?;
+        let sw = self.switch()?;
+        let mut vlan_id: u16 = 0;
+        // SAFETY: `vlan_id` is a live u16 the shim writes only on OK.
+        check("default_vlan", unsafe { f(sw, &mut vlan_id) })?;
+        Ok(vlan_id)
+    }
+
+    /// Shared by `add_vlan_member` and `restore_port_default_vlan`,
+    /// which differ only in what they do with the status.
+    fn vlan_member_add(&self, vlan_id: u16, port: PortId, tagged: bool) -> Result<(), SaiError> {
+        let f = slot!(self, add_vlan_member, "add_vlan_member")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("add_vlan_member", unsafe {
+            f(sw, vlan_id, port.0 as u32, i32::from(tagged))
+        })
+    }
+
+    fn vlan_member_remove(&self, vlan_id: u16, port: PortId) -> Result<(), SaiError> {
+        let f = slot!(self, remove_vlan_member, "remove_vlan_member")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("remove_vlan_member", unsafe {
+            f(sw, vlan_id, port.0 as u32)
+        })
     }
 }
 
@@ -642,7 +729,7 @@ impl SaiBackend for OpenBcmBackend {
             storm_control: false,
             mirror: raw.mirror_sessions_max > 0,
             mirror_sessions_max: raw.mirror_sessions_max,
-            port_tpid: false,
+            port_tpid: slot!(self, set_port_tpid, "set_port_tpid").is_ok(),
             ecmp_width: raw.ecmp_width,
             ipv6: raw.ipv6 != 0,
             my_mac: false,
@@ -751,37 +838,75 @@ impl SaiBackend for OpenBcmBackend {
         unimplemented_slot("remove_my_mac")
     }
 
-    fn create_vlan(&mut self, _vlan_id: u16) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_vlan")
+    // --- L2 VLANs (ABI 1.2) ------------------------------------------
+    //
+    // SAI hands out opaque object ids for VLANs and memberships; OpenBCM
+    // has neither. Rather than make the shim keep a table it would have
+    // to rebuild after a restart, the ids are minted here out of the
+    // facts themselves -- a VLAN *is* its id, a membership *is* (vlan,
+    // port) -- so they survive a syncd restart for free and the shim
+    // stays stateless. See `vlan_oid` / `member_oid` below.
+
+    fn create_vlan(&mut self, vlan_id: u16) -> Result<Oid, SaiError> {
+        let f = slot!(self, create_vlan, "create_vlan")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("create_vlan", unsafe { f(sw, vlan_id) })?;
+        Ok(vlan_oid(vlan_id))
     }
 
-    fn remove_vlan(&mut self, _vlan: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_vlan")
+    fn remove_vlan(&mut self, vlan: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, remove_vlan, "remove_vlan")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("remove_vlan", unsafe { f(sw, oid_vlan_id(vlan)) })
     }
 
-    fn add_vlan_member(
-        &mut self,
-        _vlan: Oid,
-        _port: PortId,
-        _tagged: bool,
-    ) -> Result<Oid, SaiError> {
-        unimplemented_slot("add_vlan_member")
+    fn add_vlan_member(&mut self, vlan: Oid, port: PortId, tagged: bool) -> Result<Oid, SaiError> {
+        let vlan_id = oid_vlan_id(vlan);
+        self.vlan_member_add(vlan_id, port, tagged)?;
+        Ok(member_oid(vlan_id, port))
     }
 
-    fn remove_vlan_member(&mut self, _member: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_vlan_member")
+    fn remove_vlan_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        let (vlan_id, port) = oid_member(member);
+        self.vlan_member_remove(vlan_id, port)
     }
 
-    fn set_port_pvid(&mut self, _port: PortId, _vlan_number: u16) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_pvid")
+    fn set_port_pvid(&mut self, port: PortId, vlan_number: u16) -> Result<(), SaiError> {
+        let f = slot!(self, set_port_pvid, "set_port_pvid")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("set_port_pvid", unsafe {
+            f(sw, port.0 as u32, vlan_number)
+        })
     }
 
-    fn remove_port_default_vlan(&mut self, _port: PortId) -> Result<(), SaiError> {
-        unimplemented_slot("remove_port_default_vlan")
+    fn remove_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        let default = self.default_vlan()?;
+        // Idempotent per the trait: a port that is already out of the
+        // default VLAN is the desired state, not a failure.
+        match self.vlan_member_remove(default, port) {
+            Err(SaiError::Status {
+                status: ERR_ITEM_NOT_FOUND,
+                ..
+            }) => Ok(()),
+            other => other,
+        }
     }
 
-    fn restore_port_default_vlan(&mut self, _port: PortId) -> Result<(), SaiError> {
-        unimplemented_slot("restore_port_default_vlan")
+    fn restore_port_default_vlan(&mut self, port: PortId) -> Result<(), SaiError> {
+        let default = self.default_vlan()?;
+        match self.vlan_member_add(default, port, false) {
+            Err(SaiError::Status {
+                status: ERR_ITEM_ALREADY_EXISTS,
+                ..
+            }) => Ok(()),
+            other => other,
+        }?;
+        // Membership and ingress classification are independent on this
+        // hardware, so "back to default L2" is both or neither.
+        self.set_port_pvid(port, default)
     }
 
     fn set_fdb_aging(&mut self, _secs: u32) -> Result<(), SaiError> {
@@ -855,8 +980,11 @@ impl SaiBackend for OpenBcmBackend {
         unimplemented_slot("set_port_sample_session")
     }
 
-    fn set_port_tpid(&mut self, _port: PortId, _tpid: u16) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_tpid")
+    fn set_port_tpid(&mut self, port: PortId, tpid: u16) -> Result<(), SaiError> {
+        let f = slot!(self, set_port_tpid, "set_port_tpid")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("set_port_tpid", unsafe { f(sw, port.0 as u32, tpid) })
     }
 
     fn create_lag(&mut self) -> Result<PortId, SaiError> {
@@ -1135,6 +1263,9 @@ fn shim_name(raw: &[std::os::raw::c_char; PORT_NAME_MAX]) -> String {
 mod tests {
     use super::*;
 
+    /// A vtable slot is one function pointer wide.
+    const WORD: usize = std::mem::size_of::<usize>();
+
     /// Path of the stub shim build.rs compiled for us.
     fn stub_path() -> PathBuf {
         PathBuf::from(env!("HEMLOCK_OPENBCM_STUB"))
@@ -1285,10 +1416,10 @@ mod tests {
     }
 
     /// Everything phase 6 has not reached yet takes the same path.
+    /// VLANs have left this list; everything else has not.
     #[test]
     fn phase_six_families_are_unsupported() {
         let mut b = backend();
-        assert!(b.create_vlan(10).unwrap_err().is_unsupported());
         assert!(b.create_lag().unwrap_err().is_unsupported());
         assert!(b.set_fdb_aging(300).unwrap_err().is_unsupported());
         assert!(b.create_stp_instance().unwrap_err().is_unsupported());
@@ -1303,8 +1434,9 @@ mod tests {
         assert!(b.port_queue_counters(PortId(1)).unwrap().is_empty());
     }
 
-    /// Capabilities must reflect the vtable, not optimism: the stub
-    /// implements no phase-6 family, so none may read as supported.
+    /// Capabilities must reflect the vtable, not optimism: a family
+    /// reads as supported exactly when its slot is there. The stub
+    /// implements the VLAN slots and nothing else of phase 6.
     #[test]
     fn capabilities_report_only_what_exists() {
         let mut b = backend();
@@ -1314,6 +1446,9 @@ mod tests {
         assert!(caps.ipv6);
         // No mirror sessions reported => the family is off.
         assert!(!caps.mirror && caps.mirror_sessions_max == 0);
+        // ...but the QinQ slot exists in ABI 1.2, so this one is on --
+        // derived from the vtable, not from a hand-maintained list.
+        assert!(caps.port_tpid);
         for (name, on) in [
             ("lag", caps.lag),
             ("stp", caps.stp),
@@ -1407,9 +1542,119 @@ mod tests {
             port_counters: None,
             capabilities: None,
             load_led_program: None,
+            default_vlan: None,
+            create_vlan: None,
+            remove_vlan: None,
+            add_vlan_member: None,
+            remove_vlan_member: None,
+            set_port_pvid: None,
+            set_port_tpid: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
+        // Nor a 1.2 one, which is further out still.
+        assert!(!one_zero.has(std::mem::offset_of!(Api, create_vlan)));
+    }
+
+    /// The vtable's slots, in the order the header declares them.
+    ///
+    /// Three independent transcriptions of one struct have to agree: the
+    /// header, the Rust `Api` above, and each shim's positional
+    /// initializer. Two of those are C initializers with no field names,
+    /// and neighbouring slots can share a signature -- `set_port_pvid`
+    /// and `set_port_tpid` are both `(sw, u32, u16)` -- so swapping them
+    /// compiles cleanly and misbehaves only on hardware. This parses the
+    /// header, and the tests below hold the others against it.
+    fn header_slots() -> Vec<String> {
+        const HEADER: &str = include_str!("../openbcm-shim/hemlockbcm.h");
+        let body = HEADER
+            .split_once("struct hemlockbcm_api {")
+            .expect("header declares the vtable")
+            .1
+            .split_once("\n};")
+            .expect("vtable is closed")
+            .0;
+        body.lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("int (*")?;
+                Some(rest.split(')').next()?.to_string())
+            })
+            .collect()
+    }
+
+    /// Slot names as they appear in a C vtable initializer, given the
+    /// prefix that shim spells its functions with.
+    fn initializer_slots(source: &str, prefix: &str) -> Vec<String> {
+        let body = source
+            .split_once("struct hemlockbcm_api ")
+            .expect("source defines a vtable")
+            .1
+            .split_once("\n};")
+            .expect("vtable is closed")
+            .0;
+        body.lines()
+            .filter_map(|line| {
+                let line = line.trim().trim_end_matches(',');
+                // NULL entries carry a trailing comment saying which slot
+                // they are; take the name from there.
+                if let Some(comment) = line.strip_prefix("NULL,") {
+                    let name = comment.trim().trim_start_matches("/*").trim();
+                    return Some(name.split(':').next()?.trim().to_string());
+                }
+                line.strip_prefix(prefix).map(|name| name.to_string())
+            })
+            .collect()
+    }
+
+    /// The Rust transcription and the header must name the same slots in
+    /// the same order, and there must be exactly as many of them as the
+    /// struct has room for -- which is what catches a slot added to the
+    /// header and forgotten here.
+    #[test]
+    fn the_header_rust_and_both_shims_agree_on_slot_order() {
+        let expected = [
+            "create_switch",
+            "destroy_switch",
+            "set_link_callback",
+            "ports",
+            "set_port_admin_state",
+            "set_port_speed",
+            "set_port_duplex",
+            "set_port_autoneg",
+            "set_port_mtu",
+            "port_counters",
+            "capabilities",
+            "load_led_program",
+            "default_vlan",
+            "create_vlan",
+            "remove_vlan",
+            "add_vlan_member",
+            "remove_vlan_member",
+            "set_port_pvid",
+            "set_port_tpid",
+        ];
+        assert_eq!(header_slots(), expected, "header slot order changed");
+
+        // Same count in the Rust struct: everything after the three
+        // fixed header fields is one word-sized slot.
+        let slots = (std::mem::size_of::<Api>() - std::mem::offset_of!(Api, create_switch)) / WORD;
+        assert_eq!(slots, expected.len(), "Api has a slot the header does not");
+
+        // Both shims fill the vtable positionally, so their initializers
+        // must list the same slots in the same order.
+        assert_eq!(
+            initializer_slots(include_str!("../openbcm-shim/hemlockbcm_stub.c"), "stub_"),
+            expected,
+            "the stub's vtable is out of order"
+        );
+        assert_eq!(
+            initializer_slots(
+                include_str!("../../../vendor/openbcm-shim/hemlockbcm.c"),
+                "hb_"
+            ),
+            expected,
+            "the real shim's vtable is out of order"
+        );
     }
 
     /// The layout facts a hand-transcribed ABI could get wrong. If the
@@ -1435,14 +1680,132 @@ mod tests {
             std::mem::offset_of!(Api, set_port_mtu),
             std::mem::offset_of!(Api, port_counters),
             std::mem::offset_of!(Api, capabilities),
+            std::mem::offset_of!(Api, load_led_program),
+            std::mem::offset_of!(Api, default_vlan),
+            std::mem::offset_of!(Api, create_vlan),
+            std::mem::offset_of!(Api, remove_vlan),
+            std::mem::offset_of!(Api, add_vlan_member),
+            std::mem::offset_of!(Api, remove_vlan_member),
+            std::mem::offset_of!(Api, set_port_pvid),
+            std::mem::offset_of!(Api, set_port_tpid),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
         }
         // Function pointers are word-sized, so the slots are contiguous.
-        assert_eq!(
-            order[order.len() - 1] - order[0],
-            (order.len() - 1) * std::mem::size_of::<usize>()
-        );
+        assert_eq!(order[order.len() - 1] - order[0], (order.len() - 1) * WORD);
+    }
+    // --- L2 VLANs -----------------------------------------------------
+
+    /// `hemlockbcm_stub_vlan_member`: -1 = not a member, 0 = untagged,
+    /// 1 = tagged. Reaching into the stub is the only way to check that a
+    /// call did the right thing rather than merely returned OK.
+    fn stub_member(b: &OpenBcmBackend, vlan_id: u16, port: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u16, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_vlan_member\0").unwrap();
+            f(b.switch, vlan_id, port)
+        }
+    }
+
+    fn stub_pvid(b: &OpenBcmBackend, port: u32) -> u16 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> u16> =
+                b._library.get(b"hemlockbcm_stub_pvid\0").unwrap();
+            f(b.switch, port)
+        }
+    }
+
+    #[test]
+    fn vlan_membership_reaches_the_shim_tagged_and_untagged() {
+        let mut b = backend();
+        let vlan = b.create_vlan(100).unwrap();
+
+        let tagged = b.add_vlan_member(vlan, PortId(1), true).unwrap();
+        assert_eq!(stub_member(&b, 100, 1), 1, "tagged member");
+        b.add_vlan_member(vlan, PortId(2), false).unwrap();
+        assert_eq!(stub_member(&b, 100, 2), 0, "untagged member");
+
+        // The membership id is enough on its own to undo the membership:
+        // nothing is remembered on either side of the ABI.
+        b.remove_vlan_member(tagged).unwrap();
+        assert_eq!(stub_member(&b, 100, 1), -1, "no longer a member");
+
+        // A VLAN with members left cannot be destroyed, which is the
+        // SDK's rule and the trait's documented precondition.
+        assert!(b.remove_vlan(vlan).is_err());
+        b.remove_vlan_member(member_oid(100, PortId(2))).unwrap();
+        b.remove_vlan(vlan).unwrap();
+    }
+
+    /// The ids carry their own meaning, so they survive a syncd restart
+    /// with no table to reload -- and a VLAN id and a membership id can
+    /// never be confused for one another.
+    #[test]
+    fn object_ids_encode_the_facts_they_name() {
+        assert_eq!(oid_vlan_id(vlan_oid(4094)), 4094);
+        assert_eq!(oid_member(member_oid(100, PortId(53))), (100, PortId(53)));
+        assert_ne!(vlan_oid(100).0, member_oid(100, PortId(0)).0);
+        // Tags live above the payload, so neither can collide with the
+        // other's range however large the payload gets.
+        assert_ne!(vlan_oid(1).0 >> 56, member_oid(1, PortId(1)).0 >> 56);
+    }
+
+    /// Both are documented idempotent, and the shim is allowed either to
+    /// report "already like that" or to report success -- so the second
+    /// call must succeed whichever the shim does.
+    #[test]
+    fn default_vlan_moves_are_idempotent() {
+        let mut b = backend();
+        // The stub starts every port an untagged default-VLAN member.
+        assert_eq!(stub_member(&b, 1, 1), 0);
+
+        b.remove_port_default_vlan(PortId(1)).unwrap();
+        assert_eq!(stub_member(&b, 1, 1), -1);
+        b.remove_port_default_vlan(PortId(1))
+            .expect("removing a port that is already out is not a failure");
+
+        b.set_port_pvid(PortId(1), 100).unwrap();
+        b.restore_port_default_vlan(PortId(1)).unwrap();
+        assert_eq!(stub_member(&b, 1, 1), 0, "untagged member again");
+        assert_eq!(stub_pvid(&b, 1), 1, "and classified into the default VLAN");
+        b.restore_port_default_vlan(PortId(1))
+            .expect("restoring a port that is already back is not a failure");
+    }
+
+    /// A real failure must still be a failure: the idempotency above is
+    /// scoped to one status code, not to "ignore errors from this call".
+    #[test]
+    fn idempotency_does_not_swallow_real_failures() {
+        let mut b = backend();
+        // Port 404 does not exist; the stub rejects it as a bad
+        // parameter, which is not "already like that".
+        assert!(b.remove_port_default_vlan(PortId(404)).is_err());
+        assert!(b.restore_port_default_vlan(PortId(404)).is_err());
+    }
+
+    fn stub_tpid(b: &OpenBcmBackend, port: u32) -> u16 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> u16> =
+                b._library.get(b"hemlockbcm_stub_tpid\0").unwrap();
+            f(b.switch, port)
+        }
+    }
+
+    #[test]
+    fn port_tpid_reaches_the_shim() {
+        let mut b = backend();
+        assert_eq!(stub_tpid(&b, 1), 0x8100, "the 802.1Q default");
+        b.set_port_tpid(PortId(1), 0x88a8).unwrap();
+        assert_eq!(stub_tpid(&b, 1), 0x88a8, "a provider-bridge port");
+    }
+
+    /// The default VLAN is asked of the shim, not assumed to be 1:
+    /// config.bcm can move it.
+    #[test]
+    fn the_default_vlan_comes_from_the_shim() {
+        let b = backend();
+        assert_eq!(b.default_vlan().unwrap(), 1);
     }
 }

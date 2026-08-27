@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 1
+#define HEMLOCKBCM_ABI_MINOR 2
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -90,6 +90,7 @@ extern "C" {
 #define HEMLOCKBCM_ERR_NOT_SUPPORTED (-2)
 #define HEMLOCKBCM_ERR_NO_MEMORY   (-3)
 #define HEMLOCKBCM_ERR_INVALID_PARAM (-5)
+#define HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS (-6)
 #define HEMLOCKBCM_ERR_ITEM_NOT_FOUND (-7)
 #define HEMLOCKBCM_ERR_NOT_IMPLEMENTED (-15)
 
@@ -233,12 +234,60 @@ struct hemlockbcm_api {
      */
     int (*load_led_program)(struct hemlockbcm_switch *sw, const char *hex);
 
+    /* --- L2 VLANs (ABI 1.2) ----------------------------------------- */
+
     /*
-     * Everything below is phase 6: FDB, LAG, STP, mirroring, storm
-     * control, ACLs/policers/CoPP, sFlow and QoS. Each lands as one slot
-     * appended here plus the matching Rust method, with the minor bumped.
-     * Until then Rust reports those families unsupported, which is the
-     * truth and which both consoles already handle.
+     * These slots are deliberately primitive: a VLAN is its 802.1Q id and
+     * a membership is (vlan, port). SAI hands out opaque object ids for
+     * both, and the caller packs and unpacks those ids on the Rust side
+     * rather than making the shim keep a table it would have to keep
+     * consistent across a warm restart. The shim stays stateless.
+     *
+     * VLAN ids are 1..=4094. A port is a logical port number, the same
+     * one `ports` reports.
+     */
+
+    /* The chip's default VLAN, which always exists and cannot be
+     * created or destroyed. The caller needs it to move a port in and
+     * out of default bridging. */
+    int (*default_vlan)(struct hemlockbcm_switch *sw, uint16_t *out);
+
+    int (*create_vlan)(struct hemlockbcm_switch *sw, uint16_t vlan_id);
+    /* Members must already be gone; the SDK enforces it. */
+    int (*remove_vlan)(struct hemlockbcm_switch *sw, uint16_t vlan_id);
+
+    /* Add `logical_port` to `vlan_id`. `tagged` = 0 makes it an untagged
+     * (access) member, which is a separate egress bitmap on this
+     * hardware rather than a property of the membership.
+     *
+     * A shim MAY return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS for a port
+     * that is already a member, and HEMLOCKBCM_ERR_ITEM_NOT_FOUND for
+     * removing one that is not, or it MAY report success for both --
+     * the underlying SDK sets and clears bits in a bitmap and does not
+     * document which it does. The caller's idempotent operations accept
+     * either, so no shim has to find out. What a shim must NOT do is
+     * report some third failure for those cases. */
+    int (*add_vlan_member)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                           uint32_t logical_port, int tagged);
+    int (*remove_vlan_member)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                              uint32_t logical_port);
+
+    /* Ingress classification of untagged frames (PVID). Independent of
+     * membership: setting it does not join the VLAN. */
+    int (*set_port_pvid)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                         uint16_t vlan_id);
+
+    /* The port's outer TPID; 0x8100 is the default and 0x88a8 makes it a
+     * provider-bridge (dot1q-tunnel) port. */
+    int (*set_port_tpid)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                         uint16_t tpid);
+
+    /*
+     * Everything below is the rest of phase 6: FDB, LAG, STP, mirroring,
+     * storm control, ACLs/policers/CoPP, sFlow and QoS. Each lands as one
+     * slot appended here plus the matching Rust method, with the minor
+     * bumped. Until then Rust reports those families unsupported, which
+     * is the truth and which both consoles already handle.
      */
 };
 

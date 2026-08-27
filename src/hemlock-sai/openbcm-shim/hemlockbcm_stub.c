@@ -29,9 +29,26 @@
 #include <string.h>
 
 #define STUB_PORTS 4
+#define STUB_VLANS 8
+#define STUB_DEFAULT_VLAN 1
+
+/*
+ * Enough VLAN state to be worth testing against: which VLANs exist, who
+ * is a member, and whether that membership is tagged. A fixed table,
+ * because the point is to exercise the marshalling and the caller's
+ * idempotency rules, not to be a switch.
+ */
+struct stub_vlan {
+    uint16_t vlan_id;               /* 0 = free slot */
+    uint32_t members[STUB_PORTS];   /* logical port, 0 = free */
+    int tagged[STUB_PORTS];
+};
 
 struct hemlockbcm_switch {
     struct hemlockbcm_port ports[STUB_PORTS];
+    struct stub_vlan vlans[STUB_VLANS];
+    uint16_t pvid[STUB_PORTS];
+    uint16_t tpid[STUB_PORTS];
     hemlockbcm_link_cb link_cb;
     void *link_ctx;
     int created;
@@ -76,6 +93,15 @@ static int stub_create_switch(struct hemlockbcm_switch **out,
         } else {
             snprintf(sw->ports[i].name, HEMLOCKBCM_PORT_NAME_MAX, "xe%u", (unsigned)(i - 2));
         }
+    }
+    /* Every port starts an untagged member of the default VLAN with a
+     * matching PVID, which is where a real chip comes up too. */
+    sw->vlans[0].vlan_id = STUB_DEFAULT_VLAN;
+    for (i = 0; i < STUB_PORTS; i++) {
+        sw->vlans[0].members[i] = sw->ports[i].logical_port;
+        sw->vlans[0].tagged[i] = 0;
+        sw->pvid[i] = STUB_DEFAULT_VLAN;
+        sw->tpid[i] = 0x8100;
     }
     sw->created = 1;
     *out = sw;
@@ -204,6 +230,212 @@ HEMLOCKBCM_EXPORT const char *hemlockbcm_stub_led_program(void)
     return stub_led_program;
 }
 
+/* --- L2 VLANs (ABI 1.2) ------------------------------------------------- */
+
+static struct stub_vlan *find_vlan(struct hemlockbcm_switch *sw, uint16_t vlan_id)
+{
+    size_t i;
+    for (i = 0; i < STUB_VLANS; i++) {
+        if (sw->vlans[i].vlan_id == vlan_id) {
+            return &sw->vlans[i];
+        }
+    }
+    return NULL;
+}
+
+/* Index of `logical` in a VLAN's member list, or -1. */
+static int vlan_member_index(const struct stub_vlan *vlan, uint32_t logical)
+{
+    size_t i;
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (vlan->members[i] == logical) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int vlan_has_members(const struct stub_vlan *vlan)
+{
+    size_t i;
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (vlan->members[i] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int stub_default_vlan(struct hemlockbcm_switch *sw, uint16_t *out)
+{
+    if (sw == NULL || out == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    *out = STUB_DEFAULT_VLAN;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_create_vlan(struct hemlockbcm_switch *sw, uint16_t vlan_id)
+{
+    size_t i;
+
+    if (sw == NULL || vlan_id == 0 || vlan_id > 4094) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (find_vlan(sw, vlan_id) != NULL) {
+        return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
+    }
+    for (i = 0; i < STUB_VLANS; i++) {
+        if (sw->vlans[i].vlan_id == 0) {
+            memset(&sw->vlans[i], 0, sizeof(sw->vlans[i]));
+            sw->vlans[i].vlan_id = vlan_id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_remove_vlan(struct hemlockbcm_switch *sw, uint16_t vlan_id)
+{
+    struct stub_vlan *vlan;
+
+    if (sw == NULL || vlan_id == STUB_DEFAULT_VLAN) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* The SDK refuses to destroy a VLAN that still has members. */
+    if (vlan_has_members(vlan)) {
+        return HEMLOCKBCM_ERR_FAILURE;
+    }
+    memset(vlan, 0, sizeof(*vlan));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_add_vlan_member(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                uint32_t logical_port, int tagged)
+{
+    struct stub_vlan *vlan;
+    size_t i;
+
+    if (sw == NULL || find_port(sw, logical_port) == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    if (vlan_member_index(vlan, logical_port) >= 0) {
+        return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
+    }
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (vlan->members[i] == 0) {
+            vlan->members[i] = logical_port;
+            vlan->tagged[i] = tagged ? 1 : 0;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_remove_vlan_member(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                   uint32_t logical_port)
+{
+    struct stub_vlan *vlan;
+    int index;
+
+    /* Validate the port, like the add path does: the caller reads
+     * ITEM_NOT_FOUND as "already not a member" and reports success, so a
+     * port that does not exist must not answer with it. */
+    if (sw == NULL || find_port(sw, logical_port) == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    index = vlan_member_index(vlan, logical_port);
+    if (index < 0) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    vlan->members[index] = 0;
+    vlan->tagged[index] = 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_set_port_pvid(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint16_t vlan_id)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL || vlan_id == 0 || vlan_id > 4094) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->pvid[port - sw->ports] = vlan_id;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_set_port_tpid(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint16_t tpid)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->tpid[port - sw->ports] = tpid;
+    return HEMLOCKBCM_OK;
+}
+
+/*
+ * Test hooks, not part of the ABI: they let the Rust tests assert on what
+ * a call actually did rather than only on its status code.
+ */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_vlan_member(struct hemlockbcm_switch *sw,
+                                                  uint16_t vlan_id,
+                                                  uint32_t logical_port)
+{
+    struct stub_vlan *vlan;
+    int index;
+
+    if (sw == NULL) {
+        return -1;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return -1;
+    }
+    index = vlan_member_index(vlan, logical_port);
+    if (index < 0) {
+        return -1;  /* not a member */
+    }
+    return vlan->tagged[index];  /* 0 = untagged member, 1 = tagged */
+}
+
+HEMLOCKBCM_EXPORT uint16_t hemlockbcm_stub_pvid(struct hemlockbcm_switch *sw,
+                                                uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+    return port == NULL ? 0 : sw->pvid[port - sw->ports];
+}
+
+HEMLOCKBCM_EXPORT uint16_t hemlockbcm_stub_tpid(struct hemlockbcm_switch *sw,
+                                                uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+    return port == NULL ? 0 : sw->tpid[port - sw->ports];
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -220,6 +452,13 @@ static const struct hemlockbcm_api STUB_API = {
     stub_port_counters,
     stub_capabilities,
     stub_load_led_program,
+    stub_default_vlan,
+    stub_create_vlan,
+    stub_remove_vlan,
+    stub_add_vlan_member,
+    stub_remove_vlan_member,
+    stub_set_port_pvid,
+    stub_set_port_tpid,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

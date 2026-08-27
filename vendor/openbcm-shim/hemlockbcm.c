@@ -25,7 +25,7 @@
  * NOT COMPILED BY CI. The SDK is not fetchable in CI and the target is
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
- * (include/bcm/{port,link,stat,error}.h, include/soc/drv.h) — but
+ * (include/bcm/{port,link,stat,error,vlan}.h, include/soc/drv.h) — but
  * "checked against the header" is not "compiled", so treat the first
  * build as a review step, not a formality.
  */
@@ -47,6 +47,7 @@
 #include <bcm/port.h>
 #include <bcm/stat.h>
 #include <bcm/types.h>
+#include <bcm/vlan.h>
 
 #include <soc/drv.h>
 
@@ -90,8 +91,16 @@ static int hb_status(int rv)
     case BCM_E_PARAM:
         return HEMLOCKBCM_ERR_INVALID_PARAM;
     case BCM_E_PORT:
+        /* Distinct from NOT_FOUND on purpose. The caller treats
+         * "not found" from a VLAN membership call as "already not a
+         * member" and reports success, because several of its operations
+         * are idempotent -- so an invalid port must not arrive wearing
+         * that code, or a typo becomes a silent no-op. */
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
     case BCM_E_NOT_FOUND:
         return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    case BCM_E_EXISTS:
+        return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
     default:
         return HEMLOCKBCM_ERR_FAILURE;
     }
@@ -537,6 +546,101 @@ static int hb_load_led_program(struct hemlockbcm_switch *sw, const char *hex)
 
 /* ------------------------------------------------------------------ */
 
+/* --- L2 VLANs (ABI 1.2) ------------------------------------------------- */
+
+/*
+ * A VLAN here is its 802.1Q id and a membership is (vlan, port): the
+ * opaque object ids SAI hands out are minted and unpacked on the Rust
+ * side, so this file keeps no table of its own and nothing to lose
+ * across a restart.
+ */
+
+static int hb_default_vlan(struct hemlockbcm_switch *sw, uint16_t *out)
+{
+    bcm_vlan_t vid = 0;
+    int status;
+
+    if (sw == NULL || out == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = HB_CALL(bcm_vlan_default_get(sw->unit, &vid));
+    if (status == HEMLOCKBCM_OK) {
+        *out = (uint16_t)vid;
+    }
+    return status;
+}
+
+static int hb_create_vlan(struct hemlockbcm_switch *sw, uint16_t vlan_id)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_vlan_create(sw->unit, (bcm_vlan_t)vlan_id));
+}
+
+static int hb_remove_vlan(struct hemlockbcm_switch *sw, uint16_t vlan_id)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_vlan_destroy(sw->unit, (bcm_vlan_t)vlan_id));
+}
+
+static int hb_add_vlan_member(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                              uint32_t logical_port, int tagged)
+{
+    bcm_pbmp_t pbmp, ubmp;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * Two bitmaps, not one flag: `pbmp` is who is in the VLAN and `ubmp`
+     * is who egresses untagged. An untagged member is in both. Passing a
+     * port in ubmp but not pbmp is meaningless, so it never happens here.
+     */
+    BCM_PBMP_CLEAR(pbmp);
+    BCM_PBMP_CLEAR(ubmp);
+    BCM_PBMP_PORT_ADD(pbmp, (bcm_port_t)logical_port);
+    if (!tagged) {
+        BCM_PBMP_PORT_ADD(ubmp, (bcm_port_t)logical_port);
+    }
+    return HB_CALL(bcm_vlan_port_add(sw->unit, (bcm_vlan_t)vlan_id, pbmp, ubmp));
+}
+
+static int hb_remove_vlan_member(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                 uint32_t logical_port)
+{
+    bcm_pbmp_t pbmp;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    BCM_PBMP_CLEAR(pbmp);
+    BCM_PBMP_PORT_ADD(pbmp, (bcm_port_t)logical_port);
+    /* Removing from pbmp drops the untagged bitmap entry with it. */
+    return HB_CALL(bcm_vlan_port_remove(sw->unit, (bcm_vlan_t)vlan_id, pbmp));
+}
+
+static int hb_set_port_pvid(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                            uint16_t vlan_id)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_port_untagged_vlan_set(sw->unit, (bcm_port_t)logical_port,
+                                              (bcm_vlan_t)vlan_id));
+}
+
+static int hb_set_port_tpid(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                            uint16_t tpid)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_port_tpid_set(sw->unit, (bcm_port_t)logical_port, (uint16)tpid));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -553,7 +657,14 @@ static const struct hemlockbcm_api HB_API = {
     hb_port_counters,
     hb_capabilities,
     hb_load_led_program,
-    /* Phase 6 slots are appended below this line as they land. */
+    hb_default_vlan,
+    hb_create_vlan,
+    hb_remove_vlan,
+    hb_add_vlan_member,
+    hb_remove_vlan_member,
+    hb_set_port_pvid,
+    hb_set_port_tpid,
+    /* Remaining phase 6 slots are appended below this line. */
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)
