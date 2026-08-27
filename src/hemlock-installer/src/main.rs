@@ -63,6 +63,13 @@ fn payload_platform(payload: &std::path::Path) -> Result<(String, String)> {
     Ok((platform_id, onie_machine))
 }
 
+/// Which boot style the payload was built for. Absent marker = an older
+/// x86-only payload.
+fn payload_boot_style(payload: &std::path::Path) -> install::BootStyle {
+    let arch = std::fs::read_to_string(payload.join("platform/cpu-arch")).unwrap_or_default();
+    install::BootStyle::from_arch(&arch)
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -124,6 +131,7 @@ fn run() -> Result<()> {
         disk,
         payload: args.payload.clone(),
         platform_id,
+        boot_style: payload_boot_style(&args.payload),
         dry_run: args.dry_run,
     };
     plan.validate_payload()?;

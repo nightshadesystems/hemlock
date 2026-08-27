@@ -70,11 +70,15 @@ impl MachineConf {
             .values
             .get("onie_machine")
             .ok_or(MachineError::NoPlatform)?;
+        // No default: assuming x86_64 was fine while every platform was
+        // x86, but on an ARM board it silently assembles the wrong
+        // platform string and the image installs onto the wrong machine
+        // (or refuses to install onto the right one).
         let arch = self
             .values
             .get("onie_arch")
             .map(String::as_str)
-            .unwrap_or("x86_64");
+            .ok_or(MachineError::NoPlatform)?;
         let rev = self
             .values
             .get("onie_machine_rev")
@@ -118,6 +122,26 @@ onie_version=2019.05
         let conf =
             MachineConf::parse("onie_machine=acme_sw48\nonie_arch=x86_64\nonie_machine_rev=2\n");
         assert_eq!(conf.platform().unwrap(), "x86_64-acme_sw48-r2");
+    }
+
+    /// ONIE on an ARM box reports `onie_arch=arm`. Defaulting the arch
+    /// would have assembled `x86_64-accton_as4610_54-r0` and refused to
+    /// install onto the very board the image was built for.
+    #[test]
+    fn assembles_an_arm_platform_from_parts() {
+        let conf = MachineConf::parse(
+            "onie_machine=accton_as4610_54\nonie_arch=arm\nonie_machine_rev=0\n",
+        );
+        assert_eq!(conf.platform().unwrap(), "arm-accton_as4610_54-r0");
+        assert!(!conf.matches("arm-accton-as4610-54-r0"));
+        assert!(conf.matches("arm-accton_as4610_54-r0"));
+    }
+
+    /// An arch we cannot read is not an x86 box by default: say so.
+    #[test]
+    fn a_missing_arch_is_an_error_not_an_assumption() {
+        let conf = MachineConf::parse("onie_machine=acme_sw48\nonie_machine_rev=0\n");
+        assert!(conf.platform().is_err());
     }
 
     #[test]

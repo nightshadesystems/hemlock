@@ -46,7 +46,43 @@ ONIE_MACHINE="$(manifest_value onie_machine)"
 SAI_PIN="$(manifest_value version_pin)"
 SAI_HEADERS="$(manifest_value api_headers)"
 CONFIG_BCM="$(manifest_value config_bcm)"
+SAI_BACKEND="$(manifest_value backend)"
+[ -n "$SAI_BACKEND" ] || SAI_BACKEND="sai"
 [ -n "$ONIE_MACHINE" ] || die "cannot read onie_machine from $PDIR/platform.toml"
+
+# --- Architecture -----------------------------------------------------------
+# Everything below that differs between an x86 and an ARM board hangs off
+# this one manifest field. Boards are not all x86: the AS4610's host CPU
+# is an on-die ARM Cortex-A9, which changes the rootfs architecture, the
+# boot artifacts (a FIT image instead of GRUB), the installer's target
+# triple and how the BDE kernel modules are built.
+CPU_ARCH="$(manifest_value cpu_arch)"
+[ -n "$CPU_ARCH" ] || CPU_ARCH="amd64"
+case "$CPU_ARCH" in
+amd64)
+    DEB_ARCH="amd64"
+    KERNEL_PKG="linux-image-amd64"
+    RUST_TARGET=""                              # host build
+    INSTALLER_TARGET="x86_64-unknown-linux-musl"
+    BOOT_STYLE="grub"
+    ;;
+armhf)
+    DEB_ARCH="armhf"
+    KERNEL_PKG=""                               # platform kernel; see below
+    RUST_TARGET="armv7-unknown-linux-gnueabihf"
+    INSTALLER_TARGET="armv7-unknown-linux-musleabihf"
+    BOOT_STYLE="fit"
+    ;;
+*)
+    die "unknown cpu_arch $CPU_ARCH in $PDIR/platform.toml (known: amd64, armhf)"
+    ;;
+esac
+# Cross-building at all? The host is assumed x86_64 (what CI and every
+# development box is); a native armhf builder would set this to 0 and
+# skip debootstrap's second stage.
+CROSS=0
+[ "$DEB_ARCH" = "amd64" ] || CROSS=1
+log "platform $PLATFORM: cpu_arch=$CPU_ARCH backend=$SAI_BACKEND boot=$BOOT_STYLE"
 
 OUT="$ROOT/build/out"
 WORK="$OUT/work-$PLATFORM"
@@ -61,33 +97,114 @@ if [ "$DUMMY" = 1 ]; then
     mkdir -p "$ROOTFS/etc" "$ROOTFS/usr/lib/hemlock" "$ROOTFS/boot"
     echo "dummy-kernel" > "$ROOTFS/boot/vmlinuz"
     echo "dummy-initrd" > "$ROOTFS/boot/initrd.img"
+    # An ARM board boots a FIT, not a kernel+initrd pair; the dummy one
+    # is a placeholder so verify-image.sh exercises the same layout CI
+    # would see for a real armhf build.
+    [ "$BOOT_STYLE" = "fit" ] && echo "dummy-fit" > "$ROOTFS/boot/hemlock.itb"
 else
     command -v debootstrap >/dev/null || die "debootstrap not installed"
     command -v mksquashfs >/dev/null || die "squashfs-tools not installed"
 
-    # The vendor SAI blob must exist for a real image.
-    # Exact-name glob: libsaibcm-dev_* must never match here.
-    SAI_DEB="$(ls "$ROOT"/vendor/sai/libsaibcm_"$SAI_PIN"_*.deb 2>/dev/null | head -1 || true)"
-    [ -n "$SAI_DEB" ] || die \
-        "no libsaibcm .deb matching pin '$SAI_PIN' in vendor/sai/ — see vendor/sai/README.md
+    if [ "$CROSS" = 1 ]; then
+        # Foreign-architecture rootfs: debootstrap unpacks the first
+        # stage, then the second stage runs the packages' maintainer
+        # scripts *inside* the chroot under qemu-user via binfmt.
+        command -v qemu-arm-static >/dev/null \
+            || [ -x /usr/bin/qemu-arm-static ] \
+            || die "qemu-arm-static not installed (needed for the $DEB_ARCH second stage)
+ apt-get install qemu-user-static binfmt-support"
+        [ -e /proc/sys/fs/binfmt_misc/qemu-arm ] \
+            || log "WARNING: binfmt qemu-arm not registered; the second stage may fail"
+        command -v "arm-linux-gnueabihf-gcc" >/dev/null \
+            || die "arm-linux-gnueabihf-gcc not installed (cross toolchain for $DEB_ARCH)"
+    fi
+
+    # The datapath library. A SAI platform needs its pinned vendor blob;
+    # an openbcm platform needs the shim built from the SDK (which is a
+    # separate, cross-container step — see vendor/openbcm-shim/).
+    SAI_DEB=""
+    SHIM_SO=""
+    if [ "$SAI_BACKEND" = "openbcm" ]; then
+        SHIM_SO="$(ls "$ROOT"/vendor/openbcm/out/libhemlockbcm.so* 2>/dev/null | head -1 || true)"
+        [ -n "$SHIM_SO" ] || die \
+            "no libhemlockbcm.so in vendor/openbcm/out/ — build it first:
+   vendor/fetch-vendor.sh $PLATFORM
+   vendor/openbcm-shim/build-shim.sh
+ (CI and development never need this: use --dummy-rootfs or --mock)"
+    else
+        # Exact-name glob: libsaibcm-dev_* must never match here.
+        SAI_DEB="$(ls "$ROOT"/vendor/sai/libsaibcm_"$SAI_PIN"_*.deb 2>/dev/null | head -1 || true)"
+        [ -n "$SAI_DEB" ] || die \
+            "no libsaibcm .deb matching pin '$SAI_PIN' in vendor/sai/ — see vendor/sai/README.md
  (CI and development never need this: use --dummy-rootfs or mock-sai)"
+    fi
     [ -f "$PDIR/$CONFIG_BCM" ] || die \
         "$CONFIG_BCM missing from $PDIR — run vendor/fetch-vendor.sh $PLATFORM"
 
-    log "debootstrap Debian trixie"
-    debootstrap --variant=minbase \
-        --include="$(grep -v '^#' "$ROOT/build/rootfs/packages.list" | grep -v '^$' | paste -sd, -)" \
-        trixie "$ROOTFS" https://deb.debian.org/debian
+    log "debootstrap Debian trixie ($DEB_ARCH)"
+    DEBOOTSTRAP_ARGS=(--variant=minbase --arch="$DEB_ARCH"
+        "--include=$(grep -v '^#' "$ROOT/build/rootfs/packages.list" | grep -v '^$' | paste -sd, -)")
+    if [ "$CROSS" = 1 ]; then
+        # First stage unpacks only; the maintainer scripts run in the
+        # second stage, under qemu, from inside the chroot.
+        debootstrap "${DEBOOTSTRAP_ARGS[@]}" --foreign \
+            trixie "$ROOTFS" https://deb.debian.org/debian
+        install -D /usr/bin/qemu-arm-static "$ROOTFS/usr/bin/qemu-arm-static"
+        log "debootstrap second stage (qemu-user)"
+        chroot "$ROOTFS" /debootstrap/debootstrap --second-stage \
+            || die "debootstrap second stage failed (is binfmt qemu-arm registered?)"
+    else
+        debootstrap "${DEBOOTSTRAP_ARGS[@]}" trixie "$ROOTFS" https://deb.debian.org/debian
+    fi
+
+    # --- Platform kernel ---------------------------------------------------
+    # x86 rides Debian's own kernel. armhf cannot: upstream Linux has no
+    # Helix4 support, so the image needs a kernel Hemlock builds itself.
+    if [ -n "$KERNEL_PKG" ]; then
+        : # already pulled in by packages.list on amd64
+    else
+        KERNEL_DEB="$(ls "$ROOT"/vendor/kernel/linux-image-*-hemlock-iproc*_"$DEB_ARCH".deb 2>/dev/null | head -1 || true)"
+        [ -n "$KERNEL_DEB" ] || die \
+            "no Hemlock iProc kernel package in vendor/kernel/ for $DEB_ARCH.
+
+ Upstream Linux has no Helix4 support and Debian's armmp kernel will not
+ boot this board, so the image needs a kernel built from the triaged
+ iProc patch set. That port is tracked separately:
+
+     docs/as4610-kernel-port.md
+
+ Build it, drop the resulting linux-image-*.deb in vendor/kernel/, and
+ re-run. (--dummy-rootfs needs none of this.)"
+        log "installing platform kernel $(basename "$KERNEL_DEB")"
+        cp "$KERNEL_DEB" "$ROOTFS/tmp/"
+        chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$KERNEL_DEB")" \
+            || die "platform kernel install failed"
+        rm -f "$ROOTFS/tmp/$(basename "$KERNEL_DEB")"
+    fi
 
     log "installing Hemlock daemons"
-    (cd "$ROOT" && cargo build --release --workspace --features hemlock-syncd/real-sai)
+    CARGO_ARGS=(build --release --workspace)
+    if [ "$SAI_BACKEND" = "openbcm" ]; then
+        CARGO_ARGS+=(--features hemlock-syncd/openbcm)
+    else
+        CARGO_ARGS+=(--features hemlock-syncd/real-sai)
+    fi
+    BIN_DIR="$ROOT/target/release"
+    if [ -n "$RUST_TARGET" ]; then
+        command -v rustup >/dev/null && rustup target add "$RUST_TARGET" >/dev/null
+        CARGO_ARGS+=(--target "$RUST_TARGET")
+        BIN_DIR="$ROOT/target/$RUST_TARGET/release"
+        # cargo needs to be told which linker drives the cross target.
+        export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER="arm-linux-gnueabihf-gcc"
+    fi
+    (cd "$ROOT" && cargo "${CARGO_ARGS[@]}")
     install -D -t "$ROOTFS/usr/sbin" \
-        "$ROOT"/target/release/hemlock-syncd \
-        "$ROOT"/target/release/hemlock-pmon \
-        "$ROOT"/target/release/hemlock-mgmtd \
-        "$ROOT"/target/release/hemlock-orch \
-        "$ROOT"/target/release/hemlock-webd
-    install -D -t "$ROOTFS/usr/bin" "$ROOT"/target/release/hemlockctl
+        "$BIN_DIR"/hemlock-syncd \
+        "$BIN_DIR"/hemlock-pmon \
+        "$BIN_DIR"/hemlock-mgmtd \
+        "$BIN_DIR"/hemlock-orch \
+        "$BIN_DIR"/hemlock-webd
+    install -D -t "$ROOTFS/usr/bin" "$BIN_DIR"/hemlockctl
     install -D -m 644 -t "$ROOTFS/etc/systemd/system" "$ROOT"/build/rootfs/systemd/*.service "$ROOT"/build/rootfs/systemd/*.target
     for unit in "$ROOT"/build/rootfs/systemd/*.service; do
         chroot "$ROOTFS" systemctl enable "$(basename "$unit")" || true
@@ -110,10 +227,26 @@ else
     mkdir -p "$ROOTFS/usr/share/hemlock"
     cp -r "$ROOT/web/out" "$ROOTFS/usr/share/hemlock/web"
 
-    log "installing vendor SAI ($SAI_DEB)"
-    cp "$SAI_DEB" "$ROOTFS/tmp/"
-    chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$SAI_DEB")" || die "vendor SAI install failed"
-    rm -f "$ROOTFS/tmp/$(basename "$SAI_DEB")"
+    if [ "$SAI_BACKEND" = "openbcm" ]; then
+        # Hemlock's own shim, at exactly the path the manifest pins so
+        # syncd's dlopen finds it.
+        SHIM_PATH="$(manifest_value shim_path)"
+        [ -n "$SHIM_PATH" ] || die "no [sai] shim_path in $PDIR/platform.toml"
+        log "installing OpenBCM shim ($SHIM_SO -> $SHIM_PATH)"
+        install -D -m 755 "$SHIM_SO" "$ROOTFS$SHIM_PATH"
+        # SFP+ PHY microcode, pulled through request_firmware at PHY init.
+        if [ -f "$ROOT/vendor/firmware/bcm84758_ucode.bin" ]; then
+            install -D -m 644 "$ROOT/vendor/firmware/bcm84758_ucode.bin" \
+                "$ROOTFS/lib/firmware/bcm84758_ucode.bin"
+        else
+            log "WARNING: no bcm84758_ucode.bin staged; the SFP+ ports will stay down"
+        fi
+    else
+        log "installing vendor SAI ($SAI_DEB)"
+        cp "$SAI_DEB" "$ROOTFS/tmp/"
+        chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$SAI_DEB")" || die "vendor SAI install failed"
+        rm -f "$ROOTFS/tmp/$(basename "$SAI_DEB")"
+    fi
 
     # --- Kernel modules (BDE + platform drivers) ---------------------------
     # The manifest's [kernel] required_modules must be loadable in the
@@ -123,10 +256,7 @@ else
     # headers match the image kernel exactly, and refuse to ship an image
     # where any required module would not resolve.
     KVER="$(ls "$ROOTFS/lib/modules" | head -1)"
-    [ -n "$KVER" ] || die "no kernel in rootfs (linux-image-amd64 missing?)"
-    BDE_SRC="$ROOT/vendor/sai/saibcm-modules"
-    [ -d "$BDE_SRC" ] || die \
-        "vendor/sai/saibcm-modules missing — run vendor/fetch-vendor.sh $PLATFORM"
+    [ -n "$KVER" ] || die "no kernel in rootfs ($KERNEL_PKG missing?)"
 
     log "building kernel modules for $KVER (BDE + platform drivers)"
     export DEBIAN_FRONTEND=noninteractive
@@ -139,10 +269,28 @@ else
     MODDEST="$ROOTFS/lib/modules/$KVER/updates/hemlock"
     mkdir -p "$KMOD_TMP" "$MODDEST"
 
-    cp -r "$BDE_SRC" "$KMOD_TMP/saibcm-modules"
-    install -m 755 "$ROOT/build/build-bde.sh" "$KMOD_TMP/build-bde.sh"
-    chroot "$ROOTFS" /tmp/kmod/build-bde.sh /tmp/kmod/saibcm-modules "$KVER" /tmp/kmod/bde-out \
-        || die "BDE module build failed"
+    # Where the BDE/KNET sources come from depends on the backend, not on
+    # the architecture: a SAI platform's modules must match the pinned
+    # SAI's SDK lineage (SONiC's saibcm-modules), while an openbcm
+    # platform's come from the same OpenBCM tree the shim was built from.
+    if [ "$SAI_BACKEND" = "openbcm" ]; then
+        BDE_SRC="$(ls -d "$ROOT"/vendor/openbcm/sdk-* 2>/dev/null | head -1 || true)"
+        [ -n "$BDE_SRC" ] || die \
+            "no OpenBCM tree in vendor/openbcm/ — run vendor/fetch-vendor.sh $PLATFORM"
+        log "building BDE/KNET from $(basename "$BDE_SRC") for $KVER"
+        install -m 755 "$ROOT/build/build-bde-openbcm.sh" "$KMOD_TMP/build-bde-openbcm.sh"
+        cp -r "$BDE_SRC" "$KMOD_TMP/openbcm"
+        chroot "$ROOTFS" /tmp/kmod/build-bde-openbcm.sh /tmp/kmod/openbcm "$KVER" \
+            /tmp/kmod/bde-out || die "OpenBCM BDE/KNET module build failed"
+    else
+        BDE_SRC="$ROOT/vendor/sai/saibcm-modules"
+        [ -d "$BDE_SRC" ] || die \
+            "vendor/sai/saibcm-modules missing — run vendor/fetch-vendor.sh $PLATFORM"
+        cp -r "$BDE_SRC" "$KMOD_TMP/saibcm-modules"
+        install -m 755 "$ROOT/build/build-bde.sh" "$KMOD_TMP/build-bde.sh"
+        chroot "$ROOTFS" /tmp/kmod/build-bde.sh /tmp/kmod/saibcm-modules "$KVER" \
+            /tmp/kmod/bde-out || die "BDE module build failed"
+    fi
     cp "$KMOD_TMP/bde-out/"*.ko "$MODDEST/"
 
     # Platform driver kbuild dirs committed under <platform>/kmod/
@@ -315,15 +463,106 @@ chroot "$ROOTFS" systemctl disable ssh >/dev/null 2>&1 || true
 mkdir -p "$PAYLOAD/boot"
 CONSOLE_DEV=0; CONSOLE_SPEED=115200
 [ -f "$PDIR/boot.env" ] && . "$PDIR/boot.env"
-sed -e "s/@CONSOLE_DEV@/$CONSOLE_DEV/g" \
-    -e "s/@CONSOLE_SPEED@/$CONSOLE_SPEED/g" \
-    -e "s/@VERSION@/$VERSION/g" \
-    "$ROOT/build/rootfs/grub.cfg.in" > "$PAYLOAD/boot/grub.cfg"
-cp "$ROOTFS/boot/vmlinuz"* "$PAYLOAD/boot/vmlinuz" 2>/dev/null \
-    || echo dummy > "$PAYLOAD/boot/vmlinuz"
-cp "$ROOTFS/boot/initrd.img"* "$PAYLOAD/boot/initrd.img" 2>/dev/null \
-    || echo dummy > "$PAYLOAD/boot/initrd.img"
-rm -f "$ROOTFS"/boot/vmlinuz* "$ROOTFS"/boot/initrd.img* \
+
+if [ "$BOOT_STYLE" = "fit" ]; then
+    # U-Boot boots a FIT: one container holding the kernel, the board
+    # device tree and the initramfs. There is no GRUB and no bootloader
+    # config — the kernel command line is baked into the FIT's own
+    # `bootargs`, which is why it is rendered here rather than in a
+    # separate file the installer would have to place.
+    KCMDLINE="console=ttyS${CONSOLE_DEV},${CONSOLE_SPEED}n8 root=/dev/ram0 hemlock.rootfs=/hemlock/rootfs.squashfs rw net.ifnames=0"
+    if [ "$DUMMY" = 1 ]; then
+        # CI has no kernel, no dtb and no mkimage. Ship the placeholder
+        # the dummy rootfs made, so the payload layout is still the real
+        # one and verify-image.sh checks the same thing it would for a
+        # real build.
+        cp "$ROOTFS/boot/hemlock.itb" "$PAYLOAD/boot/hemlock.itb"
+    else
+        command -v mkimage >/dev/null || die "mkimage not installed (u-boot-tools)"
+        command -v dtc >/dev/null || die "dtc not installed (device-tree-compiler)"
+        DTS="$(ls "$PDIR"/dts/*.dts 2>/dev/null | head -1 || true)"
+        [ -n "$DTS" ] || die "no device tree in $PDIR/dts/ (needed for the FIT)"
+
+        FITDIR="$WORK/fit"
+        mkdir -p "$FITDIR"
+        KIMAGE="$(ls "$ROOTFS"/boot/vmlinuz* "$ROOTFS"/boot/Image* 2>/dev/null | head -1 || true)"
+        [ -n "$KIMAGE" ] || die "no kernel image in the rootfs"
+        gzip -nc "$KIMAGE" > "$FITDIR/kernel.gz"
+        INITRD="$(ls "$ROOTFS"/boot/initrd.img* 2>/dev/null | head -1 || true)"
+        [ -n "$INITRD" ] || die "no initramfs in the rootfs"
+        cp "$INITRD" "$FITDIR/initrd.img"
+        dtc -I dts -O dtb "$DTS" -o "$FITDIR/board.dtb" 2>/dev/null \
+            || die "compiling $DTS failed"
+
+        # Load/entry 0x61008000: where U-Boot on this board expects the
+        # decompressed kernel, per the board memory map in its device tree
+        # (memory starts at 0x61000000).
+        cat > "$FITDIR/fit.its" <<ITS
+/dts-v1/;
+/ {
+    description = "Hemlock $VERSION for $PLATFORM";
+    #address-cells = <1>;
+    images {
+        kernel {
+            description = "Linux";
+            data = /incbin/("kernel.gz");
+            type = "kernel";
+            arch = "arm";
+            os = "linux";
+            compression = "gzip";
+            load = <0x61008000>;
+            entry = <0x61008000>;
+            hash-1 { algo = "crc32"; };
+        };
+        fdt {
+            description = "$(basename "$DTS" .dts)";
+            data = /incbin/("board.dtb");
+            type = "flat_dt";
+            arch = "arm";
+            compression = "none";
+            hash-1 { algo = "crc32"; };
+        };
+        ramdisk {
+            description = "initramfs";
+            data = /incbin/("initrd.img");
+            type = "ramdisk";
+            arch = "arm";
+            os = "linux";
+            compression = "none";
+            hash-1 { algo = "crc32"; };
+        };
+    };
+    configurations {
+        default = "conf";
+        conf {
+            description = "$PLATFORM";
+            kernel = "kernel";
+            fdt = "fdt";
+            ramdisk = "ramdisk";
+        };
+    };
+};
+ITS
+        # SOURCE_DATE_EPOCH keeps the FIT byte-reproducible across builds.
+        (cd "$FITDIR" && SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}" \
+            mkimage -f fit.its "$PAYLOAD/boot/hemlock.itb" >/dev/null) \
+            || die "building the FIT failed"
+        log "built FIT $(du -h "$PAYLOAD/boot/hemlock.itb" | cut -f1) (cmdline: $KCMDLINE)"
+    fi
+    # The command line the installer stamps into the U-Boot environment.
+    printf '%s\n' "$KCMDLINE" > "$PAYLOAD/boot/cmdline"
+else
+    sed -e "s/@CONSOLE_DEV@/$CONSOLE_DEV/g" \
+        -e "s/@CONSOLE_SPEED@/$CONSOLE_SPEED/g" \
+        -e "s/@VERSION@/$VERSION/g" \
+        "$ROOT/build/rootfs/grub.cfg.in" > "$PAYLOAD/boot/grub.cfg"
+    cp "$ROOTFS/boot/vmlinuz"* "$PAYLOAD/boot/vmlinuz" 2>/dev/null \
+        || echo dummy > "$PAYLOAD/boot/vmlinuz"
+    cp "$ROOTFS/boot/initrd.img"* "$PAYLOAD/boot/initrd.img" 2>/dev/null \
+        || echo dummy > "$PAYLOAD/boot/initrd.img"
+fi
+rm -f "$ROOTFS"/boot/vmlinuz* "$ROOTFS"/boot/Image* "$ROOTFS"/boot/initrd.img* \
+      "$ROOTFS"/boot/hemlock.itb \
       "$ROOTFS"/boot/System.map* "$ROOTFS"/boot/config-*
 
 # --- 3. Squash it -----------------------------------------------------------
@@ -340,6 +579,9 @@ mkdir -p "$PAYLOAD/platform"
 cp "$PDIR/platform.toml" "$PAYLOAD/platform/"
 echo "$ONIE_MACHINE" > "$PAYLOAD/platform/onie-machine"
 echo "$PLATFORM" > "$PAYLOAD/platform/platform-id"
+# CPU architecture, so the installer and verify-image.sh know which boot
+# layout this payload carries without re-parsing the manifest.
+echo "$CPU_ARCH" > "$PAYLOAD/platform/cpu-arch"
 # Vendor data files ride along when present (real builds require them above).
 for f in "$PDIR"/*; do
     case "$(basename "$f")" in
@@ -351,13 +593,21 @@ done
 # --- 5. Installer binary ----------------------------------------------------
 # ONIE's runtime is BusyBox with no glibc dynamic loader, so the installer
 # must be statically linked: build it for the musl target.
-INSTALLER_TARGET="x86_64-unknown-linux-musl"
+# (the triple came from the manifest's cpu_arch, above)
 if [ "$DUMMY" = 1 ] && ! command -v cargo >/dev/null; then
     log "WARNING: cargo unavailable; dummy payload gets a stub installer"
     printf '#!/bin/sh\necho hemlock-installer stub\n' > "$PAYLOAD/hemlock-installer"
 else
     if command -v rustup >/dev/null; then
         rustup target add "$INSTALLER_TARGET" >/dev/null
+    fi
+    # A cross target's default linker is `cc`, which on an x86 host is
+    # the host compiler and cannot link ARM. rust-lld ships with the
+    # toolchain and links a fully static musl binary on its own, so
+    # building the ARM installer needs no C cross-toolchain — which is
+    # what keeps this step runnable in CI.
+    if [ "$INSTALLER_TARGET" != "x86_64-unknown-linux-musl" ]; then
+        export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=rust-lld
     fi
     (cd "$ROOT" && cargo build --release -p hemlock-installer --target "$INSTALLER_TARGET")
     cp "$ROOT/target/$INSTALLER_TARGET/release/hemlock-installer" "$PAYLOAD/hemlock-installer"
@@ -385,6 +635,11 @@ if [ -n "\${HEMLOCK_EXTRACT_ONLY:-}" ]; then
     exit 0
 fi
 cd "\$EXTRACT_DIR"
+# The mode should already be right, but it depends on the build host's
+# filesystem and on tar preserving it. This runs once, as root, in ONIE,
+# and a missing execute bit here is a failed install on a switch that has
+# just been wiped — cheap insurance.
+chmod +x ./hemlock-installer 2>/dev/null || true
 exec ./hemlock-installer --payload "\$EXTRACT_DIR" "\$@"
 __HEMLOCK_PAYLOAD__
 EOF

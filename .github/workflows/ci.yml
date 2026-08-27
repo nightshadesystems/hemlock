@@ -96,5 +96,13 @@ jobs:
       # The ONIE installer must be a static musl binary (no loader in ONIE).
       - run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+      # The ARM installer links with rust-lld, so no C cross-toolchain is
+      # needed here — only the target's std.
+      - run: rustup target add armv7-unknown-linux-musleabihf
       - run: bash build/mkimage.sh cel-e1031 --dummy-rootfs
       - run: bash build/verify-image.sh build/out/hemlock-*-cel-e1031.bin
+      # The armhf path assembles a FIT instead of GRUB artifacts and a
+      # static ARM installer instead of an x86 one. Structural only: no
+      # ARM toolchain, no vendor artifacts, no kernel.
+      - run: bash build/mkimage.sh accton-as4610-54 --dummy-rootfs
+      - run: bash build/verify-image.sh build/out/hemlock-*-accton-as4610-54.bin

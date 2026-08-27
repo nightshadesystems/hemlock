@@ -10,16 +10,44 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
+/// How the target board boots, which decides the whole install shape.
+///
+/// Read from the payload's `platform/cpu-arch` marker rather than guessed
+/// from the running environment: the image knows what it was built for,
+/// and the installer runs inside ONIE, not on the installed system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BootStyle {
+    /// x86: GPT on a block device, GRUB in the BIOS boot partition.
+    #[default]
+    Grub,
+    /// ARM: U-Boot loads a FIT image; the NOS lives on raw NAND with no
+    /// bootloader of its own to install.
+    Fit,
+}
+
+impl BootStyle {
+    /// Derive from the payload's `cpu-arch` marker. Payloads written
+    /// before the marker existed are all x86.
+    pub fn from_arch(arch: &str) -> Self {
+        match arch.trim() {
+            "armhf" => BootStyle::Fit,
+            _ => BootStyle::Grub,
+        }
+    }
+}
+
 /// Everything an install needs to know, resolved before any step runs.
 #[derive(Debug, Clone)]
 pub struct InstallPlan {
-    /// Target block device, e.g. `/dev/sda`.
+    /// Target block device, e.g. `/dev/sda`. On a FIT/NAND board this is
+    /// the UBI-backed MTD device instead.
     pub disk: PathBuf,
     /// Payload directory (unpacked ONIE self-extractor): rootfs.squashfs,
     /// platform/ overlay, boot assets.
     pub payload: PathBuf,
     /// Platform id baked into the image (e.g. `cel-e1031`).
     pub platform_id: String,
+    pub boot_style: BootStyle,
     pub dry_run: bool,
 }
 
@@ -42,10 +70,137 @@ impl InstallPlan {
         }
     }
 
-    /// The ordered steps. Layout: GPT with an EFI system partition (kept
-    /// small; Rangeley boxes boot legacy GRUB from the BIOS boot part) and
-    /// one root filesystem holding the squashfs + persistent overlay.
+    /// The ordered steps for this board's boot style.
     pub fn steps(&self) -> Vec<Step> {
+        match self.boot_style {
+            BootStyle::Grub => self.grub_steps(),
+            BootStyle::Fit => self.fit_steps(),
+        }
+    }
+
+    /// ARM / U-Boot / NAND.
+    ///
+    /// There is no bootloader to install: U-Boot is already in SPI-NOR
+    /// and ONIE owns it. What an install does here is put a FIT and the
+    /// root filesystem into UBI volumes on the NAND, then point U-Boot's
+    /// `nos_bootcmd` at the FIT. `onie-nos-mode -s` is what makes the
+    /// next boot pick the NOS instead of ONIE.
+    ///
+    /// **The UBI layout below is unverified.** Open question 2 in
+    /// docs/as4610-54-port.md: nobody has yet read `/proc/mtd` on this
+    /// board from ONIE, so which MTD partition the NOS gets, and whether
+    /// ONIE presents it as raw MTD or an existing UBI device, is still a
+    /// guess. It is written out in full precisely so `--dry-run` shows
+    /// the whole sequence for checking against the real box before
+    /// anything is written. Phase 5 corrects it.
+    fn fit_steps(&self) -> Vec<Step> {
+        let mtd = self.disk.display().to_string();
+        let payload = self.payload.display().to_string();
+        // UBI volume names, kept short: UBI caps them at 127 bytes but
+        // U-Boot's env is where they have to be typed.
+        let boot_vol = "hemlock-boot";
+        let root_vol = "hemlock-root";
+
+        vec![
+            Step {
+                title: "Attach NAND (UBI)",
+                commands: vec![
+                    // Detach first so a reinstall does not fail on an
+                    // already-attached device.
+                    cmd(["ubidetach", "-p", &mtd]),
+                    cmd(["ubiformat", &mtd, "-y"]),
+                    cmd(["ubiattach", "-p", &mtd]),
+                ],
+            },
+            Step {
+                title: "Create UBI volumes",
+                commands: vec![
+                    cmd(["ubimkvol", "/dev/ubi0", "-N", boot_vol, "-s", "32MiB"]),
+                    // The rest of the device: the squashfs plus room for
+                    // the writable overlay and a future upgrade.
+                    cmd(["ubimkvol", "/dev/ubi0", "-N", root_vol, "-m"]),
+                ],
+            },
+            Step {
+                title: "Write boot image (FIT)",
+                commands: vec![
+                    cmd(["mkdir", "-p", &format!("{MOUNT_POINT}/boot")]),
+                    cmd([
+                        "mount",
+                        "-t",
+                        "ubifs",
+                        &format!("ubi0:{boot_vol}"),
+                        &format!("{MOUNT_POINT}/boot"),
+                    ]),
+                    cmd([
+                        "cp",
+                        &format!("{payload}/boot/hemlock.itb"),
+                        &format!("{MOUNT_POINT}/boot/hemlock.itb"),
+                    ]),
+                    cmd(["umount", &format!("{MOUNT_POINT}/boot")]),
+                ],
+            },
+            Step {
+                title: "Copy system image",
+                commands: vec![
+                    cmd(["mkdir", "-p", MOUNT_POINT]),
+                    cmd([
+                        "mount",
+                        "-t",
+                        "ubifs",
+                        &format!("ubi0:{root_vol}"),
+                        MOUNT_POINT,
+                    ]),
+                    cmd(["mkdir", "-p", &format!("{MOUNT_POINT}/hemlock")]),
+                    cmd([
+                        "cp",
+                        &format!("{payload}/rootfs.squashfs"),
+                        &format!("{MOUNT_POINT}/hemlock/rootfs.squashfs"),
+                    ]),
+                    cmd(["mkdir", "-p", &format!("{MOUNT_POINT}/hemlock/persist")]),
+                ],
+            },
+            Step {
+                title: "Place platform overlay",
+                commands: vec![cmd([
+                    "cp",
+                    "-r",
+                    &format!("{payload}/platform"),
+                    &format!("{MOUNT_POINT}/hemlock/platform"),
+                ])],
+            },
+            Step {
+                title: "Set U-Boot environment",
+                commands: vec![
+                    // Load the FIT from the boot volume and boot its
+                    // default configuration. The kernel command line
+                    // rides in the FIT itself (mkimage.sh renders it),
+                    // so nothing here has to repeat it.
+                    cmd([
+                        "fw_setenv",
+                        "nos_bootcmd",
+                        &format!(
+                            "ubi part {mtd_name}; ubifsmount ubi0:{boot_vol}; \
+                             ubifsload 0x61000000 /hemlock.itb; bootm 0x61000000",
+                            mtd_name = "nos"
+                        ),
+                    ]),
+                    // Tell ONIE the NOS is installed, so the next boot
+                    // runs nos_bootcmd rather than dropping into ONIE.
+                    cmd(["onie-nos-mode", "-s"]),
+                ],
+            },
+            Step {
+                title: "Finish",
+                commands: vec![cmd(["umount", MOUNT_POINT])],
+            },
+        ]
+    }
+
+    /// x86 / GRUB. Layout: GPT with an EFI system partition (kept small;
+    /// Rangeley boxes boot legacy GRUB from the BIOS boot part) and one
+    /// root filesystem holding the squashfs + persistent overlay.
+    fn grub_steps(&self) -> Vec<Step> {
         let disk = self.disk.display().to_string();
         let root = self.part(3);
         let payload = self.payload.display().to_string();
@@ -170,10 +325,16 @@ impl InstallPlan {
 
     /// Sanity-check the payload before touching the disk.
     pub fn validate_payload(&self) -> Result<()> {
-        let required: [&Path; 2] = [
+        let mut required: Vec<&Path> = vec![
             Path::new("rootfs.squashfs"),
             Path::new("platform/platform.toml"),
         ];
+        // The boot artifact this board actually needs. Finding it absent
+        // here beats finding it absent after the NAND has been erased.
+        match self.boot_style {
+            BootStyle::Grub => required.push(Path::new("boot/grub.cfg")),
+            BootStyle::Fit => required.push(Path::new("boot/hemlock.itb")),
+        }
         for rel in required {
             let path = self.payload.join(rel);
             if !path.exists() {
@@ -249,8 +410,30 @@ mod tests {
             disk: disk.into(),
             payload: "payload".into(),
             platform_id: "cel-e1031".into(),
+            boot_style: BootStyle::Grub,
             dry_run: true,
         }
+    }
+
+    fn arm_plan(mtd: &str) -> InstallPlan {
+        InstallPlan {
+            disk: mtd.into(),
+            payload: "payload".into(),
+            platform_id: "accton-as4610-54".into(),
+            boot_style: BootStyle::Fit,
+            dry_run: true,
+        }
+    }
+
+    /// Every command a plan would run, for assertions about the shape of
+    /// an install rather than its individual steps.
+    fn all_commands(plan: &InstallPlan) -> String {
+        plan.steps()
+            .iter()
+            .flat_map(|s| s.commands.iter())
+            .map(|argv| argv.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -287,6 +470,109 @@ mod tests {
         std::fs::write(dir.path().join("rootfs.squashfs"), b"squash").unwrap();
         std::fs::create_dir_all(dir.path().join("platform")).unwrap();
         std::fs::write(dir.path().join("platform/platform.toml"), b"# m").unwrap();
+        std::fs::create_dir_all(dir.path().join("boot")).unwrap();
+        std::fs::write(dir.path().join("boot/grub.cfg"), b"# g").unwrap();
         assert!(p.validate_payload().is_ok());
+    }
+
+    #[test]
+    fn boot_style_comes_from_the_payload_marker() {
+        assert_eq!(BootStyle::from_arch("armhf"), BootStyle::Fit);
+        assert_eq!(BootStyle::from_arch("armhf\n"), BootStyle::Fit);
+        assert_eq!(BootStyle::from_arch("amd64"), BootStyle::Grub);
+        // An absent or unreadable marker is an older x86-only payload.
+        assert_eq!(BootStyle::from_arch(""), BootStyle::Grub);
+    }
+
+    /// Each boot style demands its own boot artifact, checked before the
+    /// storage is touched — on an ARM board the NAND is erased in the
+    /// first step, so "the FIT is missing" must surface before that.
+    #[test]
+    fn each_boot_style_requires_its_own_boot_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rootfs.squashfs"), b"squash").unwrap();
+        std::fs::create_dir_all(dir.path().join("platform")).unwrap();
+        std::fs::write(dir.path().join("platform/platform.toml"), b"# m").unwrap();
+        std::fs::create_dir_all(dir.path().join("boot")).unwrap();
+
+        let mut arm = arm_plan("/dev/mtd3");
+        arm.payload = dir.path().to_path_buf();
+        let mut x86 = plan("/dev/sda");
+        x86.payload = dir.path().to_path_buf();
+        assert!(arm.validate_payload().is_err(), "no FIT yet");
+        assert!(x86.validate_payload().is_err(), "no grub.cfg yet");
+
+        std::fs::write(dir.path().join("boot/hemlock.itb"), b"fit").unwrap();
+        assert!(arm.validate_payload().is_ok());
+        assert!(x86.validate_payload().is_err(), "a FIT is not a grub.cfg");
+
+        std::fs::write(dir.path().join("boot/grub.cfg"), b"# g").unwrap();
+        assert!(x86.validate_payload().is_ok());
+    }
+
+    /// The ARM install writes a FIT into UBI and points U-Boot at it.
+    /// There is no bootloader to install: ONIE owns U-Boot in SPI-NOR.
+    #[test]
+    fn the_arm_install_writes_a_fit_and_sets_the_uboot_environment() {
+        let commands = all_commands(&arm_plan("/dev/mtd3"));
+        for expected in [
+            "ubiformat /dev/mtd3",
+            "ubiattach -p /dev/mtd3",
+            "hemlock.itb",
+            "fw_setenv nos_bootcmd",
+            "onie-nos-mode -s",
+        ] {
+            assert!(
+                commands.contains(expected),
+                "missing {expected:?}:\n{commands}"
+            );
+        }
+        // Nothing x86 leaks into it.
+        for forbidden in ["grub-install", "sgdisk", "mkfs.ext4", "vmlinuz"] {
+            assert!(
+                !commands.contains(forbidden),
+                "{forbidden:?} has no business in an ARM install:\n{commands}"
+            );
+        }
+    }
+
+    /// ...and the x86 install is unchanged by any of it.
+    #[test]
+    fn the_x86_install_is_untouched() {
+        let commands = all_commands(&plan("/dev/sda"));
+        for expected in ["sgdisk --zap-all /dev/sda", "grub-install", "mkfs.ext4"] {
+            assert!(commands.contains(expected), "missing {expected:?}");
+        }
+        for forbidden in ["ubiformat", "fw_setenv", "onie-nos-mode"] {
+            assert!(
+                !commands.contains(forbidden),
+                "{forbidden:?} leaked into x86"
+            );
+        }
+    }
+
+    /// Both styles place the squashfs, the persist dir and the platform
+    /// overlay — that is the boot contract the initramfs relies on, and
+    /// it does not vary by architecture.
+    #[test]
+    fn both_styles_honour_the_boot_contract() {
+        for plan in [plan("/dev/sda"), arm_plan("/dev/mtd3")] {
+            let commands = all_commands(&plan);
+            for expected in ["hemlock/rootfs.squashfs", "hemlock/persist", "platform"] {
+                assert!(
+                    commands.contains(expected),
+                    "{:?} install is missing {expected:?}",
+                    plan.boot_style
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arm_dry_run_executes_without_tools() {
+        let p = arm_plan("/dev/mtd3");
+        for step in p.steps() {
+            p.run_step(&step).unwrap();
+        }
     }
 }
