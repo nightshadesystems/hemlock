@@ -98,6 +98,7 @@ i2c-1 (SoC)  pca9548 @0x70 -> buses 2-9
                ch0-3  optoe2 @0x50   SFP+  Ethernet49-52
                ch4-5  optoe1 @0x50   QSFP+ (not modeled)
                ch6    psu1/2 eeprom @0x50/0x51, pmbus ym1921 @0x58/0x59
+                        (both confirmed by i2cdetect on the box)
                ch7    lm77 @0x48, board eeprom 24c04 @0x50, RTC @0x68
 ```
 

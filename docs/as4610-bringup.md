@@ -100,6 +100,7 @@ next reader does not have to re-derive it:
 | i2c adapters | `iproc-smb0`, `iproc-smb1` |
 | Mux channels | buses **10–17** (chan_id 0–7 of `i2c-1-mux`), not the 2–9 the manifest declares |
 | Mux `channel-N` links | **absent** under ONIE — its 3.2.69 kernel predates them; see below |
+| Mux channel 6 (`i2c-16`) | PSU EEPROMs at **0x50/0x51** (`UU`, driver-claimed), pmbus at **0x58/0x59** |
 | Product ID | CPLD `0x01` = **`0x05`** = AS4610-54T **revision B**, which has fans |
 | `sda1` / `sda2` / `sda3` | ext3 (`uImage`) / ext3 (`grub-core.img`) / **btrfs** |
 | Kernel load/entry | `0x61008000`, confirmed by the salvaged uImage header *and* its embedded config — see [`as4610-kernel-port.md`](as4610-kernel-port.md) |
@@ -155,19 +156,36 @@ leave every bus at its declared number in silence. It now warns, and the
 first device on that mux fails naming the bus it could not find, instead
 of a switch that boots reporting no sensors.
 
-**Scan channel 6 to confirm the PSU bay addresses**, once you have a
-device node for it:
+**Channel 6 confirms the PSU bay addresses.** It needs a device node
+first, ONIE having created none past `i2c-3`:
 
 ```sh
 mknod /dev/i2c-16 c 89 16
 i2cdetect -y 16
 ```
 
-The manifest puts the PSU EEPROMs at 0x50/0x51 from edgenos's device
-tree; ONL's driver carries a stale `normal_i2c` list naming 0x50 and
-**0x53** (unreachable -- that driver has no `.detect` callback -- so it
-was never exercised). If the scan disagrees with the DTS, the DTS is what
-gets corrected. Expect pmbus at 0x58/0x59 alongside.
+```
+50: UU UU -- -- -- -- -- -- 58 59 -- -- -- -- -- --
+70: UU
+```
+
+The EEPROMs are at **0x50 and 0x51**, as edgenos's device tree says --
+so the manifest was right and ONL's driver was wrong. Its `normal_i2c`
+list named 0x50 and **0x53**; that list was unreachable (the driver has
+no `.detect` callback, so the i2c core never consulted it) and it is
+dropped in the local port. `UU` means a driver is already bound, which
+under ONIE is its DTS claiming them.
+
+`0x58`/`0x59` are the PSU pmbus devices, where voltage/current/power
+would come from. They stay out of the manifest deliberately: pmon's
+`PsuReading` carries `present` and `ok` and nothing else, both of which
+come from the CPLD via the EEPROM client, so declaring the pmbus devices
+would create sysfs nodes with no consumer. Model them when pmon grows
+somewhere to put the readings.
+
+`0x70` is the mux answering on its own child segment -- a pca9548
+channel is the same physical wire, so the chip is still on it. Expected,
+not a second device.
 
 ### Salvage what is on `sda` before you wipe it
 

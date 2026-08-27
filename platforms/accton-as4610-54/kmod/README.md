@@ -58,8 +58,9 @@ rather than letting an older kernel fail somewhere less obvious.
 - The PSU driver's `.class = I2C_CLASS_HWMON` and `.address_list` are
   dropped. The i2c core reads both only from `i2c_detect()`, which needs
   a `.detect` callback this driver never had, so they were dead — and the
-  address list disagreed with the board's device tree besides (0x50/0x53
-  vs 0x50/0x51). Both clients are created from the manifest topology.
+  address list was wrong besides: it named 0x50/0x53, and `i2cdetect`
+  on mux channel 6 answers at 0x50/0x51, matching the device tree.
+  Both clients are created from the manifest topology.
 
 Not changed, and worth knowing when reading the diff: `sprintf` in sysfs
 show functions (`sysfs_emit` is preferred now but the buffers are safe),

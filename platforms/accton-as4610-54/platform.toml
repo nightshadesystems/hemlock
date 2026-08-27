@@ -256,10 +256,14 @@ crit_c = 65.0
 # resolves them against the PSU's resolved device dir and they survive the
 # kernel numbering the mux children differently than declared.
 #
-# Addresses come from edgenos's device tree, like the rest of the topology
-# above; ONL's driver carries a stale `normal_i2c` list naming 0x50/0x53,
-# but that list was never reachable (no `.detect` callback) and the DTS is
-# the board-specific source. Confirm with i2cdetect on channel 6 at gate 1.
+# Addresses come from edgenos's device tree and are confirmed on the box:
+# `i2cdetect` on channel 6 answers at 0x50 and 0x51. ONL's driver carried
+# a stale `normal_i2c` list naming 0x50/0x53 instead, which was never
+# reachable (no `.detect` callback) and is dropped in the local port.
+#
+# The bay's pmbus devices (0x58/0x59, seen in the same scan) are not
+# modeled: presence and power-good both come from the CPLD through the
+# EEPROM client below, and pmon has nowhere to put voltage or current.
 # ---------------------------------------------------------------------------
 
 [[hardware.psu]]
