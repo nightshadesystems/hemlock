@@ -136,7 +136,7 @@ fn as4610_declares_an_arm_openbcm_platform() {
 
     let p = platform("accton-as4610-54");
     let m = &p.manifest;
-    assert_eq!(m.platform.onie_machine, "arm-accton-as4610-54-r0");
+    assert_eq!(m.platform.onie_machine, "arm-accton_as4610_54-r0");
     assert_eq!(m.platform.cpu_arch, "armhf");
     // No PCI device to find: a pcie probe would let --auto-mock mock a
     // live switch.

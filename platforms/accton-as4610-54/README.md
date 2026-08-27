@@ -3,7 +3,9 @@
 48x1G copper + 4x10G SFP+ + 2x20G QSFP+ stacking. Broadcom BCM56340
 (Helix4) with an **on-die iProc dual-core Cortex-A9** host CPU — no PCIe,
 the CMIC is CMICd on the SoC bus. 2 GB DDR3, 8 MB SPI-NOR (U-Boot +
-ONIE), 8 GB NAND. ONIE machine string `arm-accton-as4610-54-r0`.
+ONIE) and USB-attached NOS storage. ONIE machine string
+`arm-accton_as4610_54-r0` — note the underscores; the hyphenated form in
+edgenos's switchdb does not match this box.
 
 This is Hemlock's first non-x86 board and its first non-SAI datapath.
 The reasoning, the schema additions and the phase plan are in
@@ -37,7 +39,7 @@ Run `vendor/fetch-vendor.sh accton-as4610-54` (added in phase 3):
 **This is the one input that cannot be re-fetched from a public repo.**
 The edgenos tree references a `PORTMAP.md` / `as4610-54.portmap` that is
 not published; the table below is the Cumulus Linux `porttab` for
-`arm-accton-as4610-54-r0`, read off the hardware. The map is scrambled
+`arm-accton_as4610_54-r0`, read off the hardware. The map is scrambled
 and pair-swapped — copied verbatim into `platform.toml`, never derived.
 
 ```

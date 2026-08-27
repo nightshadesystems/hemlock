@@ -111,12 +111,16 @@ fn run() -> Result<()> {
         }
     }
 
+    // Resolved before disk selection: it decides both which devices are
+    // offered and what the install does with the one chosen.
+    let boot_style = payload_boot_style(&args.payload);
+
     // --- Disk selection ---
     let disk = match (&args.disk, args.non_interactive) {
         (Some(disk), _) => disk.clone(),
         (None, true) => bail!("--non-interactive requires --disk"),
         (None, false) => {
-            let disks = install::list_disks();
+            let disks = install::list_disks(boot_style);
             match tui::select_disk(&disks, &platform_id)? {
                 Some(disk) => disk.device,
                 None => {
@@ -131,7 +135,7 @@ fn run() -> Result<()> {
         disk,
         payload: args.payload.clone(),
         platform_id,
-        boot_style: payload_boot_style(&args.payload),
+        boot_style,
         dry_run: args.dry_run,
     };
     plan.validate_payload()?;

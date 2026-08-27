@@ -6,7 +6,7 @@
 # Background and the whole plan: docs/as4610-54-port.md.
 #
 # Sources (data referenced, never code ported):
-#   Cumulus Linux porttab for arm-accton-as4610-54-r0  (faceplate -> geN)
+#   Cumulus Linux porttab for arm-accton_as4610_54-r0  (faceplate -> geN)
 #   edgenos platform/accton-as4610-54/                 (config.bcm, DTS,
 #                                                       bcmd-prep.sh)
 #   ONL packages/platforms/accton/armxx/arm-accton-as4610/  (CPLD map)
@@ -16,7 +16,7 @@ schema_version = 1
 
 [platform]
 id = "accton-as4610-54"
-onie_machine = "arm-accton-as4610-54-r0"
+onie_machine = "arm-accton_as4610_54-r0"
 vendor = "Edgecore"
 model = "AS4610-54T"
 asic_family = "broadcom-xgs"
@@ -183,15 +183,18 @@ sdk_names = ["xe0", "xe1", "xe2", "xe3"]
 # i2c1's xfer lock until userspace wedges. NTP sets the clock.
 # ---------------------------------------------------------------------------
 
+# Adapter names read off the box (ONIE 2016.05, kernel 3.2.69): the two
+# SoC controllers register as "iproc-smb0" and "iproc-smb1", one name
+# each, so they need no instance disambiguation after all. `instance`
+# stays at its default 0 — the second controller is a different *name*,
+# not a second match on the same one.
 [[hardware.i2c.root]]
 name = "cpld-bus"
-adapter = "iproc-smbus"
-instance = 0
+adapter = "iproc-smb0"
 
 [[hardware.i2c.root]]
 name = "mux-bus"
-adapter = "iproc-smbus"
-instance = 1
+adapter = "iproc-smb1"
 
 [[hardware.i2c.mux]]
 name = "main-mux"

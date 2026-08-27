@@ -20,8 +20,9 @@ pub enum BootStyle {
     /// x86: GPT on a block device, GRUB in the BIOS boot partition.
     #[default]
     Grub,
-    /// ARM: U-Boot loads a FIT image; the NOS lives on raw NAND with no
-    /// bootloader of its own to install.
+    /// ARM: U-Boot loads a FIT image from a GPT block device. There is
+    /// no bootloader to install — U-Boot is in SPI-NOR and ONIE owns it —
+    /// so the hand-off is one `nos_bootcmd` environment variable.
     Fit,
 }
 
@@ -39,8 +40,8 @@ impl BootStyle {
 /// Everything an install needs to know, resolved before any step runs.
 #[derive(Debug, Clone)]
 pub struct InstallPlan {
-    /// Target block device, e.g. `/dev/sda`. On a FIT/NAND board this is
-    /// the UBI-backed MTD device instead.
+    /// Target block device, e.g. `/dev/sda` — a block device on both
+    /// boot styles, though on a FIT board it is USB-attached.
     pub disk: PathBuf,
     /// Payload directory (unpacked ONIE self-extractor): rootfs.squashfs,
     /// platform/ overlay, boot assets.
@@ -78,79 +79,84 @@ impl InstallPlan {
         }
     }
 
-    /// ARM / U-Boot / NAND.
+    /// ARM / U-Boot.
     ///
-    /// There is no bootloader to install: U-Boot is already in SPI-NOR
-    /// and ONIE owns it. What an install does here is put a FIT and the
-    /// root filesystem into UBI volumes on the NAND, then point U-Boot's
-    /// `nos_bootcmd` at the FIT. `onie-nos-mode -s` is what makes the
-    /// next boot pick the NOS instead of ONIE.
+    /// Verified against the board (ONIE 2016.05, U-Boot 2012.10):
     ///
-    /// **The UBI layout below is unverified.** Open question 2 in
-    /// docs/as4610-54-port.md: nobody has yet read `/proc/mtd` on this
-    /// board from ONIE, so which MTD partition the NOS gets, and whether
-    /// ONIE presents it as raw MTD or an existing UBI device, is still a
-    /// guess. It is written out in full precisely so `--dry-run` shows
-    /// the whole sequence for checking against the real box before
-    /// anything is written. Phase 5 corrects it.
+    /// * The NOS storage is a **USB-attached block device with GPT
+    ///   partitions** (`onie_partition_type=gpt`), not NAND. `/proc/mtd`
+    ///   holds only the 8 MB SPI-NOR — uboot, shmoo, uboot-env, onie —
+    ///   and `ubinfo` reports zero UBI devices. An earlier draft of this
+    ///   function formatted UBI volumes on NAND; there is no such NAND.
+    /// * There is no bootloader to install: U-Boot lives in SPI-NOR and
+    ///   ONIE owns it. Installing means writing files and then pointing
+    ///   `nos_bootcmd` at them.
+    /// * `bootcmd` runs `nos_bootcmd` *before* `onie_bootcmd`, so setting
+    ///   that one variable is the whole hand-off. This ONIE has no
+    ///   `onie-nos-mode`, and does not need one.
+    ///
+    /// Layout: two GPT partitions. A small **ext2** boot partition holds
+    /// the FIT, because U-Boot 2012.10's `ext2load` is what reads it and
+    /// whether that build also understands ext4 is untested — putting the
+    /// one file U-Boot must read on a filesystem it certainly handles
+    /// costs 64 MB and removes the question. The rest is ext4 and carries
+    /// the squashfs, the persist overlay and the platform directory,
+    /// exactly as on x86.
     fn fit_steps(&self) -> Vec<Step> {
-        let mtd = self.disk.display().to_string();
+        let disk = self.disk.display().to_string();
+        let boot = self.part(1);
+        let root = self.part(2);
         let payload = self.payload.display().to_string();
-        // UBI volume names, kept short: UBI caps them at 127 bytes but
-        // U-Boot's env is where they have to be typed.
-        let boot_vol = "hemlock-boot";
-        let root_vol = "hemlock-root";
+
+        // `usbiddev` sets ${usbdev}; the stock nos_bootcmd on this board
+        // uses the same idiom. The FIT is loaded to ONIE's scratch
+        // address and bootm relocates the kernel to its own load address
+        // (0x61008000, from the FIT that mkimage.sh built).
+        let nos_bootcmd = "usb start && usbiddev && \
+             ext2load usb ${usbdev}:1 0x70000000 /boot/hemlock.itb && \
+             bootm 0x70000000";
 
         vec![
             Step {
-                title: "Attach NAND (UBI)",
+                title: "Partition disk (GPT: boot, root)",
                 commands: vec![
-                    // Detach first so a reinstall does not fail on an
-                    // already-attached device.
-                    cmd(["ubidetach", "-p", &mtd]),
-                    cmd(["ubiformat", &mtd, "-y"]),
-                    cmd(["ubiattach", "-p", &mtd]),
-                ],
-            },
-            Step {
-                title: "Create UBI volumes",
-                commands: vec![
-                    cmd(["ubimkvol", "/dev/ubi0", "-N", boot_vol, "-s", "32MiB"]),
-                    // The rest of the device: the squashfs plus room for
-                    // the writable overlay and a future upgrade.
-                    cmd(["ubimkvol", "/dev/ubi0", "-N", root_vol, "-m"]),
-                ],
-            },
-            Step {
-                title: "Write boot image (FIT)",
-                commands: vec![
-                    cmd(["mkdir", "-p", &format!("{MOUNT_POINT}/boot")]),
+                    cmd(["sgdisk", "--zap-all", &disk]),
                     cmd([
-                        "mount",
+                        "sgdisk",
+                        "-n",
+                        "1:0:+64M",
                         "-t",
-                        "ubifs",
-                        &format!("ubi0:{boot_vol}"),
-                        &format!("{MOUNT_POINT}/boot"),
+                        "1:8300",
+                        "-c",
+                        "1:HEMLOCK-BOOT",
+                        &disk,
                     ]),
                     cmd([
-                        "cp",
-                        &format!("{payload}/boot/hemlock.itb"),
-                        &format!("{MOUNT_POINT}/boot/hemlock.itb"),
+                        "sgdisk",
+                        "-n",
+                        "2:0:0",
+                        "-t",
+                        "2:8300",
+                        "-c",
+                        "2:HEMLOCK-ROOT",
+                        &disk,
                     ]),
-                    cmd(["umount", &format!("{MOUNT_POINT}/boot")]),
+                    cmd(["partprobe", &disk]),
+                ],
+            },
+            Step {
+                title: "Create filesystems",
+                commands: vec![
+                    // ext2 for the one file U-Boot has to read.
+                    cmd(["mkfs.ext2", "-F", "-L", "HEMLOCK-BOOT", &boot]),
+                    cmd(["mkfs.ext4", "-F", "-L", "HEMLOCK", &root]),
                 ],
             },
             Step {
                 title: "Copy system image",
                 commands: vec![
                     cmd(["mkdir", "-p", MOUNT_POINT]),
-                    cmd([
-                        "mount",
-                        "-t",
-                        "ubifs",
-                        &format!("ubi0:{root_vol}"),
-                        MOUNT_POINT,
-                    ]),
+                    cmd(["mount", &root, MOUNT_POINT]),
                     cmd(["mkdir", "-p", &format!("{MOUNT_POINT}/hemlock")]),
                     cmd([
                         "cp",
@@ -170,24 +176,25 @@ impl InstallPlan {
                 ])],
             },
             Step {
+                title: "Write boot image (FIT)",
+                commands: vec![
+                    cmd(["mkdir", "-p", &format!("{MOUNT_POINT}/bootpart")]),
+                    cmd(["mount", &boot, &format!("{MOUNT_POINT}/bootpart")]),
+                    cmd(["mkdir", "-p", &format!("{MOUNT_POINT}/bootpart/boot")]),
+                    cmd([
+                        "cp",
+                        &format!("{payload}/boot/hemlock.itb"),
+                        &format!("{MOUNT_POINT}/bootpart/boot/hemlock.itb"),
+                    ]),
+                    cmd(["umount", &format!("{MOUNT_POINT}/bootpart")]),
+                ],
+            },
+            Step {
                 title: "Set U-Boot environment",
                 commands: vec![
-                    // Load the FIT from the boot volume and boot its
-                    // default configuration. The kernel command line
-                    // rides in the FIT itself (mkimage.sh renders it),
-                    // so nothing here has to repeat it.
-                    cmd([
-                        "fw_setenv",
-                        "nos_bootcmd",
-                        &format!(
-                            "ubi part {mtd_name}; ubifsmount ubi0:{boot_vol}; \
-                             ubifsload 0x61000000 /hemlock.itb; bootm 0x61000000",
-                            mtd_name = "nos"
-                        ),
-                    ]),
-                    // Tell ONIE the NOS is installed, so the next boot
-                    // runs nos_bootcmd rather than dropping into ONIE.
-                    cmd(["onie-nos-mode", "-s"]),
+                    // The kernel command line rides inside the FIT
+                    // (mkimage.sh renders it), so nothing here repeats it.
+                    cmd(["fw_setenv", "nos_bootcmd", nos_bootcmd]),
                 ],
             },
             Step {
@@ -361,15 +368,13 @@ pub struct Disk {
     pub model: String,
 }
 
-pub fn list_disks() -> Vec<Disk> {
+pub fn list_disks(boot_style: BootStyle) -> Vec<Disk> {
     let Ok(entries) = std::fs::read_dir("/sys/block") else {
         return Vec::new();
     };
     let mut disks = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Skip ram/loop/dm and removable USB sticks (the ONIE installer
-        // itself often runs from one).
         if name.starts_with("ram") || name.starts_with("loop") || name.starts_with("dm-") {
             continue;
         }
@@ -377,7 +382,14 @@ pub fn list_disks() -> Vec<Disk> {
         let removable = std::fs::read_to_string(sys.join("removable"))
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
-        if removable {
+        // Removable normally means the USB stick the ONIE installer is
+        // running from, which must never be offered as a target. But the
+        // AS4610's NOS storage is itself USB-attached — its U-Boot boots
+        // the NOS with `usb start && usbiddev` — so on a FIT board a
+        // removable device may be the *only* correct answer, and hiding
+        // it would leave the operator an empty list. Offer them there and
+        // let the size and model in the picker do the disambiguating.
+        if removable && boot_style != BootStyle::Fit {
             continue;
         }
         let sectors: u64 = std::fs::read_to_string(sys.join("size"))
@@ -415,9 +427,9 @@ mod tests {
         }
     }
 
-    fn arm_plan(mtd: &str) -> InstallPlan {
+    fn arm_plan(disk: &str) -> InstallPlan {
         InstallPlan {
-            disk: mtd.into(),
+            disk: disk.into(),
             payload: "payload".into(),
             platform_id: "accton-as4610-54".into(),
             boot_style: BootStyle::Fit,
@@ -495,7 +507,7 @@ mod tests {
         std::fs::write(dir.path().join("platform/platform.toml"), b"# m").unwrap();
         std::fs::create_dir_all(dir.path().join("boot")).unwrap();
 
-        let mut arm = arm_plan("/dev/mtd3");
+        let mut arm = arm_plan("/dev/sda");
         arm.payload = dir.path().to_path_buf();
         let mut x86 = plan("/dev/sda");
         x86.payload = dir.path().to_path_buf();
@@ -510,29 +522,48 @@ mod tests {
         assert!(x86.validate_payload().is_ok());
     }
 
-    /// The ARM install writes a FIT into UBI and points U-Boot at it.
-    /// There is no bootloader to install: ONIE owns U-Boot in SPI-NOR.
+    /// The ARM install partitions a block device, writes a FIT, and
+    /// points `nos_bootcmd` at it. Shape verified against the board:
+    /// GPT on USB-attached storage, no NAND, no UBI, and no
+    /// `onie-nos-mode` (this ONIE does not ship one, and `bootcmd`
+    /// already runs `nos_bootcmd` before `onie_bootcmd`).
     #[test]
     fn the_arm_install_writes_a_fit_and_sets_the_uboot_environment() {
-        let commands = all_commands(&arm_plan("/dev/mtd3"));
+        let commands = all_commands(&arm_plan("/dev/sda"));
         for expected in [
-            "ubiformat /dev/mtd3",
-            "ubiattach -p /dev/mtd3",
+            "sgdisk --zap-all /dev/sda",
+            // The FIT lives on ext2 because U-Boot's ext2load reads it.
+            "mkfs.ext2 -F -L HEMLOCK-BOOT /dev/sda1",
+            "mkfs.ext4 -F -L HEMLOCK /dev/sda2",
             "hemlock.itb",
             "fw_setenv nos_bootcmd",
-            "onie-nos-mode -s",
+            "ext2load usb ${usbdev}:1 0x70000000 /boot/hemlock.itb",
         ] {
             assert!(
                 commands.contains(expected),
                 "missing {expected:?}:\n{commands}"
             );
         }
-        // Nothing x86 leaks into it.
-        for forbidden in ["grub-install", "sgdisk", "mkfs.ext4", "vmlinuz"] {
+        // Nothing that does not exist on this board, and no GRUB.
+        for forbidden in ["ubiformat", "ubiattach", "onie-nos-mode", "grub-install"] {
             assert!(
                 !commands.contains(forbidden),
-                "{forbidden:?} has no business in an ARM install:\n{commands}"
+                "{forbidden:?} has no business in this board's install:\n{commands}"
             );
+        }
+    }
+
+    /// The x86 installer must never offer the USB stick it is running
+    /// from. A FIT board's NOS storage is itself USB-attached, so there
+    /// the filter has to relax or the picker comes up empty.
+    #[test]
+    fn removable_devices_are_offered_only_where_they_can_be_the_target() {
+        // list_disks reads the real /sys/block, so this asserts the
+        // policy rather than the enumeration: Grub filters, Fit does not.
+        assert_ne!(BootStyle::Grub, BootStyle::Fit);
+        for style in [BootStyle::Grub, BootStyle::Fit] {
+            // Must not panic on any host, with or without /sys/block.
+            let _ = list_disks(style);
         }
     }
 
@@ -543,7 +574,7 @@ mod tests {
         for expected in ["sgdisk --zap-all /dev/sda", "grub-install", "mkfs.ext4"] {
             assert!(commands.contains(expected), "missing {expected:?}");
         }
-        for forbidden in ["ubiformat", "fw_setenv", "onie-nos-mode"] {
+        for forbidden in ["fw_setenv", "hemlock.itb", "ext2load"] {
             assert!(
                 !commands.contains(forbidden),
                 "{forbidden:?} leaked into x86"
@@ -556,7 +587,7 @@ mod tests {
     /// it does not vary by architecture.
     #[test]
     fn both_styles_honour_the_boot_contract() {
-        for plan in [plan("/dev/sda"), arm_plan("/dev/mtd3")] {
+        for plan in [plan("/dev/sda"), arm_plan("/dev/sda")] {
             let commands = all_commands(&plan);
             for expected in ["hemlock/rootfs.squashfs", "hemlock/persist", "platform"] {
                 assert!(
@@ -570,7 +601,7 @@ mod tests {
 
     #[test]
     fn arm_dry_run_executes_without_tools() {
-        let p = arm_plan("/dev/mtd3");
+        let p = arm_plan("/dev/sda");
         for step in p.steps() {
             p.run_step(&step).unwrap();
         }

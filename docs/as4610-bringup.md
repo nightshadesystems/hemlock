@@ -57,7 +57,7 @@ Boot to ONIE (`ONIE: Rescue` or `ONIE: Install OS`) and capture all of
 this. It is quick, it is safe, and it closes open questions 1–4.
 
 ```sh
-onie-sysinfo -p                 # expect: arm-accton-as4610-54-r0
+onie-sysinfo -p                 # expect: arm-accton_as4610_54-r0
 cat /etc/machine.conf           # onie_arch=arm, onie_machine, onie_machine_rev
 cat /proc/mtd                   # the NAND partition table
 cat /proc/cmdline
