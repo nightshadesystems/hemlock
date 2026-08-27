@@ -499,9 +499,22 @@ fn print_probe_report(handle: &actor::SaiHandle) {
     };
     let mut ports: Vec<_> = table.values().collect();
     ports.sort_by_key(|p| p.def.index);
+    // The SDK column is only meaningful on a backend that names its
+    // ports (OpenBCM does; SAI identifies them by object id), and it is
+    // what a bring-up porttab spot-check reads: cable faceplate 1 and
+    // the port that comes up should be the SDK name the map predicts.
+    // Startup has already asserted these against what the backend
+    // reports, so what prints here is the verified name, not a wish.
+    let show_sdk = ports.iter().any(|p| p.def.sdk_name.is_some());
     println!(
-        "{:<12} {:>5} {:>8} {:<14} {:>5} {:>4}  SAI OID",
-        "Port", "Index", "Speed", "Lanes", "Admin", "Oper"
+        "{:<12} {:>5} {:>8} {:<14} {:<6} {:>5} {:>4}  SAI OID",
+        "Port",
+        "Index",
+        "Speed",
+        "Lanes",
+        if show_sdk { "SDK" } else { "" },
+        "Admin",
+        "Oper"
     );
     for port in ports {
         let lanes = port
@@ -512,11 +525,12 @@ fn print_probe_report(handle: &actor::SaiHandle) {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{:<12} {:>5} {:>8} {:<14} {:>5} {:>4}  {}",
+            "{:<12} {:>5} {:>8} {:<14} {:<6} {:>5} {:>4}  {}",
             port.def.name,
             port.def.index,
             format!("{}M", port.def.speed_mbps),
             lanes,
+            port.def.sdk_name.as_deref().unwrap_or(""),
             if port.admin_up { "up" } else { "down" },
             if port.oper_up { "up" } else { "down" },
             port.sai_id,

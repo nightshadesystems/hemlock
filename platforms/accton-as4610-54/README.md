@@ -105,6 +105,13 @@ CPLD register map, from ONL's
 | `0x2c`, `0x2d` | Fan 2 / fan 1 tach; rpm = `raw * 379 * 60 / 2 / 100` |
 | `0x07`, `0x08`, `0x0d`, `0x19`, `0x1b` | External-PHY reset deassert (see below) |
 
+## Bring-up
+
+The gate-by-gate runbook for taking this board from "builds" to
+"forwards" is [docs/as4610-bringup.md](../../docs/as4610-bringup.md).
+Start with its gate 1: a handful of read-only commands in ONIE that
+close four of the port's open questions.
+
 ## Known quirks
 
 - **The external PHYs come up held in reset.** Until the CPLD at i2c-0
@@ -113,7 +120,7 @@ CPLD register map, from ONL's
   the SDK's PHY probe finds nothing. The CMICd platform driver must also
   be unbound (`48000000.iproc_cmicd` from `iproc_cmic`) before the BDE
   can claim the device. Both live in the `as4610` quirks driver's
-  `pre_asic_init`, landing in phase 3 with the shim.
+  `pre_asic_init`.
 - **Fans and PSUs are not modeled yet.** Both are read through the CPLD,
   and pmon reads fans and PSU state from sysfs — so which attributes
   exist depends on an unresolved question in the port spec: port ONL's
