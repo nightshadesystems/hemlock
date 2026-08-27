@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 4
+#define HEMLOCKBCM_ABI_MINOR 5
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -93,6 +93,15 @@ extern "C" {
 #define HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS (-6)
 #define HEMLOCKBCM_ERR_ITEM_NOT_FOUND (-7)
 #define HEMLOCKBCM_ERR_NOT_IMPLEMENTED (-15)
+
+/*
+ * Port forwarding states within a spanning-tree group. Deliberately the
+ * three Hemlock actually drives: 802.1D's listen and disable never reach
+ * the datapath from above.
+ */
+#define HEMLOCKBCM_STP_BLOCKING   0
+#define HEMLOCKBCM_STP_LEARNING   1
+#define HEMLOCKBCM_STP_FORWARDING 2
 
 /* Which fields narrow a flush_fdb call; see that slot. */
 #define HEMLOCKBCM_FLUSH_VLAN 0x1u
@@ -382,12 +391,55 @@ struct hemlockbcm_api {
      */
     int (*lag_set_pvid)(struct hemlockbcm_switch *sw, uint32_t tid, uint16_t vlan_id);
 
+    /* --- Spanning tree (ABI 1.5) ------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: STP, mirroring, storm
-     * control, ACLs/policers/CoPP, sFlow and QoS. Each lands as one slot
-     * appended here plus the matching Rust method, with the minor
-     * bumped. Until then Rust reports those families unsupported, which
-     * is the truth and which both consoles already handle.
+     * An STP instance is an SDK spanning-tree group (STG). As with VLANs
+     * and trunks, the caller derives its object id from the group id.
+     *
+     * A VLAN belongs to exactly one group, so assigning it to a new one
+     * is a move, not an addition.
+     */
+
+    /* The group every VLAN starts in. Always exists; cannot be created
+     * or destroyed. */
+    int (*stp_default)(struct hemlockbcm_switch *sw, uint32_t *stg);
+    int (*stp_create)(struct hemlockbcm_switch *sw, uint32_t *stg);
+    /* Its VLANs must have moved elsewhere first. */
+    int (*stp_destroy)(struct hemlockbcm_switch *sw, uint32_t stg);
+
+    /* Move `vlan_id` into `stg`, out of whichever group holds it now. */
+    int (*stp_vlan_set)(struct hemlockbcm_switch *sw, uint32_t stg, uint16_t vlan_id);
+
+    /*
+     * A port's forwarding state within one group. `state` is one of the
+     * HEMLOCKBCM_STP_* values below, which are a smaller set than the
+     * SDK's: Hemlock never drives listen or disable, so a shim that maps
+     * them onto its hardware's nearest equivalent is not making a
+     * decision anyone above depends on.
+     */
+    int (*stp_port_state)(struct hemlockbcm_switch *sw, uint32_t stg,
+                          uint32_t logical_port, int state);
+    /*
+     * The same for a trunk. Like PVID this has no trunk-wide form in the
+     * hardware -- forwarding state is per port -- so the shim applies it
+     * to every member, gated-closed ones included.
+     *
+     * Unlike PVID it is NOT inherited by a member that joins later, and
+     * the caller must re-apply it after a membership change. The reason
+     * is structural rather than laziness: a port has a forwarding state
+     * in every group at once, so there is no single value for a joining
+     * member to take, whereas a port has exactly one PVID.
+     */
+    int (*lag_stp_port_state)(struct hemlockbcm_switch *sw, uint32_t stg,
+                              uint32_t tid, int state);
+
+    /*
+     * Everything below is the rest of phase 6: mirroring, storm control,
+     * ACLs/policers/CoPP, sFlow and QoS. Each lands as one slot appended
+     * here plus the matching Rust method, with the minor bumped. Until
+     * then Rust reports those families unsupported, which is the truth
+     * and which both consoles already handle.
      */
 };
 

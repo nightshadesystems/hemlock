@@ -33,6 +33,9 @@
 #define STUB_DEFAULT_VLAN 1
 #define STUB_FDB 8
 #define STUB_LAGS 2
+#define STUB_STGS 2
+/* The SDK's own default spanning-tree group id. */
+#define STUB_DEFAULT_STG 1
 
 /*
  * Enough VLAN state to be worth testing against: which VLANs exist, who
@@ -54,6 +57,15 @@ struct stub_vlan {
     int lag_used[STUB_LAGS];
     uint32_t lags[STUB_LAGS];
     int lag_tagged[STUB_LAGS];
+    /* Exactly one spanning-tree group holds a VLAN at any time. */
+    uint32_t stg;
+};
+
+/* A spanning-tree group other than the default one. */
+struct stub_stg {
+    int used;
+    uint32_t stg;
+    int port_state[STUB_PORTS];
 };
 
 /*
@@ -90,6 +102,10 @@ struct hemlockbcm_switch {
     struct stub_vlan vlans[STUB_VLANS];
     struct stub_fdb fdb[STUB_FDB];
     struct stub_lag lags[STUB_LAGS];
+    struct stub_stg stgs[STUB_STGS];
+    /* The default group is always there, so its per-port state lives
+       here rather than in the table above. */
+    int default_stg_state[STUB_PORTS];
     uint16_t pvid[STUB_PORTS];
     uint16_t tpid[STUB_PORTS];
     uint32_t fdb_aging;
@@ -143,6 +159,7 @@ static int stub_create_switch(struct hemlockbcm_switch **out,
     /* Every port starts an untagged member of the default VLAN with a
      * matching PVID, which is where a real chip comes up too. */
     sw->vlans[0].vlan_id = STUB_DEFAULT_VLAN;
+    sw->vlans[0].stg = STUB_DEFAULT_STG;
     for (i = 0; i < STUB_PORTS; i++) {
         sw->vlans[0].member_used[i] = 1;
         sw->vlans[0].members[i] = sw->ports[i].logical_port;
@@ -150,6 +167,7 @@ static int stub_create_switch(struct hemlockbcm_switch **out,
         sw->pvid[i] = STUB_DEFAULT_VLAN;
         sw->tpid[i] = 0x8100;
         sw->learning[i] = 1;    /* learning on, like a chip out of reset */
+        sw->default_stg_state[i] = HEMLOCKBCM_STP_FORWARDING;
         sw->learn_limit[i] = -1;
     }
     sw->created = 1;
@@ -338,6 +356,7 @@ static int stub_create_vlan(struct hemlockbcm_switch *sw, uint16_t vlan_id)
         if (sw->vlans[i].vlan_id == 0) {
             memset(&sw->vlans[i], 0, sizeof(sw->vlans[i]));
             sw->vlans[i].vlan_id = vlan_id;
+            sw->vlans[i].stg = STUB_DEFAULT_STG;
             return HEMLOCKBCM_OK;
         }
     }
@@ -780,7 +799,10 @@ static int stub_lag_member_add(struct hemlockbcm_switch *sw, uint32_t tid,
             lag->member_enabled[i] = enabled ? 1 : 0;
             /* A member joining picks up the trunk's ingress
              * classification, the same way lag_set_pvid applies it to
-             * the members already there. */
+             * the members already there. The real shim has no trunk-wide
+             * PVID to read, so it takes the same value off a member
+             * already in the trunk; the observable result is identical,
+             * which is what the ABI specifies. */
             if (lag->pvid != 0) {
                 struct hemlockbcm_port *port = find_port(sw, logical_port);
                 sw->pvid[port - sw->ports] = lag->pvid;
@@ -956,6 +978,178 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_vlan_lag(struct hemlockbcm_switch *sw,
     return -1;
 }
 
+/* --- Spanning tree (ABI 1.5) -------------------------------------------- */
+
+static struct stub_stg *find_stg(struct hemlockbcm_switch *sw, uint32_t stg)
+{
+    size_t i;
+    for (i = 0; i < STUB_STGS; i++) {
+        if (sw->stgs[i].used && sw->stgs[i].stg == stg) {
+            return &sw->stgs[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_stp_default(struct hemlockbcm_switch *sw, uint32_t *stg)
+{
+    if (sw == NULL || stg == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    *stg = STUB_DEFAULT_STG;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_stp_create(struct hemlockbcm_switch *sw, uint32_t *stg)
+{
+    size_t i;
+
+    if (sw == NULL || stg == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_STGS; i++) {
+        if (!sw->stgs[i].used) {
+            memset(&sw->stgs[i], 0, sizeof(sw->stgs[i]));
+            sw->stgs[i].used = 1;
+            /* Ids above the default one, which always exists. */
+            sw->stgs[i].stg = STUB_DEFAULT_STG + (uint32_t)i + 1;
+            *stg = sw->stgs[i].stg;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_stp_destroy(struct hemlockbcm_switch *sw, uint32_t stg)
+{
+    struct stub_stg *group;
+    size_t i;
+
+    if (sw == NULL || stg == STUB_DEFAULT_STG) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    group = find_stg(sw, stg);
+    if (group == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_VLANS; i++) {
+        if (sw->vlans[i].vlan_id != 0 && sw->vlans[i].stg == stg) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* VLANs must move first */
+        }
+    }
+    memset(group, 0, sizeof(*group));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_stp_vlan_set(struct hemlockbcm_switch *sw, uint32_t stg, uint16_t vlan_id)
+{
+    struct stub_vlan *vlan;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (stg != STUB_DEFAULT_STG && find_stg(sw, stg) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    if (vlan == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* One group per VLAN, so this is a move rather than an addition. */
+    vlan->stg = stg;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_stp_apply(struct hemlockbcm_switch *sw, uint32_t stg,
+                          uint32_t logical_port, int state)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+    struct stub_stg *group;
+
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (stg == STUB_DEFAULT_STG) {
+        sw->default_stg_state[port - sw->ports] = state;
+        return HEMLOCKBCM_OK;
+    }
+    group = find_stg(sw, stg);
+    if (group == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    group->port_state[port - sw->ports] = state;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_stp_port_state(struct hemlockbcm_switch *sw, uint32_t stg,
+                               uint32_t logical_port, int state)
+{
+    if (sw == NULL || state < HEMLOCKBCM_STP_BLOCKING ||
+        state > HEMLOCKBCM_STP_FORWARDING) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return stub_stp_apply(sw, stg, logical_port, state);
+}
+
+static int stub_lag_stp_port_state(struct hemlockbcm_switch *sw, uint32_t stg,
+                                   uint32_t tid, int state)
+{
+    struct stub_lag *lag;
+    size_t i;
+
+    if (sw == NULL || state < HEMLOCKBCM_STP_BLOCKING ||
+        state > HEMLOCKBCM_STP_FORWARDING) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    lag = find_lag(sw, tid);
+    if (lag == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* Every member, gated-closed ones included. Not inherited on join:
+     * a port has a state in every group, so there is nothing single to
+     * inherit. */
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (lag->member_used[i]) {
+            int status = stub_stp_apply(sw, stg, lag->members[i], state);
+            if (status != HEMLOCKBCM_OK) {
+                return status;
+            }
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_stp_state(struct hemlockbcm_switch *sw,
+                                                uint32_t stg, uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+    struct stub_stg *group;
+
+    if (sw == NULL || port == NULL) {
+        return -1;
+    }
+    if (stg == STUB_DEFAULT_STG) {
+        return sw->default_stg_state[port - sw->ports];
+    }
+    group = find_stg(sw, stg);
+    return group == NULL ? -1 : group->port_state[port - sw->ports];
+}
+
+/* The group holding a VLAN, or 0 if there is no such VLAN. */
+HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_vlan_stg(struct hemlockbcm_switch *sw,
+                                                    uint16_t vlan_id)
+{
+    struct stub_vlan *vlan;
+
+    if (sw == NULL) {
+        return 0;
+    }
+    vlan = find_vlan(sw, vlan_id);
+    return vlan == NULL ? 0 : vlan->stg;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -993,6 +1187,12 @@ static const struct hemlockbcm_api STUB_API = {
     stub_lag_vlan_member_add,
     stub_lag_vlan_member_remove,
     stub_lag_set_pvid,
+    stub_stp_default,
+    stub_stp_create,
+    stub_stp_destroy,
+    stub_stp_vlan_set,
+    stub_stp_port_state,
+    stub_lag_stp_port_state,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

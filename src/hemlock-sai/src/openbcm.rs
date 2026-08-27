@@ -65,6 +65,13 @@ const ERR_NOT_IMPLEMENTED: i32 = -15;
 const ERR_ITEM_ALREADY_EXISTS: i32 = -6;
 const ERR_ITEM_NOT_FOUND: i32 = -7;
 
+/// `HEMLOCKBCM_STP_*`: the three forwarding states Hemlock drives.
+/// 802.1D's listen and disable never reach the datapath from above, so
+/// the ABI does not carry them.
+const STP_BLOCKING: std::os::raw::c_int = 0;
+const STP_LEARNING: std::os::raw::c_int = 1;
+const STP_FORWARDING: std::os::raw::c_int = 2;
+
 /// `HEMLOCKBCM_FLUSH_VLAN` / `HEMLOCKBCM_FLUSH_PORT`: which of a
 /// `flush_fdb` call's arguments narrow the flush. Flags rather than
 /// sentinel values because logical port 0 is a real port.
@@ -204,6 +211,16 @@ struct Api {
         Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32, std::os::raw::c_int) -> Status>,
     lag_vlan_member_remove: Option<unsafe extern "C" fn(*mut ShimSwitch, u16, u32) -> Status>,
     lag_set_pvid: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16) -> Status>,
+
+    // --- ABI 1.5: spanning tree --------------------------------------
+    stp_default: Option<unsafe extern "C" fn(*mut ShimSwitch, *mut u32) -> Status>,
+    stp_create: Option<unsafe extern "C" fn(*mut ShimSwitch, *mut u32) -> Status>,
+    stp_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    stp_vlan_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16) -> Status>,
+    stp_port_state:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
+    lag_stp_port_state:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
 }
 
 impl Api {
@@ -288,6 +305,16 @@ fn oid_lag_member(oid: Oid) -> (u32, PortId) {
         ((oid.0 >> 32) & 0x00ff_ffff) as u32,
         PortId(oid.0 & 0xffff_ffff),
     )
+}
+
+const OID_TAG_STP: u64 = 0x05;
+
+fn stp_oid(stg: u32) -> Oid {
+    Oid((OID_TAG_STP << 56) | u64::from(stg))
+}
+
+fn oid_stg(oid: Oid) -> u32 {
+    oid.0 as u32
 }
 
 fn lag_vlan_member_oid(vlan_id: u16, tid: u32) -> Oid {
@@ -564,6 +591,23 @@ impl OpenBcmBackend {
         }
     }
 
+    /// An STP argument the trait spells `Option<Oid>`, where `None`
+    /// means the default instance -- which the shim reports rather than
+    /// this side assuming the SDK's usual value of 1.
+    fn stg_or_default(&self, stp: Option<Oid>) -> Result<u32, SaiError> {
+        match stp {
+            Some(stp) => Ok(oid_stg(stp)),
+            None => {
+                let f = slot!(self, stp_default, "stp_default")?;
+                let sw = self.switch()?;
+                let mut stg: u32 = 0;
+                // SAFETY: `stg` is a live u32 the shim writes only on OK.
+                check("stp_default", unsafe { f(sw, &mut stg) })?;
+                Ok(stg)
+            }
+        }
+    }
+
     /// Shared by `add_vlan_member` and `restore_port_default_vlan`,
     /// which differ only in what they do with the status.
     fn vlan_member_add(&self, vlan_id: u16, port: PortId, tagged: bool) -> Result<(), SaiError> {
@@ -820,7 +864,7 @@ impl SaiBackend for OpenBcmBackend {
         // so the flags cannot drift from the implementation.
         Ok(SaiCapabilities {
             lag: slot!(self, lag_create, "lag_create").is_ok(),
-            stp: false,
+            stp: slot!(self, stp_create, "stp_create").is_ok(),
             fdb_flush: slot!(self, flush_fdb, "flush_fdb").is_ok(),
             fdb_aging: slot!(self, set_fdb_aging, "set_fdb_aging").is_ok(),
             l2mc: false,
@@ -1230,29 +1274,70 @@ impl SaiBackend for OpenBcmBackend {
         })
     }
 
+    // --- Spanning tree (ABI 1.5) --------------------------------------
+    //
+    // An STP instance is an SDK spanning-tree group, and its id is
+    // derived from the group id like every other object here. `None`
+    // means the default group, which the shim reports rather than this
+    // side assuming it.
+
     fn create_stp_instance(&mut self) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_stp_instance")
+        let f = slot!(self, stp_create, "stp_create")?;
+        let sw = self.switch()?;
+        let mut stg: u32 = 0;
+        // SAFETY: `stg` is a live u32 the shim writes only on OK.
+        check("stp_create", unsafe { f(sw, &mut stg) })?;
+        Ok(stp_oid(stg))
     }
 
-    fn remove_stp_instance(&mut self, _stp: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_stp_instance")
+    fn remove_stp_instance(&mut self, stp: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, stp_destroy, "stp_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("stp_destroy", unsafe { f(sw, oid_stg(stp)) })
     }
 
     fn set_vlan_stp_instance(
         &mut self,
-        _vlan: Option<Oid>,
-        _stp: Option<Oid>,
+        vlan: Option<Oid>,
+        stp: Option<Oid>,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("set_vlan_stp_instance")
+        let f = slot!(self, stp_vlan_set, "stp_vlan_set")?;
+        let vlan_id = self.vlan_id_or_default(vlan)?;
+        let stg = self.stg_or_default(stp)?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("stp_vlan_set", unsafe { f(sw, stg, vlan_id) })
     }
 
     fn set_stp_port_state(
         &mut self,
-        _stp: Option<Oid>,
-        _port: PortId,
-        _state: StpPortState,
+        stp: Option<Oid>,
+        port: PortId,
+        state: StpPortState,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("set_stp_port_state")
+        let stg = self.stg_or_default(stp)?;
+        let state = match state {
+            StpPortState::Blocking => STP_BLOCKING,
+            StpPortState::Learning => STP_LEARNING,
+            StpPortState::Forwarding => STP_FORWARDING,
+        };
+        // Port-like, so a LAG id is legal here too and reaches every
+        // member. Unlike PVID this is not inherited on join: a port has
+        // a state in every group at once, so there is no single value to
+        // inherit, and the caller re-applies after a membership change.
+        if let Some(tid) = lag_tid_of(port) {
+            let f = slot!(self, lag_stp_port_state, "lag_stp_port_state")?;
+            let sw = self.switch()?;
+            // SAFETY: plain scalars over the ABI.
+            return check("lag_stp_port_state", unsafe { f(sw, stg, tid, state) });
+        }
+        let f = slot!(self, stp_port_state, "stp_port_state")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("stp_port_state", unsafe {
+            f(sw, stg, port.0 as u32, state)
+        })
     }
 
     fn create_l2mc_group(&mut self) -> Result<Oid, SaiError> {
@@ -1656,11 +1741,11 @@ mod tests {
     }
 
     /// Everything phase 6 has not reached yet takes the same path.
-    /// VLANs, the FDB and LAGs have left this list; the rest has not.
+    /// VLANs, the FDB, LAGs and STP have left this list; the rest has
+    /// not.
     #[test]
     fn phase_six_families_are_unsupported() {
         let mut b = backend();
-        assert!(b.create_stp_instance().unwrap_err().is_unsupported());
         assert!(b.create_samplepacket(1024).unwrap_err().is_unsupported());
         assert!(b.run_cable_diag(PortId(1)).unwrap_err().is_unsupported());
         assert!(b
@@ -1692,8 +1777,8 @@ mod tests {
             "ABI 1.3"
         );
         assert!(caps.lag, "ABI 1.4");
+        assert!(caps.stp, "ABI 1.5");
         for (name, on) in [
-            ("stp", caps.stp),
             ("l2mc", caps.l2mc),
             ("storm_control", caps.storm_control),
             ("acl_ingress", caps.acl_ingress),
@@ -1804,6 +1889,12 @@ mod tests {
             lag_vlan_member_add: None,
             lag_vlan_member_remove: None,
             lag_set_pvid: None,
+            stp_default: None,
+            stp_create: None,
+            stp_destroy: None,
+            stp_vlan_set: None,
+            stp_port_state: None,
+            lag_stp_port_state: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -1901,6 +1992,12 @@ mod tests {
             "lag_vlan_member_add",
             "lag_vlan_member_remove",
             "lag_set_pvid",
+            "stp_default",
+            "stp_create",
+            "stp_destroy",
+            "stp_vlan_set",
+            "stp_port_state",
+            "lag_stp_port_state",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -1971,6 +2068,12 @@ mod tests {
             std::mem::offset_of!(Api, lag_vlan_member_add),
             std::mem::offset_of!(Api, lag_vlan_member_remove),
             std::mem::offset_of!(Api, lag_set_pvid),
+            std::mem::offset_of!(Api, stp_default),
+            std::mem::offset_of!(Api, stp_create),
+            std::mem::offset_of!(Api, stp_destroy),
+            std::mem::offset_of!(Api, stp_vlan_set),
+            std::mem::offset_of!(Api, stp_port_state),
+            std::mem::offset_of!(Api, lag_stp_port_state),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -2413,5 +2516,117 @@ mod tests {
                 "tag {tag:#x} is used by two id families"
             );
         }
+    }
+    // --- Spanning tree -------------------------------------------------
+
+    /// -1 = no such group or port, else the HEMLOCKBCM_STP_* value.
+    fn stub_stp(b: &OpenBcmBackend, stg: u32, port: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_stp_state\0").unwrap();
+            f(b.switch, stg, port)
+        }
+    }
+
+    /// The group holding a VLAN, or 0 if there is no such VLAN.
+    fn stub_vlan_stg(b: &OpenBcmBackend, vlan_id: u16) -> u32 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u16) -> u32> =
+                b._library.get(b"hemlockbcm_stub_vlan_stg\0").unwrap();
+            f(b.switch, vlan_id)
+        }
+    }
+
+    /// A VLAN is in exactly one group, so assigning it to another is a
+    /// move. Getting that wrong leaves it in two, and the SDK does not
+    /// document which way its own call behaves.
+    #[test]
+    fn assigning_a_vlan_to_an_instance_moves_it() {
+        let mut b = backend();
+        let default_stg = b.stg_or_default(None).unwrap();
+        let stp = b.create_stp_instance().unwrap();
+        let vlan = b.create_vlan(100).unwrap();
+        assert_eq!(stub_vlan_stg(&b, 100), default_stg, "starts in the default");
+
+        b.set_vlan_stp_instance(Some(vlan), Some(stp)).unwrap();
+        assert_eq!(stub_vlan_stg(&b, 100), oid_stg(stp));
+
+        // An instance still holding VLANs cannot be removed.
+        assert!(b.remove_stp_instance(stp).is_err());
+        b.set_vlan_stp_instance(Some(vlan), None).unwrap();
+        assert_eq!(stub_vlan_stg(&b, 100), default_stg, "moved back");
+        b.remove_stp_instance(stp).unwrap();
+    }
+
+    #[test]
+    fn port_forwarding_state_is_per_instance() {
+        let mut b = backend();
+        let default_stg = b.stg_or_default(None).unwrap();
+        let stp = b.create_stp_instance().unwrap();
+
+        assert_eq!(
+            stub_stp(&b, default_stg, 1),
+            STP_FORWARDING,
+            "ports come up forwarding in the default instance"
+        );
+        b.set_stp_port_state(Some(stp), PortId(1), StpPortState::Blocking)
+            .unwrap();
+        assert_eq!(stub_stp(&b, oid_stg(stp), 1), STP_BLOCKING);
+        assert_eq!(
+            stub_stp(&b, default_stg, 1),
+            STP_FORWARDING,
+            "the other instance is untouched"
+        );
+
+        b.set_stp_port_state(None, PortId(1), StpPortState::Learning)
+            .unwrap();
+        assert_eq!(stub_stp(&b, default_stg, 1), STP_LEARNING);
+        assert_eq!(stub_stp(&b, oid_stg(stp), 1), STP_BLOCKING);
+    }
+
+    /// A LAG id is port-like here too, and reaches every member --
+    /// including gated-closed ones, which is the whole reason they stay
+    /// in the trunk.
+    #[test]
+    fn a_lag_forwarding_state_reaches_every_member() {
+        let mut b = backend();
+        let default_stg = b.stg_or_default(None).unwrap();
+        let lag = b.create_lag().unwrap();
+        let gated = b.add_lag_member(lag, PortId(1)).unwrap();
+        let open = b.add_lag_member(lag, PortId(2)).unwrap();
+        b.set_lag_member_state(open, true).unwrap();
+        let _ = gated;
+
+        b.set_stp_port_state(None, lag, StpPortState::Blocking)
+            .unwrap();
+        assert_eq!(stub_stp(&b, default_stg, 1), STP_BLOCKING, "gated member");
+        assert_eq!(stub_stp(&b, default_stg, 2), STP_BLOCKING, "open member");
+        assert_eq!(
+            stub_stp(&b, default_stg, 3),
+            STP_FORWARDING,
+            "a port outside the LAG is untouched"
+        );
+
+        // Not inherited on join, unlike PVID: a port has a state in
+        // every instance, so there is no single value to inherit. The
+        // caller re-applies after a membership change, and the ABI says
+        // so rather than the shim pretending otherwise.
+        b.add_lag_member(lag, PortId(3)).unwrap();
+        assert_eq!(stub_stp(&b, default_stg, 3), STP_FORWARDING);
+    }
+
+    /// An STP id is its own family: it must not be readable as a VLAN,
+    /// a membership or a LAG.
+    #[test]
+    fn stp_ids_are_their_own_family() {
+        assert_eq!(oid_stg(stp_oid(7)), 7);
+        assert_eq!(lag_tid_of(PortId(stp_oid(7).0)), None);
+        assert_eq!(oid_lag_vlan_member(stp_oid(7)), None);
+        assert_ne!(oid_tag(stp_oid(1).0), oid_tag(vlan_oid(1).0));
+        assert_ne!(
+            oid_tag(stp_oid(1).0),
+            oid_tag(lag_member_oid(1, PortId(1)).0)
+        );
     }
 }

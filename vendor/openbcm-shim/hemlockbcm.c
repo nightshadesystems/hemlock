@@ -25,7 +25,7 @@
  * NOT COMPILED BY CI. The SDK is not fetchable in CI and the target is
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
- * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk}.h,
+ * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -50,6 +50,7 @@
 #include <bcm/port.h>
 #include <bcm/stack.h>
 #include <bcm/stat.h>
+#include <bcm/stg.h>
 #include <bcm/trunk.h>
 #include <bcm/types.h>
 #include <bcm/vlan.h>
@@ -896,6 +897,27 @@ static int hb_lag_member_add(struct hemlockbcm_switch *sw, uint32_t tid,
     if (count >= HB_TRUNK_MAX_MEMBERS) {
         return HEMLOCKBCM_ERR_NO_MEMORY;
     }
+    /*
+     * A joining member has to pick up the trunk's ingress
+     * classification, or a port added after lag_set_pvid would classify
+     * into whatever VLAN it last had. There is no trunk-wide PVID to
+     * read back -- it only exists as the per-member setting -- so take it
+     * from a member already in the trunk. Inductively that keeps every
+     * member in step, and an empty trunk has nothing to inherit because
+     * the caller has not set a PVID on it yet.
+     */
+    if (count > 0 && BCM_GPORT_IS_LOCAL(members[0].gport)) {
+        bcm_vlan_t pvid = 0;
+        bcm_port_t first = BCM_GPORT_LOCAL_GET(members[0].gport);
+
+        if (bcm_port_untagged_vlan_get(sw->unit, first, &pvid) == BCM_E_NONE) {
+            status = HB_CALL(bcm_port_untagged_vlan_set(
+                sw->unit, (bcm_port_t)logical_port, pvid));
+            if (status != HEMLOCKBCM_OK) {
+                return status;
+            }
+        }
+    }
     bcm_trunk_member_t_init(&members[count]);
     BCM_GPORT_LOCAL_SET(members[count].gport, (bcm_port_t)logical_port);
     members[count].flags = enabled ? 0 : HB_TRUNK_GATED;
@@ -1017,6 +1039,191 @@ static int hb_lag_set_pvid(struct hemlockbcm_switch *sw, uint32_t tid, uint16_t 
     return HEMLOCKBCM_OK;
 }
 
+/* --- Spanning tree (ABI 1.5) -------------------------------------------- */
+
+static int hb_stp_state(int state, int *out)
+{
+    switch (state) {
+    case HEMLOCKBCM_STP_BLOCKING:
+        *out = BCM_STG_STP_BLOCK;
+        return HEMLOCKBCM_OK;
+    case HEMLOCKBCM_STP_LEARNING:
+        *out = BCM_STG_STP_LEARN;
+        return HEMLOCKBCM_OK;
+    case HEMLOCKBCM_STP_FORWARDING:
+        *out = BCM_STG_STP_FORWARD;
+        return HEMLOCKBCM_OK;
+    default:
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+}
+
+static int hb_stp_default(struct hemlockbcm_switch *sw, uint32_t *stg)
+{
+    bcm_stg_t value = 0;
+    int status;
+
+    if (sw == NULL || stg == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = HB_CALL(bcm_stg_default_get(sw->unit, &value));
+    if (status == HEMLOCKBCM_OK) {
+        *stg = (uint32_t)value;
+    }
+    return status;
+}
+
+static int hb_stp_create(struct hemlockbcm_switch *sw, uint32_t *stg)
+{
+    bcm_stg_t created = 0;
+    int status;
+
+    if (sw == NULL || stg == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = HB_CALL(bcm_stg_create(sw->unit, &created));
+    if (status == HEMLOCKBCM_OK) {
+        *stg = (uint32_t)created;
+    }
+    return status;
+}
+
+static int hb_stp_destroy(struct hemlockbcm_switch *sw, uint32_t stg)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_stg_destroy(sw->unit, (bcm_stg_t)stg));
+}
+
+/*
+ * The group currently holding `vlan_id`, or BCM_STG_INVALID if none does.
+ *
+ * There is no "which group is this VLAN in" call, so this walks the
+ * groups and asks each for its VLANs. Both lists are SDK-allocated and
+ * have their own destructors; the loop frees every list it takes,
+ * including on the early exit.
+ */
+static int hb_stp_group_of(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                           bcm_stg_t *out)
+{
+    bcm_stg_t *groups = NULL;
+    int group_count = 0;
+    int status;
+    int i;
+
+    *out = BCM_STG_INVALID;
+    status = HB_CALL(bcm_stg_list(sw->unit, &groups, &group_count));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    for (i = 0; i < group_count; i++) {
+        bcm_vlan_t *vlans = NULL;
+        int vlan_count = 0;
+        int j;
+
+        if (bcm_stg_vlan_list(sw->unit, groups[i], &vlans, &vlan_count) != BCM_E_NONE) {
+            continue;
+        }
+        for (j = 0; j < vlan_count; j++) {
+            if (vlans[j] == (bcm_vlan_t)vlan_id) {
+                *out = groups[i];
+                break;
+            }
+        }
+        bcm_stg_vlan_list_destroy(sw->unit, vlans, vlan_count);
+        if (*out != BCM_STG_INVALID) {
+            break;
+        }
+    }
+    bcm_stg_list_destroy(sw->unit, groups, group_count);
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_stp_vlan_set(struct hemlockbcm_switch *sw, uint32_t stg, uint16_t vlan_id)
+{
+    bcm_stg_t current = BCM_STG_INVALID;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_stp_group_of(sw, vlan_id, &current);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    if (current == (bcm_stg_t)stg) {
+        return HEMLOCKBCM_OK;  /* already there */
+    }
+    /*
+     * A VLAN belongs to exactly one group. Whether bcm_stg_vlan_add
+     * relocates it is not documented, so do the move explicitly rather
+     * than leave the VLAN in two groups on a device that does not.
+     */
+    if (current != BCM_STG_INVALID) {
+        status = HB_CALL(bcm_stg_vlan_remove(sw->unit, current, (bcm_vlan_t)vlan_id));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+    }
+    return HB_CALL(bcm_stg_vlan_add(sw->unit, (bcm_stg_t)stg, (bcm_vlan_t)vlan_id));
+}
+
+static int hb_stp_port_state(struct hemlockbcm_switch *sw, uint32_t stg,
+                             uint32_t logical_port, int state)
+{
+    int bcm_state = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_stp_state(state, &bcm_state);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    return HB_CALL(bcm_stg_stp_set(sw->unit, (bcm_stg_t)stg,
+                                   (bcm_port_t)logical_port, bcm_state));
+}
+
+static int hb_lag_stp_port_state(struct hemlockbcm_switch *sw, uint32_t stg,
+                                 uint32_t tid, int state)
+{
+    bcm_trunk_info_t info;
+    bcm_trunk_member_t members[HB_TRUNK_MAX_MEMBERS];
+    int count = 0;
+    int bcm_state = 0;
+    int status;
+    int i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_stp_state(state, &bcm_state);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    status = hb_trunk_read(sw, tid, &info, members, &count);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    /* Forwarding state is per port, like ingress classification: every
+     * member, gated-closed ones included. */
+    for (i = 0; i < count; i++) {
+        bcm_port_t port;
+
+        if (!BCM_GPORT_IS_LOCAL(members[i].gport)) {
+            continue;
+        }
+        port = BCM_GPORT_LOCAL_GET(members[i].gport);
+        status = HB_CALL(bcm_stg_stp_set(sw->unit, (bcm_stg_t)stg, port, bcm_state));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1054,6 +1261,12 @@ static const struct hemlockbcm_api HB_API = {
     hb_lag_vlan_member_add,
     hb_lag_vlan_member_remove,
     hb_lag_set_pvid,
+    hb_stp_default,
+    hb_stp_create,
+    hb_stp_destroy,
+    hb_stp_vlan_set,
+    hb_stp_port_state,
+    hb_lag_stp_port_state,
     /* Remaining phase 6 slots are appended below this line. */
 };
 
