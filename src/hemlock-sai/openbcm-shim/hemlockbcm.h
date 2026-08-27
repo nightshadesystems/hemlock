@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 6
+#define HEMLOCKBCM_ABI_MINOR 7
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -102,6 +102,11 @@ extern "C" {
 #define HEMLOCKBCM_STP_BLOCKING   0
 #define HEMLOCKBCM_STP_LEARNING   1
 #define HEMLOCKBCM_STP_FORWARDING 2
+
+/* Traffic classes a storm-control policer can meter. */
+#define HEMLOCKBCM_STORM_BROADCAST       0
+#define HEMLOCKBCM_STORM_MULTICAST       1
+#define HEMLOCKBCM_STORM_UNKNOWN_UNICAST 2
 
 /* Which fields narrow a flush_fdb call; see that slot. */
 #define HEMLOCKBCM_FLUSH_VLAN 0x1u
@@ -462,12 +467,30 @@ struct hemlockbcm_api {
     int (*mirror_port_detach)(struct hemlockbcm_switch *sw, uint32_t logical_port,
                               int egress);
 
+    /* --- Storm control (ABI 1.7) -------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: storm control,
-     * ACLs/policers/CoPP, sFlow and QoS. Each lands as one slot appended
-     * here plus the matching Rust method, with the minor bumped. Until
-     * then Rust reports those families unsupported, which is the truth
-     * and which both consoles already handle.
+     * Meter one traffic class on a port. `kbps` of 0 removes the limit,
+     * which is the SDK's own encoding of "no rate" rather than a
+     * sentinel invented here.
+     *
+     * There is deliberately no companion slot for per-class drop
+     * counts. The chip has one storm-control drop trigger per port
+     * (`bcmDbgCntRxStormControlDrop`), not one per class, so a
+     * `port_storm_drops(port, class)` answer built on it would be the
+     * same port-wide number reported three times as if it were three
+     * facts. The caller reports the family as unsupported for reads,
+     * which is true, instead.
+     */
+    int (*storm_control_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                             int storm_class, uint32_t kbps);
+
+    /*
+     * Everything below is the rest of phase 6: ACLs/policers/CoPP,
+     * sFlow and QoS. Each lands as one slot appended here plus the
+     * matching Rust method, with the minor bumped. Until then Rust
+     * reports those families unsupported, which is the truth and which
+     * both consoles already handle.
      */
 };
 

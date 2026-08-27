@@ -25,7 +25,8 @@
  * NOT COMPILED BY CI. The SDK is not fetchable in CI and the target is
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
- * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror}.h,
+ * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
+ * rate}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -49,6 +50,7 @@
 #include <bcm/link.h>
 #include <bcm/mirror.h>
 #include <bcm/port.h>
+#include <bcm/rate.h>
 #include <bcm/stack.h>
 #include <bcm/stat.h>
 #include <bcm/stg.h>
@@ -1311,6 +1313,60 @@ static int hb_mirror_port_detach(struct hemlockbcm_switch *sw, uint32_t logical_
                                                    hb_mirror_flags(egress)));
 }
 
+/* --- Storm control (ABI 1.7) --------------------------------------------- */
+
+static int hb_storm_flags(int storm_class, int *out)
+{
+    switch (storm_class) {
+    case HEMLOCKBCM_STORM_BROADCAST:
+        *out = BCM_RATE_BCAST;
+        return HEMLOCKBCM_OK;
+    case HEMLOCKBCM_STORM_MULTICAST:
+        *out = BCM_RATE_MCAST;
+        return HEMLOCKBCM_OK;
+    case HEMLOCKBCM_STORM_UNKNOWN_UNICAST:
+        /* Destination lookup failure: unicast with no FDB entry. */
+        *out = BCM_RATE_DLF;
+        return HEMLOCKBCM_OK;
+    default:
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+}
+
+static int hb_storm_control_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                int storm_class, uint32_t kbps)
+{
+    int flags = 0;
+    uint32 burst;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_storm_flags(storm_class, &flags);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    /*
+     * The burst allowance is the one number here the caller does not
+     * supply, and the SDK has no "pick a sensible default" value: zero
+     * is a rate, not an absence. An eighth of the rate is 125 ms of
+     * traffic, which is long enough that a normal burst of broadcast
+     * (an ARP storm from a rebooting rack) is metered rather than
+     * shredded, and short enough that the cap still means something.
+     * Worth revisiting against real traffic; it changes smoothness, not
+     * the enforced rate.
+     */
+    burst = kbps / 8;
+    if (kbps != 0 && burst == 0) {
+        burst = 1;
+    }
+    /* BCM_RATE_DISABLE is 0, so "no limit" is the SDK's own encoding
+     * rather than a sentinel invented here. */
+    return HB_CALL(bcm_rate_bandwidth_set(sw->unit, (bcm_port_t)logical_port, flags,
+                                          kbps, burst));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1358,6 +1414,7 @@ static const struct hemlockbcm_api HB_API = {
     hb_mirror_destroy,
     hb_mirror_port_attach,
     hb_mirror_port_detach,
+    hb_storm_control_set,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

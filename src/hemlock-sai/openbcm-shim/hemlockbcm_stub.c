@@ -115,6 +115,8 @@ struct hemlockbcm_switch {
     /* The session each direction of each port feeds; 0 = none. */
     uint32_t mirror_in[STUB_PORTS];
     uint32_t mirror_out[STUB_PORTS];
+    /* Metered rate per port per storm class; 0 = no limit. */
+    uint32_t storm_kbps[STUB_PORTS][3];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -1284,6 +1286,38 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_mirror(struct hemlockbcm_switch *sw,
                         : sw->mirror_in[port - sw->ports]);
 }
 
+/* --- Storm control (ABI 1.7) --------------------------------------------- */
+
+static int stub_storm_control_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                  int storm_class, uint32_t kbps)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL || storm_class < HEMLOCKBCM_STORM_BROADCAST ||
+        storm_class > HEMLOCKBCM_STORM_UNKNOWN_UNICAST) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->storm_kbps[port - sw->ports][storm_class] = kbps;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI. -1 = no such port. */
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_storm(struct hemlockbcm_switch *sw,
+                                                uint32_t logical_port, int storm_class)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+
+    if (sw == NULL || port == NULL || storm_class < HEMLOCKBCM_STORM_BROADCAST ||
+        storm_class > HEMLOCKBCM_STORM_UNKNOWN_UNICAST) {
+        return -1;
+    }
+    return (int64_t)sw->storm_kbps[port - sw->ports][storm_class];
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1331,6 +1365,7 @@ static const struct hemlockbcm_api STUB_API = {
     stub_mirror_destroy,
     stub_mirror_port_attach,
     stub_mirror_port_detach,
+    stub_storm_control_set,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

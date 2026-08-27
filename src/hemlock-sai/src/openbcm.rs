@@ -72,6 +72,15 @@ const STP_BLOCKING: std::os::raw::c_int = 0;
 const STP_LEARNING: std::os::raw::c_int = 1;
 const STP_FORWARDING: std::os::raw::c_int = 2;
 
+/// `HEMLOCKBCM_STORM_*`, in the trait's own order.
+fn storm_class(class: StormClass) -> std::os::raw::c_int {
+    match class {
+        StormClass::Broadcast => 0,
+        StormClass::Multicast => 1,
+        StormClass::UnknownUnicast => 2,
+    }
+}
+
 /// `HEMLOCKBCM_FLUSH_VLAN` / `HEMLOCKBCM_FLUSH_PORT`: which of a
 /// `flush_fdb` call's arguments narrow the flush. Flags rather than
 /// sentinel values because logical port 0 is a real port.
@@ -229,6 +238,10 @@ struct Api {
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
     mirror_port_detach:
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
+
+    // --- ABI 1.7: storm control --------------------------------------
+    storm_control_set:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int, u32) -> Status>,
 }
 
 impl Api {
@@ -904,7 +917,7 @@ impl SaiBackend for OpenBcmBackend {
             fdb_flush: slot!(self, flush_fdb, "flush_fdb").is_ok(),
             fdb_aging: slot!(self, set_fdb_aging, "set_fdb_aging").is_ok(),
             l2mc: false,
-            storm_control: false,
+            storm_control: slot!(self, storm_control_set, "storm_control_set").is_ok(),
             mirror: slot!(self, mirror_create, "mirror_create").is_ok(),
             mirror_sessions_max: raw.mirror_sessions_max,
             port_tpid: slot!(self, set_port_tpid, "set_port_tpid").is_ok(),
@@ -1189,23 +1202,35 @@ impl SaiBackend for OpenBcmBackend {
         check("flush_fdb", unsafe { f(sw, vlan_id, logical_port, flags) })
     }
 
+    // --- Storm control (ABI 1.7) --------------------------------------
+
     fn set_port_storm_control(
         &mut self,
-        _port: PortId,
-        _class: StormClass,
-        _kbps: Option<u64>,
+        port: PortId,
+        class: StormClass,
+        kbps: Option<u64>,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_storm_control")
+        let f = slot!(self, storm_control_set, "storm_control_set")?;
+        let logical = self.logical_port(port)?;
+        let sw = self.switch()?;
+        // The SDK meters in kbit/s and spells "no limit" as 0, so `None`
+        // needs no sentinel of its own. A rate past u32 is not a real
+        // configuration on a 10G port, so it saturates rather than
+        // wrapping -- and wrapping to 0 would silently remove the limit.
+        let kbps = kbps.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // SAFETY: plain scalars over the ABI.
+        check("storm_control_set", unsafe {
+            f(sw, logical, storm_class(class), kbps)
+        })
     }
 
+    /// Not implemented, and not an oversight: the chip counts storm
+    /// drops once per port, not once per class, so there is no honest
+    /// per-class answer to give. Reporting the port-wide number three
+    /// times would read as three measurements. See the ABI header.
     fn port_storm_drops(&mut self, _port: PortId, _class: StormClass) -> Result<u64, SaiError> {
         unimplemented_slot("port_storm_drops")
     }
-
-    // --- Port mirroring (ABI 1.6) -------------------------------------
-    //
-    // A session is an SDK mirror destination; its id is the
-    // destination's own, derived like every other object id here.
 
     fn create_mirror_session(&mut self, monitor: PortId) -> Result<Oid, SaiError> {
         let f = slot!(self, mirror_create, "mirror_create")?;
@@ -1861,9 +1886,9 @@ mod tests {
         );
         assert!(caps.lag, "ABI 1.4");
         assert!(caps.stp, "ABI 1.5");
+        assert!(caps.storm_control, "ABI 1.7");
         for (name, on) in [
             ("l2mc", caps.l2mc),
-            ("storm_control", caps.storm_control),
             ("acl_ingress", caps.acl_ingress),
             ("copp", caps.copp),
             ("sflow", caps.sflow),
@@ -1982,6 +2007,7 @@ mod tests {
             mirror_destroy: None,
             mirror_port_attach: None,
             mirror_port_detach: None,
+            storm_control_set: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2089,6 +2115,7 @@ mod tests {
             "mirror_destroy",
             "mirror_port_attach",
             "mirror_port_detach",
+            "storm_control_set",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2169,6 +2196,7 @@ mod tests {
             std::mem::offset_of!(Api, mirror_destroy),
             std::mem::offset_of!(Api, mirror_port_attach),
             std::mem::offset_of!(Api, mirror_port_detach),
+            std::mem::offset_of!(Api, storm_control_set),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -2822,5 +2850,77 @@ mod tests {
         assert_eq!(stub_tpid(&b, 1), 0x8100);
         assert_eq!(stub_mirror(&b, 1, false), 0);
         assert_eq!(stub_member(&b, 1, 1), 0, "still in the default VLAN");
+    }
+    // --- Storm control -------------------------------------------------
+
+    /// The metered rate for one class, or -1 for no such port.
+    fn stub_storm(b: &OpenBcmBackend, port: u32, class: StormClass) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> i64,
+            > = b._library.get(b"hemlockbcm_stub_storm\0").unwrap();
+            f(b.switch, port, storm_class(class))
+        }
+    }
+
+    #[test]
+    fn storm_control_meters_each_class_separately() {
+        let mut b = backend();
+        for class in [
+            StormClass::Broadcast,
+            StormClass::Multicast,
+            StormClass::UnknownUnicast,
+        ] {
+            assert_eq!(stub_storm(&b, 1, class), 0, "unmetered by default");
+        }
+
+        b.set_port_storm_control(PortId(1), StormClass::Broadcast, Some(1000))
+            .unwrap();
+        assert_eq!(stub_storm(&b, 1, StormClass::Broadcast), 1000);
+        assert_eq!(
+            stub_storm(&b, 1, StormClass::Multicast),
+            0,
+            "the other classes are independent"
+        );
+        assert_eq!(
+            stub_storm(&b, 2, StormClass::Broadcast),
+            0,
+            "and so are ports"
+        );
+
+        // None removes the limit, which the SDK spells as a rate of 0.
+        b.set_port_storm_control(PortId(1), StormClass::Broadcast, None)
+            .unwrap();
+        assert_eq!(stub_storm(&b, 1, StormClass::Broadcast), 0);
+    }
+
+    /// A rate past u32 saturates. Wrapping would land on a small number
+    /// or, worse, on 0 -- which is how the SDK spells "no limit", so a
+    /// huge cap would silently become no cap at all.
+    #[test]
+    fn an_absurd_storm_rate_saturates_rather_than_removing_the_limit() {
+        let mut b = backend();
+        b.set_port_storm_control(PortId(1), StormClass::Multicast, Some(u64::MAX))
+            .unwrap();
+        assert_eq!(
+            stub_storm(&b, 1, StormClass::Multicast),
+            i64::from(u32::MAX)
+        );
+        // The value that would wrap to exactly 0.
+        b.set_port_storm_control(PortId(1), StormClass::Multicast, Some(1 << 32))
+            .unwrap();
+        assert_ne!(stub_storm(&b, 1, StormClass::Multicast), 0);
+    }
+
+    /// The chip counts storm drops once per port, not once per class, so
+    /// there is no honest per-class answer. Unsupported is the truthful
+    /// reply, and both consoles already render it.
+    #[test]
+    fn per_class_storm_drops_are_unsupported_not_invented() {
+        let mut b = backend();
+        let err = b
+            .port_storm_drops(PortId(1), StormClass::Broadcast)
+            .unwrap_err();
+        assert!(err.is_unsupported(), "{err:?}");
     }
 }
