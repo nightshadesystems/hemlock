@@ -36,6 +36,8 @@
 #define STUB_STGS 2
 #define STUB_MIRRORS 2
 #define STUB_POLICERS 4
+#define STUB_ACL_TABLES 2
+#define STUB_ACL_ENTRIES 8
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -61,6 +63,23 @@ struct stub_vlan {
     int lag_tagged[STUB_LAGS];
     /* Exactly one spanning-tree group holds a VLAN at any time. */
     uint32_t stg;
+};
+
+/* An ACL table (a field group) and one of its entries. */
+struct stub_acl_table {
+    int used;
+    uint32_t id;
+    int egress;
+    int bound[STUB_PORTS];
+};
+
+struct stub_acl_entry {
+    int used;
+    uint32_t id;
+    uint32_t table;
+    uint32_t priority;
+    int action;
+    struct hemlockbcm_acl_fields fields;
 };
 
 /* A single-rate policer. */
@@ -137,6 +156,8 @@ struct hemlockbcm_switch {
     struct stub_hostif hostifs[STUB_PORTS];
     int punt_ready;
     struct stub_policer policers[STUB_POLICERS];
+    struct stub_acl_table acl_tables[STUB_ACL_TABLES];
+    struct stub_acl_entry acl_entries[STUB_ACL_ENTRIES];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -1506,6 +1527,238 @@ HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_policer_rate(struct hemlockbcm_switch 
     return entry->pps ? -(int64_t)entry->rate : (int64_t)entry->rate;
 }
 
+/* --- ACLs (ABI 1.10) ------------------------------------------------------ */
+
+static struct stub_acl_table *find_acl_table(struct hemlockbcm_switch *sw, uint32_t table)
+{
+    size_t i;
+    for (i = 0; i < STUB_ACL_TABLES; i++) {
+        if (sw->acl_tables[i].used && sw->acl_tables[i].id == table) {
+            return &sw->acl_tables[i];
+        }
+    }
+    return NULL;
+}
+
+static struct stub_acl_entry *find_acl_entry(struct hemlockbcm_switch *sw, uint32_t entry)
+{
+    size_t i;
+    for (i = 0; i < STUB_ACL_ENTRIES; i++) {
+        if (sw->acl_entries[i].used && sw->acl_entries[i].id == entry) {
+            return &sw->acl_entries[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_acl_table_create(struct hemlockbcm_switch *sw, int egress, uint32_t *table)
+{
+    size_t i;
+
+    if (sw == NULL || table == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_ACL_TABLES; i++) {
+        if (!sw->acl_tables[i].used) {
+            memset(&sw->acl_tables[i], 0, sizeof(sw->acl_tables[i]));
+            sw->acl_tables[i].used = 1;
+            sw->acl_tables[i].id = (uint32_t)i + 1;
+            sw->acl_tables[i].egress = egress ? 1 : 0;
+            *table = sw->acl_tables[i].id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_acl_table_destroy(struct hemlockbcm_switch *sw, uint32_t table)
+{
+    struct stub_acl_table *found;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_acl_table(sw, table);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_ACL_ENTRIES; i++) {
+        if (sw->acl_entries[i].used && sw->acl_entries[i].table == table) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* entries must go first */
+        }
+    }
+    for (i = 0; i < STUB_PORTS; i++) {
+        if (found->bound[i]) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* and so must bindings */
+        }
+    }
+    memset(found, 0, sizeof(*found));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_acl_table_bind(struct hemlockbcm_switch *sw, uint32_t table,
+                               uint32_t logical_port, int bind)
+{
+    struct stub_acl_table *found;
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_acl_table(sw, table);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    found->bound[port - sw->ports] = bind ? 1 : 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_acl_table_unbind_all(struct hemlockbcm_switch *sw, int egress,
+                                     uint32_t logical_port)
+{
+    struct hemlockbcm_port *port;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Only this stage's tables: the other stage's binding is a separate
+     * fact and unbinding one must not disturb it. */
+    for (i = 0; i < STUB_ACL_TABLES; i++) {
+        if (sw->acl_tables[i].used && sw->acl_tables[i].egress == (egress ? 1 : 0)) {
+            sw->acl_tables[i].bound[port - sw->ports] = 0;
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_acl_entry_create(struct hemlockbcm_switch *sw, uint32_t table,
+                                 uint32_t priority,
+                                 const struct hemlockbcm_acl_fields *fields,
+                                 int action, uint32_t *entry)
+{
+    size_t i;
+
+    if (sw == NULL || fields == NULL || entry == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (action < HEMLOCKBCM_ACL_FORWARD || action > HEMLOCKBCM_ACL_COPY) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (find_acl_table(sw, table) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_ACL_ENTRIES; i++) {
+        if (!sw->acl_entries[i].used) {
+            memset(&sw->acl_entries[i], 0, sizeof(sw->acl_entries[i]));
+            sw->acl_entries[i].used = 1;
+            sw->acl_entries[i].id = (uint32_t)i + 1;
+            sw->acl_entries[i].table = table;
+            sw->acl_entries[i].priority = priority;
+            sw->acl_entries[i].action = action;
+            sw->acl_entries[i].fields = *fields;
+            *entry = sw->acl_entries[i].id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_acl_entry_action_set(struct hemlockbcm_switch *sw, uint32_t entry,
+                                     int action)
+{
+    struct stub_acl_entry *found;
+
+    if (sw == NULL || action < HEMLOCKBCM_ACL_FORWARD || action > HEMLOCKBCM_ACL_COPY) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_acl_entry(sw, entry);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* The match is untouched, which is the point of having this at all. */
+    found->action = action;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_acl_entry_destroy(struct hemlockbcm_switch *sw, uint32_t entry)
+{
+    struct stub_acl_entry *found;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_acl_entry(sw, entry);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    memset(found, 0, sizeof(*found));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_acl_available(struct hemlockbcm_switch *sw, int egress, uint32_t *entries)
+{
+    uint32_t used = 0;
+    size_t i;
+
+    if (sw == NULL || entries == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_ACL_ENTRIES; i++) {
+        struct stub_acl_table *table;
+
+        if (!sw->acl_entries[i].used) {
+            continue;
+        }
+        table = find_acl_table(sw, sw->acl_entries[i].table);
+        if (table != NULL && table->egress == (egress ? 1 : 0)) {
+            used++;
+        }
+    }
+    *entries = (uint32_t)STUB_ACL_ENTRIES - used;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+/* The entry's action, or -1 if there is no such entry. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_acl_action(struct hemlockbcm_switch *sw,
+                                                 uint32_t entry)
+{
+    struct stub_acl_entry *found = sw == NULL ? NULL : find_acl_entry(sw, entry);
+    return found == NULL ? -1 : found->action;
+}
+
+/* The entry's `present` mask, or 0 if there is no such entry. */
+HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_acl_fields(struct hemlockbcm_switch *sw,
+                                                      uint32_t entry)
+{
+    struct stub_acl_entry *found = sw == NULL ? NULL : find_acl_entry(sw, entry);
+    return found == NULL ? 0 : found->fields.present;
+}
+
+/* 1 if the port binds the table, 0 if not, -1 if either is unknown. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_acl_bound(struct hemlockbcm_switch *sw,
+                                                uint32_t table, uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+    struct stub_acl_table *found = sw == NULL ? NULL : find_acl_table(sw, table);
+
+    if (port == NULL || found == NULL) {
+        return -1;
+    }
+    return found->bound[port - sw->ports];
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1560,6 +1813,14 @@ static const struct hemlockbcm_api STUB_API = {
     stub_policer_set,
     stub_policer_destroy,
     stub_policer_stats,
+    stub_acl_table_create,
+    stub_acl_table_destroy,
+    stub_acl_table_bind,
+    stub_acl_table_unbind_all,
+    stub_acl_entry_create,
+    stub_acl_entry_action_set,
+    stub_acl_entry_destroy,
+    stub_acl_available,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

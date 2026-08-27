@@ -26,7 +26,7 @@
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
  * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
- * rate,knet,policer}.h,
+ * rate,knet,policer,field}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -45,6 +45,7 @@
 #include <sal/types.h>
 
 #include <bcm/error.h>
+#include <bcm/field.h>
 #include <bcm/init.h>
 #include <bcm/knet.h>
 #include <bcm/l2.h>
@@ -1574,6 +1575,343 @@ static int hb_policer_stats(struct hemlockbcm_switch *sw, uint32_t policer,
     return HEMLOCKBCM_OK;
 }
 
+/* --- ACLs (ABI 1.10) ----------------------------------------------------- */
+
+/*
+ * Field groups are created with the full qualifier set this ABI can
+ * express, rather than one tailored per table. The chip allocates TCAM
+ * by slice and a wider qset can cost a wider slice, but a group whose
+ * qset is decided at create time cannot gain a qualifier later -- and
+ * the caller does not tell us, at create time, which fields its entries
+ * will use. Trading slice width for that is the right way round: an
+ * entry that cannot be expressed is a failure, a slice that is wider
+ * than it needed to be is an inefficiency.
+ */
+static void hb_acl_qset(bcm_field_qset_t *qset, int egress)
+{
+    BCM_FIELD_QSET_INIT(*qset);
+    BCM_FIELD_QSET_ADD(*qset, egress ? bcmFieldQualifyStageEgress
+                                     : bcmFieldQualifyStageIngress);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyInPorts);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifySrcIp);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyDstIp);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyIpProtocol);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyL4SrcPort);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyL4DstPort);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyDSCP);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifySrcMac);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyDstMac);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyEtherType);
+    BCM_FIELD_QSET_ADD(*qset, bcmFieldQualifyOuterVlanId);
+}
+
+static int hb_acl_table_create(struct hemlockbcm_switch *sw, int egress, uint32_t *table)
+{
+    bcm_field_qset_t qset;
+    bcm_field_group_t group = 0;
+    int status;
+
+    if (sw == NULL || table == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    hb_acl_qset(&qset, egress);
+    /*
+     * Group priority is the order between *groups*, not between entries,
+     * and Hemlock has one group per table with no defined precedence
+     * among tables -- a port binds one table per stage. BCM_FIELD_GROUP_
+     * PRIO_ANY lets the SDK place it.
+     */
+    status = HB_CALL(bcm_field_group_create(sw->unit, qset, BCM_FIELD_GROUP_PRIO_ANY,
+                                            &group));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    *table = (uint32_t)group;
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_acl_table_destroy(struct hemlockbcm_switch *sw, uint32_t table)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_field_group_destroy(sw->unit, (bcm_field_group_t)table));
+}
+
+static int hb_acl_table_bind(struct hemlockbcm_switch *sw, uint32_t table,
+                             uint32_t logical_port, int bind)
+{
+    bcm_pbmp_t pbmp;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    BCM_PBMP_CLEAR(pbmp);
+    BCM_PBMP_PORT_ADD(pbmp, (bcm_port_t)logical_port);
+    if (bind) {
+        return HB_CALL(bcm_field_group_ports_add(sw->unit, (bcm_field_group_t)table,
+                                                 pbmp));
+    }
+    return HB_CALL(bcm_field_group_ports_remove(sw->unit, (bcm_field_group_t)table,
+                                                pbmp));
+}
+
+struct hb_unbind_ctx {
+    int unit;
+    int egress;
+    bcm_port_t port;
+    int status;
+};
+
+static int hb_unbind_one(int unit, bcm_field_group_t group, void *user_data)
+{
+    struct hb_unbind_ctx *ctx = (struct hb_unbind_ctx *)user_data;
+    bcm_field_qset_t qset;
+    bcm_pbmp_t pbmp;
+    int rv;
+
+    /* Only groups at the stage we were asked about. The stage is a
+     * qualifier in the group's own qset, which is how it is read back. */
+    if (bcm_field_group_get(unit, group, &qset) != BCM_E_NONE) {
+        return BCM_E_NONE;  /* skip; traversal continues */
+    }
+    if (BCM_FIELD_QSET_TEST(qset, ctx->egress ? bcmFieldQualifyStageEgress
+                                              : bcmFieldQualifyStageIngress) == 0) {
+        return BCM_E_NONE;
+    }
+    BCM_PBMP_CLEAR(pbmp);
+    BCM_PBMP_PORT_ADD(pbmp, ctx->port);
+    rv = bcm_field_group_ports_remove(unit, group, pbmp);
+    /* A group the port was never bound to is not a failure here: this is
+     * "unbind from whatever holds it", and most groups will not. */
+    if (rv != BCM_E_NONE && rv != BCM_E_NOT_FOUND) {
+        ctx->status = hb_status(rv);
+    }
+    return BCM_E_NONE;
+}
+
+static int hb_acl_table_unbind_all(struct hemlockbcm_switch *sw, int egress,
+                                   uint32_t logical_port)
+{
+    struct hb_unbind_ctx ctx;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    ctx.unit = sw->unit;
+    ctx.egress = egress;
+    ctx.port = (bcm_port_t)logical_port;
+    ctx.status = HEMLOCKBCM_OK;
+    status = HB_CALL(bcm_field_group_traverse(sw->unit, hb_unbind_one, &ctx));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    return ctx.status;
+}
+
+static int hb_acl_action(struct hemlockbcm_switch *sw, bcm_field_entry_t entry,
+                         int action)
+{
+    switch (action) {
+    case HEMLOCKBCM_ACL_FORWARD:
+        /* Nothing to add: an entry with no action matches and lets the
+         * packet take its normal path, which is what permit means. */
+        return HEMLOCKBCM_OK;
+    case HEMLOCKBCM_ACL_DROP:
+        return HB_CALL(bcm_field_action_add(sw->unit, entry, bcmFieldActionDrop, 0, 0));
+    case HEMLOCKBCM_ACL_TRAP: {
+        /* Punted *and* dropped: the copy reaches the CPU, the original
+         * does not forward. Two actions, not one. */
+        int status = HB_CALL(bcm_field_action_add(sw->unit, entry,
+                                                  bcmFieldActionCopyToCpu, 0, 0));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+        return HB_CALL(bcm_field_action_add(sw->unit, entry, bcmFieldActionDrop, 0, 0));
+    }
+    case HEMLOCKBCM_ACL_COPY:
+        return HB_CALL(bcm_field_action_add(sw->unit, entry, bcmFieldActionCopyToCpu,
+                                            0, 0));
+    default:
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+}
+
+static int hb_acl_qualify(struct hemlockbcm_switch *sw, bcm_field_entry_t entry,
+                          const struct hemlockbcm_acl_fields *f)
+{
+    int status;
+
+#define HB_QUALIFY(expr)                    \
+    do {                                    \
+        status = HB_CALL(expr);             \
+        if (status != HEMLOCKBCM_OK) {      \
+            return status;                  \
+        }                                   \
+    } while (0)
+
+    if (f->present & HEMLOCKBCM_ACL_F_SRC_IP) {
+        HB_QUALIFY(bcm_field_qualify_SrcIp(sw->unit, entry, f->src_ip, f->src_ip_mask));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_DST_IP) {
+        HB_QUALIFY(bcm_field_qualify_DstIp(sw->unit, entry, f->dst_ip, f->dst_ip_mask));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_PROTOCOL) {
+        HB_QUALIFY(bcm_field_qualify_IpProtocol(sw->unit, entry, f->protocol, 0xff));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_SRC_PORT) {
+        HB_QUALIFY(bcm_field_qualify_L4SrcPort(sw->unit, entry, f->src_port, 0xffff));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_DST_PORT) {
+        HB_QUALIFY(bcm_field_qualify_L4DstPort(sw->unit, entry, f->dst_port, 0xffff));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_DSCP) {
+        HB_QUALIFY(bcm_field_qualify_DSCP(sw->unit, entry, f->dscp, 0x3f));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_SRC_MAC) {
+        bcm_mac_t mac, mask;
+        sal_memcpy(mac, f->src_mac, sizeof(mac));
+        sal_memcpy(mask, f->src_mac_mask, sizeof(mask));
+        HB_QUALIFY(bcm_field_qualify_SrcMac(sw->unit, entry, mac, mask));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_DST_MAC) {
+        bcm_mac_t mac, mask;
+        sal_memcpy(mac, f->dst_mac, sizeof(mac));
+        sal_memcpy(mask, f->dst_mac_mask, sizeof(mask));
+        HB_QUALIFY(bcm_field_qualify_DstMac(sw->unit, entry, mac, mask));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_ETHERTYPE) {
+        HB_QUALIFY(bcm_field_qualify_EtherType(sw->unit, entry, f->ethertype, 0xffff));
+    }
+    if (f->present & HEMLOCKBCM_ACL_F_VLAN) {
+        HB_QUALIFY(bcm_field_qualify_OuterVlanId(sw->unit, entry, f->vlan, 0xfff));
+    }
+#undef HB_QUALIFY
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_acl_entry_create(struct hemlockbcm_switch *sw, uint32_t table,
+                               uint32_t priority,
+                               const struct hemlockbcm_acl_fields *fields,
+                               int action, uint32_t *entry)
+{
+    bcm_field_entry_t created = 0;
+    int status;
+
+    if (sw == NULL || fields == NULL || entry == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = HB_CALL(bcm_field_entry_create(sw->unit, (bcm_field_group_t)table,
+                                            &created));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    status = HB_CALL(bcm_field_entry_prio_set(sw->unit, created, (int)priority));
+    if (status == HEMLOCKBCM_OK) {
+        status = hb_acl_qualify(sw, created, fields);
+    }
+    if (status == HEMLOCKBCM_OK) {
+        status = hb_acl_action(sw, created, action);
+    }
+    if (status == HEMLOCKBCM_OK) {
+        /* Nothing above touches the TCAM until this. */
+        status = HB_CALL(bcm_field_entry_install(sw->unit, created));
+    }
+    if (status != HEMLOCKBCM_OK) {
+        /* A half-built entry is worse than none: it occupies a slot and
+         * matches on whichever qualifiers did land. */
+        (void)bcm_field_entry_destroy(sw->unit, created);
+        return status;
+    }
+    *entry = (uint32_t)created;
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_acl_entry_action_set(struct hemlockbcm_switch *sw, uint32_t entry,
+                                   int action)
+{
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Replace rather than accumulate: adding drop to an entry that
+     * already copies would leave both in place. */
+    status = HB_CALL(bcm_field_action_remove_all(sw->unit, (bcm_field_entry_t)entry));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    status = hb_acl_action(sw, (bcm_field_entry_t)entry, action);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    return HB_CALL(bcm_field_entry_install(sw->unit, (bcm_field_entry_t)entry));
+}
+
+static int hb_acl_entry_destroy(struct hemlockbcm_switch *sw, uint32_t entry)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_field_entry_destroy(sw->unit, (bcm_field_entry_t)entry));
+}
+
+struct hb_avail_ctx {
+    int unit;
+    int egress;
+    uint32_t free_entries;
+};
+
+static int hb_avail_one(int unit, bcm_field_group_t group, void *user_data)
+{
+    struct hb_avail_ctx *ctx = (struct hb_avail_ctx *)user_data;
+    bcm_field_group_status_t status;
+    bcm_field_qset_t qset;
+
+    if (bcm_field_group_get(unit, group, &qset) != BCM_E_NONE) {
+        return BCM_E_NONE;
+    }
+    if (BCM_FIELD_QSET_TEST(qset, ctx->egress ? bcmFieldQualifyStageEgress
+                                              : bcmFieldQualifyStageIngress) == 0) {
+        return BCM_E_NONE;
+    }
+    if (bcm_field_group_status_get(unit, group, &status) != BCM_E_NONE) {
+        return BCM_E_NONE;
+    }
+    if (status.entries_free > 0) {
+        ctx->free_entries += (uint32_t)status.entries_free;
+    }
+    return BCM_E_NONE;
+}
+
+static int hb_acl_available(struct hemlockbcm_switch *sw, int egress, uint32_t *entries)
+{
+    struct hb_avail_ctx ctx;
+    int status;
+
+    if (sw == NULL || entries == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * Free TCAM is reported per group, and a group holds a slice, so the
+     * honest total at a stage is the sum over that stage's groups. It is
+     * not the whole free TCAM: space in slices no group has claimed yet
+     * is not counted, because the SDK will not say how much of it this
+     * stage could still take. Under-reporting is the safe direction for
+     * a utilisation figure.
+     */
+    ctx.unit = sw->unit;
+    ctx.egress = egress;
+    ctx.free_entries = 0;
+    status = HB_CALL(bcm_field_group_traverse(sw->unit, hb_avail_one, &ctx));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    *entries = ctx.free_entries;
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1628,6 +1966,14 @@ static const struct hemlockbcm_api HB_API = {
     hb_policer_set,
     hb_policer_destroy,
     hb_policer_stats,
+    hb_acl_table_create,
+    hb_acl_table_destroy,
+    hb_acl_table_bind,
+    hb_acl_table_unbind_all,
+    hb_acl_entry_create,
+    hb_acl_entry_action_set,
+    hb_acl_entry_destroy,
+    hb_acl_available,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

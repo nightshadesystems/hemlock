@@ -30,10 +30,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::{
-    AclAction, AclFamily, AclFields, AclStage, CablePair, FdbAction, IpPrefix, Oid, PolicerSpec,
-    PolicerStats, PortCounters, PortId, QosMapType, QueueCounters, RouteTarget, SaiBackend,
-    SaiCapabilities, SaiError, SaiEvent, SaiPort, SchedulerSpec, StormClass, StpPortState,
-    SwitchInfo, TrapKind, WredSpec,
+    AclAction, AclFamily, AclFields, AclPacketAction, AclStage, CablePair, FdbAction, IpPrefix,
+    Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QosMapType, QueueCounters, RouteTarget,
+    SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, SchedulerSpec, StormClass,
+    StpPortState, SwitchInfo, TrapKind, WredSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,161 @@ struct ShimCapabilities {
     ecmp_width: u32,
     mirror_sessions_max: u32,
     ipv6: std::os::raw::c_int,
+}
+
+/// Mirrors `struct hemlockbcm_acl_fields`. Field order and types must
+/// match the header exactly.
+#[repr(C)]
+#[derive(Default)]
+struct ShimAclFields {
+    present: u32,
+    src_ip: u32,
+    src_ip_mask: u32,
+    dst_ip: u32,
+    dst_ip_mask: u32,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    src_mac: [u8; 6],
+    src_mac_mask: [u8; 6],
+    dst_mac: [u8; 6],
+    dst_mac_mask: [u8; 6],
+    ethertype: u16,
+    vlan: u16,
+}
+
+// `HEMLOCKBCM_ACL_F_*`, in header order.
+const ACL_F_SRC_IP: u32 = 0x0001;
+const ACL_F_DST_IP: u32 = 0x0002;
+const ACL_F_PROTOCOL: u32 = 0x0004;
+const ACL_F_SRC_PORT: u32 = 0x0008;
+const ACL_F_DST_PORT: u32 = 0x0010;
+const ACL_F_DSCP: u32 = 0x0020;
+const ACL_F_SRC_MAC: u32 = 0x0040;
+const ACL_F_DST_MAC: u32 = 0x0080;
+const ACL_F_ETHERTYPE: u32 = 0x0100;
+const ACL_F_VLAN: u32 = 0x0200;
+
+// `HEMLOCKBCM_ACL_*` actions.
+const ACL_FORWARD: std::os::raw::c_int = 0;
+const ACL_DROP: std::os::raw::c_int = 1;
+const ACL_TRAP: std::os::raw::c_int = 2;
+const ACL_COPY: std::os::raw::c_int = 3;
+
+/// An IPv4 prefix as address and mask, or an error for a v6 one.
+///
+/// The shim reports no IPv6, so a v6 prefix here means the caller built
+/// a rule this datapath cannot express. Truncating it to its low 32 bits
+/// would produce a rule that matches something else entirely.
+fn ipv4_prefix(prefix: IpPrefix, what: &str) -> Result<(u32, u32), SaiError> {
+    match prefix.0 {
+        std::net::IpAddr::V4(addr) => {
+            let bits = u32::from(addr);
+            let len = prefix.1.min(32);
+            // A /0 mask is 0, and `u32::MAX << 32` is undefined, so the
+            // shift is done in 64 bits and truncated.
+            let mask = (!0u64 << (32 - u32::from(len))) as u32;
+            Ok((bits & mask, mask))
+        }
+        std::net::IpAddr::V6(_) => Err(SaiError::Other(format!(
+            "{what}: IPv6 ACL matches need an IPv6 table, which this datapath does not have"
+        ))),
+    }
+}
+
+/// One L4 port match. The chip expresses a range with a range checker,
+/// a separately allocated resource this ABI does not yet carry, so a
+/// non-degenerate range is refused rather than silently narrowed to its
+/// lower bound.
+fn l4_port(range: (u16, u16), what: &str) -> Result<u16, SaiError> {
+    if range.0 == range.1 {
+        Ok(range.0)
+    } else {
+        Err(SaiError::Other(format!(
+            "{what}: L4 port ranges ({}-{}) need a range checker, which this backend \
+             does not implement yet",
+            range.0, range.1
+        )))
+    }
+}
+
+impl ShimAclFields {
+    fn build(fields: &AclFields) -> Result<Self, SaiError> {
+        let mut out = ShimAclFields::default();
+        if let Some(prefix) = fields.src_ip {
+            let (addr, mask) = ipv4_prefix(prefix, "src_ip")?;
+            out.src_ip = addr;
+            out.src_ip_mask = mask;
+            out.present |= ACL_F_SRC_IP;
+        }
+        if let Some(prefix) = fields.dst_ip {
+            let (addr, mask) = ipv4_prefix(prefix, "dst_ip")?;
+            out.dst_ip = addr;
+            out.dst_ip_mask = mask;
+            out.present |= ACL_F_DST_IP;
+        }
+        if let Some(protocol) = fields.protocol {
+            out.protocol = protocol;
+            out.present |= ACL_F_PROTOCOL;
+        }
+        if let Some(range) = fields.src_port {
+            out.src_port = l4_port(range, "src_port")?;
+            out.present |= ACL_F_SRC_PORT;
+        }
+        if let Some(range) = fields.dst_port {
+            out.dst_port = l4_port(range, "dst_port")?;
+            out.present |= ACL_F_DST_PORT;
+        }
+        if let Some(dscp) = fields.dscp {
+            out.dscp = dscp;
+            out.present |= ACL_F_DSCP;
+        }
+        if let Some((mac, mask)) = fields.src_mac {
+            out.src_mac = mac;
+            out.src_mac_mask = mask;
+            out.present |= ACL_F_SRC_MAC;
+        }
+        if let Some((mac, mask)) = fields.dst_mac {
+            out.dst_mac = mac;
+            out.dst_mac_mask = mask;
+            out.present |= ACL_F_DST_MAC;
+        }
+        if let Some(ethertype) = fields.ethertype {
+            out.ethertype = ethertype;
+            out.present |= ACL_F_ETHERTYPE;
+        }
+        if let Some(vlan) = fields.vlan {
+            out.vlan = vlan;
+            out.present |= ACL_F_VLAN;
+        }
+        Ok(out)
+    }
+}
+
+/// The ABI's action code for one action set.
+///
+/// A counter or a per-entry policer is refused rather than dropped on
+/// the floor: both are separate objects this ABI does not carry yet, and
+/// installing the rule without them would silently lose the operator's
+/// `log` or `police` clause while reporting success.
+fn acl_action(action: &AclAction) -> Result<std::os::raw::c_int, SaiError> {
+    if action.counter.is_some() {
+        return Err(SaiError::Other(
+            "ACL match counters are not implemented on this backend yet".into(),
+        ));
+    }
+    if action.policer.is_some() {
+        return Err(SaiError::Other(
+            "per-entry ACL policers are not implemented on this backend yet".into(),
+        ));
+    }
+    Ok(match action.action {
+        AclPacketAction::Forward => ACL_FORWARD,
+        AclPacketAction::Drop => ACL_DROP,
+        AclPacketAction::Trap => ACL_TRAP,
+        AclPacketAction::Copy => ACL_COPY,
+    })
 }
 
 /// Opaque switch handle.
@@ -257,6 +412,30 @@ struct Api {
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int, u64, u64) -> Status>,
     policer_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
     policer_stats: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut u64, *mut u64) -> Status>,
+
+    // --- ABI 1.10: ACLs ----------------------------------------------
+    acl_table_create:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, std::os::raw::c_int, *mut u32) -> Status>,
+    acl_table_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    acl_table_bind:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int) -> Status>,
+    acl_table_unbind_all:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, std::os::raw::c_int, u32) -> Status>,
+    acl_entry_create: Option<
+        unsafe extern "C" fn(
+            *mut ShimSwitch,
+            u32,
+            u32,
+            *const ShimAclFields,
+            std::os::raw::c_int,
+            *mut u32,
+        ) -> Status,
+    >,
+    acl_entry_action_set:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
+    acl_entry_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    acl_available:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, std::os::raw::c_int, *mut u32) -> Status>,
 }
 
 impl Api {
@@ -347,6 +526,32 @@ const OID_TAG_STP: u64 = 0x05;
 const OID_TAG_MIRROR: u64 = 0x06;
 const OID_TAG_HOSTIF: u64 = 0x07;
 const OID_TAG_POLICER: u64 = 0x08;
+const OID_TAG_ACL_TABLE: u64 = 0x09;
+const OID_TAG_ACL_ENTRY: u64 = 0x0a;
+
+fn acl_table_oid(table: u32) -> Oid {
+    Oid((OID_TAG_ACL_TABLE << 56) | u64::from(table))
+}
+
+fn oid_acl_table(oid: Oid) -> u32 {
+    oid.0 as u32
+}
+
+fn acl_entry_oid(entry: u32) -> Oid {
+    Oid((OID_TAG_ACL_ENTRY << 56) | u64::from(entry))
+}
+
+fn oid_acl_entry(oid: Oid) -> u32 {
+    oid.0 as u32
+}
+
+/// The ABI's stage flag: egress is 1, ingress 0.
+fn acl_stage(stage: AclStage) -> std::os::raw::c_int {
+    match stage {
+        AclStage::Ingress => 0,
+        AclStage::Egress => 1,
+    }
+}
 
 fn policer_oid(policer: u32) -> Oid {
     Oid((OID_TAG_POLICER << 56) | u64::from(policer))
@@ -953,8 +1158,8 @@ impl SaiBackend for OpenBcmBackend {
             ecmp_width: raw.ecmp_width,
             ipv6: raw.ipv6 != 0,
             my_mac: false,
-            acl_ingress: false,
-            acl_egress: false,
+            acl_ingress: slot!(self, acl_entry_create, "acl_entry_create").is_ok(),
+            acl_egress: slot!(self, acl_entry_create, "acl_entry_create").is_ok(),
             acl_entry_policer: false,
             port_learn_limit: slot!(self, set_port_learn_limit, "set_port_learn_limit").is_ok(),
             copp: false,
@@ -1537,30 +1742,122 @@ impl SaiBackend for OpenBcmBackend {
         unimplemented_slot("set_vlan_unknown_mcast_group")
     }
 
-    fn create_acl_table(&mut self, _stage: AclStage, _family: AclFamily) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_acl_table")
+    // --- ACLs (ABI 1.10) ----------------------------------------------
+    //
+    // A table is a field group and an entry is a field entry in it; both
+    // ids are the SDK's own. Counters and per-entry policers are not
+    // carried yet, and an action asking for either is refused rather
+    // than quietly installed without it.
+
+    fn create_acl_table(&mut self, stage: AclStage, family: AclFamily) -> Result<Oid, SaiError> {
+        // An IPv6 table would need the v6 qualifiers, and this shim
+        // reports no IPv6 at all -- so the table would exist and none of
+        // its entries could be expressed.
+        if family == AclFamily::Ipv6 {
+            return Err(SaiError::Other(
+                "IPv6 ACL tables need an IPv6 datapath, which this backend does not have".into(),
+            ));
+        }
+        let f = slot!(self, acl_table_create, "acl_table_create")?;
+        let sw = self.switch()?;
+        let mut table: u32 = 0;
+        // SAFETY: `table` is a live u32 the shim writes only on OK.
+        check("acl_table_create", unsafe {
+            f(sw, acl_stage(stage), &mut table)
+        })?;
+        Ok(acl_table_oid(table))
     }
 
-    fn remove_acl_table(&mut self, _table: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_acl_table")
+    fn remove_acl_table(&mut self, table: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, acl_table_destroy, "acl_table_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("acl_table_destroy", unsafe { f(sw, oid_acl_table(table)) })
     }
 
     fn create_acl_entry(
         &mut self,
-        _table: Oid,
-        _priority: u32,
-        _fields: &AclFields,
-        _action: &AclAction,
+        table: Oid,
+        priority: u32,
+        fields: &AclFields,
+        action: &AclAction,
     ) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_acl_entry")
+        let f = slot!(self, acl_entry_create, "acl_entry_create")?;
+        // Both of these can refuse, and both do so before anything
+        // reaches the chip.
+        let shim_fields = ShimAclFields::build(fields)?;
+        let action = acl_action(action)?;
+        let sw = self.switch()?;
+        let mut entry: u32 = 0;
+        // SAFETY: `shim_fields` outlives the call; `entry` is written on OK.
+        check("acl_entry_create", unsafe {
+            f(
+                sw,
+                oid_acl_table(table),
+                priority,
+                &shim_fields,
+                action,
+                &mut entry,
+            )
+        })?;
+        Ok(acl_entry_oid(entry))
     }
 
-    fn set_acl_entry_action(&mut self, _entry: Oid, _action: &AclAction) -> Result<(), SaiError> {
-        unimplemented_slot("set_acl_entry_action")
+    fn set_acl_entry_action(&mut self, entry: Oid, action: &AclAction) -> Result<(), SaiError> {
+        let f = slot!(self, acl_entry_action_set, "acl_entry_action_set")?;
+        let action = acl_action(action)?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("acl_entry_action_set", unsafe {
+            f(sw, oid_acl_entry(entry), action)
+        })
     }
 
-    fn remove_acl_entry(&mut self, _entry: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_acl_entry")
+    fn remove_acl_entry(&mut self, entry: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, acl_entry_destroy, "acl_entry_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("acl_entry_destroy", unsafe { f(sw, oid_acl_entry(entry)) })
+    }
+
+    fn bind_port_acl(
+        &mut self,
+        port: PortId,
+        stage: AclStage,
+        table: Option<Oid>,
+    ) -> Result<(), SaiError> {
+        let logical = self.logical_port(port)?;
+        match table {
+            Some(table) => {
+                let f = slot!(self, acl_table_bind, "acl_table_bind")?;
+                let sw = self.switch()?;
+                // SAFETY: plain scalars over the ABI.
+                check("acl_table_bind", unsafe {
+                    f(sw, oid_acl_table(table), logical, 1)
+                })
+            }
+            // Unbind without being told from what. Neither side keeps a
+            // binding table, so the shim sweeps its stage's groups.
+            None => {
+                let f = slot!(self, acl_table_unbind_all, "acl_table_unbind_all")?;
+                let sw = self.switch()?;
+                // SAFETY: plain scalars over the ABI.
+                check("acl_table_unbind_all", unsafe {
+                    f(sw, acl_stage(stage), logical)
+                })
+            }
+        }
+    }
+
+    fn acl_available_entries(&mut self, stage: AclStage) -> Result<u32, SaiError> {
+        let f = slot!(self, acl_available, "acl_available")?;
+        let sw = self.switch()?;
+        let mut entries: u32 = 0;
+        // SAFETY: `entries` is a live u32 the shim writes only on OK.
+        check("acl_available", unsafe {
+            f(sw, acl_stage(stage), &mut entries)
+        })?;
+        Ok(entries)
     }
 
     fn create_acl_counter(&mut self, _table: Oid) -> Result<Oid, SaiError> {
@@ -1573,19 +1870,6 @@ impl SaiBackend for OpenBcmBackend {
 
     fn get_acl_counter(&mut self, _counter: Oid) -> Result<u64, SaiError> {
         unimplemented_slot("get_acl_counter")
-    }
-
-    fn bind_port_acl(
-        &mut self,
-        _port: PortId,
-        _stage: AclStage,
-        _table: Option<Oid>,
-    ) -> Result<(), SaiError> {
-        unimplemented_slot("bind_port_acl")
-    }
-
-    fn acl_available_entries(&mut self, _stage: AclStage) -> Result<u32, SaiError> {
-        unimplemented_slot("acl_available_entries")
     }
 
     // --- Policers (ABI 1.9) -------------------------------------------
@@ -1946,10 +2230,6 @@ mod tests {
         let mut b = backend();
         assert!(b.create_samplepacket(1024).unwrap_err().is_unsupported());
         assert!(b.run_cable_diag(PortId(1)).unwrap_err().is_unsupported());
-        assert!(b
-            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
-            .unwrap_err()
-            .is_unsupported());
         // Queue counters are the one "absent" family with a defined
         // empty answer rather than an error.
         assert!(b.port_queue_counters(PortId(1)).unwrap().is_empty());
@@ -1979,9 +2259,12 @@ mod tests {
         assert!(caps.lag, "ABI 1.4");
         assert!(caps.stp, "ABI 1.5");
         assert!(caps.storm_control, "ABI 1.7");
+        assert!(caps.acl_ingress && caps.acl_egress, "ABI 1.10");
+        // ...but per-entry policers are a separate slot that does
+        // not exist yet, so that one stays off.
+        assert!(!caps.acl_entry_policer);
         for (name, on) in [
             ("l2mc", caps.l2mc),
-            ("acl_ingress", caps.acl_ingress),
             ("copp", caps.copp),
             ("sflow", caps.sflow),
             ("cable_diag", caps.cable_diag),
@@ -2106,6 +2389,14 @@ mod tests {
             policer_set: None,
             policer_destroy: None,
             policer_stats: None,
+            acl_table_create: None,
+            acl_table_destroy: None,
+            acl_table_bind: None,
+            acl_table_unbind_all: None,
+            acl_entry_create: None,
+            acl_entry_action_set: None,
+            acl_entry_destroy: None,
+            acl_available: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2220,6 +2511,14 @@ mod tests {
             "policer_set",
             "policer_destroy",
             "policer_stats",
+            "acl_table_create",
+            "acl_table_destroy",
+            "acl_table_bind",
+            "acl_table_unbind_all",
+            "acl_entry_create",
+            "acl_entry_action_set",
+            "acl_entry_destroy",
+            "acl_available",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2307,6 +2606,14 @@ mod tests {
             std::mem::offset_of!(Api, policer_set),
             std::mem::offset_of!(Api, policer_destroy),
             std::mem::offset_of!(Api, policer_stats),
+            std::mem::offset_of!(Api, acl_table_create),
+            std::mem::offset_of!(Api, acl_table_destroy),
+            std::mem::offset_of!(Api, acl_table_bind),
+            std::mem::offset_of!(Api, acl_table_unbind_all),
+            std::mem::offset_of!(Api, acl_entry_create),
+            std::mem::offset_of!(Api, acl_entry_action_set),
+            std::mem::offset_of!(Api, acl_entry_destroy),
+            std::mem::offset_of!(Api, acl_available),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -3167,5 +3474,216 @@ mod tests {
         assert_eq!(lag_tid_of(PortId(policer_oid(9).0)), None);
         assert_ne!(oid_tag(policer_oid(1).0), oid_tag(stp_oid(1).0));
         assert_ne!(oid_tag(policer_oid(1).0), oid_tag(mirror_oid(1).0));
+    }
+    // --- ACLs ------------------------------------------------------------
+
+    fn permit() -> AclAction {
+        AclAction {
+            action: AclPacketAction::Forward,
+            counter: None,
+            policer: None,
+        }
+    }
+
+    fn deny() -> AclAction {
+        AclAction {
+            action: AclPacketAction::Drop,
+            counter: None,
+            policer: None,
+        }
+    }
+
+    /// The entry's action code, or -1 if there is no such entry.
+    fn stub_acl_action(b: &OpenBcmBackend, entry: Oid) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_acl_action\0").unwrap();
+            f(b.switch, oid_acl_entry(entry))
+        }
+    }
+
+    /// The entry's `present` mask, or 0 for no such entry.
+    fn stub_acl_fields(b: &OpenBcmBackend, entry: Oid) -> u32 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> u32> =
+                b._library.get(b"hemlockbcm_stub_acl_fields\0").unwrap();
+            f(b.switch, oid_acl_entry(entry))
+        }
+    }
+
+    /// 1 bound, 0 not, -1 if either the table or the port is unknown.
+    fn stub_acl_bound(b: &OpenBcmBackend, table: Oid, port: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_acl_bound\0").unwrap();
+            f(b.switch, oid_acl_table(table), port)
+        }
+    }
+
+    #[test]
+    fn acl_entries_carry_their_match_and_action() {
+        let mut b = backend();
+        let table = b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+
+        let fields = AclFields {
+            src_ip: Some(("10.0.0.0".parse().unwrap(), 8)),
+            protocol: Some(6),
+            dst_port: Some((22, 22)),
+            ..Default::default()
+        };
+        let entry = b.create_acl_entry(table, 100, &fields, &deny()).unwrap();
+        assert_eq!(stub_acl_action(&b, entry), ACL_DROP);
+        assert_eq!(
+            stub_acl_fields(&b, entry),
+            ACL_F_SRC_IP | ACL_F_PROTOCOL | ACL_F_DST_PORT,
+            "only the fields that were set"
+        );
+
+        // The action changes; the match does not.
+        b.set_acl_entry_action(entry, &permit()).unwrap();
+        assert_eq!(stub_acl_action(&b, entry), ACL_FORWARD);
+        assert_eq!(
+            stub_acl_fields(&b, entry),
+            ACL_F_SRC_IP | ACL_F_PROTOCOL | ACL_F_DST_PORT
+        );
+
+        // A table with entries cannot go.
+        assert!(b.remove_acl_table(table).is_err());
+        b.remove_acl_entry(entry).unwrap();
+        b.remove_acl_table(table).unwrap();
+    }
+
+    /// Binding belongs to the table, not its entries, and unbinding
+    /// without being told from what sweeps only that stage.
+    #[test]
+    fn binding_is_per_table_and_per_stage() {
+        let mut b = backend();
+        let ingress = b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+        let egress = b
+            .create_acl_table(AclStage::Egress, AclFamily::Ipv4)
+            .unwrap();
+
+        b.bind_port_acl(PortId(1), AclStage::Ingress, Some(ingress))
+            .unwrap();
+        b.bind_port_acl(PortId(1), AclStage::Egress, Some(egress))
+            .unwrap();
+        assert_eq!(stub_acl_bound(&b, ingress, 1), 1);
+        assert_eq!(stub_acl_bound(&b, egress, 1), 1);
+        assert_eq!(stub_acl_bound(&b, ingress, 2), 0, "another port");
+
+        // Unbinding ingress leaves egress alone -- they are separate
+        // facts, and a sweep that took both would silently disarm an
+        // egress ACL nobody asked about.
+        b.bind_port_acl(PortId(1), AclStage::Ingress, None).unwrap();
+        assert_eq!(stub_acl_bound(&b, ingress, 1), 0);
+        assert_eq!(stub_acl_bound(&b, egress, 1), 1);
+
+        // A table a port still binds cannot go.
+        assert!(b.remove_acl_table(egress).is_err());
+        b.bind_port_acl(PortId(1), AclStage::Egress, None).unwrap();
+        b.remove_acl_table(egress).unwrap();
+        b.remove_acl_table(ingress).unwrap();
+    }
+
+    /// A prefix becomes address-and-mask, and the /0 and /32 ends are
+    /// where the shift is easy to get wrong.
+    #[test]
+    fn ipv4_prefixes_become_address_and_mask() {
+        assert_eq!(
+            ipv4_prefix(("10.1.2.3".parse().unwrap(), 24), "x").unwrap(),
+            (0x0a01_0200, 0xffff_ff00),
+            "host bits are cleared"
+        );
+        assert_eq!(
+            ipv4_prefix(("10.1.2.3".parse().unwrap(), 32), "x").unwrap(),
+            (0x0a01_0203, 0xffff_ffff)
+        );
+        assert_eq!(
+            ipv4_prefix(("0.0.0.0".parse().unwrap(), 0), "x").unwrap(),
+            (0, 0),
+            "a /0 masks nothing, and must not shift by 32"
+        );
+    }
+
+    /// Four things this backend cannot express. Each is refused, and
+    /// none is quietly approximated -- an ACL that silently matches
+    /// something other than what was asked for is worse than one that
+    /// fails to install.
+    #[test]
+    fn acl_rules_this_backend_cannot_express_are_refused() {
+        let mut b = backend();
+        let table = b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+
+        // An IPv6 table, on a datapath reporting no IPv6.
+        assert!(b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv6)
+            .is_err());
+
+        // An IPv6 match in an IPv4 table: truncating it to 32 bits would
+        // match some unrelated v4 prefix.
+        let v6 = AclFields {
+            src_ip: Some(("2001:db8::".parse().unwrap(), 32)),
+            ..Default::default()
+        };
+        assert!(b.create_acl_entry(table, 100, &v6, &deny()).is_err());
+
+        // A real L4 port range needs a range checker.
+        let range = AclFields {
+            dst_port: Some((1024, 2048)),
+            ..Default::default()
+        };
+        assert!(b.create_acl_entry(table, 100, &range, &deny()).is_err());
+        // ...but a degenerate one is an exact match and is fine.
+        let single = AclFields {
+            dst_port: Some((1024, 1024)),
+            ..Default::default()
+        };
+        b.create_acl_entry(table, 100, &single, &deny()).unwrap();
+
+        // A counter or a policer the ABI does not carry yet: installing
+        // the rule without them would lose the operator's log or police
+        // clause while reporting success.
+        let counted = AclAction {
+            counter: Some(Oid(1)),
+            ..deny()
+        };
+        assert!(b.create_acl_entry(table, 100, &single, &counted).is_err());
+        let policed = AclAction {
+            policer: Some(Oid(1)),
+            ..deny()
+        };
+        assert!(b.create_acl_entry(table, 100, &single, &policed).is_err());
+        assert!(b.set_acl_entry_action(Oid(1), &policed).is_err());
+    }
+
+    #[test]
+    fn acl_availability_falls_as_entries_are_added() {
+        let mut b = backend();
+        let table = b
+            .create_acl_table(AclStage::Ingress, AclFamily::Ipv4)
+            .unwrap();
+        let before = b.acl_available_entries(AclStage::Ingress).unwrap();
+        assert!(before > 0);
+
+        let entry = b
+            .create_acl_entry(table, 10, &AclFields::default(), &permit())
+            .unwrap();
+        assert_eq!(
+            b.acl_available_entries(AclStage::Ingress).unwrap(),
+            before - 1
+        );
+        // The other stage is counted separately.
+        assert_eq!(b.acl_available_entries(AclStage::Egress).unwrap(), before);
+
+        b.remove_acl_entry(entry).unwrap();
+        assert_eq!(b.acl_available_entries(AclStage::Ingress).unwrap(), before);
     }
 }

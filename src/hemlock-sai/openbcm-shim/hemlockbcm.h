@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 9
+#define HEMLOCKBCM_ABI_MINOR 10
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -111,6 +111,55 @@ extern "C" {
 /* Which fields narrow a flush_fdb call; see that slot. */
 #define HEMLOCKBCM_FLUSH_VLAN 0x1u
 #define HEMLOCKBCM_FLUSH_PORT 0x2u
+
+/* Which fields of a hemlockbcm_acl_fields are set. */
+#define HEMLOCKBCM_ACL_F_SRC_IP    0x0001u
+#define HEMLOCKBCM_ACL_F_DST_IP    0x0002u
+#define HEMLOCKBCM_ACL_F_PROTOCOL  0x0004u
+#define HEMLOCKBCM_ACL_F_SRC_PORT  0x0008u
+#define HEMLOCKBCM_ACL_F_DST_PORT  0x0010u
+#define HEMLOCKBCM_ACL_F_DSCP      0x0020u
+#define HEMLOCKBCM_ACL_F_SRC_MAC   0x0040u
+#define HEMLOCKBCM_ACL_F_DST_MAC   0x0080u
+#define HEMLOCKBCM_ACL_F_ETHERTYPE 0x0100u
+#define HEMLOCKBCM_ACL_F_VLAN      0x0200u
+
+/* What an ACL entry does with a matching packet. */
+#define HEMLOCKBCM_ACL_FORWARD 0
+#define HEMLOCKBCM_ACL_DROP    1
+/* CPU only: punted and dropped in the forwarding plane. */
+#define HEMLOCKBCM_ACL_TRAP    2
+/* Forwarded and copied to the CPU. */
+#define HEMLOCKBCM_ACL_COPY    3
+
+/*
+ * One ACL entry's match. Every field is IPv4-shaped: the caller refuses
+ * IPv6 tables on a shim that reports no IPv6, so nothing here needs a
+ * v6 form.
+ *
+ * L4 port matches are exact, not ranges. The `_port` fields are a single
+ * value each, because expressing a range needs the chip's range checkers
+ * (`bcm_field_range_create`) -- a small, separately allocated resource
+ * with its own lifecycle -- and the caller rejects a non-degenerate
+ * range rather than the shim quietly matching only its lower bound.
+ */
+struct hemlockbcm_acl_fields {
+    uint32_t present;       /* HEMLOCKBCM_ACL_F_* */
+    uint32_t src_ip;        /* host byte order */
+    uint32_t src_ip_mask;
+    uint32_t dst_ip;
+    uint32_t dst_ip_mask;
+    uint8_t protocol;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t dscp;
+    uint8_t src_mac[6];
+    uint8_t src_mac_mask[6];
+    uint8_t dst_mac[6];
+    uint8_t dst_mac_mask[6];
+    uint16_t ethertype;
+    uint16_t vlan;
+};
 
 /* Opaque per-switch handle, created by create_switch. */
 struct hemlockbcm_switch;
@@ -545,9 +594,50 @@ struct hemlockbcm_api {
     int (*policer_stats)(struct hemlockbcm_switch *sw, uint32_t policer,
                          uint64_t *conforming, uint64_t *dropped);
 
+    /* --- ACLs (ABI 1.10) ---------------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: ACLs, CoPP traps,
-     * sFlow and QoS. Each lands as one slot appended here plus the
+     * A table is a field group; an entry is a field entry in it. Both
+     * ids are the SDK's own, so as everywhere else the caller derives
+     * its object ids and the shim keeps no table.
+     *
+     * `egress` selects the pipeline stage. There is no family argument:
+     * the caller refuses IPv6 tables while this shim reports no IPv6,
+     * and a MAC-only table is an IPv4 group whose entries happen to
+     * qualify on L2 fields, which costs nothing on this hardware.
+     */
+    int (*acl_table_create)(struct hemlockbcm_switch *sw, int egress, uint32_t *table);
+    /* Entries must be gone and no port may still bind it. */
+    int (*acl_table_destroy)(struct hemlockbcm_switch *sw, uint32_t table);
+
+    /* Bind or unbind one port. Binding is a property of the group, not
+     * of its entries, so this does not touch them. */
+    int (*acl_table_bind)(struct hemlockbcm_switch *sw, uint32_t table,
+                          uint32_t logical_port, int bind);
+    /*
+     * Unbind `logical_port` from every table at `egress`'s stage. The
+     * caller reaches this when told to unbind without being told from
+     * what, which it cannot answer itself without keeping the binding
+     * table the shim deliberately does not keep either.
+     */
+    int (*acl_table_unbind_all)(struct hemlockbcm_switch *sw, int egress,
+                                uint32_t logical_port);
+
+    /* Higher `priority` wins, matching the caller's ordering. */
+    int (*acl_entry_create)(struct hemlockbcm_switch *sw, uint32_t table,
+                            uint32_t priority,
+                            const struct hemlockbcm_acl_fields *fields,
+                            int action, uint32_t *entry);
+    /* Replace the entry's action, leaving its match alone. */
+    int (*acl_entry_action_set)(struct hemlockbcm_switch *sw, uint32_t entry, int action);
+    int (*acl_entry_destroy)(struct hemlockbcm_switch *sw, uint32_t entry);
+
+    /* Free TCAM entries at a stage, for utilisation reporting. */
+    int (*acl_available)(struct hemlockbcm_switch *sw, int egress, uint32_t *entries);
+
+    /*
+     * Everything below is the rest of phase 6: ACL counters and
+     * per-entry policers, CoPP traps, sFlow and QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.
