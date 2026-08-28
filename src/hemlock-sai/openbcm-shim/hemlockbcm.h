@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 15
+#define HEMLOCKBCM_ABI_MINOR 16
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -788,9 +788,71 @@ struct hemlockbcm_api {
     int (*route_via_ecmp)(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask,
                           uint32_t group);
 
+    /* --- CoPP traps (ABI 1.16) ---------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: CoPP traps, sFlow and
-     * QoS. Each lands as one slot appended here plus the
+     * A protocol trap is a field entry with copy-to-CPU (plus drop, for
+     * a punt rather than a copy) and a policer attached. The shim owns
+     * each kind's match, because several need qualifiers the generic
+     * ACL fields cannot carry (the ARP opcode, "destination IP is
+     * local").
+     *
+     * Everything is keyed by (kind, is_default): the shim derives its
+     * field group and entry ids from them, so the chip's own entry
+     * table is the state and a trap_set for an existing pair replaces
+     * it. `is_default` marks traps in the switch's default trap group,
+     * whose policer can be swept later by trap_default_policer_set;
+     * named-group traps carry their group's policer at create time.
+     *
+     * Two kinds are deliberately less precise than their names, because
+     * this chip's parser cannot do better, and pretending otherwise
+     * would be worse:
+     *   - The IGMP kinds all install the same match (IP protocol 2).
+     *     The message-type byte is only reachable through a qualifier
+     *     the SDK marks internal-only. They share a policer in every
+     *     real class table, so the imprecision costs nothing there; put
+     *     them in *different* groups and the highest kind wins.
+     *   - The MLD kinds install "IPv6 multicast" (EtherType 0x86dd,
+     *     MAC 33:33::/16) -- a superset that genuinely contains MLD on
+     *     a box with no IPv6 datapath to classify deeper.
+     */
+#define HEMLOCKBCM_TRAP_IP2ME       0   /* lowest priority: protocol traps
+                                         * win overlaps like DHCP-to-me */
+#define HEMLOCKBCM_TRAP_STP         1
+#define HEMLOCKBCM_TRAP_LACP        2
+#define HEMLOCKBCM_TRAP_LLDP        3
+#define HEMLOCKBCM_TRAP_EAPOL       4
+#define HEMLOCKBCM_TRAP_IGMP_QUERY  5
+#define HEMLOCKBCM_TRAP_IGMP_LEAVE  6
+#define HEMLOCKBCM_TRAP_IGMP_V1_REPORT 7
+#define HEMLOCKBCM_TRAP_IGMP_V2_REPORT 8
+#define HEMLOCKBCM_TRAP_IGMP_V3_REPORT 9
+#define HEMLOCKBCM_TRAP_MLD_V1_V2   10
+#define HEMLOCKBCM_TRAP_MLD_V1_REPORT 11
+#define HEMLOCKBCM_TRAP_MLD_V1_DONE 12
+#define HEMLOCKBCM_TRAP_MLD_V2_REPORT 13
+#define HEMLOCKBCM_TRAP_ARP_REQUEST 14
+#define HEMLOCKBCM_TRAP_ARP_RESPONSE 15
+#define HEMLOCKBCM_TRAP_DHCP        16
+#define HEMLOCKBCM_TRAP_OSPF        17
+#define HEMLOCKBCM_TRAP_BGP         18
+#define HEMLOCKBCM_TRAP_VRRP        19
+#define HEMLOCKBCM_TRAP_KIND_COUNT  20
+
+    /* Install (or replace) the trap for (kind, is_default). `trap_only`
+     * punts -- the forwarding copy is dropped; otherwise the packet
+     * forwards and the CPU gets a copy. `policer` of 0 = unpoliced. */
+    int (*trap_set)(struct hemlockbcm_switch *sw, int kind, int trap_only,
+                    int is_default, uint32_t policer);
+    int (*trap_clear)(struct hemlockbcm_switch *sw, int kind, int is_default);
+
+    /* Re-policer every installed default-group trap. The sweep walks
+     * the derived entry ids and probes the chip, so nothing has to
+     * remember which kinds are installed. */
+    int (*trap_default_policer_set)(struct hemlockbcm_switch *sw, uint32_t policer);
+
+    /*
+     * Everything below is the rest of phase 6: sFlow and QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.

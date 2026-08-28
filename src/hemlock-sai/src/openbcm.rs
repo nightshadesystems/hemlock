@@ -473,6 +473,21 @@ struct Api {
     ecmp_member_add: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
     ecmp_member_remove: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
     route_via_ecmp: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, u32) -> Status>,
+
+    // --- ABI 1.16: CoPP traps ----------------------------------------
+    trap_set: Option<
+        unsafe extern "C" fn(
+            *mut ShimSwitch,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+            u32,
+        ) -> Status,
+    >,
+    trap_clear: Option<
+        unsafe extern "C" fn(*mut ShimSwitch, std::os::raw::c_int, std::os::raw::c_int) -> Status,
+    >,
+    trap_default_policer_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
 }
 
 impl Api {
@@ -718,6 +733,71 @@ fn rif_vlan_for(logical_port: u32) -> Result<u16, SaiError> {
         })
 }
 
+/// `HEMLOCKBCM_TRAP_*`: the trap kinds the shim can match. AclLog and
+/// SamplePacket are absent on purpose -- the first installs nothing (see
+/// `create_hostif_trap`), the second belongs to the sFlow family.
+const TRAP_STP: std::os::raw::c_int = 1;
+const TRAP_DHCP: std::os::raw::c_int = 16;
+
+fn trap_kind(kind: TrapKind) -> Result<std::os::raw::c_int, SaiError> {
+    Ok(match kind {
+        TrapKind::Ip2me => 0,
+        TrapKind::Stp => TRAP_STP,
+        TrapKind::Lacp => 2,
+        TrapKind::Lldp => 3,
+        TrapKind::Eapol => 4,
+        TrapKind::IgmpQuery => 5,
+        TrapKind::IgmpLeave => 6,
+        TrapKind::IgmpV1Report => 7,
+        TrapKind::IgmpV2Report => 8,
+        TrapKind::IgmpV3Report => 9,
+        TrapKind::MldV1V2 => 10,
+        TrapKind::MldV1Report => 11,
+        TrapKind::MldV1Done => 12,
+        TrapKind::MldV2Report => 13,
+        TrapKind::ArpRequest => 14,
+        TrapKind::ArpResponse => 15,
+        TrapKind::Dhcp => TRAP_DHCP,
+        TrapKind::Ospf => 17,
+        TrapKind::Bgp => 18,
+        TrapKind::Vrrp => 19,
+        // Sampled packets are the sFlow family's to punt; until that
+        // lands there is no session for this trap to serve.
+        TrapKind::SamplePacket => return unimplemented_slot("samplepacket trap"),
+        TrapKind::AclLog => {
+            return Err(SaiError::Other(
+                "AclLog is handled before the kind mapping".into(),
+            ))
+        }
+    })
+}
+
+const OID_TAG_TRAP_GROUP: u64 = 0x11;
+const OID_TAG_TRAP: u64 = 0x12;
+
+/// A trap group is its policer, so the id carries it. 0 = unpoliced.
+fn trap_group_oid(policer: u32) -> Oid {
+    Oid((OID_TAG_TRAP_GROUP << 56) | u64::from(policer))
+}
+
+fn oid_trap_group_policer(oid: Oid) -> u32 {
+    oid.0 as u32
+}
+
+/// Kind in the low byte, default-group flag in bit 8.
+fn trap_oid(kind: std::os::raw::c_int, is_default: bool) -> Oid {
+    Oid((OID_TAG_TRAP << 56) | (u64::from(is_default) << 8) | kind as u64)
+}
+
+fn oid_trap(oid: Oid) -> (std::os::raw::c_int, bool) {
+    ((oid.0 & 0xff) as std::os::raw::c_int, oid.0 & 0x100 != 0)
+}
+
+/// The accepted-but-inert AclLog trap; 0xff is no real kind.
+fn acl_log_trap_oid() -> Oid {
+    Oid((OID_TAG_TRAP << 56) | 0xff)
+}
+
 /// Map a shim status onto the error type the rest of Hemlock understands.
 fn check(call: &'static str, status: Status) -> Result<(), SaiError> {
     if status == 0 {
@@ -792,6 +872,12 @@ pub struct OpenBcmBackend {
     led_program_path: Option<PathBuf>,
     config_bcm_path: PathBuf,
     src_mac: Option<[u8; 6]>,
+    /// The default trap group's policer (0 = none): the one cached word
+    /// in this backend. A trap created into the default group needs the
+    /// value from the last set_default_trap_group_policer call, and
+    /// nothing derivable holds it. Lost on restart, and safely so --
+    /// syncd replays the whole CoPP program after create_switch.
+    default_trap_policer: u32,
     diag_shell: bool,
     events: Option<mpsc::UnboundedReceiver<SaiEvent>>,
     event_ctx: Arc<EventContext>,
@@ -891,6 +977,7 @@ impl OpenBcmBackend {
             led_program_path: init.led_program_path.clone(),
             config_bcm_path: init.config_bcm_path.clone(),
             src_mac: init.src_mac,
+            default_trap_policer: 0,
             diag_shell: init.diag_shell,
             events: Some(rx),
             event_ctx: Arc::new(EventContext { tx }),
@@ -1341,7 +1428,7 @@ impl SaiBackend for OpenBcmBackend {
             acl_egress: slot!(self, acl_entry_create, "acl_entry_create").is_ok(),
             acl_entry_policer: slot!(self, acl_entry_attach, "acl_entry_attach").is_ok(),
             port_learn_limit: slot!(self, set_port_learn_limit, "set_port_learn_limit").is_ok(),
-            copp: false,
+            copp: slot!(self, trap_set, "trap_set").is_ok(),
             buffer_bytes_total: raw.buffer_bytes_total,
             qos_map_ingress: false,
             qos_map_egress: false,
@@ -2277,29 +2364,92 @@ impl SaiBackend for OpenBcmBackend {
         })
     }
 
-    fn create_hostif_trap_group(&mut self, _policer: Option<Oid>) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_hostif_trap_group")
+    // --- CoPP traps (ABI 1.16) ----------------------------------------
+    //
+    // A trap group carries exactly one fact -- its policer -- so its id
+    // *is* that fact and nothing is allocated. A trap's id carries its
+    // kind and whether it sits in the default group, which is all a
+    // removal needs. The one cached word in this whole backend is the
+    // default group's policer: a trap created into the default group
+    // later needs the current value, and nothing derivable holds it.
+
+    fn create_hostif_trap_group(&mut self, policer: Option<Oid>) -> Result<Oid, SaiError> {
+        // The group is a name for its policer; the hardware object only
+        // comes into being when a trap is created into it.
+        Ok(trap_group_oid(policer.map_or(0, oid_policer)))
     }
 
     fn remove_hostif_trap_group(&mut self, _group: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_hostif_trap_group")
+        // Nothing was allocated. The trap entries themselves are removed
+        // through remove_hostif_trap, which is where their lifetime sits.
+        Ok(())
     }
 
     fn create_hostif_trap(
         &mut self,
-        _kind: TrapKind,
-        _trap_only: bool,
-        _group: Oid,
+        kind: TrapKind,
+        trap_only: bool,
+        group: Oid,
     ) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_hostif_trap")
+        // ACL log copies cannot be told apart from other CPU-bound
+        // traffic by this chip's pipeline -- the copy is made by the ACL
+        // entry itself, and a second FP stage cannot match "was copied
+        // by the first". The trap is accepted so the CoPP program can
+        // run, installs nothing, and the class's counters will read
+        // zero. The gap is documented here and in the port doc, not
+        // hidden.
+        if kind == TrapKind::AclLog {
+            return Ok(acl_log_trap_oid());
+        }
+        let kind_id = trap_kind(kind)?;
+        let f = slot!(self, trap_set, "trap_set")?;
+        let is_default = group.0 == 0;
+        let policer = if is_default {
+            self.default_trap_policer
+        } else if oid_tag(group.0) == OID_TAG_TRAP_GROUP {
+            oid_trap_group_policer(group)
+        } else {
+            // A junk group id would decode to a junk policer and attach
+            // it; refuse rather than meter through garbage.
+            return Err(SaiError::Other(format!("{group} is not a trap group")));
+        };
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("trap_set", unsafe {
+            f(
+                sw,
+                kind_id,
+                i32::from(trap_only),
+                i32::from(is_default),
+                policer,
+            )
+        })?;
+        Ok(trap_oid(kind_id, is_default))
     }
 
-    fn remove_hostif_trap(&mut self, _trap: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_hostif_trap")
+    fn remove_hostif_trap(&mut self, trap: Oid) -> Result<(), SaiError> {
+        if trap == acl_log_trap_oid() {
+            return Ok(()); // nothing was installed
+        }
+        let f = slot!(self, trap_clear, "trap_clear")?;
+        let (kind_id, is_default) = oid_trap(trap);
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("trap_clear", unsafe {
+            f(sw, kind_id, i32::from(is_default))
+        })
     }
 
-    fn set_default_trap_group_policer(&mut self, _policer: Option<Oid>) -> Result<(), SaiError> {
-        unimplemented_slot("set_default_trap_group_policer")
+    fn set_default_trap_group_policer(&mut self, policer: Option<Oid>) -> Result<(), SaiError> {
+        let f = slot!(self, trap_default_policer_set, "trap_default_policer_set")?;
+        let id = policer.map_or(0, oid_policer);
+        let sw = self.switch()?;
+        // The shim sweeps the traps already installed in the default
+        // group; the cached value covers the ones created after.
+        // SAFETY: plain scalars over the ABI.
+        check("trap_default_policer_set", unsafe { f(sw, id) })?;
+        self.default_trap_policer = id;
+        Ok(())
     }
 
     fn create_qos_map(
@@ -2615,10 +2765,10 @@ mod tests {
         assert!(caps.stp, "ABI 1.5");
         assert!(caps.storm_control, "ABI 1.7");
         assert!(caps.acl_ingress && caps.acl_egress, "ABI 1.10");
+        assert!(caps.copp, "ABI 1.16");
         assert!(caps.acl_entry_policer, "ABI 1.11");
         for (name, on) in [
             ("l2mc", caps.l2mc),
-            ("copp", caps.copp),
             ("sflow", caps.sflow),
             ("cable_diag", caps.cable_diag),
             ("wred", caps.wred),
@@ -2770,6 +2920,9 @@ mod tests {
             ecmp_member_add: None,
             ecmp_member_remove: None,
             route_via_ecmp: None,
+            trap_set: None,
+            trap_clear: None,
+            trap_default_policer_set: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2912,6 +3065,9 @@ mod tests {
             "ecmp_member_add",
             "ecmp_member_remove",
             "route_via_ecmp",
+            "trap_set",
+            "trap_clear",
+            "trap_default_policer_set",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -3027,6 +3183,9 @@ mod tests {
             std::mem::offset_of!(Api, ecmp_member_add),
             std::mem::offset_of!(Api, ecmp_member_remove),
             std::mem::offset_of!(Api, route_via_ecmp),
+            std::mem::offset_of!(Api, trap_set),
+            std::mem::offset_of!(Api, trap_clear),
+            std::mem::offset_of!(Api, trap_default_policer_set),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -4608,5 +4767,180 @@ mod tests {
         );
         b.remove_route(route("10.2.0.0/16")).unwrap();
         b.remove_next_hop_group(group).unwrap();
+    }
+    // --- CoPP traps --------------------------------------------------------
+
+    /// -1 if the trap is not installed, else (policer << 8) |
+    /// (trap_only << 1) | 1.
+    fn stub_trap(b: &OpenBcmBackend, kind: std::os::raw::c_int, is_default: bool) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *mut ShimSwitch,
+                    std::os::raw::c_int,
+                    std::os::raw::c_int,
+                ) -> i64,
+            > = b._library.get(b"hemlockbcm_stub_trap\0").unwrap();
+            f(b.switch, kind, i32::from(is_default))
+        }
+    }
+
+    fn installed(policer: Option<Oid>, trap_only: bool) -> i64 {
+        (i64::from(policer.map_or(0, oid_policer)) << 8) | (i64::from(trap_only) << 1) | 1
+    }
+
+    fn copp_policer(b: &mut OpenBcmBackend, rate: u64) -> Oid {
+        b.create_policer(PolicerSpec {
+            pps: true,
+            rate,
+            burst: rate / 4,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn copp_traps_carry_their_groups_policer() {
+        let mut b = backend();
+        let policer = copp_policer(&mut b, 512);
+        let group = b.create_hostif_trap_group(Some(policer)).unwrap();
+
+        // A punt: the forwarding copy is dropped.
+        let stp = b.create_hostif_trap(TrapKind::Stp, true, group).unwrap();
+        assert_eq!(
+            stub_trap(&b, TRAP_STP, false),
+            installed(Some(policer), true)
+        );
+
+        // A copy: DHCP keeps forwarding.
+        let dhcp = b.create_hostif_trap(TrapKind::Dhcp, false, group).unwrap();
+        assert_eq!(
+            stub_trap(&b, TRAP_DHCP, false),
+            installed(Some(policer), false)
+        );
+        assert_ne!(stp, dhcp);
+
+        b.remove_hostif_trap(stp).unwrap();
+        assert_eq!(stub_trap(&b, TRAP_STP, false), -1);
+        assert!(b.remove_hostif_trap(stp).is_err(), "already gone");
+        assert_eq!(
+            stub_trap(&b, TRAP_DHCP, false),
+            installed(Some(policer), false),
+            "the other trap is untouched"
+        );
+
+        // The group is a name for its policer: removing it frees
+        // nothing, and the same policer names the same group.
+        b.remove_hostif_trap_group(group).unwrap();
+        assert_eq!(b.create_hostif_trap_group(Some(policer)).unwrap(), group);
+    }
+
+    /// program_copp uses `?` on every trap it creates, so one refused
+    /// kind takes down all of CoPP at startup. Every kind in the class
+    /// table must therefore be accepted -- this is that guarantee,
+    /// pinned. (SamplePacket is absent from the table; it belongs to
+    /// sFlow and is refused until that family exists.)
+    #[test]
+    fn every_copp_class_table_kind_is_accepted() {
+        let mut b = backend();
+        let policer = copp_policer(&mut b, 1000);
+        let group = b.create_hostif_trap_group(Some(policer)).unwrap();
+        for kind in [
+            TrapKind::Ip2me,
+            TrapKind::Stp,
+            TrapKind::Lacp,
+            TrapKind::Lldp,
+            TrapKind::Eapol,
+            TrapKind::IgmpQuery,
+            TrapKind::IgmpLeave,
+            TrapKind::IgmpV1Report,
+            TrapKind::IgmpV2Report,
+            TrapKind::IgmpV3Report,
+            TrapKind::MldV1V2,
+            TrapKind::MldV1Report,
+            TrapKind::MldV1Done,
+            TrapKind::MldV2Report,
+            TrapKind::ArpRequest,
+            TrapKind::ArpResponse,
+            TrapKind::Dhcp,
+            TrapKind::Ospf,
+            TrapKind::Bgp,
+            TrapKind::Vrrp,
+            TrapKind::AclLog,
+        ] {
+            b.create_hostif_trap(kind, false, group)
+                .unwrap_or_else(|e| panic!("{kind:?} must be accepted: {e}"));
+        }
+        assert!(b
+            .create_hostif_trap(TrapKind::SamplePacket, false, group)
+            .unwrap_err()
+            .is_unsupported());
+    }
+
+    /// Default-group traps follow the default policer both ways: ones
+    /// installed before a policer change are swept, ones created after
+    /// pick up the cached value.
+    #[test]
+    fn default_group_traps_follow_the_default_policer() {
+        let mut b = backend();
+        let before = b
+            .create_hostif_trap(TrapKind::ArpRequest, false, Oid(0))
+            .unwrap();
+        assert_eq!(stub_trap(&b, 14, true), installed(None, false), "unpoliced");
+
+        let policer = copp_policer(&mut b, 256);
+        b.set_default_trap_group_policer(Some(policer)).unwrap();
+        assert_eq!(
+            stub_trap(&b, 14, true),
+            installed(Some(policer), false),
+            "swept onto the existing trap"
+        );
+
+        let after = b
+            .create_hostif_trap(TrapKind::ArpResponse, false, Oid(0))
+            .unwrap();
+        assert_eq!(
+            stub_trap(&b, 15, true),
+            installed(Some(policer), false),
+            "picked up by a trap created afterwards"
+        );
+        assert_ne!(before, after);
+
+        b.set_default_trap_group_policer(None).unwrap();
+        assert_eq!(stub_trap(&b, 14, true), installed(None, false));
+        assert_eq!(stub_trap(&b, 15, true), installed(None, false));
+
+        // The same kind in the default group and a named group are
+        // different traps -- the id carries the distinction.
+        let group = b.create_hostif_trap_group(None).unwrap();
+        let named = b
+            .create_hostif_trap(TrapKind::ArpRequest, false, group)
+            .unwrap();
+        assert_ne!(before, named);
+    }
+
+    /// The AclLog trap is accepted so the CoPP program can run, and
+    /// installs nothing: the pipeline cannot tell an ACL entry's CPU
+    /// copy from any other CPU-bound packet. Zero counters, not a
+    /// refused class -- and not a pretend match either.
+    #[test]
+    fn acl_log_is_accepted_but_inert() {
+        let mut b = backend();
+        let group = b.create_hostif_trap_group(None).unwrap();
+        let trap = b.create_hostif_trap(TrapKind::AclLog, true, group).unwrap();
+        for kind in 0..20 {
+            assert_eq!(stub_trap(&b, kind, false), -1, "kind {kind} installed");
+        }
+        b.remove_hostif_trap(trap).unwrap();
+    }
+
+    /// A junk group id would decode to a junk policer and meter through
+    /// garbage; it is refused instead.
+    #[test]
+    fn a_trap_into_a_non_group_is_refused() {
+        let mut b = backend();
+        assert!(b
+            .create_hostif_trap(TrapKind::Stp, true, vlan_oid(100))
+            .is_err());
+        assert_eq!(stub_trap(&b, TRAP_STP, false), -1);
     }
 }

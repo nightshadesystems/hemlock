@@ -2524,6 +2524,281 @@ static int hb_route_via_ecmp(struct hemlockbcm_switch *sw, uint32_t prefix,
     return HB_CALL(bcm_l3_route_add(sw->unit, &route));
 }
 
+/* --- CoPP traps (ABI 1.16) ------------------------------------------------- */
+
+/*
+ * The trap entries live in a field group of their own, with a fixed id
+ * so it can be found again without anything remembering it -- the same
+ * derived-id idiom the trap entries themselves use. User ACL groups get
+ * SDK-assigned ids counting up from zero, and entry ids likewise, so
+ * the fixed ids sit far above both. Confirm on hardware that they are
+ * inside the chip's valid ranges; a wrong base fails the first
+ * trap_set loudly.
+ */
+#define HB_TRAP_GROUP_ID        100
+#define HB_TRAP_GROUP_PRIO      1
+#define HB_TRAP_ENTRY_BASE      0x8000
+#define HB_TRAP_DEFAULT_OFFSET  0x100
+#define HB_TRAP_PRIO_BASE       100
+#define HB_TRAP_MAX_SUB         2
+
+static bcm_field_entry_t hb_trap_entry_id(int kind, int is_default, int sub)
+{
+    return HB_TRAP_ENTRY_BASE + (is_default ? HB_TRAP_DEFAULT_OFFSET : 0)
+           + kind * HB_TRAP_MAX_SUB + sub;
+}
+
+/* How many entries a kind needs: DHCP has two server ports, BGP two
+ * directions. Everything else is one match. */
+static int hb_trap_subentries(int kind)
+{
+    return (kind == HEMLOCKBCM_TRAP_DHCP || kind == HEMLOCKBCM_TRAP_BGP) ? 2 : 1;
+}
+
+/* Ensure the trap group exists; racing a previous creation is fine. */
+static int hb_trap_group_ensure(struct hemlockbcm_switch *sw)
+{
+    bcm_field_qset_t qset;
+    int rv;
+
+    BCM_FIELD_QSET_INIT(qset);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyStageIngress);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyDstMac);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyEtherType);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyIpProtocol);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyL4SrcPort);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyL4DstPort);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyArpOpcode);
+    BCM_FIELD_QSET_ADD(qset, bcmFieldQualifyDstIpLocal);
+    rv = bcm_field_group_create_id(sw->unit, qset, HB_TRAP_GROUP_PRIO,
+                                   HB_TRAP_GROUP_ID);
+    if (rv == BCM_E_EXISTS) {
+        return HEMLOCKBCM_OK;
+    }
+    return HB_CALL(rv);
+}
+
+/* One kind's match, on one of its entries. Where a MAC is matched it is
+ * exact unless stated; every IPv4 protocol match also pins the
+ * EtherType, so a parser that reuses the protocol field for IPv6
+ * next-headers cannot alias it. */
+static int hb_trap_qualify(struct hemlockbcm_switch *sw, bcm_field_entry_t entry,
+                           int kind, int sub)
+{
+    static const bcm_mac_t exact = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    static const bcm_mac_t stp_mac = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 };
+    static const bcm_mac_t lacp_mac = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x02 };
+    static const bcm_mac_t lldp_mac = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e };
+    static const bcm_mac_t v6_mcast = { 0x33, 0x33, 0x00, 0x00, 0x00, 0x00 };
+    static const bcm_mac_t v6_mcast_mask = { 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 };
+    bcm_mac_t mac, mask;
+    int status;
+
+#define HB_TQ(expr)                        \
+    do {                                   \
+        status = HB_CALL(expr);            \
+        if (status != HEMLOCKBCM_OK) {     \
+            return status;                 \
+        }                                  \
+    } while (0)
+
+    switch (kind) {
+    case HEMLOCKBCM_TRAP_IP2ME:
+        /* Frames whose destination IP resolves to this switch. */
+        HB_TQ(bcm_field_qualify_DstIpLocal(sw->unit, entry, 1, 1));
+        break;
+    case HEMLOCKBCM_TRAP_STP:
+        sal_memcpy(mac, stp_mac, sizeof(mac));
+        sal_memcpy(mask, exact, sizeof(mask));
+        HB_TQ(bcm_field_qualify_DstMac(sw->unit, entry, mac, mask));
+        break;
+    case HEMLOCKBCM_TRAP_LACP:
+        sal_memcpy(mac, lacp_mac, sizeof(mac));
+        sal_memcpy(mask, exact, sizeof(mask));
+        HB_TQ(bcm_field_qualify_DstMac(sw->unit, entry, mac, mask));
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x8809, 0xffff));
+        break;
+    case HEMLOCKBCM_TRAP_LLDP:
+        sal_memcpy(mac, lldp_mac, sizeof(mac));
+        sal_memcpy(mask, exact, sizeof(mask));
+        HB_TQ(bcm_field_qualify_DstMac(sw->unit, entry, mac, mask));
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x88cc, 0xffff));
+        break;
+    case HEMLOCKBCM_TRAP_EAPOL:
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x888e, 0xffff));
+        break;
+    case HEMLOCKBCM_TRAP_IGMP_QUERY:
+    case HEMLOCKBCM_TRAP_IGMP_LEAVE:
+    case HEMLOCKBCM_TRAP_IGMP_V1_REPORT:
+    case HEMLOCKBCM_TRAP_IGMP_V2_REPORT:
+    case HEMLOCKBCM_TRAP_IGMP_V3_REPORT:
+        /* All IGMP: the type byte is not honestly reachable. */
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x0800, 0xffff));
+        HB_TQ(bcm_field_qualify_IpProtocol(sw->unit, entry, 2, 0xff));
+        break;
+    case HEMLOCKBCM_TRAP_MLD_V1_V2:
+    case HEMLOCKBCM_TRAP_MLD_V1_REPORT:
+    case HEMLOCKBCM_TRAP_MLD_V1_DONE:
+    case HEMLOCKBCM_TRAP_MLD_V2_REPORT:
+        /* IPv6 multicast: a superset that contains MLD. */
+        sal_memcpy(mac, v6_mcast, sizeof(mac));
+        sal_memcpy(mask, v6_mcast_mask, sizeof(mask));
+        HB_TQ(bcm_field_qualify_DstMac(sw->unit, entry, mac, mask));
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x86dd, 0xffff));
+        break;
+    case HEMLOCKBCM_TRAP_ARP_REQUEST:
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x0806, 0xffff));
+        HB_TQ(bcm_field_qualify_ArpOpcode(sw->unit, entry, bcmFieldArpOpcodeRequest));
+        break;
+    case HEMLOCKBCM_TRAP_ARP_RESPONSE:
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x0806, 0xffff));
+        HB_TQ(bcm_field_qualify_ArpOpcode(sw->unit, entry, bcmFieldArpOpcodeReply));
+        break;
+    case HEMLOCKBCM_TRAP_DHCP:
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x0800, 0xffff));
+        HB_TQ(bcm_field_qualify_IpProtocol(sw->unit, entry, 17, 0xff));
+        HB_TQ(bcm_field_qualify_L4DstPort(sw->unit, entry, sub == 0 ? 67 : 68,
+                                          0xffff));
+        break;
+    case HEMLOCKBCM_TRAP_OSPF:
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x0800, 0xffff));
+        HB_TQ(bcm_field_qualify_IpProtocol(sw->unit, entry, 89, 0xff));
+        break;
+    case HEMLOCKBCM_TRAP_BGP:
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x0800, 0xffff));
+        HB_TQ(bcm_field_qualify_IpProtocol(sw->unit, entry, 6, 0xff));
+        if (sub == 0) {
+            HB_TQ(bcm_field_qualify_L4DstPort(sw->unit, entry, 179, 0xffff));
+        } else {
+            HB_TQ(bcm_field_qualify_L4SrcPort(sw->unit, entry, 179, 0xffff));
+        }
+        break;
+    case HEMLOCKBCM_TRAP_VRRP:
+        HB_TQ(bcm_field_qualify_EtherType(sw->unit, entry, 0x0800, 0xffff));
+        HB_TQ(bcm_field_qualify_IpProtocol(sw->unit, entry, 112, 0xff));
+        break;
+    default:
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+#undef HB_TQ
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_trap_set(struct hemlockbcm_switch *sw, int kind, int trap_only,
+                       int is_default, uint32_t policer)
+{
+    int sub;
+    int status;
+
+    if (sw == NULL || kind < 0 || kind >= HEMLOCKBCM_TRAP_KIND_COUNT) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_trap_group_ensure(sw);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    for (sub = 0; sub < hb_trap_subentries(kind); sub++) {
+        bcm_field_entry_t entry = hb_trap_entry_id(kind, is_default, sub);
+
+        /* A replace: whatever was there for this (kind, is_default)
+         * goes first, so re-programming a class never duplicates. */
+        (void)bcm_field_entry_destroy(sw->unit, entry);
+        status = HB_CALL(bcm_field_entry_create_id(sw->unit, HB_TRAP_GROUP_ID, entry));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+        /* Deterministic overlap resolution: the higher kind wins, and
+         * IP2ME is kind 0 so every protocol trap beats it. */
+        status = HB_CALL(bcm_field_entry_prio_set(sw->unit, entry,
+                                                  HB_TRAP_PRIO_BASE + kind));
+        if (status == HEMLOCKBCM_OK) {
+            status = hb_trap_qualify(sw, entry, kind, sub);
+        }
+        if (status == HEMLOCKBCM_OK) {
+            status = HB_CALL(bcm_field_action_add(sw->unit, entry,
+                                                  bcmFieldActionCopyToCpu, 0, 0));
+        }
+        if (status == HEMLOCKBCM_OK && trap_only) {
+            /* A punt: the CPU copy is the only copy. */
+            status = HB_CALL(bcm_field_action_add(sw->unit, entry,
+                                                  bcmFieldActionDrop, 0, 0));
+        }
+        if (status == HEMLOCKBCM_OK && policer != 0) {
+            status = HB_CALL(bcm_field_entry_policer_attach(
+                sw->unit, entry, HB_ACL_POLICER_LEVEL, (bcm_policer_t)policer));
+        }
+        if (status == HEMLOCKBCM_OK) {
+            status = HB_CALL(bcm_field_entry_install(sw->unit, entry));
+        }
+        if (status != HEMLOCKBCM_OK) {
+            /* A half-built trap matches wrongly; take it back out. */
+            (void)bcm_field_entry_destroy(sw->unit, entry);
+            return status;
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_trap_clear(struct hemlockbcm_switch *sw, int kind, int is_default)
+{
+    int sub;
+    int status = HEMLOCKBCM_OK;
+
+    if (sw == NULL || kind < 0 || kind >= HEMLOCKBCM_TRAP_KIND_COUNT) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (sub = 0; sub < hb_trap_subentries(kind); sub++) {
+        int rv = bcm_field_entry_destroy(
+            sw->unit, hb_trap_entry_id(kind, is_default, sub));
+        if (rv != BCM_E_NONE && status == HEMLOCKBCM_OK) {
+            status = hb_status(rv);
+        }
+    }
+    return status;
+}
+
+static int hb_trap_default_policer_set(struct hemlockbcm_switch *sw, uint32_t policer)
+{
+    int kind;
+    int sub;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * Walk the derived ids and probe the chip for which default-group
+     * traps exist -- prio_get is the cheapest call that distinguishes
+     * "no such entry" from an entry with no policer. The chip's entry
+     * table is the membership list; nothing here remembers one.
+     */
+    for (kind = 0; kind < HEMLOCKBCM_TRAP_KIND_COUNT; kind++) {
+        for (sub = 0; sub < hb_trap_subentries(kind); sub++) {
+            bcm_field_entry_t entry = hb_trap_entry_id(kind, 1, sub);
+            int prio = 0;
+
+            if (bcm_field_entry_prio_get(sw->unit, entry, &prio) != BCM_E_NONE) {
+                continue;  /* not installed */
+            }
+            (void)bcm_field_entry_policer_detach(sw->unit, entry,
+                                                 HB_ACL_POLICER_LEVEL);
+            if (policer != 0) {
+                status = HB_CALL(bcm_field_entry_policer_attach(
+                    sw->unit, entry, HB_ACL_POLICER_LEVEL,
+                    (bcm_policer_t)policer));
+                if (status != HEMLOCKBCM_OK) {
+                    return status;
+                }
+            }
+            status = HB_CALL(bcm_field_entry_install(sw->unit, entry));
+            if (status != HEMLOCKBCM_OK) {
+                return status;
+            }
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2606,6 +2881,9 @@ static const struct hemlockbcm_api HB_API = {
     hb_ecmp_member_add,
     hb_ecmp_member_remove,
     hb_route_via_ecmp,
+    hb_trap_set,
+    hb_trap_clear,
+    hb_trap_default_policer_set,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

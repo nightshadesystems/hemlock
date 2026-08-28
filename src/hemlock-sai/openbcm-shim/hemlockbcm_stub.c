@@ -120,6 +120,14 @@ struct stub_route {
     uint32_t nexthop_ip;            /* 0 unless the kind is NEXTHOP */
 };
 
+/* One installed protocol trap: (kind, is_default) -> what trap_set put
+ * there. */
+struct stub_trap {
+    int used;
+    int trap_only;
+    uint32_t policer;
+};
+
 /* An ECMP group and the next hops it spreads across. */
 struct stub_ecmp {
     int used;
@@ -226,6 +234,7 @@ struct hemlockbcm_switch {
     struct stub_route routes[STUB_ROUTES];
     struct stub_neighbor neighbors[STUB_NEIGHBORS];
     struct stub_ecmp ecmps[STUB_ECMP_GROUPS];
+    struct stub_trap traps[HEMLOCKBCM_TRAP_KIND_COUNT][2];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -2501,6 +2510,79 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_ecmp_member(struct hemlockbcm_switch *sw,
     return 0;
 }
 
+/* --- CoPP traps (ABI 1.16) ------------------------------------------------- */
+
+static int stub_trap_valid(int kind)
+{
+    return kind >= 0 && kind < HEMLOCKBCM_TRAP_KIND_COUNT;
+}
+
+static int stub_trap_set(struct hemlockbcm_switch *sw, int kind, int trap_only,
+                         int is_default, uint32_t policer)
+{
+    struct stub_trap *slot;
+
+    if (sw == NULL || !stub_trap_valid(kind)) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* A replace, keyed by (kind, is_default), like the real shim's
+     * derived entry ids make it. */
+    slot = &sw->traps[kind][is_default ? 1 : 0];
+    slot->used = 1;
+    slot->trap_only = trap_only ? 1 : 0;
+    slot->policer = policer;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_trap_clear(struct hemlockbcm_switch *sw, int kind, int is_default)
+{
+    struct stub_trap *slot;
+
+    if (sw == NULL || !stub_trap_valid(kind)) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    slot = &sw->traps[kind][is_default ? 1 : 0];
+    if (!slot->used) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    memset(slot, 0, sizeof(*slot));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_trap_default_policer_set(struct hemlockbcm_switch *sw, uint32_t policer)
+{
+    int kind;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Only the installed default-group traps; named groups keep the
+     * policer they were created with. */
+    for (kind = 0; kind < HEMLOCKBCM_TRAP_KIND_COUNT; kind++) {
+        if (sw->traps[kind][1].used) {
+            sw->traps[kind][1].policer = policer;
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI: -1 if the trap is not installed, else
+ * (policer << 8) | (trap_only << 1) | 1. */
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_trap(struct hemlockbcm_switch *sw,
+                                               int kind, int is_default)
+{
+    struct stub_trap *slot;
+
+    if (sw == NULL || !stub_trap_valid(kind)) {
+        return -1;
+    }
+    slot = &sw->traps[kind][is_default ? 1 : 0];
+    if (!slot->used) {
+        return -1;
+    }
+    return ((int64_t)slot->policer << 8) | ((int64_t)slot->trap_only << 1) | 1;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2583,6 +2665,9 @@ static const struct hemlockbcm_api STUB_API = {
     stub_ecmp_member_add,
     stub_ecmp_member_remove,
     stub_route_via_ecmp,
+    stub_trap_set,
+    stub_trap_clear,
+    stub_trap_default_policer_set,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)
