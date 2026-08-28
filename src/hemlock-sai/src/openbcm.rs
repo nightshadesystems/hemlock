@@ -208,6 +208,19 @@ fn ipv4_prefix(prefix: IpPrefix, what: &str) -> Result<(u32, u32), SaiError> {
     }
 }
 
+/// An IPv4 address as a u32, or an error for a v6 one.
+///
+/// The shim reports no IPv6, and truncating a v6 address to 32 bits
+/// would name some unrelated v4 host.
+fn ipv4_address(ip: std::net::IpAddr, what: &str) -> Result<u32, SaiError> {
+    match ip {
+        std::net::IpAddr::V4(addr) => Ok(u32::from(addr)),
+        std::net::IpAddr::V6(_) => Err(SaiError::Other(format!(
+            "{what}: IPv6 needs an IPv6 datapath, which this backend does not have"
+        ))),
+    }
+}
+
 /// One L4 port match. The chip expresses a range with a range checker,
 /// a separately allocated resource this ABI does not yet carry, so a
 /// non-degenerate range is refused rather than silently narrowed to its
@@ -448,6 +461,11 @@ struct Api {
     route_set:
         Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int, u32) -> Status>,
     route_delete: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
+
+    // --- ABI 1.14: neighbours and next hops --------------------------
+    neighbor_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, *const u8) -> Status>,
+    neighbor_clear: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
+    route_via_nexthop: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, u32) -> Status>,
 }
 
 impl Api {
@@ -543,6 +561,18 @@ const OID_TAG_ACL_ENTRY: u64 = 0x0a;
 const OID_TAG_ACL_COUNTER: u64 = 0x0b;
 const OID_TAG_RIF: u64 = 0x0c;
 const OID_TAG_MY_MAC: u64 = 0x0d;
+const OID_TAG_NEXT_HOP: u64 = 0x0e;
+
+/// A next hop is named by the neighbour it forwards to, because that is
+/// how the chip's host table is keyed. Nothing is allocated, so the id
+/// is the address itself.
+fn next_hop_oid(ip: u32) -> Oid {
+    Oid((OID_TAG_NEXT_HOP << 56) | u64::from(ip))
+}
+
+fn oid_next_hop(oid: Oid) -> u32 {
+    oid.0 as u32
+}
 
 fn rif_oid(rif: u32) -> Oid {
     Oid((OID_TAG_RIF << 56) | u64::from(rif))
@@ -1433,10 +1463,22 @@ impl SaiBackend for OpenBcmBackend {
             RouteTarget::Cpu => (ROUTE_CPU, 0),
             RouteTarget::Rif(rif) => (ROUTE_RIF, oid_rif(rif)),
             RouteTarget::Drop => (ROUTE_DROP, 0),
-            RouteTarget::NextHop(_) | RouteTarget::Group(_) => {
+            RouteTarget::NextHop(next_hop) => {
+                // A different slot: the target is the neighbour's egress
+                // object, which the shim finds by looking the next hop's
+                // address up in the chip's host table. "Not found" there
+                // means the neighbour has not resolved yet.
+                let f = slot!(self, route_via_nexthop, "route_via_nexthop")?;
+                let sw = self.switch()?;
+                // SAFETY: plain scalars over the ABI.
+                return check("route_via_nexthop", unsafe {
+                    f(sw, prefix, mask, oid_next_hop(next_hop))
+                });
+            }
+            RouteTarget::Group(_) => {
                 return Err(SaiError::Other(
-                    "routes via a next hop or an ECMP group need the next-hop family, \
-                     which this backend does not implement yet"
+                    "routes via an ECMP group need the next-hop group family, which \
+                     this backend does not implement yet"
                         .into(),
                 ))
             }
@@ -1454,25 +1496,50 @@ impl SaiBackend for OpenBcmBackend {
         check("route_delete", unsafe { f(sw, prefix, mask) })
     }
 
+    // --- Neighbours and next hops (ABI 1.14) --------------------------
+    //
+    // A next hop is (interface, ip) -- a name, not something the chip
+    // allocates. Resolving the *neighbour* is what builds the egress
+    // object, and the chip files it under the neighbour's IP in its own
+    // host table. That table is the resolution table, so neither side
+    // keeps one and `create_next_hop` touches no hardware at all.
+
     fn create_neighbor(
         &mut self,
-        _rif: Oid,
-        _ip: std::net::IpAddr,
-        _mac: [u8; 6],
+        rif: Oid,
+        ip: std::net::IpAddr,
+        mac: [u8; 6],
     ) -> Result<(), SaiError> {
-        unimplemented_slot("create_neighbor")
+        let f = slot!(self, neighbor_set, "neighbor_set")?;
+        let ip = ipv4_address(ip, "neighbor")?;
+        let sw = self.switch()?;
+        // SAFETY: `mac` outlives the call.
+        check("neighbor_set", unsafe {
+            f(sw, oid_rif(rif), ip, mac.as_ptr())
+        })
     }
 
-    fn remove_neighbor(&mut self, _rif: Oid, _ip: std::net::IpAddr) -> Result<(), SaiError> {
-        unimplemented_slot("remove_neighbor")
+    fn remove_neighbor(&mut self, rif: Oid, ip: std::net::IpAddr) -> Result<(), SaiError> {
+        let f = slot!(self, neighbor_clear, "neighbor_clear")?;
+        let ip = ipv4_address(ip, "neighbor")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("neighbor_clear", unsafe { f(sw, oid_rif(rif), ip) })
     }
 
-    fn create_next_hop(&mut self, _rif: Oid, _ip: std::net::IpAddr) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_next_hop")
+    fn create_next_hop(&mut self, rif: Oid, ip: std::net::IpAddr) -> Result<Oid, SaiError> {
+        // No hardware object: the egress object belongs to the
+        // neighbour, and this is only the name a route uses to ask for
+        // it. Minting the id here rather than at the chip is what keeps
+        // both sides free of a resolution table.
+        let _ = rif;
+        Ok(next_hop_oid(ipv4_address(ip, "next hop")?))
     }
 
     fn remove_next_hop(&mut self, _next_hop: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_next_hop")
+        // Nothing was allocated, so nothing is freed. The egress object
+        // goes when its neighbour does.
+        Ok(())
     }
 
     fn create_next_hop_group(&mut self) -> Result<Oid, SaiError> {
@@ -2638,6 +2705,9 @@ mod tests {
             my_mac_destroy: None,
             route_set: None,
             route_delete: None,
+            neighbor_set: None,
+            neighbor_clear: None,
+            route_via_nexthop: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2772,6 +2842,9 @@ mod tests {
             "my_mac_destroy",
             "route_set",
             "route_delete",
+            "neighbor_set",
+            "neighbor_clear",
+            "route_via_nexthop",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2879,6 +2952,9 @@ mod tests {
             std::mem::offset_of!(Api, my_mac_destroy),
             std::mem::offset_of!(Api, route_set),
             std::mem::offset_of!(Api, route_delete),
+            std::mem::offset_of!(Api, neighbor_set),
+            std::mem::offset_of!(Api, neighbor_clear),
+            std::mem::offset_of!(Api, route_via_nexthop),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -4256,5 +4332,128 @@ mod tests {
         assert!(b
             .create_route(("2001:db8::".parse().unwrap(), 32), RouteTarget::Drop)
             .is_err());
+    }
+    // --- Neighbours and next hops ------------------------------------------
+
+    const NEIGHBOR_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+
+    fn stub_neighbor(b: &OpenBcmBackend, ip: &str) -> i32 {
+        let addr = ipv4_address(ip.parse().unwrap(), "test").unwrap();
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_neighbor\0").unwrap();
+            f(b.switch, addr)
+        }
+    }
+
+    fn stub_route_nexthop(b: &OpenBcmBackend, dest: &str) -> u32 {
+        let (bits, mask) = ipv4_prefix(route(dest), "test").unwrap();
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> u32> =
+                b._library.get(b"hemlockbcm_stub_route_nexthop\0").unwrap();
+            f(b.switch, bits, mask)
+        }
+    }
+
+    /// Set up an SVI with the neighbour's MAC learned on it, which is
+    /// what the egress object's port comes from.
+    fn routed_backend() -> (OpenBcmBackend, Oid) {
+        let mut b = backend();
+        let vlan = b.create_vlan(100).unwrap();
+        b.add_vlan_member(vlan, PortId(1), false).unwrap();
+        let rif = b.create_vlan_router_interface(Some(vlan)).unwrap();
+        b.add_fdb_entry(Some(vlan), NEIGHBOR_MAC, FdbAction::Forward(PortId(1)))
+            .unwrap();
+        (b, rif)
+    }
+
+    #[test]
+    fn a_route_follows_its_neighbour_once_resolved() {
+        let (mut b, rif) = routed_backend();
+        let next_hop = b.create_next_hop(rif, "10.0.0.1".parse().unwrap()).unwrap();
+
+        // Unresolved: the route cannot be programmed, and says so rather
+        // than pointing somewhere arbitrary.
+        assert_eq!(stub_neighbor(&b, "10.0.0.1"), 0);
+        assert!(b
+            .create_route(route("10.1.0.0/16"), RouteTarget::NextHop(next_hop))
+            .is_err());
+        assert_eq!(stub_route(&b, "10.1.0.0/16"), -1, "nothing programmed");
+
+        // Resolve it, and the same route goes in.
+        b.create_neighbor(rif, "10.0.0.1".parse().unwrap(), NEIGHBOR_MAC)
+            .unwrap();
+        assert_eq!(stub_neighbor(&b, "10.0.0.1"), 1);
+        b.create_route(route("10.1.0.0/16"), RouteTarget::NextHop(next_hop))
+            .unwrap();
+        assert_eq!(
+            stub_route_nexthop(&b, "10.1.0.0/16"),
+            ipv4_address("10.0.0.1".parse().unwrap(), "test").unwrap()
+        );
+
+        b.remove_neighbor(rif, "10.0.0.1".parse().unwrap()).unwrap();
+        assert_eq!(stub_neighbor(&b, "10.0.0.1"), 0);
+        assert!(b.remove_neighbor(rif, "10.0.0.1".parse().unwrap()).is_err());
+    }
+
+    /// The egress object needs a port, and the port comes from the FDB.
+    /// An unlearned MAC has no port, and guessing one would be a black
+    /// hole -- so the neighbour does not resolve, which is the state the
+    /// caller already models by leaving the route on the CPU.
+    #[test]
+    fn a_neighbour_whose_mac_is_unlearned_does_not_resolve() {
+        let mut b = backend();
+        let vlan = b.create_vlan(100).unwrap();
+        b.add_vlan_member(vlan, PortId(1), false).unwrap();
+        let rif = b.create_vlan_router_interface(Some(vlan)).unwrap();
+
+        // No FDB entry for it yet.
+        assert!(b
+            .create_neighbor(rif, "10.0.0.1".parse().unwrap(), NEIGHBOR_MAC)
+            .is_err());
+        assert_eq!(stub_neighbor(&b, "10.0.0.1"), 0);
+
+        // Learn it, and the same call succeeds.
+        b.add_fdb_entry(Some(vlan), NEIGHBOR_MAC, FdbAction::Forward(PortId(1)))
+            .unwrap();
+        b.create_neighbor(rif, "10.0.0.1".parse().unwrap(), NEIGHBOR_MAC)
+            .unwrap();
+        assert_eq!(stub_neighbor(&b, "10.0.0.1"), 1);
+    }
+
+    /// A next hop allocates nothing: it is the name of a neighbour, so
+    /// creating one twice yields the same id and removing one is a
+    /// no-op. That is what lets both sides stay free of a resolution
+    /// table.
+    #[test]
+    fn a_next_hop_is_a_name_not_an_object() {
+        let (mut b, rif) = routed_backend();
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let one = b.create_next_hop(rif, ip).unwrap();
+        let two = b.create_next_hop(rif, ip).unwrap();
+        assert_eq!(one, two, "the same neighbour is the same next hop");
+        assert_eq!(oid_next_hop(one), ipv4_address(ip, "test").unwrap());
+
+        // Removing it frees nothing and cannot fail.
+        b.remove_next_hop(one).unwrap();
+        b.remove_next_hop(one).unwrap();
+
+        // ...and a resolved neighbour still routes afterwards, because
+        // the egress object belonged to the neighbour all along.
+        b.create_neighbor(rif, ip, NEIGHBOR_MAC).unwrap();
+        b.create_route(route("10.1.0.0/16"), RouteTarget::NextHop(one))
+            .unwrap();
+    }
+
+    /// IPv6 has no datapath here, and truncating an address to 32 bits
+    /// would name an unrelated v4 host.
+    #[test]
+    fn ipv6_neighbours_and_next_hops_are_refused() {
+        let (mut b, rif) = routed_backend();
+        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(b.create_neighbor(rif, v6, NEIGHBOR_MAC).is_err());
+        assert!(b.remove_neighbor(rif, v6).is_err());
+        assert!(b.create_next_hop(rif, v6).is_err());
     }
 }

@@ -42,6 +42,9 @@
 #define STUB_RIFS 4
 #define STUB_MY_MACS 4
 #define STUB_ROUTES 8
+#define STUB_NEIGHBORS 4
+/* Beyond the ABI's three route kinds: a route through a next hop. */
+#define STUB_ROUTE_NEXTHOP 3
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -111,6 +114,15 @@ struct stub_route {
     uint32_t mask;
     int kind;
     uint32_t rif;                   /* 0 unless the kind is RIF */
+    uint32_t nexthop_ip;            /* 0 unless the kind is NEXTHOP */
+};
+
+/* A resolved neighbour: an IP, the interface it is on, and its MAC. */
+struct stub_neighbor {
+    int used;
+    uint32_t ip;
+    uint32_t rif;
+    uint8_t mac[6];
 };
 
 /* A match counter, which belongs to one table. */
@@ -201,6 +213,7 @@ struct hemlockbcm_switch {
     struct stub_rif rifs[STUB_RIFS];
     struct stub_my_mac my_macs[STUB_MY_MACS];
     struct stub_route routes[STUB_ROUTES];
+    struct stub_neighbor neighbors[STUB_NEIGHBORS];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -2173,6 +2186,139 @@ HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_route(struct hemlockbcm_switch *sw,
     return ((int64_t)found->rif << 32) | (int64_t)found->kind;
 }
 
+/* --- Neighbours and next hops (ABI 1.14) ----------------------------------- */
+
+static struct stub_neighbor *find_neighbor(struct hemlockbcm_switch *sw, uint32_t ip)
+{
+    size_t i;
+    for (i = 0; i < STUB_NEIGHBORS; i++) {
+        if (sw->neighbors[i].used && sw->neighbors[i].ip == ip) {
+            return &sw->neighbors[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_neighbor_set(struct hemlockbcm_switch *sw, uint32_t rif, uint32_t ip,
+                             const uint8_t mac[6])
+{
+    struct stub_neighbor *found;
+    struct stub_rif *interface;
+    size_t i;
+
+    if (sw == NULL || mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    interface = find_rif(sw, rif);
+    if (interface == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /*
+     * The FDB lookup the real shim does. Without a learned MAC there is
+     * no egress port, and the caller is expected to leave the route on
+     * the CPU until there is.
+     */
+    {
+        int learned = 0;
+        for (i = 0; i < STUB_FDB; i++) {
+            if (sw->fdb[i].used && sw->fdb[i].vlan_id == interface->vlan_id &&
+                memcmp(sw->fdb[i].mac, mac, 6) == 0) {
+                learned = 1;
+                break;
+            }
+        }
+        if (!learned) {
+            return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+        }
+    }
+
+    /* Replace in place: a neighbour whose MAC changed keeps its slot. */
+    found = find_neighbor(sw, ip);
+    if (found == NULL) {
+        for (i = 0; i < STUB_NEIGHBORS; i++) {
+            if (!sw->neighbors[i].used) {
+                found = &sw->neighbors[i];
+                break;
+            }
+        }
+    }
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_NO_MEMORY;
+    }
+    found->used = 1;
+    found->ip = ip;
+    found->rif = rif;
+    memcpy(found->mac, mac, 6);
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_neighbor_clear(struct hemlockbcm_switch *sw, uint32_t rif, uint32_t ip)
+{
+    struct stub_neighbor *found;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    (void)rif;
+    found = find_neighbor(sw, ip);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    memset(found, 0, sizeof(*found));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_route_via_nexthop(struct hemlockbcm_switch *sw, uint32_t prefix,
+                                  uint32_t mask, uint32_t nexthop_ip)
+{
+    struct stub_neighbor *neighbor;
+    struct stub_route *found;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    neighbor = find_neighbor(sw, nexthop_ip);
+    if (neighbor == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;  /* unresolved */
+    }
+    found = find_route(sw, prefix, mask);
+    if (found == NULL) {
+        for (i = 0; i < STUB_ROUTES; i++) {
+            if (!sw->routes[i].used) {
+                found = &sw->routes[i];
+                break;
+            }
+        }
+    }
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_NO_MEMORY;
+    }
+    found->used = 1;
+    found->prefix = prefix;
+    found->mask = mask;
+    found->kind = STUB_ROUTE_NEXTHOP;
+    found->rif = neighbor->rif;
+    found->nexthop_ip = nexthop_ip;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+/* 1 if a neighbour for `ip` is resolved, else 0. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_neighbor(struct hemlockbcm_switch *sw, uint32_t ip)
+{
+    return (sw != NULL && find_neighbor(sw, ip) != NULL) ? 1 : 0;
+}
+
+/* The next-hop IP a route forwards through, or 0. */
+HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_route_nexthop(struct hemlockbcm_switch *sw,
+                                                         uint32_t prefix, uint32_t mask)
+{
+    struct stub_route *found = sw == NULL ? NULL : find_route(sw, prefix, mask);
+    return found == NULL ? 0 : found->nexthop_ip;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2247,6 +2393,9 @@ static const struct hemlockbcm_api STUB_API = {
     stub_my_mac_destroy,
     stub_route_set,
     stub_route_delete,
+    stub_neighbor_set,
+    stub_neighbor_clear,
+    stub_route_via_nexthop,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

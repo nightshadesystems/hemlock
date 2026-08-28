@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 13
+#define HEMLOCKBCM_ABI_MINOR 14
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -731,10 +731,42 @@ struct hemlockbcm_api {
                      int kind, uint32_t rif);
     int (*route_delete)(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask);
 
+    /* --- Neighbours and next hops (ABI 1.14) -------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: neighbours and next hops
-     * (and the routes that point at them), then CoPP traps, sFlow and
-     * QoS. Each lands as one slot appended here plus the
+     * Resolving a neighbour builds the egress object that a next hop
+     * forwards through, and files it in the chip's host table under the
+     * neighbour's IP. That table is the resolution table: neither side
+     * keeps one, and `route_via_nexthop` finds the egress object by
+     * looking the next hop's IP up in it.
+     *
+     * An egress object needs a destination port, which is not in
+     * anything the caller passes: it comes from the FDB, by looking up
+     * the neighbour's MAC in the interface's VLAN. Until the MAC is
+     * learned there is no port, and this returns "not found" rather than
+     * guessing one. That is not a failure state -- it is the
+     * resolve-via-punt case the caller already models by pointing the
+     * route at the CPU until the neighbour answers.
+     */
+    int (*neighbor_set)(struct hemlockbcm_switch *sw, uint32_t rif, uint32_t ip,
+                        const uint8_t mac[6]);
+    int (*neighbor_clear)(struct hemlockbcm_switch *sw, uint32_t rif, uint32_t ip);
+
+    /*
+     * A route through a resolved next hop. `nexthop_ip` names the
+     * neighbour; the shim finds its egress object in the host table.
+     * "Not found" means the neighbour has not resolved yet.
+     *
+     * There is no next-hop *object* slot: a next hop is (interface, ip),
+     * which is a name rather than something the chip allocates, so the
+     * caller mints its own id and nothing needs creating or destroying.
+     */
+    int (*route_via_nexthop)(struct hemlockbcm_switch *sw, uint32_t prefix,
+                             uint32_t mask, uint32_t nexthop_ip);
+
+    /*
+     * Everything below is the rest of phase 6: ECMP groups, CoPP traps,
+     * sFlow and QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.

@@ -2283,6 +2283,156 @@ static int hb_route_delete(struct hemlockbcm_switch *sw, uint32_t prefix, uint32
     return HB_CALL(bcm_l3_route_delete(sw->unit, &route));
 }
 
+/* --- Neighbours and next hops (ABI 1.14) ----------------------------------- */
+
+/* The VLAN an L3 interface sits on. Needed to look a neighbour's MAC up
+ * in the FDB, and read back rather than remembered. */
+static int hb_rif_vlan(struct hemlockbcm_switch *sw, uint32_t rif, bcm_vlan_t *vlan)
+{
+    bcm_l3_intf_t intf;
+    int status;
+
+    bcm_l3_intf_t_init(&intf);
+    intf.l3a_intf_id = (bcm_if_t)rif;
+    status = HB_CALL(bcm_l3_intf_get(sw->unit, &intf));
+    if (status == HEMLOCKBCM_OK) {
+        *vlan = intf.l3a_vid;
+    }
+    return status;
+}
+
+/* The egress object filed under a neighbour's IP, or an error. */
+static int hb_host_egress(struct hemlockbcm_switch *sw, uint32_t ip, bcm_if_t *egress)
+{
+    bcm_l3_host_t host;
+    int status;
+
+    bcm_l3_host_t_init(&host);
+    host.l3a_ip_addr = (bcm_ip_t)ip;
+    status = HB_CALL(bcm_l3_host_find(sw->unit, &host));
+    if (status == HEMLOCKBCM_OK) {
+        *egress = host.l3a_intf;
+    }
+    return status;
+}
+
+static int hb_neighbor_set(struct hemlockbcm_switch *sw, uint32_t rif, uint32_t ip,
+                           const uint8_t mac[6])
+{
+    bcm_l3_egress_t egress;
+    bcm_l3_host_t host;
+    bcm_l2_addr_t l2addr;
+    bcm_vlan_t vlan = 0;
+    bcm_mac_t address;
+    bcm_if_t egress_id = 0;
+    int status;
+
+    if (sw == NULL || mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_rif_vlan(sw, rif, &vlan);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+
+    /*
+     * Where the packet actually leaves. The chip's egress object carries
+     * a port, and nothing the caller passes says which one -- so ask the
+     * FDB where this MAC lives. An unlearned MAC has no answer, and a
+     * guess would be a black hole: BCM_E_NOT_FOUND becomes "not found"
+     * for the caller, which keeps the route pointed at the CPU until
+     * the neighbour answers an ARP.
+     */
+    sal_memcpy(address, mac, sizeof(address));
+    status = HB_CALL(bcm_l2_addr_get(sw->unit, address, vlan, &l2addr));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+
+    bcm_l3_egress_t_init(&egress);
+    egress.intf = (bcm_if_t)rif;
+    sal_memcpy(egress.mac_addr, mac, sizeof(egress.mac_addr));
+    egress.vlan = vlan;
+    egress.module = l2addr.modid;
+    if (l2addr.tgid != BCM_TRUNK_INVALID) {
+        /* The neighbour is behind a LAG; the egress follows the trunk so
+         * that hashing still spreads across its members. */
+        egress.flags |= BCM_L3_TGID;
+        egress.trunk = l2addr.tgid;
+    } else {
+        egress.port = l2addr.port;
+    }
+    status = HB_CALL(bcm_l3_egress_create(sw->unit, 0, &egress, &egress_id));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+
+    /*
+     * The host entry does two jobs: it makes the neighbour itself
+     * reachable, and it is where the egress object is filed under the
+     * neighbour's IP so a route can find it later. REPLACE so that a
+     * neighbour whose MAC changed does not need deleting first.
+     */
+    bcm_l3_host_t_init(&host);
+    host.l3a_ip_addr = (bcm_ip_t)ip;
+    host.l3a_intf = egress_id;
+    host.l3a_flags |= BCM_L3_REPLACE;
+    sal_memcpy(host.l3a_nexthop_mac, mac, sizeof(host.l3a_nexthop_mac));
+    status = HB_CALL(bcm_l3_host_add(sw->unit, &host));
+    if (status != HEMLOCKBCM_OK) {
+        /* No entry points at it, so it would leak silently. */
+        (void)bcm_l3_egress_destroy(sw->unit, egress_id);
+        return status;
+    }
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_neighbor_clear(struct hemlockbcm_switch *sw, uint32_t rif, uint32_t ip)
+{
+    bcm_l3_host_t host;
+    bcm_if_t egress_id = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    (void)rif;  /* the host table is keyed by IP alone */
+
+    /* Read the egress object out before the entry that names it goes. */
+    status = hb_host_egress(sw, ip, &egress_id);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    bcm_l3_host_t_init(&host);
+    host.l3a_ip_addr = (bcm_ip_t)ip;
+    status = HB_CALL(bcm_l3_host_delete(sw->unit, &host));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    return HB_CALL(bcm_l3_egress_destroy(sw->unit, egress_id));
+}
+
+static int hb_route_via_nexthop(struct hemlockbcm_switch *sw, uint32_t prefix,
+                                uint32_t mask, uint32_t nexthop_ip)
+{
+    bcm_l3_route_t route;
+    bcm_if_t egress_id = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Unresolved neighbour: nothing to forward through yet. */
+    status = hb_host_egress(sw, nexthop_ip, &egress_id);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    hb_route_key(&route, prefix, mask);
+    route.l3a_intf = egress_id;
+    route.l3a_flags |= BCM_L3_REPLACE;
+    return HB_CALL(bcm_l3_route_add(sw->unit, &route));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2357,6 +2507,9 @@ static const struct hemlockbcm_api HB_API = {
     hb_my_mac_destroy,
     hb_route_set,
     hb_route_delete,
+    hb_neighbor_set,
+    hb_neighbor_clear,
+    hb_route_via_nexthop,
     /* Remaining phase 6 slots are appended below this line. */
 };
 
