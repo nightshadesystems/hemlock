@@ -158,6 +158,17 @@ deliberate absences — SMP method, USB PHY, SPI-NOR partition offsets
 — are each recorded in that directory's README with the bench step
 that resolves them.
 
+**The config and build path are written too.** `hemlock.config` merges
+over `multi_v7_defconfig` (all 30 symbols verified against 6.1's own
+Kconfig files, and the build script re-checks each one survived
+`olddefconfig` — a symbol that quietly falls out is an unbootable box
+found at sea). `build-kernel.sh` produces the
+`linux-image-*-hemlock-iproc*_armhf.deb` that `build/mkimage.sh` was
+already waiting for, and mkimage now takes the dtb from that deb
+instead of compiling the DTS itself. What remains before first boot is
+running `build-kernel.sh` on a Linux box with the cross toolchain, then
+`mkimage.sh accton-as4610-54` — and the bench.
+
 ### D — drivers this board needs
 
 Every one is pinned to a `compatible` string that `bcm-helix4.dtsi` or

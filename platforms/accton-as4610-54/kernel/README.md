@@ -14,6 +14,8 @@ is what lives here.
 | `dts/bcm-hx4.dtsi` | The Helix4 SoC: A9 mpcore, UARTs, both SMBus controllers, QSPI (the 8 MB SPI-NOR), the AMAC pair, MDIO, EHCI, watchdog, and the CMICd node the BDE claims |
 | `dts/arm-accton-as4610-54.dts` | The board: 2 GB at `0x60000000`, console `ttyS0`, the enabled subset, and the chain `"accton,as4610-54", "brcm,hx4", "brcm,hr2"` — the last entry is what lets a stock `ARCH_BCM_HR2` kernel boot it with **zero out-of-tree machine code** |
 | `check-dts.sh` | cpp + dtc against mainline v6.1's dt-bindings; run after touching `dts/` |
+| `hemlock.config` | Config fragment merged over `multi_v7_defconfig`; every symbol verified to exist in 6.1's Kconfig, and `build-kernel.sh` re-verifies each one survived `olddefconfig` |
+| `build-kernel.sh` | Fetches linux-6.1.y, drops the DTS in-tree (one appended `dtb-y` line, no patch), merges the fragment, cross-builds `bindeb-pkg`, and stages `vendor/kernel/linux-image-*-hemlock-iproc*_armhf.deb` — exactly what `build/mkimage.sh` looks for |
 
 ## Provenance
 
@@ -50,5 +52,7 @@ Every node uses a mainline driver's compatible where one exists.
    management PHY's address.
 3. Confirm the two stand-in clock rates (uart 62.5 MHz, APB 100 MHz)
    and the full-2 GB memory node.
-4. FIT packaging at load/entry `0x61008000` (`build/mkimage.sh`
-   already expects `boot/hemlock.itb`).
+4. ~~FIT packaging~~ wired: `mkimage.sh` now takes the dtb from the
+   kernel deb (`dtbs_install` output) rather than compiling the DTS
+   itself — bare dtc cannot preprocess the includes — and its FIT
+   already loads at `0x61008000`.

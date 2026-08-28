@@ -130,10 +130,10 @@ else
     fi
     if [ "$BOOT_STYLE" = "fit" ]; then
         want "mkimage (apt: u-boot-tools) — builds the FIT" command -v mkimage
-        want "dtc (apt: device-tree-compiler) — compiles the board device tree" \
-            command -v dtc
-        want "a device tree in $PDIR/dts/" \
-            sh -c "ls '$PDIR'/dts/*.dts >/dev/null 2>&1"
+        # The dtb itself comes prebuilt out of the platform kernel deb;
+        # the sources it was built from live in platforms/<id>/kernel/.
+        want "a device tree source in $PDIR/kernel/dts/" \
+            sh -c "ls '$PDIR'/kernel/dts/*.dts >/dev/null 2>&1"
     fi
 
     # The datapath library. A SAI platform needs its pinned vendor blob;
@@ -494,9 +494,6 @@ if [ "$BOOT_STYLE" = "fit" ]; then
         cp "$ROOTFS/boot/hemlock.itb" "$PAYLOAD/boot/hemlock.itb"
     else
         command -v mkimage >/dev/null || die "mkimage not installed (u-boot-tools)"
-        command -v dtc >/dev/null || die "dtc not installed (device-tree-compiler)"
-        DTS="$(ls "$PDIR"/dts/*.dts 2>/dev/null | head -1 || true)"
-        [ -n "$DTS" ] || die "no device tree in $PDIR/dts/ (needed for the FIT)"
 
         FITDIR="$WORK/fit"
         mkdir -p "$FITDIR"
@@ -506,12 +503,21 @@ if [ "$BOOT_STYLE" = "fit" ]; then
         INITRD="$(ls "$ROOTFS"/boot/initrd.img* 2>/dev/null | head -1 || true)"
         [ -n "$INITRD" ] || die "no initramfs in the rootfs"
         cp "$INITRD" "$FITDIR/initrd.img"
-        dtc -I dts -O dtb "$DTS" -o "$FITDIR/board.dtb" 2>/dev/null \
-            || die "compiling $DTS failed"
+        # The dtb comes out of the kernel package (dtbs_install puts it
+        # under /usr/lib/linux-image-<ver>/), compiled by the kernel's
+        # own build. The DTS source uses cpp includes, so a bare dtc
+        # here could not compile it anyway — a platform kernel deb that
+        # ships no dtb is a broken kernel build, not a fallback case.
+        DTB="$(ls "$ROOTFS"/usr/lib/linux-image-*/*.dtb 2>/dev/null | head -1 || true)"
+        [ -n "$DTB" ] || die "no .dtb under /usr/lib/linux-image-*/ in the rootfs
+ (the platform kernel deb must ship the board device tree; see
+  platforms/$PLATFORM/kernel/build-kernel.sh)"
+        cp "$DTB" "$FITDIR/board.dtb"
 
         # Load/entry 0x61008000: where U-Boot on this board expects the
-        # decompressed kernel, per the board memory map in its device tree
-        # (memory starts at 0x61000000).
+        # kernel, confirmed three ways off the salvaged vendor image
+        # (DRAM starts at 0x60000000; 0x61000000 is the vendor's
+        # parameter block, and the kernel sits 0x8000 above it).
         cat > "$FITDIR/fit.its" <<ITS
 /dts-v1/;
 / {
@@ -530,7 +536,7 @@ if [ "$BOOT_STYLE" = "fit" ]; then
             hash-1 { algo = "crc32"; };
         };
         fdt {
-            description = "$(basename "$DTS" .dts)";
+            description = "$(basename "$DTB" .dtb)";
             data = /incbin/("board.dtb");
             type = "flat_dt";
             arch = "arm";
