@@ -26,7 +26,7 @@
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
  * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
- * rate,knet,policer,field}.h,
+ * rate,knet,policer,field,l3}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -48,6 +48,7 @@
 #include <bcm/field.h>
 #include <bcm/init.h>
 #include <bcm/knet.h>
+#include <bcm/l3.h>
 #include <bcm/l2.h>
 #include <bcm/link.h>
 #include <bcm/mirror.h>
@@ -2021,6 +2022,210 @@ static int hb_acl_entry_attach(struct hemlockbcm_switch *sw, uint32_t entry,
     return HB_CALL(bcm_field_entry_install(sw->unit, (bcm_field_entry_t)entry));
 }
 
+/* --- Router interfaces (ABI 1.12) ----------------------------------------- */
+
+static int hb_l3_intf_create(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                             const uint8_t mac[6], uint32_t *rif)
+{
+    bcm_l3_intf_t intf;
+    int status;
+
+    bcm_l3_intf_t_init(&intf);
+    intf.l3a_vid = (bcm_vlan_t)vlan_id;
+    sal_memcpy(intf.l3a_mac_addr, mac, sizeof(intf.l3a_mac_addr));
+    status = HB_CALL(bcm_l3_intf_create(sw->unit, &intf));
+    if (status == HEMLOCKBCM_OK) {
+        *rif = (uint32_t)intf.l3a_intf_id;
+    }
+    return status;
+}
+
+static int hb_l3_intf_destroy(struct hemlockbcm_switch *sw, uint32_t rif)
+{
+    bcm_l3_intf_t intf;
+
+    /* Delete takes the whole struct, but only the id is read. */
+    bcm_l3_intf_t_init(&intf);
+    intf.l3a_intf_id = (bcm_if_t)rif;
+    return HB_CALL(bcm_l3_intf_delete(sw->unit, &intf));
+}
+
+static int hb_rif_port_create(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint16_t vlan_id, const uint8_t mac[6], uint32_t *rif)
+{
+    bcm_pbmp_t pbmp, ubmp;
+    bcm_vlan_t default_vlan = 0;
+    int status;
+
+    if (sw == NULL || mac == NULL || rif == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+
+    /*
+     * Four steps, and the order matters: the port has to leave the
+     * bridge before it joins the routed VLAN, or it briefly forwards
+     * between the two. Each failure below unwinds what came before it,
+     * because a port left half-routed forwards nothing and looks like a
+     * cable fault.
+     */
+    status = HB_CALL(bcm_vlan_default_get(sw->unit, &default_vlan));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    BCM_PBMP_CLEAR(pbmp);
+    BCM_PBMP_PORT_ADD(pbmp, (bcm_port_t)logical_port);
+    /* Not an error if it was not a member; the caller may have moved it. */
+    (void)bcm_vlan_port_remove(sw->unit, default_vlan, pbmp);
+
+    status = HB_CALL(bcm_vlan_create(sw->unit, (bcm_vlan_t)vlan_id));
+    if (status != HEMLOCKBCM_OK) {
+        goto restore_bridge;
+    }
+    BCM_PBMP_CLEAR(ubmp);
+    BCM_PBMP_PORT_ADD(ubmp, (bcm_port_t)logical_port);
+    status = HB_CALL(bcm_vlan_port_add(sw->unit, (bcm_vlan_t)vlan_id, pbmp, ubmp));
+    if (status != HEMLOCKBCM_OK) {
+        goto destroy_vlan;
+    }
+    status = HB_CALL(bcm_port_untagged_vlan_set(sw->unit, (bcm_port_t)logical_port,
+                                                (bcm_vlan_t)vlan_id));
+    if (status != HEMLOCKBCM_OK) {
+        goto remove_member;
+    }
+    status = hb_l3_intf_create(sw, vlan_id, mac, rif);
+    if (status != HEMLOCKBCM_OK) {
+        goto restore_pvid;
+    }
+    return HEMLOCKBCM_OK;
+
+restore_pvid:
+    (void)bcm_port_untagged_vlan_set(sw->unit, (bcm_port_t)logical_port, default_vlan);
+remove_member:
+    (void)bcm_vlan_port_remove(sw->unit, (bcm_vlan_t)vlan_id, pbmp);
+destroy_vlan:
+    (void)bcm_vlan_destroy(sw->unit, (bcm_vlan_t)vlan_id);
+restore_bridge:
+    BCM_PBMP_CLEAR(ubmp);
+    BCM_PBMP_PORT_ADD(ubmp, (bcm_port_t)logical_port);
+    (void)bcm_vlan_port_add(sw->unit, default_vlan, pbmp, ubmp);
+    (void)bcm_port_untagged_vlan_set(sw->unit, (bcm_port_t)logical_port, default_vlan);
+    return status;
+}
+
+static int hb_rif_port_destroy(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                               uint16_t vlan_id, uint32_t rif)
+{
+    bcm_pbmp_t pbmp, ubmp;
+    bcm_vlan_t default_vlan = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = HB_CALL(bcm_vlan_default_get(sw->unit, &default_vlan));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    /*
+     * Undo in reverse, and keep going past a failure: this runs when the
+     * operator has already said the interface is gone, and stopping
+     * half way would leave the port in the routed VLAN with no
+     * interface on it -- a port that forwards nothing at all. The first
+     * failure is what gets reported.
+     */
+    status = hb_l3_intf_destroy(sw, rif);
+
+    BCM_PBMP_CLEAR(pbmp);
+    BCM_PBMP_PORT_ADD(pbmp, (bcm_port_t)logical_port);
+    BCM_PBMP_CLEAR(ubmp);
+    BCM_PBMP_PORT_ADD(ubmp, (bcm_port_t)logical_port);
+
+    {
+        int rv = bcm_vlan_port_remove(sw->unit, (bcm_vlan_t)vlan_id, pbmp);
+        if (rv != BCM_E_NONE && rv != BCM_E_NOT_FOUND && status == HEMLOCKBCM_OK) {
+            status = hb_status(rv);
+        }
+    }
+    {
+        int rv = bcm_vlan_destroy(sw->unit, (bcm_vlan_t)vlan_id);
+        if (rv != BCM_E_NONE && rv != BCM_E_NOT_FOUND && status == HEMLOCKBCM_OK) {
+            status = hb_status(rv);
+        }
+    }
+    {
+        int rv = bcm_vlan_port_add(sw->unit, default_vlan, pbmp, ubmp);
+        if (rv != BCM_E_NONE && rv != BCM_E_EXISTS && status == HEMLOCKBCM_OK) {
+            status = hb_status(rv);
+        }
+    }
+    {
+        int rv = bcm_port_untagged_vlan_set(sw->unit, (bcm_port_t)logical_port,
+                                            default_vlan);
+        if (rv != BCM_E_NONE && status == HEMLOCKBCM_OK) {
+            status = hb_status(rv);
+        }
+    }
+    return status;
+}
+
+static int hb_rif_vlan_create(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                              const uint8_t mac[6], uint32_t *rif)
+{
+    if (sw == NULL || mac == NULL || rif == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* The VLAN exists and keeps bridging; only the interface is new. */
+    return hb_l3_intf_create(sw, vlan_id, mac, rif);
+}
+
+static int hb_rif_vlan_destroy(struct hemlockbcm_switch *sw, uint32_t rif)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return hb_l3_intf_destroy(sw, rif);
+}
+
+static int hb_my_mac_create(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                            const uint8_t mac[6], uint32_t *my_mac)
+{
+    bcm_l2_station_t station;
+    int station_id = 0;
+    int status;
+    static const bcm_mac_t exact = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+    if (sw == NULL || mac == NULL || my_mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    bcm_l2_station_t_init(&station);
+    sal_memcpy(station.dst_mac, mac, sizeof(station.dst_mac));
+    sal_memcpy(station.dst_mac_mask, exact, sizeof(station.dst_mac_mask));
+    if (vlan_id != 0) {
+        station.vlan = (bcm_vlan_t)vlan_id;
+        station.vlan_mask = 0xfff;
+    }
+    /*
+     * Which protocols this MAC makes routable. IPv4 and ARP together:
+     * without ARP the box answers no resolution for an address it
+     * routes, which looks like a dead next hop rather than a missing
+     * flag. IPv6 is left out while the datapath reports none.
+     */
+    station.flags = BCM_L2_STATION_IPV4 | BCM_L2_STATION_ARP_RARP;
+    status = HB_CALL(bcm_l2_station_add(sw->unit, &station_id, &station));
+    if (status == HEMLOCKBCM_OK) {
+        *my_mac = (uint32_t)station_id;
+    }
+    return status;
+}
+
+static int hb_my_mac_destroy(struct hemlockbcm_switch *sw, uint32_t my_mac)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_l2_station_delete(sw->unit, (int)my_mac));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2087,6 +2292,12 @@ static const struct hemlockbcm_api HB_API = {
     hb_acl_counter_destroy,
     hb_acl_counter_get,
     hb_acl_entry_attach,
+    hb_rif_port_create,
+    hb_rif_port_destroy,
+    hb_rif_vlan_create,
+    hb_rif_vlan_destroy,
+    hb_my_mac_create,
+    hb_my_mac_destroy,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

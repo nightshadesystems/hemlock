@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 11
+#define HEMLOCKBCM_ABI_MINOR 12
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -666,9 +666,52 @@ struct hemlockbcm_api {
     int (*acl_entry_attach)(struct hemlockbcm_switch *sw, uint32_t entry,
                             uint32_t counter, uint32_t policer);
 
+    /* --- Router interfaces (ABI 1.12) --------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: CoPP traps, sFlow and
-     * QoS. Each lands as one slot appended here plus the
+     * An L3 interface on this hardware is per *VLAN*, not per port:
+     * `bcm_l3_intf_t` carries a VLAN id and no port. A SAI port router
+     * interface therefore has no direct counterpart, and is built as a
+     * VLAN of the port's own plus an L3 interface on it.
+     *
+     * Which VLAN is the caller's choice, not the shim's, so that the
+     * shim keeps no allocator and a restart cannot forget what it
+     * handed out. The caller passes the VLAN it has reserved; the shim
+     * creates it, moves the port into it untagged, sets the PVID, and
+     * puts the interface on it. `rif_port_destroy` undoes all four in
+     * reverse, leaving the port bridging again.
+     */
+    int (*rif_port_create)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                           uint16_t vlan_id, const uint8_t mac[6], uint32_t *rif);
+    int (*rif_port_destroy)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                            uint16_t vlan_id, uint32_t rif);
+
+    /*
+     * An SVI: an L3 interface on a VLAN that keeps bridging. The VLAN
+     * already exists and is left alone on destroy -- only the interface
+     * goes.
+     */
+    int (*rif_vlan_create)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                           const uint8_t mac[6], uint32_t *rif);
+    int (*rif_vlan_destroy)(struct hemlockbcm_switch *sw, uint32_t rif);
+
+    /*
+     * A My-MAC entry: frames whose destination MAC matches enter L3
+     * instead of being bridged. `vlan_id` of 0 matches any VLAN.
+     *
+     * Creating a router interface does not imply one of these. The two
+     * are separate on this hardware -- the interface says what L3 looks
+     * like on a VLAN, the station entry says which frames get there --
+     * and SAI's VRRP virtual MACs need station entries with no
+     * interface of their own.
+     */
+    int (*my_mac_create)(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                         const uint8_t mac[6], uint32_t *my_mac);
+    int (*my_mac_destroy)(struct hemlockbcm_switch *sw, uint32_t my_mac);
+
+    /*
+     * Everything below is the rest of phase 6: routes, neighbours and
+     * next hops, then CoPP traps, sFlow and QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.

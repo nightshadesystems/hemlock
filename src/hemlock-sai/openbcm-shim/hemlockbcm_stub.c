@@ -39,6 +39,8 @@
 #define STUB_ACL_TABLES 2
 #define STUB_ACL_ENTRIES 8
 #define STUB_ACL_COUNTERS 4
+#define STUB_RIFS 4
+#define STUB_MY_MACS 4
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -83,6 +85,22 @@ struct stub_acl_entry {
     uint32_t counter;               /* 0 = none */
     uint32_t policer;               /* 0 = none */
     struct hemlockbcm_acl_fields fields;
+};
+
+/* An L3 interface, and a My-MAC station entry. */
+struct stub_rif {
+    int used;
+    uint32_t id;
+    uint16_t vlan_id;
+    uint32_t port;                  /* 0 for an SVI */
+    uint8_t mac[6];
+};
+
+struct stub_my_mac {
+    int used;
+    uint32_t id;
+    uint16_t vlan_id;               /* 0 = any VLAN */
+    uint8_t mac[6];
 };
 
 /* A match counter, which belongs to one table. */
@@ -170,6 +188,8 @@ struct hemlockbcm_switch {
     struct stub_acl_table acl_tables[STUB_ACL_TABLES];
     struct stub_acl_entry acl_entries[STUB_ACL_ENTRIES];
     struct stub_acl_counter acl_counters[STUB_ACL_COUNTERS];
+    struct stub_rif rifs[STUB_RIFS];
+    struct stub_my_mac my_macs[STUB_MY_MACS];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -1885,6 +1905,187 @@ HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_acl_attach(struct hemlockbcm_switch *s
     return ((int64_t)found->counter << 32) | (int64_t)found->policer;
 }
 
+/* --- Router interfaces (ABI 1.12) ----------------------------------------- */
+
+static struct stub_rif *find_rif(struct hemlockbcm_switch *sw, uint32_t rif)
+{
+    size_t i;
+    for (i = 0; i < STUB_RIFS; i++) {
+        if (sw->rifs[i].used && sw->rifs[i].id == rif) {
+            return &sw->rifs[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_rif_alloc(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                          const uint8_t mac[6], uint32_t *rif)
+{
+    size_t i;
+
+    for (i = 0; i < STUB_RIFS; i++) {
+        if (!sw->rifs[i].used) {
+            memset(&sw->rifs[i], 0, sizeof(sw->rifs[i]));
+            sw->rifs[i].used = 1;
+            sw->rifs[i].id = (uint32_t)i + 1;
+            sw->rifs[i].vlan_id = vlan_id;
+            memcpy(sw->rifs[i].mac, mac, 6);
+            *rif = sw->rifs[i].id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_rif_port_create(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                uint16_t vlan_id, const uint8_t mac[6], uint32_t *rif)
+{
+    struct hemlockbcm_port *port;
+    int status;
+
+    if (sw == NULL || mac == NULL || rif == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Out of the bridge, into a VLAN of its own, then the interface. */
+    (void)stub_remove_vlan_member(sw, STUB_DEFAULT_VLAN, logical_port);
+    status = stub_create_vlan(sw, vlan_id);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    status = stub_add_vlan_member(sw, vlan_id, logical_port, 0);
+    if (status != HEMLOCKBCM_OK) {
+        (void)stub_remove_vlan(sw, vlan_id);
+        return status;
+    }
+    sw->pvid[port - sw->ports] = vlan_id;
+    status = stub_rif_alloc(sw, vlan_id, mac, rif);
+    if (status != HEMLOCKBCM_OK) {
+        (void)stub_remove_vlan_member(sw, vlan_id, logical_port);
+        (void)stub_remove_vlan(sw, vlan_id);
+        sw->pvid[port - sw->ports] = STUB_DEFAULT_VLAN;
+        (void)stub_add_vlan_member(sw, STUB_DEFAULT_VLAN, logical_port, 0);
+        return status;
+    }
+    sw->rifs[*rif - 1].port = logical_port;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_rif_port_destroy(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 uint16_t vlan_id, uint32_t rif)
+{
+    struct hemlockbcm_port *port;
+    struct stub_rif *found;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    found = find_rif(sw, rif);
+    if (port == NULL || found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    memset(found, 0, sizeof(*found));
+    (void)stub_remove_vlan_member(sw, vlan_id, logical_port);
+    (void)stub_remove_vlan(sw, vlan_id);
+    /* Bridging again: member of the default VLAN, PVID to match. */
+    (void)stub_add_vlan_member(sw, STUB_DEFAULT_VLAN, logical_port, 0);
+    sw->pvid[port - sw->ports] = STUB_DEFAULT_VLAN;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_rif_vlan_create(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                                const uint8_t mac[6], uint32_t *rif)
+{
+    if (sw == NULL || mac == NULL || rif == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (find_vlan(sw, vlan_id) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    return stub_rif_alloc(sw, vlan_id, mac, rif);
+}
+
+static int stub_rif_vlan_destroy(struct hemlockbcm_switch *sw, uint32_t rif)
+{
+    struct stub_rif *found;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_rif(sw, rif);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* The VLAN stays: it was bridging before and still is. */
+    memset(found, 0, sizeof(*found));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_my_mac_create(struct hemlockbcm_switch *sw, uint16_t vlan_id,
+                              const uint8_t mac[6], uint32_t *my_mac)
+{
+    size_t i;
+
+    if (sw == NULL || mac == NULL || my_mac == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_MY_MACS; i++) {
+        if (!sw->my_macs[i].used) {
+            memset(&sw->my_macs[i], 0, sizeof(sw->my_macs[i]));
+            sw->my_macs[i].used = 1;
+            sw->my_macs[i].id = (uint32_t)i + 1;
+            sw->my_macs[i].vlan_id = vlan_id;
+            memcpy(sw->my_macs[i].mac, mac, 6);
+            *my_mac = sw->my_macs[i].id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_my_mac_destroy(struct hemlockbcm_switch *sw, uint32_t my_mac)
+{
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_MY_MACS; i++) {
+        if (sw->my_macs[i].used && sw->my_macs[i].id == my_mac) {
+            memset(&sw->my_macs[i], 0, sizeof(sw->my_macs[i]));
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+}
+
+/* Test hooks, not part of the ABI. */
+
+/* The VLAN an interface sits on, or 0 if there is no such interface. */
+HEMLOCKBCM_EXPORT uint16_t hemlockbcm_stub_rif_vlan(struct hemlockbcm_switch *sw,
+                                                    uint32_t rif)
+{
+    struct stub_rif *found = sw == NULL ? NULL : find_rif(sw, rif);
+    return found == NULL ? 0 : found->vlan_id;
+}
+
+HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_my_mac_count(struct hemlockbcm_switch *sw)
+{
+    uint32_t count = 0;
+    size_t i;
+
+    if (sw != NULL) {
+        for (i = 0; i < STUB_MY_MACS; i++) {
+            count += sw->my_macs[i].used ? 1u : 0u;
+        }
+    }
+    return count;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -1951,6 +2152,12 @@ static const struct hemlockbcm_api STUB_API = {
     stub_acl_counter_destroy,
     stub_acl_counter_get,
     stub_acl_entry_attach,
+    stub_rif_port_create,
+    stub_rif_port_destroy,
+    stub_rif_vlan_create,
+    stub_rif_vlan_destroy,
+    stub_my_mac_create,
+    stub_my_mac_destroy,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

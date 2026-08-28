@@ -427,6 +427,17 @@ struct Api {
     acl_counter_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
     acl_counter_get: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut u64) -> Status>,
     acl_entry_attach: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, u32) -> Status>,
+
+    // --- ABI 1.12: router interfaces ---------------------------------
+    rif_port_create:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16, *const u8, *mut u32) -> Status>,
+    rif_port_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u16, u32) -> Status>,
+    rif_vlan_create:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u16, *const u8, *mut u32) -> Status>,
+    rif_vlan_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    my_mac_create:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u16, *const u8, *mut u32) -> Status>,
+    my_mac_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
 }
 
 impl Api {
@@ -520,6 +531,24 @@ const OID_TAG_POLICER: u64 = 0x08;
 const OID_TAG_ACL_TABLE: u64 = 0x09;
 const OID_TAG_ACL_ENTRY: u64 = 0x0a;
 const OID_TAG_ACL_COUNTER: u64 = 0x0b;
+const OID_TAG_RIF: u64 = 0x0c;
+const OID_TAG_MY_MAC: u64 = 0x0d;
+
+fn rif_oid(rif: u32) -> Oid {
+    Oid((OID_TAG_RIF << 56) | u64::from(rif))
+}
+
+fn oid_rif(oid: Oid) -> u32 {
+    oid.0 as u32
+}
+
+fn my_mac_oid(my_mac: u32) -> Oid {
+    Oid((OID_TAG_MY_MAC << 56) | u64::from(my_mac))
+}
+
+fn oid_my_mac(oid: Oid) -> u32 {
+    oid.0 as u32
+}
 
 fn acl_counter_oid(counter: u32) -> Oid {
     Oid((OID_TAG_ACL_COUNTER << 56) | u64::from(counter))
@@ -590,6 +619,35 @@ fn lag_vlan_member_oid(vlan_id: u16, tid: u32) -> Oid {
 fn oid_lag_vlan_member(oid: Oid) -> Option<(u16, u32)> {
     (oid_tag(oid.0) == OID_TAG_LAG_VLAN_MEMBER)
         .then_some((((oid.0 >> 32) & 0xffff) as u16, oid.0 as u32))
+}
+
+/// The internal VLAN backing a port router interface.
+///
+/// An L3 interface is per VLAN here, so routing a port means giving it a
+/// VLAN of its own. Deriving that VLAN from the logical port keeps both
+/// sides free of an allocator and makes `remove_router_interface` able
+/// to name the same VLAN without anything having been remembered.
+///
+/// The range runs down from the top of the 802.1Q space, which is where
+/// an operator is least likely to have configured something. If they
+/// have, the collision is loud rather than silent: creating the VLAN
+/// returns "already exists" and the router interface fails, instead of
+/// quietly taking over a VLAN that is carrying traffic.
+const RIF_VLAN_TOP: u16 = 4094;
+
+fn rif_vlan_for(logical_port: u32) -> Result<u16, SaiError> {
+    // 4094 down to 1; a chip with more ports than that is not this one,
+    // but the arithmetic should not wrap into someone's VLAN 4000 if it
+    // ever were.
+    u16::try_from(logical_port)
+        .ok()
+        .filter(|port| *port < RIF_VLAN_TOP)
+        .map(|port| RIF_VLAN_TOP - port)
+        .ok_or_else(|| {
+            SaiError::Other(format!(
+                "logical port {logical_port} has no room for an internal router VLAN"
+            ))
+        })
 }
 
 /// Map a shim status onto the error type the rest of Hemlock understands.
@@ -851,6 +909,20 @@ impl OpenBcmBackend {
             ))),
             None => Ok(port.0 as u32),
         }
+    }
+
+    /// The MAC a router interface answers to: the switch MAC syncd
+    /// resolved from the ONIE syseeprom or the management netdev.
+    ///
+    /// There is no fallback. A router interface with a made-up MAC would
+    /// come up, answer ARP, and put a MAC on the wire that belongs to
+    /// nothing -- far worse than refusing to route.
+    fn router_mac(&self) -> Result<[u8; 6], SaiError> {
+        self.src_mac.ok_or_else(|| {
+            SaiError::Other(
+                "no switch MAC: a router interface needs one and there is no safe default".into(),
+            )
+        })
     }
 
     /// The trunk id behind a LAG's `PortId`. A real port here is a
@@ -1196,7 +1268,7 @@ impl SaiBackend for OpenBcmBackend {
             port_tpid: slot!(self, set_port_tpid, "set_port_tpid").is_ok(),
             ecmp_width: raw.ecmp_width,
             ipv6: raw.ipv6 != 0,
-            my_mac: false,
+            my_mac: slot!(self, my_mac_create, "my_mac_create").is_ok(),
             acl_ingress: slot!(self, acl_entry_create, "acl_entry_create").is_ok(),
             acl_egress: slot!(self, acl_entry_create, "acl_entry_create").is_ok(),
             acl_entry_policer: slot!(self, acl_entry_attach, "acl_entry_attach").is_ok(),
@@ -1262,20 +1334,78 @@ impl SaiBackend for OpenBcmBackend {
         Ok(hostif_oid(hostif))
     }
 
-    fn create_router_interface(&mut self, _port: PortId) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_router_interface")
+    // --- Router interfaces (ABI 1.12) ---------------------------------
+    //
+    // An L3 interface is per VLAN on this hardware, so a port router
+    // interface is a VLAN of the port's own plus an interface on it.
+    // Which VLAN is decided here rather than in the shim, so that
+    // neither side keeps an allocator: see `rif_vlan_for`.
+
+    fn create_router_interface(&mut self, port: PortId) -> Result<Oid, SaiError> {
+        let f = slot!(self, rif_port_create, "rif_port_create")?;
+        let logical = self.logical_port(port)?;
+        let vlan_id = rif_vlan_for(logical)?;
+        let mac = self.router_mac()?;
+        let sw = self.switch()?;
+        let mut rif: u32 = 0;
+        // SAFETY: `mac` outlives the call; `rif` is written only on OK.
+        check("rif_port_create", unsafe {
+            f(sw, logical, vlan_id, mac.as_ptr(), &mut rif)
+        })?;
+        Ok(rif_oid(rif))
     }
 
-    fn create_vlan_router_interface(&mut self, _vlan: Option<Oid>) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_vlan_router_interface")
+    fn remove_router_interface(&mut self, port: PortId, rif: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, rif_port_destroy, "rif_port_destroy")?;
+        let logical = self.logical_port(port)?;
+        // The same derivation as on the way in: the VLAN is a function
+        // of the port, so nothing had to be remembered between the two.
+        let vlan_id = rif_vlan_for(logical)?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("rif_port_destroy", unsafe {
+            f(sw, logical, vlan_id, oid_rif(rif))
+        })
     }
 
-    fn remove_vlan_router_interface(&mut self, _rif: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_vlan_router_interface")
+    fn create_vlan_router_interface(&mut self, vlan: Option<Oid>) -> Result<Oid, SaiError> {
+        let f = slot!(self, rif_vlan_create, "rif_vlan_create")?;
+        let vlan_id = self.vlan_id_or_default(vlan)?;
+        let mac = self.router_mac()?;
+        let sw = self.switch()?;
+        let mut rif: u32 = 0;
+        // SAFETY: `mac` outlives the call; `rif` is written only on OK.
+        check("rif_vlan_create", unsafe {
+            f(sw, vlan_id, mac.as_ptr(), &mut rif)
+        })?;
+        Ok(rif_oid(rif))
     }
 
-    fn remove_router_interface(&mut self, _port: PortId, _rif: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_router_interface")
+    fn remove_vlan_router_interface(&mut self, rif: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, rif_vlan_destroy, "rif_vlan_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("rif_vlan_destroy", unsafe { f(sw, oid_rif(rif)) })
+    }
+
+    fn create_my_mac(&mut self, vlan_id: Option<u16>, mac: [u8; 6]) -> Result<Oid, SaiError> {
+        let f = slot!(self, my_mac_create, "my_mac_create")?;
+        let sw = self.switch()?;
+        let mut my_mac: u32 = 0;
+        // 0 is the ABI's "any VLAN"; VLAN 0 is not a valid 802.1Q id, so
+        // it is not a value the caller could have meant.
+        // SAFETY: `mac` outlives the call; `my_mac` is written on OK.
+        check("my_mac_create", unsafe {
+            f(sw, vlan_id.unwrap_or(0), mac.as_ptr(), &mut my_mac)
+        })?;
+        Ok(my_mac_oid(my_mac))
+    }
+
+    fn remove_my_mac(&mut self, my_mac: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, my_mac_destroy, "my_mac_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("my_mac_destroy", unsafe { f(sw, oid_my_mac(my_mac)) })
     }
 
     fn create_route(&mut self, _dest: IpPrefix, _target: RouteTarget) -> Result<(), SaiError> {
@@ -1321,14 +1451,6 @@ impl SaiBackend for OpenBcmBackend {
 
     fn remove_next_hop_group_member(&mut self, _member: Oid) -> Result<(), SaiError> {
         unimplemented_slot("remove_next_hop_group_member")
-    }
-
-    fn create_my_mac(&mut self, _vlan_id: Option<u16>, _mac: [u8; 6]) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_my_mac")
-    }
-
-    fn remove_my_mac(&mut self, _my_mac: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_my_mac")
     }
 
     // --- L2 VLANs (ABI 1.2) ------------------------------------------
@@ -2470,6 +2592,12 @@ mod tests {
             acl_counter_destroy: None,
             acl_counter_get: None,
             acl_entry_attach: None,
+            rif_port_create: None,
+            rif_port_destroy: None,
+            rif_vlan_create: None,
+            rif_vlan_destroy: None,
+            my_mac_create: None,
+            my_mac_destroy: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2596,6 +2724,12 @@ mod tests {
             "acl_counter_destroy",
             "acl_counter_get",
             "acl_entry_attach",
+            "rif_port_create",
+            "rif_port_destroy",
+            "rif_vlan_create",
+            "rif_vlan_destroy",
+            "my_mac_create",
+            "my_mac_destroy",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2695,6 +2829,12 @@ mod tests {
             std::mem::offset_of!(Api, acl_counter_destroy),
             std::mem::offset_of!(Api, acl_counter_get),
             std::mem::offset_of!(Api, acl_entry_attach),
+            std::mem::offset_of!(Api, rif_port_create),
+            std::mem::offset_of!(Api, rif_port_destroy),
+            std::mem::offset_of!(Api, rif_vlan_create),
+            std::mem::offset_of!(Api, rif_vlan_destroy),
+            std::mem::offset_of!(Api, my_mac_create),
+            std::mem::offset_of!(Api, my_mac_destroy),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -3861,5 +4001,125 @@ mod tests {
         assert_ne!(oid_tag(acl_counter_oid(1).0), oid_tag(acl_entry_oid(1).0));
         assert_ne!(oid_tag(acl_counter_oid(1).0), oid_tag(acl_table_oid(1).0));
         assert_ne!(oid_tag(acl_counter_oid(1).0), oid_tag(policer_oid(1).0));
+    }
+    // --- Router interfaces -----------------------------------------------
+
+    /// The VLAN an interface sits on, or 0 for no such interface.
+    fn stub_rif_vlan(b: &OpenBcmBackend, rif: Oid) -> u16 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> u16> =
+                b._library.get(b"hemlockbcm_stub_rif_vlan\0").unwrap();
+            f(b.switch, oid_rif(rif))
+        }
+    }
+
+    fn stub_my_mac_count(b: &OpenBcmBackend) -> u32 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch) -> u32> =
+                b._library.get(b"hemlockbcm_stub_my_mac_count\0").unwrap();
+            f(b.switch)
+        }
+    }
+
+    /// Routing a port takes it out of the bridge and into a VLAN of its
+    /// own; removing the interface puts it back. The round trip is what
+    /// matters: a port left in the internal VLAN forwards nothing and
+    /// looks like a cable fault.
+    #[test]
+    fn a_port_router_interface_leaves_and_rejoins_the_bridge() {
+        let mut b = backend();
+        assert_eq!(stub_member(&b, 1, 1), 0, "bridging to start with");
+
+        let rif = b.create_router_interface(PortId(1)).unwrap();
+        assert_eq!(stub_member(&b, 1, 1), -1, "out of the default VLAN");
+        assert_eq!(stub_rif_vlan(&b, rif), 4093, "a VLAN of its own");
+        assert_eq!(stub_pvid(&b, 1), 4093, "and classified into it");
+
+        b.remove_router_interface(PortId(1), rif).unwrap();
+        assert_eq!(stub_member(&b, 1, 1), 0, "bridging again");
+        assert_eq!(stub_pvid(&b, 1), 1, "and back on the default PVID");
+        assert_eq!(stub_rif_vlan(&b, rif), 0, "the interface is gone");
+    }
+
+    /// The internal VLAN is a function of the port, so removing the
+    /// interface can name the same VLAN without anything having been
+    /// remembered between the two calls.
+    #[test]
+    fn the_internal_router_vlan_is_derived_from_the_port() {
+        assert_eq!(rif_vlan_for(1).unwrap(), 4093);
+        assert_eq!(rif_vlan_for(53).unwrap(), 4041, "the last SFP+ port");
+        // Distinct ports never share one.
+        assert_ne!(rif_vlan_for(1).unwrap(), rif_vlan_for(2).unwrap());
+        // And the arithmetic does not wrap into somebody's VLAN 4000.
+        assert!(rif_vlan_for(4094).is_err());
+        assert!(rif_vlan_for(u32::MAX).is_err());
+    }
+
+    /// An SVI leaves the VLAN bridging: only the interface is created,
+    /// and only the interface goes.
+    #[test]
+    fn an_svi_leaves_its_vlan_bridging() {
+        let mut b = backend();
+        let vlan = b.create_vlan(100).unwrap();
+        b.add_vlan_member(vlan, PortId(1), true).unwrap();
+
+        let rif = b.create_vlan_router_interface(Some(vlan)).unwrap();
+        assert_eq!(stub_rif_vlan(&b, rif), 100);
+        assert_eq!(stub_member(&b, 100, 1), 1, "still a tagged member");
+
+        b.remove_vlan_router_interface(rif).unwrap();
+        assert_eq!(stub_rif_vlan(&b, rif), 0);
+        assert_eq!(stub_member(&b, 100, 1), 1, "the VLAN is untouched");
+
+        // None means the default VLAN, which the shim reports.
+        let default_rif = b.create_vlan_router_interface(None).unwrap();
+        assert_eq!(stub_rif_vlan(&b, default_rif), 1);
+    }
+
+    /// A My-MAC entry is separate from an interface: VRRP virtual MACs
+    /// need one with no interface of their own.
+    #[test]
+    fn my_mac_entries_are_independent_of_interfaces() {
+        let mut b = backend();
+        assert_eq!(stub_my_mac_count(&b), 0);
+
+        let virtual_mac = b
+            .create_my_mac(Some(100), [0x00, 0x00, 0x5e, 0x00, 0x01, 0x01])
+            .unwrap();
+        // No VLAN scope: the same MAC routable everywhere.
+        let any = b
+            .create_my_mac(None, [0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+            .unwrap();
+        assert_ne!(virtual_mac, any);
+        assert_eq!(stub_my_mac_count(&b), 2);
+
+        b.remove_my_mac(virtual_mac).unwrap();
+        assert_eq!(stub_my_mac_count(&b), 1);
+        assert!(b.remove_my_mac(virtual_mac).is_err(), "already gone");
+    }
+
+    /// A router interface needs the switch MAC. Inventing one would put
+    /// an address on the wire that belongs to nothing, so with no MAC
+    /// resolved the call fails instead.
+    #[test]
+    fn a_router_interface_without_a_switch_mac_is_refused() {
+        let mut init = init_for(stub_path());
+        init.src_mac = None;
+        let mut b = OpenBcmBackend::new(&init, ABI_MAJOR).unwrap();
+        b.create_switch().unwrap();
+        assert!(b.create_router_interface(PortId(1)).is_err());
+        assert!(b.create_vlan_router_interface(None).is_err());
+        // ...and the port was not taken out of the bridge on the way.
+        assert_eq!(stub_member(&b, 1, 1), 0);
+    }
+
+    /// Interface and My-MAC ids are their own families.
+    #[test]
+    fn router_interface_ids_are_their_own_families() {
+        assert_eq!(oid_rif(rif_oid(5)), 5);
+        assert_eq!(oid_my_mac(my_mac_oid(5)), 5);
+        assert_ne!(oid_tag(rif_oid(1).0), oid_tag(my_mac_oid(1).0));
+        assert_ne!(oid_tag(rif_oid(1).0), oid_tag(acl_counter_oid(1).0));
+        assert_ne!(oid_tag(my_mac_oid(1).0), oid_tag(vlan_oid(1).0));
     }
 }
