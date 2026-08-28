@@ -530,7 +530,8 @@ static int hb_capabilities(struct hemlockbcm_switch *sw,
      * a commit reference a family that cannot be programmed.
      */
     out->buffer_bytes_total = 4ull * 1024ull * 1024ull;
-    out->ecmp_width = 0;
+    /* The width every group reserves; see HB_ECMP_MAX_PATHS. */
+    out->ecmp_width = HB_ECMP_MAX_PATHS;
     /*
      * The XGS mirror-to-port table depth. The SDK has no call that
      * reports it, and this number is load-bearing rather than
@@ -2433,6 +2434,96 @@ static int hb_route_via_nexthop(struct hemlockbcm_switch *sw, uint32_t prefix,
     return HB_CALL(bcm_l3_route_add(sw->unit, &route));
 }
 
+/* --- ECMP groups (ABI 1.15) ------------------------------------------------ */
+
+/*
+ * The widest ECMP group. The SDK has no call that reports the chip's
+ * limit, and the width has to be committed at create time -- a group
+ * created narrow cannot be widened in place, so every route pointing at
+ * it would have to be rewritten to grow it. Reserving the same width for
+ * every group trades table space for never having to do that.
+ *
+ * Confirm against the hardware: too high fails the create, too low
+ * refuses a member the chip would have taken.
+ */
+#define HB_ECMP_MAX_PATHS 32
+
+static int hb_ecmp_create(struct hemlockbcm_switch *sw, uint32_t *group)
+{
+    bcm_if_t mpintf = 0;
+    int status;
+
+    if (sw == NULL || group == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Empty, with the width reserved: intf_count 0 and no array. */
+    status = HB_CALL(bcm_l3_egress_multipath_max_create(sw->unit, 0, HB_ECMP_MAX_PATHS,
+                                                        0, NULL, &mpintf));
+    if (status == HEMLOCKBCM_OK) {
+        *group = (uint32_t)mpintf;
+    }
+    return status;
+}
+
+static int hb_ecmp_destroy(struct hemlockbcm_switch *sw, uint32_t group)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_l3_egress_multipath_destroy(sw->unit, (bcm_if_t)group));
+}
+
+static int hb_ecmp_member_add(struct hemlockbcm_switch *sw, uint32_t group,
+                              uint32_t nexthop_ip)
+{
+    bcm_if_t egress_id = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Unresolved neighbour: no object to add, and a group with a hole
+     * in it would black-hole a share of the traffic. */
+    status = hb_host_egress(sw, nexthop_ip, &egress_id);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    return HB_CALL(bcm_l3_egress_multipath_add(sw->unit, (bcm_if_t)group, egress_id));
+}
+
+static int hb_ecmp_member_remove(struct hemlockbcm_switch *sw, uint32_t group,
+                                 uint32_t nexthop_ip)
+{
+    bcm_if_t egress_id = 0;
+    int status;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    status = hb_host_egress(sw, nexthop_ip, &egress_id);
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    return HB_CALL(bcm_l3_egress_multipath_delete(sw->unit, (bcm_if_t)group, egress_id));
+}
+
+static int hb_route_via_ecmp(struct hemlockbcm_switch *sw, uint32_t prefix,
+                             uint32_t mask, uint32_t group)
+{
+    bcm_l3_route_t route;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    hb_route_key(&route, prefix, mask);
+    /* MULTIPATH says the interface is a group rather than one egress
+     * object; without it the route would follow whatever single object
+     * happened to share that id. */
+    route.l3a_flags |= BCM_L3_MULTIPATH | BCM_L3_REPLACE;
+    route.l3a_intf = (bcm_if_t)group;
+    return HB_CALL(bcm_l3_route_add(sw->unit, &route));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2510,6 +2601,11 @@ static const struct hemlockbcm_api HB_API = {
     hb_neighbor_set,
     hb_neighbor_clear,
     hb_route_via_nexthop,
+    hb_ecmp_create,
+    hb_ecmp_destroy,
+    hb_ecmp_member_add,
+    hb_ecmp_member_remove,
+    hb_route_via_ecmp,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

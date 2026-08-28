@@ -466,6 +466,13 @@ struct Api {
     neighbor_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, *const u8) -> Status>,
     neighbor_clear: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
     route_via_nexthop: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, u32) -> Status>,
+
+    // --- ABI 1.15: ECMP groups ---------------------------------------
+    ecmp_create: Option<unsafe extern "C" fn(*mut ShimSwitch, *mut u32) -> Status>,
+    ecmp_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+    ecmp_member_add: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
+    ecmp_member_remove: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
+    route_via_ecmp: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, u32) -> Status>,
 }
 
 impl Api {
@@ -562,6 +569,27 @@ const OID_TAG_ACL_COUNTER: u64 = 0x0b;
 const OID_TAG_RIF: u64 = 0x0c;
 const OID_TAG_MY_MAC: u64 = 0x0d;
 const OID_TAG_NEXT_HOP: u64 = 0x0e;
+const OID_TAG_ECMP: u64 = 0x0f;
+const OID_TAG_ECMP_MEMBER: u64 = 0x10;
+
+fn ecmp_oid(group: u32) -> Oid {
+    Oid((OID_TAG_ECMP << 56) | u64::from(group))
+}
+
+fn oid_ecmp(oid: Oid) -> u32 {
+    oid.0 as u32
+}
+
+/// Group in bits 32..56, next-hop address in the low 32. Twenty-four
+/// bits for the group, not thirty-two: bits 56..64 are the tag, and a
+/// wider mask would hand the tag back as part of the group id.
+fn ecmp_member_oid(group: u32, ip: u32) -> Oid {
+    Oid((OID_TAG_ECMP_MEMBER << 56) | (u64::from(group & 0x00ff_ffff) << 32) | u64::from(ip))
+}
+
+fn oid_ecmp_member(oid: Oid) -> (u32, u32) {
+    (((oid.0 >> 32) & 0x00ff_ffff) as u32, oid.0 as u32)
+}
 
 /// A next hop is named by the neighbour it forwards to, because that is
 /// how the chip's host table is keyed. Nothing is allocated, so the id
@@ -1475,12 +1503,13 @@ impl SaiBackend for OpenBcmBackend {
                     f(sw, prefix, mask, oid_next_hop(next_hop))
                 });
             }
-            RouteTarget::Group(_) => {
-                return Err(SaiError::Other(
-                    "routes via an ECMP group need the next-hop group family, which \
-                     this backend does not implement yet"
-                        .into(),
-                ))
+            RouteTarget::Group(group) => {
+                let f = slot!(self, route_via_ecmp, "route_via_ecmp")?;
+                let sw = self.switch()?;
+                // SAFETY: plain scalars over the ABI.
+                return check("route_via_ecmp", unsafe {
+                    f(sw, prefix, mask, oid_ecmp(group))
+                });
             }
         };
         let sw = self.switch()?;
@@ -1542,20 +1571,48 @@ impl SaiBackend for OpenBcmBackend {
         Ok(())
     }
 
+    // --- ECMP groups (ABI 1.15) ---------------------------------------
+    //
+    // A group is a multipath egress object; its members are the egress
+    // objects the neighbours own, named by the next hop's address the
+    // same way a single-path route names one. A member id carries both
+    // the group and the address, so removing one needs nothing
+    // remembered.
+
     fn create_next_hop_group(&mut self) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_next_hop_group")
+        let f = slot!(self, ecmp_create, "ecmp_create")?;
+        let sw = self.switch()?;
+        let mut group: u32 = 0;
+        // SAFETY: `group` is a live u32 the shim writes only on OK.
+        check("ecmp_create", unsafe { f(sw, &mut group) })?;
+        Ok(ecmp_oid(group))
     }
 
-    fn remove_next_hop_group(&mut self, _group: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_next_hop_group")
+    fn remove_next_hop_group(&mut self, group: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, ecmp_destroy, "ecmp_destroy")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("ecmp_destroy", unsafe { f(sw, oid_ecmp(group)) })
     }
 
-    fn add_next_hop_group_member(&mut self, _group: Oid, _next_hop: Oid) -> Result<Oid, SaiError> {
-        unimplemented_slot("add_next_hop_group_member")
+    fn add_next_hop_group_member(&mut self, group: Oid, next_hop: Oid) -> Result<Oid, SaiError> {
+        let f = slot!(self, ecmp_member_add, "ecmp_member_add")?;
+        let group_id = oid_ecmp(group);
+        let ip = oid_next_hop(next_hop);
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("ecmp_member_add", unsafe { f(sw, group_id, ip) })?;
+        Ok(ecmp_member_oid(group_id, ip))
     }
 
-    fn remove_next_hop_group_member(&mut self, _member: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_next_hop_group_member")
+    fn remove_next_hop_group_member(&mut self, member: Oid) -> Result<(), SaiError> {
+        let f = slot!(self, ecmp_member_remove, "ecmp_member_remove")?;
+        // The member id says which group and which next hop, so this
+        // needs no lookup of its own.
+        let (group_id, ip) = oid_ecmp_member(member);
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("ecmp_member_remove", unsafe { f(sw, group_id, ip) })
     }
 
     // --- L2 VLANs (ABI 1.2) ------------------------------------------
@@ -2541,7 +2598,7 @@ mod tests {
         let mut b = backend();
         let caps = b.capabilities().unwrap();
         assert_eq!(caps.buffer_bytes_total, 4 * 1024 * 1024);
-        assert_eq!(caps.ecmp_width, 64);
+        assert_eq!(caps.ecmp_width, 4, "what the stub can actually hold");
         assert!(caps.ipv6);
         // Mirroring follows its slot; the session count is a
         // separate fact the shim reports, and syncd validates
@@ -2708,6 +2765,11 @@ mod tests {
             neighbor_set: None,
             neighbor_clear: None,
             route_via_nexthop: None,
+            ecmp_create: None,
+            ecmp_destroy: None,
+            ecmp_member_add: None,
+            ecmp_member_remove: None,
+            route_via_ecmp: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2845,6 +2907,11 @@ mod tests {
             "neighbor_set",
             "neighbor_clear",
             "route_via_nexthop",
+            "ecmp_create",
+            "ecmp_destroy",
+            "ecmp_member_add",
+            "ecmp_member_remove",
+            "route_via_ecmp",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2955,6 +3022,11 @@ mod tests {
             std::mem::offset_of!(Api, neighbor_set),
             std::mem::offset_of!(Api, neighbor_clear),
             std::mem::offset_of!(Api, route_via_nexthop),
+            std::mem::offset_of!(Api, ecmp_create),
+            std::mem::offset_of!(Api, ecmp_destroy),
+            std::mem::offset_of!(Api, ecmp_member_add),
+            std::mem::offset_of!(Api, ecmp_member_remove),
+            std::mem::offset_of!(Api, route_via_ecmp),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -4455,5 +4527,86 @@ mod tests {
         assert!(b.create_neighbor(rif, v6, NEIGHBOR_MAC).is_err());
         assert!(b.remove_neighbor(rif, v6).is_err());
         assert!(b.create_next_hop(rif, v6).is_err());
+    }
+    // --- ECMP groups -------------------------------------------------------
+
+    fn stub_ecmp_member(b: &OpenBcmBackend, group: Oid, next_hop: Oid) -> bool {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_ecmp_member\0").unwrap();
+            f(b.switch, oid_ecmp(group), oid_next_hop(next_hop)) != 0
+        }
+    }
+
+    /// A member is a resolved neighbour's egress object, named by its
+    /// address. An unresolved one is refused: a group with a hole in it
+    /// black-holes a share of the traffic rather than all of it, which
+    /// is harder to notice, not easier.
+    #[test]
+    fn ecmp_members_are_resolved_next_hops() {
+        let (mut b, rif) = routed_backend();
+        let group = b.create_next_hop_group().unwrap();
+        let next_hop = b.create_next_hop(rif, "10.0.0.1".parse().unwrap()).unwrap();
+
+        assert!(b.add_next_hop_group_member(group, next_hop).is_err());
+        assert!(!stub_ecmp_member(&b, group, next_hop));
+
+        b.create_neighbor(rif, "10.0.0.1".parse().unwrap(), NEIGHBOR_MAC)
+            .unwrap();
+        let member = b.add_next_hop_group_member(group, next_hop).unwrap();
+        assert!(stub_ecmp_member(&b, group, next_hop));
+
+        // A group with members cannot go.
+        assert!(b.remove_next_hop_group(group).is_err());
+        b.remove_next_hop_group_member(member).unwrap();
+        assert!(!stub_ecmp_member(&b, group, next_hop));
+        b.remove_next_hop_group(group).unwrap();
+    }
+
+    /// The member id carries both the group and the next hop, so
+    /// removing one needs no lookup -- and the group half must survive
+    /// the round trip rather than coming back with the tag in it.
+    #[test]
+    fn an_ecmp_member_id_names_its_group_and_next_hop() {
+        assert_eq!(
+            oid_ecmp_member(ecmp_member_oid(7, 0x0a00_0001)),
+            (7, 0x0a00_0001)
+        );
+        // The widest values each field can hold.
+        assert_eq!(
+            oid_ecmp_member(ecmp_member_oid(0x00ff_ffff, u32::MAX)),
+            (0x00ff_ffff, u32::MAX)
+        );
+        assert_ne!(
+            oid_tag(ecmp_member_oid(1, 1).0),
+            oid_tag(ecmp_oid(1).0),
+            "a member is not its group"
+        );
+        assert_ne!(oid_tag(ecmp_oid(1).0), oid_tag(next_hop_oid(1).0));
+    }
+
+    /// A route through a group, and the group refusing to go while one
+    /// points at it.
+    #[test]
+    fn a_route_can_follow_an_ecmp_group() {
+        let (mut b, rif) = routed_backend();
+        b.create_neighbor(rif, "10.0.0.1".parse().unwrap(), NEIGHBOR_MAC)
+            .unwrap();
+        let group = b.create_next_hop_group().unwrap();
+        let next_hop = b.create_next_hop(rif, "10.0.0.1".parse().unwrap()).unwrap();
+        let member = b.add_next_hop_group_member(group, next_hop).unwrap();
+
+        b.create_route(route("10.2.0.0/16"), RouteTarget::Group(group))
+            .unwrap();
+        assert_eq!(stub_route_nexthop(&b, "10.2.0.0/16"), oid_ecmp(group));
+
+        b.remove_next_hop_group_member(member).unwrap();
+        assert!(
+            b.remove_next_hop_group(group).is_err(),
+            "a route still points at it"
+        );
+        b.remove_route(route("10.2.0.0/16")).unwrap();
+        b.remove_next_hop_group(group).unwrap();
     }
 }

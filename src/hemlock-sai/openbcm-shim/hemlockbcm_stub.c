@@ -45,6 +45,9 @@
 #define STUB_NEIGHBORS 4
 /* Beyond the ABI's three route kinds: a route through a next hop. */
 #define STUB_ROUTE_NEXTHOP 3
+#define STUB_ROUTE_ECMP 4
+#define STUB_ECMP_GROUPS 2
+#define STUB_ECMP_MEMBERS 4
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -115,6 +118,14 @@ struct stub_route {
     int kind;
     uint32_t rif;                   /* 0 unless the kind is RIF */
     uint32_t nexthop_ip;            /* 0 unless the kind is NEXTHOP */
+};
+
+/* An ECMP group and the next hops it spreads across. */
+struct stub_ecmp {
+    int used;
+    uint32_t id;
+    int member_used[STUB_ECMP_MEMBERS];
+    uint32_t members[STUB_ECMP_MEMBERS];
 };
 
 /* A resolved neighbour: an IP, the interface it is on, and its MAC. */
@@ -214,6 +225,7 @@ struct hemlockbcm_switch {
     struct stub_my_mac my_macs[STUB_MY_MACS];
     struct stub_route routes[STUB_ROUTES];
     struct stub_neighbor neighbors[STUB_NEIGHBORS];
+    struct stub_ecmp ecmps[STUB_ECMP_GROUPS];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -384,7 +396,10 @@ static int stub_capabilities(struct hemlockbcm_switch *sw,
     }
     memset(out, 0, sizeof(*out));
     out->buffer_bytes_total = 4u * 1024u * 1024u;  /* Helix4's 4 MB */
-    out->ecmp_width = 64;
+    /* What this stub can actually hold. A test double that claims a
+     * width it cannot serve is the kind of lie the tests exist to
+     * catch. */
+    out->ecmp_width = STUB_ECMP_MEMBERS;
     out->mirror_sessions_max = STUB_MIRRORS;                  /* phase 6 */
     out->ipv6 = 1;
     return HEMLOCKBCM_OK;
@@ -2319,6 +2334,173 @@ HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_route_nexthop(struct hemlockbcm_switc
     return found == NULL ? 0 : found->nexthop_ip;
 }
 
+/* --- ECMP groups (ABI 1.15) ------------------------------------------------ */
+
+static struct stub_ecmp *find_ecmp(struct hemlockbcm_switch *sw, uint32_t group)
+{
+    size_t i;
+    for (i = 0; i < STUB_ECMP_GROUPS; i++) {
+        if (sw->ecmps[i].used && sw->ecmps[i].id == group) {
+            return &sw->ecmps[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_ecmp_create(struct hemlockbcm_switch *sw, uint32_t *group)
+{
+    size_t i;
+
+    if (sw == NULL || group == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (i = 0; i < STUB_ECMP_GROUPS; i++) {
+        if (!sw->ecmps[i].used) {
+            memset(&sw->ecmps[i], 0, sizeof(sw->ecmps[i]));
+            sw->ecmps[i].used = 1;
+            sw->ecmps[i].id = (uint32_t)i + 1;
+            *group = sw->ecmps[i].id;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_ecmp_destroy(struct hemlockbcm_switch *sw, uint32_t group)
+{
+    struct stub_ecmp *found;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_ecmp(sw, group);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_ECMP_MEMBERS; i++) {
+        if (found->member_used[i]) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* members first */
+        }
+    }
+    for (i = 0; i < STUB_ROUTES; i++) {
+        if (sw->routes[i].used && sw->routes[i].kind == STUB_ROUTE_ECMP &&
+            sw->routes[i].nexthop_ip == group) {
+            return HEMLOCKBCM_ERR_FAILURE;  /* still routed through */
+        }
+    }
+    memset(found, 0, sizeof(*found));
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_ecmp_member_add(struct hemlockbcm_switch *sw, uint32_t group,
+                                uint32_t nexthop_ip)
+{
+    struct stub_ecmp *found;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_ecmp(sw, group);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* The neighbour has to have resolved, like a single-path route. */
+    if (find_neighbor(sw, nexthop_ip) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_ECMP_MEMBERS; i++) {
+        if (found->member_used[i] && found->members[i] == nexthop_ip) {
+            return HEMLOCKBCM_ERR_ITEM_ALREADY_EXISTS;
+        }
+    }
+    for (i = 0; i < STUB_ECMP_MEMBERS; i++) {
+        if (!found->member_used[i]) {
+            found->member_used[i] = 1;
+            found->members[i] = nexthop_ip;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_NO_MEMORY;
+}
+
+static int stub_ecmp_member_remove(struct hemlockbcm_switch *sw, uint32_t group,
+                                   uint32_t nexthop_ip)
+{
+    struct stub_ecmp *found;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_ecmp(sw, group);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    for (i = 0; i < STUB_ECMP_MEMBERS; i++) {
+        if (found->member_used[i] && found->members[i] == nexthop_ip) {
+            found->member_used[i] = 0;
+            found->members[i] = 0;
+            return HEMLOCKBCM_OK;
+        }
+    }
+    return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+}
+
+static int stub_route_via_ecmp(struct hemlockbcm_switch *sw, uint32_t prefix,
+                               uint32_t mask, uint32_t group)
+{
+    struct stub_route *found;
+    size_t i;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (find_ecmp(sw, group) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    found = find_route(sw, prefix, mask);
+    if (found == NULL) {
+        for (i = 0; i < STUB_ROUTES; i++) {
+            if (!sw->routes[i].used) {
+                found = &sw->routes[i];
+                break;
+            }
+        }
+    }
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_NO_MEMORY;
+    }
+    found->used = 1;
+    found->prefix = prefix;
+    found->mask = mask;
+    found->kind = STUB_ROUTE_ECMP;
+    found->rif = 0;
+    /* The group the route follows, in the same field a single-path
+     * route keeps its next hop in. */
+    found->nexthop_ip = group;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI: 1 if the group has that member. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_ecmp_member(struct hemlockbcm_switch *sw,
+                                                  uint32_t group, uint32_t nexthop_ip)
+{
+    struct stub_ecmp *found = sw == NULL ? NULL : find_ecmp(sw, group);
+    size_t i;
+
+    if (found == NULL) {
+        return 0;
+    }
+    for (i = 0; i < STUB_ECMP_MEMBERS; i++) {
+        if (found->member_used[i] && found->members[i] == nexthop_ip) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2396,6 +2578,11 @@ static const struct hemlockbcm_api STUB_API = {
     stub_neighbor_set,
     stub_neighbor_clear,
     stub_route_via_nexthop,
+    stub_ecmp_create,
+    stub_ecmp_destroy,
+    stub_ecmp_member_add,
+    stub_ecmp_member_remove,
+    stub_route_via_ecmp,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

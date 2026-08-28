@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 14
+#define HEMLOCKBCM_ABI_MINOR 15
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -764,9 +764,33 @@ struct hemlockbcm_api {
     int (*route_via_nexthop)(struct hemlockbcm_switch *sw, uint32_t prefix,
                              uint32_t mask, uint32_t nexthop_ip);
 
+    /* --- ECMP groups (ABI 1.15) --------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: ECMP groups, CoPP traps,
-     * sFlow and QoS. Each lands as one slot appended here plus the
+     * A group is a multipath egress object, and its members are the
+     * egress objects the neighbours own -- so a member is added by
+     * naming the next hop's address and letting the shim find its
+     * object in the host table, exactly as a single-path route does. An
+     * unresolved neighbour has no object, and adding it returns "not
+     * found" rather than a group with a hole in it.
+     *
+     * The group is created empty with its width reserved up front:
+     * widening one later would move it, and every route pointing at it
+     * would have to be rewritten.
+     */
+    int (*ecmp_create)(struct hemlockbcm_switch *sw, uint32_t *group);
+    /* Members must be gone, and no route may still point at it. */
+    int (*ecmp_destroy)(struct hemlockbcm_switch *sw, uint32_t group);
+    int (*ecmp_member_add)(struct hemlockbcm_switch *sw, uint32_t group,
+                           uint32_t nexthop_ip);
+    int (*ecmp_member_remove)(struct hemlockbcm_switch *sw, uint32_t group,
+                              uint32_t nexthop_ip);
+    int (*route_via_ecmp)(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask,
+                          uint32_t group);
+
+    /*
+     * Everything below is the rest of phase 6: CoPP traps, sFlow and
+     * QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.
