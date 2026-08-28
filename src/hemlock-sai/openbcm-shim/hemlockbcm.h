@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 12
+#define HEMLOCKBCM_ABI_MINOR 13
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -709,9 +709,32 @@ struct hemlockbcm_api {
                          const uint8_t mac[6], uint32_t *my_mac);
     int (*my_mac_destroy)(struct hemlockbcm_switch *sw, uint32_t my_mac);
 
+    /* --- Routes (ABI 1.13) -------------------------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: routes, neighbours and
-     * next hops, then CoPP traps, sFlow and QoS. Each lands as one slot appended here plus the
+     * A route on the default virtual router. `kind` says what the
+     * destination resolves to and which of the remaining arguments
+     * carries it.
+     *
+     * Only the targets that need no next-hop object are here. A route to
+     * a next hop or an ECMP group needs an egress object, and building
+     * one needs the neighbour's MAC and egress port -- which the caller
+     * may not have yet when the route is programmed. That sequencing is
+     * a design in its own right and is not folded in here silently: the
+     * caller refuses those two targets until the slot for them exists.
+     */
+#define HEMLOCKBCM_ROUTE_CPU  0   /* punt: one of the switch's own addresses */
+#define HEMLOCKBCM_ROUTE_RIF  1   /* a connected subnet, via `rif` */
+#define HEMLOCKBCM_ROUTE_DROP 2   /* a null route, dropped in hardware */
+
+    int (*route_set)(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask,
+                     int kind, uint32_t rif);
+    int (*route_delete)(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask);
+
+    /*
+     * Everything below is the rest of phase 6: neighbours and next hops
+     * (and the routes that point at them), then CoPP traps, sFlow and
+     * QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.

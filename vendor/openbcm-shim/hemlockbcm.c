@@ -2226,6 +2226,63 @@ static int hb_my_mac_destroy(struct hemlockbcm_switch *sw, uint32_t my_mac)
     return HB_CALL(bcm_l2_station_delete(sw->unit, (int)my_mac));
 }
 
+/* --- Routes (ABI 1.13) ----------------------------------------------------- */
+
+static void hb_route_key(bcm_l3_route_t *route, uint32_t prefix, uint32_t mask)
+{
+    bcm_l3_route_t_init(route);
+    route->l3a_subnet = (bcm_ip_t)prefix;
+    route->l3a_ip_mask = (bcm_ip_t)mask;
+}
+
+static int hb_route_set(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask,
+                        int kind, uint32_t rif)
+{
+    bcm_l3_route_t route;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    hb_route_key(&route, prefix, mask);
+    switch (kind) {
+    case HEMLOCKBCM_ROUTE_CPU:
+        /*
+         * L2TOCPU, not a copy: the packet goes to the CPU *unrouted*.
+         * These are the switch's own addresses, and routing one would
+         * decrement its TTL and rewrite its MACs on the way to a stack
+         * that expects neither.
+         */
+        route.l3a_flags |= BCM_L3_L2TOCPU;
+        break;
+    case HEMLOCKBCM_ROUTE_RIF:
+        route.l3a_intf = (bcm_if_t)rif;
+        break;
+    case HEMLOCKBCM_ROUTE_DROP:
+        route.l3a_flags |= BCM_L3_DST_DISCARD;
+        break;
+    default:
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /*
+     * Add is a replace when the prefix is already there, which is what
+     * the caller wants: a route whose target changed must not need a
+     * delete first, or the prefix would be unreachable in between.
+     */
+    route.l3a_flags |= BCM_L3_REPLACE;
+    return HB_CALL(bcm_l3_route_add(sw->unit, &route));
+}
+
+static int hb_route_delete(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask)
+{
+    bcm_l3_route_t route;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    hb_route_key(&route, prefix, mask);
+    return HB_CALL(bcm_l3_route_delete(sw->unit, &route));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2298,6 +2355,8 @@ static const struct hemlockbcm_api HB_API = {
     hb_rif_vlan_destroy,
     hb_my_mac_create,
     hb_my_mac_destroy,
+    hb_route_set,
+    hb_route_delete,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

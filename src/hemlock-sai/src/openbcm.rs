@@ -72,6 +72,11 @@ const STP_BLOCKING: std::os::raw::c_int = 0;
 const STP_LEARNING: std::os::raw::c_int = 1;
 const STP_FORWARDING: std::os::raw::c_int = 2;
 
+/// `HEMLOCKBCM_ROUTE_*`: what a route's destination resolves to.
+const ROUTE_CPU: std::os::raw::c_int = 0;
+const ROUTE_RIF: std::os::raw::c_int = 1;
+const ROUTE_DROP: std::os::raw::c_int = 2;
+
 /// `HEMLOCKBCM_STORM_*`, in the trait's own order.
 fn storm_class(class: StormClass) -> std::os::raw::c_int {
     match class {
@@ -438,6 +443,11 @@ struct Api {
     my_mac_create:
         Option<unsafe extern "C" fn(*mut ShimSwitch, u16, *const u8, *mut u32) -> Status>,
     my_mac_destroy: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+
+    // --- ABI 1.13: routes --------------------------------------------
+    route_set:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int, u32) -> Status>,
+    route_delete: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
 }
 
 impl Api {
@@ -1408,12 +1418,40 @@ impl SaiBackend for OpenBcmBackend {
         check("my_mac_destroy", unsafe { f(sw, oid_my_mac(my_mac)) })
     }
 
-    fn create_route(&mut self, _dest: IpPrefix, _target: RouteTarget) -> Result<(), SaiError> {
-        unimplemented_slot("create_route")
+    // --- Routes (ABI 1.13) --------------------------------------------
+    //
+    // Targets that resolve without a next-hop object. A route to a next
+    // hop or an ECMP group needs an egress object, and building one
+    // needs the neighbour's MAC and its egress port -- which may not be
+    // known when the route is programmed. Those two are refused rather
+    // than approximated; see the ABI header.
+
+    fn create_route(&mut self, dest: IpPrefix, target: RouteTarget) -> Result<(), SaiError> {
+        let f = slot!(self, route_set, "route_set")?;
+        let (prefix, mask) = ipv4_prefix(dest, "route")?;
+        let (kind, rif) = match target {
+            RouteTarget::Cpu => (ROUTE_CPU, 0),
+            RouteTarget::Rif(rif) => (ROUTE_RIF, oid_rif(rif)),
+            RouteTarget::Drop => (ROUTE_DROP, 0),
+            RouteTarget::NextHop(_) | RouteTarget::Group(_) => {
+                return Err(SaiError::Other(
+                    "routes via a next hop or an ECMP group need the next-hop family, \
+                     which this backend does not implement yet"
+                        .into(),
+                ))
+            }
+        };
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("route_set", unsafe { f(sw, prefix, mask, kind, rif) })
     }
 
-    fn remove_route(&mut self, _dest: IpPrefix) -> Result<(), SaiError> {
-        unimplemented_slot("remove_route")
+    fn remove_route(&mut self, dest: IpPrefix) -> Result<(), SaiError> {
+        let f = slot!(self, route_delete, "route_delete")?;
+        let (prefix, mask) = ipv4_prefix(dest, "route")?;
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("route_delete", unsafe { f(sw, prefix, mask) })
     }
 
     fn create_neighbor(
@@ -2598,6 +2636,8 @@ mod tests {
             rif_vlan_destroy: None,
             my_mac_create: None,
             my_mac_destroy: None,
+            route_set: None,
+            route_delete: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -2730,6 +2770,8 @@ mod tests {
             "rif_vlan_destroy",
             "my_mac_create",
             "my_mac_destroy",
+            "route_set",
+            "route_delete",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -2835,6 +2877,8 @@ mod tests {
             std::mem::offset_of!(Api, rif_vlan_destroy),
             std::mem::offset_of!(Api, my_mac_create),
             std::mem::offset_of!(Api, my_mac_destroy),
+            std::mem::offset_of!(Api, route_set),
+            std::mem::offset_of!(Api, route_delete),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -4121,5 +4165,96 @@ mod tests {
         assert_ne!(oid_tag(rif_oid(1).0), oid_tag(my_mac_oid(1).0));
         assert_ne!(oid_tag(rif_oid(1).0), oid_tag(acl_counter_oid(1).0));
         assert_ne!(oid_tag(my_mac_oid(1).0), oid_tag(vlan_oid(1).0));
+    }
+    // --- Routes ------------------------------------------------------------
+
+    /// The route's kind with its RIF in the high bits, or -1 for none.
+    fn stub_route(b: &OpenBcmBackend, dest: &str) -> i64 {
+        let prefix: IpPrefix = {
+            let (addr, len) = dest.split_once('/').unwrap();
+            (addr.parse().unwrap(), len.parse().unwrap())
+        };
+        let (bits, mask) = ipv4_prefix(prefix, "test").unwrap();
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> i64> =
+                b._library.get(b"hemlockbcm_stub_route\0").unwrap();
+            f(b.switch, bits, mask)
+        }
+    }
+
+    fn route(dest: &str) -> IpPrefix {
+        let (addr, len) = dest.split_once('/').unwrap();
+        (addr.parse().unwrap(), len.parse().unwrap())
+    }
+
+    #[test]
+    fn routes_carry_their_target() {
+        let mut b = backend();
+        let rif = b.create_router_interface(PortId(1)).unwrap();
+
+        b.create_route(route("10.0.0.0/24"), RouteTarget::Rif(rif))
+            .unwrap();
+        assert_eq!(
+            stub_route(&b, "10.0.0.0/24"),
+            ((oid_rif(rif) as i64) << 32) | ROUTE_RIF as i64
+        );
+
+        b.create_route(route("10.0.0.1/32"), RouteTarget::Cpu)
+            .unwrap();
+        assert_eq!(stub_route(&b, "10.0.0.1/32"), ROUTE_CPU as i64);
+
+        b.create_route(route("192.168.0.0/16"), RouteTarget::Drop)
+            .unwrap();
+        assert_eq!(stub_route(&b, "192.168.0.0/16"), ROUTE_DROP as i64);
+
+        // A default route is a /0, whose mask is 0 -- the shift that is
+        // easy to get wrong, and it must not collide with anything.
+        b.create_route(route("0.0.0.0/0"), RouteTarget::Drop)
+            .unwrap();
+        assert_eq!(stub_route(&b, "0.0.0.0/0"), ROUTE_DROP as i64);
+        assert_eq!(stub_route(&b, "10.0.0.1/32"), ROUTE_CPU as i64, "untouched");
+
+        b.remove_route(route("10.0.0.1/32")).unwrap();
+        assert_eq!(stub_route(&b, "10.0.0.1/32"), -1);
+        assert!(b.remove_route(route("10.0.0.1/32")).is_err());
+    }
+
+    /// Retargeting a prefix must not need a delete first: the prefix
+    /// would be unreachable in between.
+    #[test]
+    fn retargeting_a_route_replaces_it_in_place() {
+        let mut b = backend();
+        let rif = b.create_router_interface(PortId(1)).unwrap();
+        b.create_route(route("10.0.0.0/24"), RouteTarget::Drop)
+            .unwrap();
+        b.create_route(route("10.0.0.0/24"), RouteTarget::Rif(rif))
+            .unwrap();
+        assert_eq!(
+            stub_route(&b, "10.0.0.0/24"),
+            ((oid_rif(rif) as i64) << 32) | ROUTE_RIF as i64
+        );
+        // One route, not two: removing it once leaves nothing behind.
+        b.remove_route(route("10.0.0.0/24")).unwrap();
+        assert_eq!(stub_route(&b, "10.0.0.0/24"), -1);
+    }
+
+    /// Targets that need an egress object are refused, not approximated:
+    /// a route silently pointing somewhere else is a black hole with no
+    /// error to explain it.
+    #[test]
+    fn routes_needing_a_next_hop_are_refused() {
+        let mut b = backend();
+        assert!(b
+            .create_route(route("10.0.0.0/24"), RouteTarget::NextHop(Oid(1)))
+            .is_err());
+        assert!(b
+            .create_route(route("10.0.0.0/24"), RouteTarget::Group(Oid(1)))
+            .is_err());
+        assert_eq!(stub_route(&b, "10.0.0.0/24"), -1, "nothing was programmed");
+
+        // IPv6 has no datapath here, so a v6 prefix is refused too.
+        assert!(b
+            .create_route(("2001:db8::".parse().unwrap(), 32), RouteTarget::Drop)
+            .is_err());
     }
 }

@@ -41,6 +41,7 @@
 #define STUB_ACL_COUNTERS 4
 #define STUB_RIFS 4
 #define STUB_MY_MACS 4
+#define STUB_ROUTES 8
 /* The SDK's own default spanning-tree group id. */
 #define STUB_DEFAULT_STG 1
 
@@ -101,6 +102,15 @@ struct stub_my_mac {
     uint32_t id;
     uint16_t vlan_id;               /* 0 = any VLAN */
     uint8_t mac[6];
+};
+
+/* One route on the default virtual router. */
+struct stub_route {
+    int used;
+    uint32_t prefix;
+    uint32_t mask;
+    int kind;
+    uint32_t rif;                   /* 0 unless the kind is RIF */
 };
 
 /* A match counter, which belongs to one table. */
@@ -190,6 +200,7 @@ struct hemlockbcm_switch {
     struct stub_acl_counter acl_counters[STUB_ACL_COUNTERS];
     struct stub_rif rifs[STUB_RIFS];
     struct stub_my_mac my_macs[STUB_MY_MACS];
+    struct stub_route routes[STUB_ROUTES];
     /* The default group is always there, so its per-port state lives
        here rather than in the table above. */
     int default_stg_state[STUB_PORTS];
@@ -2086,6 +2097,82 @@ HEMLOCKBCM_EXPORT uint32_t hemlockbcm_stub_my_mac_count(struct hemlockbcm_switch
     return count;
 }
 
+/* --- Routes (ABI 1.13) ----------------------------------------------------- */
+
+static struct stub_route *find_route(struct hemlockbcm_switch *sw, uint32_t prefix,
+                                     uint32_t mask)
+{
+    size_t i;
+    for (i = 0; i < STUB_ROUTES; i++) {
+        if (sw->routes[i].used && sw->routes[i].prefix == prefix &&
+            sw->routes[i].mask == mask) {
+            return &sw->routes[i];
+        }
+    }
+    return NULL;
+}
+
+static int stub_route_set(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask,
+                          int kind, uint32_t rif)
+{
+    struct stub_route *found;
+    size_t i;
+
+    if (sw == NULL || kind < HEMLOCKBCM_ROUTE_CPU || kind > HEMLOCKBCM_ROUTE_DROP) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (kind == HEMLOCKBCM_ROUTE_RIF && find_rif(sw, rif) == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    /* A replace, not a duplicate: the same prefix keeps its slot. */
+    found = find_route(sw, prefix, mask);
+    if (found == NULL) {
+        for (i = 0; i < STUB_ROUTES; i++) {
+            if (!sw->routes[i].used) {
+                found = &sw->routes[i];
+                break;
+            }
+        }
+    }
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_NO_MEMORY;
+    }
+    found->used = 1;
+    found->prefix = prefix;
+    found->mask = mask;
+    found->kind = kind;
+    found->rif = kind == HEMLOCKBCM_ROUTE_RIF ? rif : 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_route_delete(struct hemlockbcm_switch *sw, uint32_t prefix, uint32_t mask)
+{
+    struct stub_route *found;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    found = find_route(sw, prefix, mask);
+    if (found == NULL) {
+        return HEMLOCKBCM_ERR_ITEM_NOT_FOUND;
+    }
+    memset(found, 0, sizeof(*found));
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hook, not part of the ABI: the route's kind, or -1 for no such
+ * route. The RIF it points at is packed into the high bits. */
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_route(struct hemlockbcm_switch *sw,
+                                                uint32_t prefix, uint32_t mask)
+{
+    struct stub_route *found = sw == NULL ? NULL : find_route(sw, prefix, mask);
+
+    if (found == NULL) {
+        return -1;
+    }
+    return ((int64_t)found->rif << 32) | (int64_t)found->kind;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2158,6 +2245,8 @@ static const struct hemlockbcm_api STUB_API = {
     stub_rif_vlan_destroy,
     stub_my_mac_create,
     stub_my_mac_destroy,
+    stub_route_set,
+    stub_route_delete,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)
