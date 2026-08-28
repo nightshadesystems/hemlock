@@ -26,7 +26,7 @@
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
  * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
- * rate,knet,policer,field,l3,rx,pkt}.h,
+ * rate,knet,policer,field,l3,rx,pkt,cosq}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -45,6 +45,7 @@
 #include <sal/core/libc.h>
 #include <sal/types.h>
 
+#include <bcm/cosq.h>
 #include <bcm/error.h>
 #include <bcm/field.h>
 #include <bcm/init.h>
@@ -2916,6 +2917,188 @@ static int hb_sample_rate_set(struct hemlockbcm_switch *sw, uint32_t logical_por
                                             (int)rate, 0));
 }
 
+/* --- QoS (ABI 1.18) --------------------------------------------------------- */
+
+static int hb_qos_dscp_tc_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              const uint8_t tc[64])
+{
+    int codepoint;
+    int status;
+
+    if (sw == NULL || tc == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (codepoint = 0; codepoint < 64; codepoint++) {
+        /* mapcp = the same codepoint: classification only, no ingress
+         * DSCP rewrite. */
+        status = HB_CALL(bcm_port_dscp_map_set(sw->unit, (bcm_port_t)logical_port,
+                                               codepoint, codepoint, tc[codepoint]));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_qos_dscp_trust_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 int trust)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_port_dscp_map_mode_set(sw->unit, (bcm_port_t)logical_port,
+                                              trust ? BCM_PORT_DSCP_MAP_ALL
+                                                    : BCM_PORT_DSCP_MAP_NONE));
+}
+
+static int hb_qos_dot1p_tc_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                               const uint8_t tc[8])
+{
+    int pri;
+    int cfi;
+    int status;
+
+    if (sw == NULL || tc == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    for (pri = 0; pri < 8; pri++) {
+        for (cfi = 0; cfi < 2; cfi++) {
+            /* Green regardless of CFI: drop precedence is WRED's job,
+             * not the classifier's. */
+            status = HB_CALL(bcm_port_vlan_priority_map_set(
+                sw->unit, (bcm_port_t)logical_port, pri, cfi, tc[pri],
+                bcmColorGreen));
+            if (status != HEMLOCKBCM_OK) {
+                return status;
+            }
+        }
+    }
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_qos_default_tc_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 uint8_t tc)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    return HB_CALL(bcm_port_untagged_priority_set(sw->unit, (bcm_port_t)logical_port,
+                                                  tc));
+}
+
+static int hb_qos_queue_sched_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                  uint32_t queue, int strict, uint8_t weight)
+{
+    bcm_gport_t gport;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    BCM_GPORT_LOCAL_SET(gport, (bcm_port_t)logical_port);
+    return HB_CALL(bcm_cosq_gport_sched_set(
+        sw->unit, gport, (bcm_cos_queue_t)queue,
+        strict ? BCM_COSQ_STRICT : BCM_COSQ_WEIGHTED_ROUND_ROBIN,
+        strict ? 0 : (int)weight));
+}
+
+static int hb_qos_queue_shaper_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   uint32_t queue, uint64_t kbps)
+{
+    bcm_gport_t gport;
+
+    if (sw == NULL || kbps > 0xffffffffull) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    BCM_GPORT_LOCAL_SET(gport, (bcm_port_t)logical_port);
+    /* min 0: a ceiling, not a guarantee. max 0 = the SDK's "unshaped". */
+    return HB_CALL(bcm_cosq_gport_bandwidth_set(sw->unit, gport,
+                                                (bcm_cos_queue_t)queue, 0,
+                                                (uint32)kbps, 0));
+}
+
+static int hb_qos_port_shaper_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                  uint64_t kbps)
+{
+    uint32 burst;
+
+    if (sw == NULL || kbps > 0xffffffffull) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* The same burst reasoning as storm control: an eighth of the rate
+     * is 125 ms of traffic -- smoothing, not the enforced rate. */
+    burst = (uint32)(kbps / 8u);
+    if (kbps != 0 && burst == 0) {
+        burst = 1;
+    }
+    return HB_CALL(bcm_port_rate_egress_set(sw->unit, (bcm_port_t)logical_port,
+                                            (uint32)kbps, burst));
+}
+
+static int hb_qos_queue_wred_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 uint32_t queue, uint32_t min_bytes, uint32_t max_bytes,
+                                 uint8_t drop_probability, int ecn, int enable)
+{
+    bcm_cosq_gport_discard_t discard;
+    bcm_gport_t gport;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    BCM_GPORT_LOCAL_SET(gport, (bcm_port_t)logical_port);
+    sal_memset(&discard, 0, sizeof(discard));
+    if (enable) {
+        discard.flags = BCM_COSQ_DISCARD_ENABLE | BCM_COSQ_DISCARD_BYTES
+                        | BCM_COSQ_DISCARD_COLOR_ALL;
+        if (ecn) {
+            discard.flags |= BCM_COSQ_DISCARD_MARK_CONGESTION;
+        }
+        discard.min_thresh = (int)min_bytes;
+        discard.max_thresh = (int)max_bytes;
+        discard.drop_probability = (int)drop_probability;
+    }
+    /* Disabled: an all-zero struct with no ENABLE flag. */
+    return HB_CALL(bcm_cosq_gport_discard_set(sw->unit, gport,
+                                              (bcm_cos_queue_t)queue, &discard));
+}
+
+static int hb_queue_counters_get(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 uint32_t queue, uint64_t *pkts, uint64_t *bytes,
+                                 uint64_t *dropped_pkts, uint64_t *dropped_bytes)
+{
+    static const bcm_cosq_stat_t stats[4] = {
+        bcmCosqStatOutPackets,
+        bcmCosqStatOutBytes,
+        bcmCosqStatDroppedPackets,
+        bcmCosqStatDroppedBytes,
+    };
+    uint64_t *out[4];
+    bcm_gport_t gport;
+    int i;
+
+    if (sw == NULL || pkts == NULL || bytes == NULL || dropped_pkts == NULL
+        || dropped_bytes == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    out[0] = pkts;
+    out[1] = bytes;
+    out[2] = dropped_pkts;
+    out[3] = dropped_bytes;
+    BCM_GPORT_LOCAL_SET(gport, (bcm_port_t)logical_port);
+    for (i = 0; i < 4; i++) {
+        uint64 value;
+        int status;
+
+        COMPILER_64_ZERO(value);
+        status = HB_CALL(bcm_cosq_stat_get(sw->unit, gport, (bcm_cos_queue_t)queue,
+                                           stats[i], &value));
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+        *out[i] = hb_u64(value);
+    }
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -3003,7 +3186,16 @@ static const struct hemlockbcm_api HB_API = {
     hb_trap_default_policer_set,
     hb_set_sample_callback,
     hb_sample_rate_set,
-    /* Remaining phase 6 slots are appended below this line. */
+    hb_qos_dscp_tc_set,
+    hb_qos_dscp_trust_set,
+    hb_qos_dot1p_tc_set,
+    hb_qos_default_tc_set,
+    hb_qos_queue_sched_set,
+    hb_qos_queue_shaper_set,
+    hb_qos_port_shaper_set,
+    hb_qos_queue_wred_set,
+    hb_queue_counters_get,
+    /* New slots are appended below this line, with the minor bumped. */
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

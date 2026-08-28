@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 17
+#define HEMLOCKBCM_ABI_MINOR 18
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -891,8 +891,62 @@ struct hemlockbcm_api {
     int (*sample_rate_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
                            uint32_t rate);
 
+    /* --- QoS (ABI 1.18) ------------------------------------------------ */
+
     /*
-     * Everything below is the rest of phase 6: QoS. Each lands as one slot appended here plus the
+     * Every slot here is port- or queue-scoped and stateless: the SAI
+     * object indirection (map objects, scheduler profiles, WRED
+     * profiles) lives on the Rust side, which knows the object contents
+     * and which ports and queues hold them. The shim only ever hears
+     * "program this port's table to exactly this".
+     *
+     * Egress rewrite maps (TC->DSCP, TC->CoS) are deliberately absent:
+     * the caller reports qos_map_egress false and refuses those tables
+     * with a proper error instead.
+     */
+
+    /* The port's DSCP -> traffic-class table, all 64 codepoints. */
+    int (*qos_dscp_tc_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                           const uint8_t tc[64]);
+    /* Whether the port consults that table at all. */
+    int (*qos_dscp_trust_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              int trust);
+    /* The port's 802.1p -> traffic-class table, all 8 priorities. An
+     * unbound port is programmed all-zero: untrusted tagged traffic
+     * lands in TC 0 (not the port's default TC -- that only covers
+     * untagged frames; the difference is documented, not hidden). */
+    int (*qos_dot1p_tc_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                            const uint8_t tc[8]);
+    /* The class untagged traffic lands in. */
+    int (*qos_default_tc_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint8_t tc);
+
+    /* One egress queue's scheduling: strict, or DWRR at `weight`. */
+    int (*qos_queue_sched_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                               uint32_t queue, int strict, uint8_t weight);
+    /* One egress queue's shaper ceiling in kbit/s; 0 = unshaped. */
+    int (*qos_queue_shaper_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                uint32_t queue, uint64_t kbps);
+    /* The whole port's egress shaper in kbit/s; 0 = unshaped. */
+    int (*qos_port_shaper_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                               uint64_t kbps);
+
+    /* One egress queue's WRED curve; thresholds in bytes, probability
+     * in percent at max threshold, `ecn` marks ECT traffic instead of
+     * dropping it. `enable` 0 turns WRED off for the queue and the
+     * other arguments are ignored. */
+    int (*qos_queue_wred_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint32_t queue, uint32_t min_bytes, uint32_t max_bytes,
+                              uint8_t drop_probability, int ecn, int enable);
+
+    /* One unicast egress queue's cumulative counters. */
+    int (*queue_counters_get)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint32_t queue, uint64_t *pkts, uint64_t *bytes,
+                              uint64_t *dropped_pkts, uint64_t *dropped_bytes);
+
+    /*
+     * Phase 6 is complete. New families append below this line with the
+     * minor bumped, as ever. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.

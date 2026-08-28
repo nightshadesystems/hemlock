@@ -120,6 +120,15 @@ struct stub_route {
     uint32_t nexthop_ip;            /* 0 unless the kind is NEXTHOP */
 };
 
+/* One queue's WRED curve, as programmed. */
+struct stub_wred {
+    int enable;
+    int ecn;
+    uint32_t min_bytes;
+    uint32_t max_bytes;
+    uint8_t drop_probability;
+};
+
 /* One installed protocol trap: (kind, is_default) -> what trap_set put
  * there. */
 struct stub_trap {
@@ -248,6 +257,15 @@ struct hemlockbcm_switch {
     hemlockbcm_sample_cb sample_cb;
     void *sample_ctx;
     uint32_t sample_rate[STUB_PORTS];
+    uint8_t dscp_tc[STUB_PORTS][64];
+    int dscp_trust[STUB_PORTS];
+    uint8_t dot1p_tc[STUB_PORTS][8];
+    uint8_t default_tc[STUB_PORTS];
+    int sched_strict[STUB_PORTS][8];
+    uint8_t sched_weight[STUB_PORTS][8];
+    uint64_t queue_shaper[STUB_PORTS][8];
+    uint64_t port_shaper[STUB_PORTS];
+    struct stub_wred wred[STUB_PORTS][8];
     int created;
 };
 
@@ -2643,6 +2661,239 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_fire_sample(struct hemlockbcm_switch *sw,
     return 0;
 }
 
+/* --- QoS (ABI 1.18) --------------------------------------------------------- */
+
+#define STUB_QUEUES 8
+
+static struct hemlockbcm_port *stub_qos_port(struct hemlockbcm_switch *sw,
+                                             uint32_t logical_port)
+{
+    return sw == NULL ? NULL : find_port(sw, logical_port);
+}
+
+static int stub_qos_dscp_tc_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                const uint8_t tc[64])
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || tc == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    memcpy(sw->dscp_tc[port - sw->ports], tc, 64);
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_qos_dscp_trust_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   int trust)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->dscp_trust[port - sw->ports] = trust ? 1 : 0;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_qos_dot1p_tc_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                 const uint8_t tc[8])
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || tc == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    memcpy(sw->dot1p_tc[port - sw->ports], tc, 8);
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_qos_default_tc_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   uint8_t tc)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->default_tc[port - sw->ports] = tc;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_qos_queue_sched_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                    uint32_t queue, int strict, uint8_t weight)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || queue >= STUB_QUEUES) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->sched_strict[port - sw->ports][queue] = strict ? 1 : 0;
+    sw->sched_weight[port - sw->ports][queue] = weight;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_qos_queue_shaper_set(struct hemlockbcm_switch *sw,
+                                     uint32_t logical_port, uint32_t queue,
+                                     uint64_t kbps)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || queue >= STUB_QUEUES) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->queue_shaper[port - sw->ports][queue] = kbps;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_qos_port_shaper_set(struct hemlockbcm_switch *sw,
+                                    uint32_t logical_port, uint64_t kbps)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->port_shaper[port - sw->ports] = kbps;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_qos_queue_wred_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   uint32_t queue, uint32_t min_bytes,
+                                   uint32_t max_bytes, uint8_t drop_probability,
+                                   int ecn, int enable)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+    struct stub_wred *slot;
+
+    if (port == NULL || queue >= STUB_QUEUES) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    slot = &sw->wred[port - sw->ports][queue];
+    if (!enable) {
+        memset(slot, 0, sizeof(*slot));
+        return HEMLOCKBCM_OK;
+    }
+    slot->enable = 1;
+    slot->ecn = ecn ? 1 : 0;
+    slot->min_bytes = min_bytes;
+    slot->max_bytes = max_bytes;
+    slot->drop_probability = drop_probability;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_queue_counters_get(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                   uint32_t queue, uint64_t *pkts, uint64_t *bytes,
+                                   uint64_t *dropped_pkts, uint64_t *dropped_bytes)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || queue >= STUB_QUEUES || pkts == NULL || bytes == NULL
+        || dropped_pkts == NULL || dropped_bytes == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Deterministic per (port, queue), so a test can prove the right
+     * queue's numbers land in the right row. */
+    *pkts = (uint64_t)logical_port * 1000u + queue * 10u;
+    *bytes = *pkts * 64u;
+    *dropped_pkts = queue;
+    *dropped_bytes = queue * 64u;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+/* tc | (trust << 8), or -1. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_dscp_tc(struct hemlockbcm_switch *sw,
+                                              uint32_t logical_port, int codepoint)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || codepoint < 0 || codepoint > 63) {
+        return -1;
+    }
+    return sw->dscp_tc[port - sw->ports][codepoint]
+           | (sw->dscp_trust[port - sw->ports] << 8);
+}
+
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_dot1p_tc(struct hemlockbcm_switch *sw,
+                                               uint32_t logical_port, int pri)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || pri < 0 || pri > 7) {
+        return -1;
+    }
+    return sw->dot1p_tc[port - sw->ports][pri];
+}
+
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_default_tc(struct hemlockbcm_switch *sw,
+                                                 uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+    return port == NULL ? -1 : sw->default_tc[port - sw->ports];
+}
+
+/* (strict << 16) | weight, or -1. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_sched(struct hemlockbcm_switch *sw,
+                                            uint32_t logical_port, uint32_t queue)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || queue >= STUB_QUEUES) {
+        return -1;
+    }
+    return (sw->sched_strict[port - sw->ports][queue] << 16)
+           | sw->sched_weight[port - sw->ports][queue];
+}
+
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_queue_shaper(struct hemlockbcm_switch *sw,
+                                                       uint32_t logical_port,
+                                                       uint32_t queue)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+
+    if (port == NULL || queue >= STUB_QUEUES) {
+        return -1;
+    }
+    return (int64_t)sw->queue_shaper[port - sw->ports][queue];
+}
+
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_port_shaper(struct hemlockbcm_switch *sw,
+                                                      uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+    return port == NULL ? -1 : (int64_t)sw->port_shaper[port - sw->ports];
+}
+
+/* (min << 32) | max, or -1. */
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_wred_range(struct hemlockbcm_switch *sw,
+                                                     uint32_t logical_port,
+                                                     uint32_t queue)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+    struct stub_wred *slot;
+
+    if (port == NULL || queue >= STUB_QUEUES) {
+        return -1;
+    }
+    slot = &sw->wred[port - sw->ports][queue];
+    return ((int64_t)slot->min_bytes << 32) | (int64_t)slot->max_bytes;
+}
+
+/* enable | (ecn << 1) | (drop_probability << 8), or -1. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_wred_mode(struct hemlockbcm_switch *sw,
+                                                uint32_t logical_port, uint32_t queue)
+{
+    struct hemlockbcm_port *port = stub_qos_port(sw, logical_port);
+    struct stub_wred *slot;
+
+    if (port == NULL || queue >= STUB_QUEUES) {
+        return -1;
+    }
+    slot = &sw->wred[port - sw->ports][queue];
+    return slot->enable | (slot->ecn << 1) | (slot->drop_probability << 8);
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2730,6 +2981,15 @@ static const struct hemlockbcm_api STUB_API = {
     stub_trap_default_policer_set,
     stub_set_sample_callback,
     stub_sample_rate_set,
+    stub_qos_dscp_tc_set,
+    stub_qos_dscp_trust_set,
+    stub_qos_dot1p_tc_set,
+    stub_qos_default_tc_set,
+    stub_qos_queue_sched_set,
+    stub_qos_queue_shaper_set,
+    stub_qos_port_shaper_set,
+    stub_qos_queue_wred_set,
+    stub_queue_counters_get,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

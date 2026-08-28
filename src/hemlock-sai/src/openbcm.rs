@@ -494,6 +494,40 @@ struct Api {
     set_sample_callback:
         Option<unsafe extern "C" fn(*mut ShimSwitch, Option<SampleCb>, *mut c_void) -> Status>,
     sample_rate_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
+
+    // --- ABI 1.18: QoS -----------------------------------------------
+    qos_dscp_tc_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *const u8) -> Status>,
+    qos_dscp_trust_set:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, std::os::raw::c_int) -> Status>,
+    qos_dot1p_tc_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *const u8) -> Status>,
+    qos_default_tc_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u8) -> Status>,
+    qos_queue_sched_set:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, std::os::raw::c_int, u8) -> Status>,
+    qos_queue_shaper_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32, u64) -> Status>,
+    qos_port_shaper_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u64) -> Status>,
+    qos_queue_wred_set: Option<
+        unsafe extern "C" fn(
+            *mut ShimSwitch,
+            u32,
+            u32,
+            u32,
+            u32,
+            u8,
+            std::os::raw::c_int,
+            std::os::raw::c_int,
+        ) -> Status,
+    >,
+    queue_counters_get: Option<
+        unsafe extern "C" fn(
+            *mut ShimSwitch,
+            u32,
+            u32,
+            *mut u64,
+            *mut u64,
+            *mut u64,
+            *mut u64,
+        ) -> Status,
+    >,
 }
 
 impl Api {
@@ -825,6 +859,92 @@ fn sample_trap_oid() -> Oid {
     Oid((OID_TAG_TRAP << 56) | 0xfe)
 }
 
+/// Which stored table a map kind uses, or an error for the egress
+/// rewrite kinds this backend does not implement -- reported through
+/// `qos_map_egress: false`, so syncd refuses those tables with a proper
+/// error before this is ever reached.
+fn qos_map_index(kind: QosMapType) -> Result<usize, SaiError> {
+    match kind {
+        QosMapType::DscpToTc => Ok(0),
+        QosMapType::Dot1pToTc => Ok(1),
+        QosMapType::TcToDscp | QosMapType::TcToDot1p => Err(SaiError::Other(
+            "egress QoS rewrite maps are not implemented on this backend".into(),
+        )),
+    }
+}
+
+fn validate_qos_entries(kind: QosMapType, entries: &[(u8, u8)]) -> Result<(), SaiError> {
+    let key_max = if kind == QosMapType::DscpToTc { 63 } else { 7 };
+    for (key, tc) in entries {
+        if *key > key_max || *tc > 7 {
+            return Err(SaiError::Other(format!(
+                "QoS map entry ({key}, {tc}) is out of range for {kind:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_wred(spec: &WredSpec) -> Result<(), SaiError> {
+    if spec.min_threshold_bytes > spec.max_threshold_bytes {
+        return Err(SaiError::Other(format!(
+            "WRED min threshold {} is above max {}",
+            spec.min_threshold_bytes, spec.max_threshold_bytes
+        )));
+    }
+    if spec.drop_probability > 100 {
+        return Err(SaiError::Other(format!(
+            "WRED drop probability {}% is not 0..=100",
+            spec.drop_probability
+        )));
+    }
+    Ok(())
+}
+
+const OID_TAG_QOS_MAP: u64 = 0x14;
+const OID_TAG_SCHEDULER: u64 = 0x15;
+const OID_TAG_WRED: u64 = 0x16;
+
+fn qos_map_oid(index: usize) -> Oid {
+    Oid((OID_TAG_QOS_MAP << 56) | index as u64)
+}
+
+fn oid_qos_map(oid: Oid) -> Result<usize, SaiError> {
+    if oid_tag(oid.0) != OID_TAG_QOS_MAP || (oid.0 & 0xff) > 1 {
+        return Err(SaiError::Other(format!("{oid} is not a QoS map")));
+    }
+    Ok((oid.0 & 0xff) as usize)
+}
+
+/// strict in bit 55, weight in bits 48..55, the ceiling in kbit/s in
+/// the low 48 -- a scheduler profile is its spec, so nothing is
+/// allocated and syncd's dedup of identical profiles is free.
+fn scheduler_oid(strict: bool, weight: u8, kbps: u64) -> Oid {
+    Oid((OID_TAG_SCHEDULER << 56)
+        | (u64::from(strict) << 55)
+        | (u64::from(weight & 0x7f) << 48)
+        | kbps)
+}
+
+fn oid_scheduler(oid: Oid) -> Result<(bool, u8, u64), SaiError> {
+    if oid_tag(oid.0) != OID_TAG_SCHEDULER {
+        return Err(SaiError::Other(format!("{oid} is not a scheduler")));
+    }
+    Ok((
+        oid.0 & (1 << 55) != 0,
+        ((oid.0 >> 48) & 0x7f) as u8,
+        oid.0 & ((1 << 48) - 1),
+    ))
+}
+
+fn wred_oid(id: u32) -> Oid {
+    Oid((OID_TAG_WRED << 56) | u64::from(id))
+}
+
+fn oid_wred(oid: Oid) -> u32 {
+    oid.0 as u32
+}
+
 /// Map a shim status onto the error type the rest of Hemlock understands.
 fn check(call: &'static str, status: Status) -> Result<(), SaiError> {
     if status == 0 {
@@ -932,6 +1052,15 @@ pub struct OpenBcmBackend {
     /// nothing derivable holds it. Lost on restart, and safely so --
     /// syncd replays the whole CoPP program after create_switch.
     default_trap_policer: u32,
+    /// The QoS indirection SAI promises and this hardware lacks: map
+    /// objects hold tables an oid cannot carry, and WRED profiles are
+    /// edited in place on queues that must not be rebound. One map per
+    /// kind (syncd's own model), all replayed after a restart.
+    qos_maps: [Option<Vec<(u8, u8)>>; 2],
+    qos_map_ports: [std::collections::BTreeSet<u32>; 2],
+    wred_profiles: std::collections::BTreeMap<u32, WredSpec>,
+    wred_queues: std::collections::BTreeMap<(u32, u32), u32>,
+    next_wred: u32,
     diag_shell: bool,
     events: Option<mpsc::UnboundedReceiver<SaiEvent>>,
     event_ctx: Arc<EventContext>,
@@ -1032,6 +1161,11 @@ impl OpenBcmBackend {
             config_bcm_path: init.config_bcm_path.clone(),
             src_mac: init.src_mac,
             default_trap_policer: 0,
+            qos_maps: [None, None],
+            qos_map_ports: Default::default(),
+            wred_profiles: std::collections::BTreeMap::new(),
+            wred_queues: std::collections::BTreeMap::new(),
+            next_wred: 1,
             diag_shell: init.diag_shell,
             events: Some(rx),
             event_ctx: Arc::new(EventContext { tx }),
@@ -1132,6 +1266,97 @@ impl OpenBcmBackend {
                 "no switch MAC: a router interface needs one and there is no safe default".into(),
             )
         })
+    }
+
+    /// Reprogram one QoS map on every port bound to it -- the in-place
+    /// update that lets `set_qos_map` change a live map without any
+    /// port being rebound.
+    fn reprogram_qos_map(&self, index: usize) -> Result<(), SaiError> {
+        for logical in self.qos_map_ports[index].clone() {
+            self.program_qos_map_port(index, logical)?;
+        }
+        Ok(())
+    }
+
+    /// Program one port's table from the stored map. Codepoints the map
+    /// does not name classify to TC 0.
+    fn program_qos_map_port(&self, index: usize, logical: u32) -> Result<(), SaiError> {
+        let entries = self.qos_maps[index]
+            .as_ref()
+            .ok_or_else(|| SaiError::Other("QoS map vanished mid-program".into()))?;
+        let sw = self.switch()?;
+        if index == 0 {
+            let f = slot!(self, qos_dscp_tc_set, "qos_dscp_tc_set")?;
+            let trust = slot!(self, qos_dscp_trust_set, "qos_dscp_trust_set")?;
+            let mut table = [0u8; 64];
+            for (codepoint, tc) in entries {
+                table[*codepoint as usize] = *tc;
+            }
+            // SAFETY: `table` outlives the call.
+            check("qos_dscp_tc_set", unsafe { f(sw, logical, table.as_ptr()) })?;
+            check("qos_dscp_trust_set", unsafe { trust(sw, logical, 1) })
+        } else {
+            let f = slot!(self, qos_dot1p_tc_set, "qos_dot1p_tc_set")?;
+            let mut table = [0u8; 8];
+            for (pri, tc) in entries {
+                table[*pri as usize] = *tc;
+            }
+            // SAFETY: `table` outlives the call.
+            check("qos_dot1p_tc_set", unsafe {
+                f(sw, logical, table.as_ptr())
+            })
+        }
+    }
+
+    /// The unbound state: DSCP untrusted, 802.1p all-zero (TC 0).
+    fn unprogram_qos_map_port(&self, index: usize, logical: u32) -> Result<(), SaiError> {
+        let sw = self.switch()?;
+        if index == 0 {
+            let trust = slot!(self, qos_dscp_trust_set, "qos_dscp_trust_set")?;
+            // SAFETY: plain scalars over the ABI.
+            check("qos_dscp_trust_set", unsafe { trust(sw, logical, 0) })
+        } else {
+            let f = slot!(self, qos_dot1p_tc_set, "qos_dot1p_tc_set")?;
+            let table = [0u8; 8];
+            // SAFETY: `table` outlives the call.
+            check("qos_dot1p_tc_set", unsafe {
+                f(sw, logical, table.as_ptr())
+            })
+        }
+    }
+
+    /// Program (or with `None` disable) one queue's WRED curve.
+    fn program_wred(
+        &self,
+        logical: u32,
+        queue: u32,
+        spec: Option<&WredSpec>,
+    ) -> Result<(), SaiError> {
+        let f = slot!(self, qos_queue_wred_set, "qos_queue_wred_set")?;
+        let sw = self.switch()?;
+        match spec {
+            Some(spec) => {
+                // SAFETY: plain scalars over the ABI.
+                check("qos_queue_wred_set", unsafe {
+                    f(
+                        sw,
+                        logical,
+                        queue,
+                        spec.min_threshold_bytes,
+                        spec.max_threshold_bytes,
+                        spec.drop_probability,
+                        i32::from(spec.ecn),
+                        1,
+                    )
+                })
+            }
+            None => {
+                // SAFETY: plain scalars over the ABI.
+                check("qos_queue_wred_set", unsafe {
+                    f(sw, logical, queue, 0, 0, 0, 0, 0)
+                })
+            }
+        }
     }
 
     /// The trunk id behind a LAG's `PortId`. A real port here is a
@@ -1453,8 +1678,45 @@ impl SaiBackend for OpenBcmBackend {
     /// No queue-stat slot until phase 6's QoS step. An empty list is the
     /// documented "backend has none" answer: syncd renders the
     /// platform-declared queues as zeros rather than failing.
-    fn port_queue_counters(&mut self, _port: PortId) -> Result<Vec<QueueCounters>, SaiError> {
-        Ok(Vec::new())
+    fn port_queue_counters(&mut self, port: PortId) -> Result<Vec<QueueCounters>, SaiError> {
+        // Without the slot, the documented "backend has none" answer:
+        // syncd renders the platform-declared queues as zeros.
+        let Ok(f) = slot!(self, queue_counters_get, "queue_counters_get") else {
+            return Ok(Vec::new());
+        };
+        let logical = self.logical_port(port)?;
+        let sw = self.switch()?;
+        // The eight unicast queues; the multicast queue has no per-queue
+        // gport on this chip's API, so syncd zero-fills it.
+        let mut queues = Vec::with_capacity(8);
+        for index in 0..8u32 {
+            let (mut pkts, mut bytes, mut dropped_pkts, mut dropped_bytes) = (0, 0, 0, 0);
+            // SAFETY: four live u64 out-params, written only on OK.
+            check("queue_counters_get", unsafe {
+                f(
+                    sw,
+                    logical,
+                    index,
+                    &mut pkts,
+                    &mut bytes,
+                    &mut dropped_pkts,
+                    &mut dropped_bytes,
+                )
+            })?;
+            queues.push(QueueCounters {
+                unicast: true,
+                index,
+                pkts,
+                bytes,
+                dropped_pkts,
+                dropped_bytes,
+                // No WRED-attributed counters on this chip's stat set;
+                // wred_queue_stats stays false and these stay zero.
+                wred_dropped: 0,
+                ecn_marked: 0,
+            });
+        }
+        Ok(queues)
     }
 
     fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<SaiEvent>> {
@@ -1491,11 +1753,18 @@ impl SaiBackend for OpenBcmBackend {
             port_learn_limit: slot!(self, set_port_learn_limit, "set_port_learn_limit").is_ok(),
             copp: slot!(self, trap_set, "trap_set").is_ok(),
             buffer_bytes_total: raw.buffer_bytes_total,
-            qos_map_ingress: false,
+            qos_map_ingress: slot!(self, qos_dscp_tc_set, "qos_dscp_tc_set").is_ok(),
+            // Egress rewrite maps would need an unmap/FP path this
+            // backend does not implement; syncd refuses those
+            // tables cleanly on the strength of this flag.
             qos_map_egress: false,
-            wred: false,
-            ecn: false,
-            queue_shaper: false,
+            wred: slot!(self, qos_queue_wred_set, "qos_queue_wred_set").is_ok(),
+            // The same slot carries the mark-congestion flag; a chip
+            // without ECN marking refuses at apply, loudly.
+            ecn: slot!(self, qos_queue_wred_set, "qos_queue_wred_set").is_ok(),
+            queue_shaper: slot!(self, qos_queue_shaper_set, "qos_queue_shaper_set").is_ok(),
+            // The cosq stat set has no WRED-attributed counters, so
+            // per-queue wred/ecn stats stay honestly zero.
             wred_queue_stats: false,
             sflow: slot!(self, sample_rate_set, "sample_rate_set").is_ok(),
             cable_diag: false,
@@ -2560,75 +2829,236 @@ impl SaiBackend for OpenBcmBackend {
         Ok(())
     }
 
-    fn create_qos_map(
-        &mut self,
-        _kind: QosMapType,
-        _entries: &[(u8, u8)],
-    ) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_qos_map")
+    // --- QoS (ABI 1.18) -----------------------------------------------
+    //
+    // This family is where SAI's object indirection genuinely exceeds
+    // what derivation can express, and the emulation lives here rather
+    // than in the shim: map objects hold entry tables an oid cannot
+    // carry, and set_wred edits a profile in place on queues that must
+    // not be rebound -- so the backend has to know both the contents
+    // and the holders. All of it is bounded (one map per kind, which is
+    // syncd's own model), all of it is replayed by syncd after a
+    // restart, and the shim below stays a stateless "program this
+    // port's table to exactly this".
+
+    fn create_qos_map(&mut self, kind: QosMapType, entries: &[(u8, u8)]) -> Result<Oid, SaiError> {
+        slot!(self, qos_dscp_tc_set, "qos_dscp_tc_set")?;
+        let index = qos_map_index(kind)?;
+        validate_qos_entries(kind, entries)?;
+        self.qos_maps[index] = Some(entries.to_vec());
+        // One map per kind, which is exactly how syncd holds them --
+        // so the id can be the kind, and a re-create is a replace.
+        self.reprogram_qos_map(index)?;
+        Ok(qos_map_oid(index))
     }
 
-    fn set_qos_map(&mut self, _map: Oid, _entries: &[(u8, u8)]) -> Result<(), SaiError> {
-        unimplemented_slot("set_qos_map")
+    fn set_qos_map(&mut self, map: Oid, entries: &[(u8, u8)]) -> Result<(), SaiError> {
+        let index = oid_qos_map(map)?;
+        let kind = if index == 0 {
+            QosMapType::DscpToTc
+        } else {
+            QosMapType::Dot1pToTc
+        };
+        validate_qos_entries(kind, entries)?;
+        if self.qos_maps[index].is_none() {
+            return Err(SaiError::Other(format!("{map} does not exist")));
+        }
+        self.qos_maps[index] = Some(entries.to_vec());
+        // In place: every bound port is reprogrammed, no rebinding.
+        self.reprogram_qos_map(index)
     }
 
-    fn remove_qos_map(&mut self, _map: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_qos_map")
+    fn remove_qos_map(&mut self, map: Oid) -> Result<(), SaiError> {
+        let index = oid_qos_map(map)?;
+        if !self.qos_map_ports[index].is_empty() {
+            return Err(SaiError::Other(format!(
+                "{map} is still bound to {} port(s)",
+                self.qos_map_ports[index].len()
+            )));
+        }
+        self.qos_maps[index] = None;
+        Ok(())
     }
 
     fn set_port_qos_map_binding(
         &mut self,
-        _port: PortId,
-        _kind: QosMapType,
-        _map: Option<Oid>,
+        port: PortId,
+        kind: QosMapType,
+        map: Option<Oid>,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_qos_map_binding")
+        let index = qos_map_index(kind)?;
+        let logical = self.logical_port(port)?;
+        match map {
+            Some(map) => {
+                if oid_qos_map(map)? != index {
+                    return Err(SaiError::Other(format!("{map} is not a {kind:?} map")));
+                }
+                if self.qos_maps[index].is_none() {
+                    return Err(SaiError::Other(format!("{map} does not exist")));
+                }
+                self.program_qos_map_port(index, logical)?;
+                self.qos_map_ports[index].insert(logical);
+            }
+            None => {
+                self.unprogram_qos_map_port(index, logical)?;
+                self.qos_map_ports[index].remove(&logical);
+            }
+        }
+        Ok(())
     }
 
-    fn set_port_default_tc(&mut self, _port: PortId, _tc: u8) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_default_tc")
+    fn set_port_default_tc(&mut self, port: PortId, tc: u8) -> Result<(), SaiError> {
+        let f = slot!(self, qos_default_tc_set, "qos_default_tc_set")?;
+        let logical = self.logical_port(port)?;
+        if tc > 7 {
+            return Err(SaiError::Other(format!("traffic class {tc} is not 0..=7")));
+        }
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("qos_default_tc_set", unsafe { f(sw, logical, tc) })
     }
 
-    fn create_scheduler(&mut self, _spec: SchedulerSpec) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_scheduler")
+    fn create_scheduler(&mut self, spec: SchedulerSpec) -> Result<Oid, SaiError> {
+        slot!(self, qos_queue_sched_set, "qos_queue_sched_set")?;
+        // A scheduler profile is its spec, and the spec fits the id:
+        // strict, a 7-bit weight, and the ceiling in kbit/s in 48 bits.
+        // Nothing is allocated, so syncd's dedup costs nothing here.
+        if !spec.strict && !(1..=127).contains(&spec.weight) {
+            return Err(SaiError::Other(format!(
+                "DWRR weight {} is not 1..=127",
+                spec.weight
+            )));
+        }
+        let kbps = match spec.max_rate_bps {
+            // Round up, so a small ceiling does not vanish into 0 --
+            // which is the encoding for "unshaped".
+            Some(bps) => bps.div_ceil(1000),
+            None => 0,
+        };
+        if kbps >= 1 << 48 {
+            return Err(SaiError::Other(format!(
+                "shaper rate {kbps} kbit/s does not fit the id"
+            )));
+        }
+        Ok(scheduler_oid(
+            spec.strict,
+            if spec.strict { 0 } else { spec.weight },
+            kbps,
+        ))
     }
 
     fn remove_scheduler(&mut self, _scheduler: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_scheduler")
+        // A name; nothing was allocated.
+        Ok(())
     }
 
     fn bind_queue_scheduler(
         &mut self,
-        _port: PortId,
-        _queue: u32,
-        _scheduler: Option<Oid>,
+        port: PortId,
+        queue: u32,
+        scheduler: Option<Oid>,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("bind_queue_scheduler")
+        let sched = slot!(self, qos_queue_sched_set, "qos_queue_sched_set")?;
+        let shaper = slot!(self, qos_queue_shaper_set, "qos_queue_shaper_set")?;
+        let logical = self.logical_port(port)?;
+        // Unbound = the chip's reset state: DWRR at weight 1, unshaped.
+        let (strict, weight, kbps) = match scheduler {
+            Some(scheduler) => oid_scheduler(scheduler)?,
+            None => (false, 1, 0),
+        };
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("qos_queue_sched_set", unsafe {
+            sched(sw, logical, queue, i32::from(strict), weight)
+        })?;
+        check("qos_queue_shaper_set", unsafe {
+            shaper(sw, logical, queue, kbps)
+        })
     }
 
-    fn set_port_shaper(&mut self, _port: PortId, _rate_bps: Option<u64>) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_shaper")
+    fn set_port_shaper(&mut self, port: PortId, rate_bps: Option<u64>) -> Result<(), SaiError> {
+        let f = slot!(self, qos_port_shaper_set, "qos_port_shaper_set")?;
+        let logical = self.logical_port(port)?;
+        // Same rounding rule as the scheduler ceiling: up, never to 0.
+        let kbps = rate_bps.map_or(0, |bps| bps.div_ceil(1000));
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("qos_port_shaper_set", unsafe { f(sw, logical, kbps) })
     }
 
-    fn create_wred(&mut self, _spec: WredSpec) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_wred")
+    fn create_wred(&mut self, spec: WredSpec) -> Result<Oid, SaiError> {
+        slot!(self, qos_queue_wred_set, "qos_queue_wred_set")?;
+        validate_wred(&spec)?;
+        // Allocated, not derived: set_wred edits the profile in place on
+        // queues that must not be rebound, so the id has to keep naming
+        // the profile across edits -- a spec-encoded id could not.
+        let id = self.next_wred;
+        self.next_wred += 1;
+        self.wred_profiles.insert(id, spec);
+        Ok(wred_oid(id))
     }
 
-    fn set_wred(&mut self, _wred: Oid, _spec: WredSpec) -> Result<(), SaiError> {
-        unimplemented_slot("set_wred")
+    fn set_wred(&mut self, wred: Oid, spec: WredSpec) -> Result<(), SaiError> {
+        let id = oid_wred(wred);
+        validate_wred(&spec)?;
+        if !self.wred_profiles.contains_key(&id) {
+            return Err(SaiError::Other(format!("{wred} does not exist")));
+        }
+        self.wred_profiles.insert(id, spec);
+        // In place: every holding queue is reprogrammed, no rebinding.
+        let holders: Vec<(u32, u32)> = self
+            .wred_queues
+            .iter()
+            .filter(|(_, held)| **held == id)
+            .map(|(key, _)| *key)
+            .collect();
+        for (logical, queue) in holders {
+            self.program_wred(logical, queue, Some(&spec))?;
+        }
+        Ok(())
     }
 
-    fn remove_wred(&mut self, _wred: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_wred")
+    fn remove_wred(&mut self, wred: Oid) -> Result<(), SaiError> {
+        let id = oid_wred(wred);
+        let holders = self
+            .wred_queues
+            .values()
+            .filter(|held| **held == id)
+            .count();
+        if holders > 0 {
+            return Err(SaiError::Other(format!(
+                "{wred} is still bound to {holders} queue(s)"
+            )));
+        }
+        if self.wred_profiles.remove(&id).is_none() {
+            return Err(SaiError::Other(format!("{wred} does not exist")));
+        }
+        Ok(())
     }
 
     fn bind_queue_wred(
         &mut self,
-        _port: PortId,
-        _queue: u32,
-        _wred: Option<Oid>,
+        port: PortId,
+        queue: u32,
+        wred: Option<Oid>,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("bind_queue_wred")
+        let logical = self.logical_port(port)?;
+        match wred {
+            Some(wred) => {
+                let id = oid_wred(wred);
+                let spec = *self
+                    .wred_profiles
+                    .get(&id)
+                    .ok_or_else(|| SaiError::Other(format!("{wred} does not exist")))?;
+                self.program_wred(logical, queue, Some(&spec))?;
+                self.wred_queues.insert((logical, queue), id);
+            }
+            None => {
+                self.program_wred(logical, queue, None)?;
+                self.wred_queues.remove(&(logical, queue));
+            }
+        }
+        Ok(())
     }
 
     fn set_port_learn_limit(&mut self, port: PortId, limit: Option<u32>) -> Result<(), SaiError> {
@@ -2841,10 +3271,9 @@ mod tests {
     #[test]
     fn phase_six_families_are_unsupported() {
         let mut b = backend();
+        // The one call left standing: copper TDR needs the PHY's cable
+        // diag, a future minor of its own.
         assert!(b.run_cable_diag(PortId(1)).unwrap_err().is_unsupported());
-        // Queue counters are the one "absent" family with a defined
-        // empty answer rather than an error.
-        assert!(b.port_queue_counters(PortId(1)).unwrap().is_empty());
     }
 
     /// Capabilities must reflect the vtable, not optimism: a family
@@ -2874,12 +3303,13 @@ mod tests {
         assert!(caps.acl_ingress && caps.acl_egress, "ABI 1.10");
         assert!(caps.copp, "ABI 1.16");
         assert!(caps.sflow, "ABI 1.17");
+        assert!(
+            caps.qos_map_ingress && caps.queue_shaper && caps.wred,
+            "ABI 1.18"
+        );
+        assert!(!caps.qos_map_egress && !caps.wred_queue_stats);
         assert!(caps.acl_entry_policer, "ABI 1.11");
-        for (name, on) in [
-            ("l2mc", caps.l2mc),
-            ("cable_diag", caps.cable_diag),
-            ("wred", caps.wred),
-        ] {
+        for (name, on) in [("l2mc", caps.l2mc), ("cable_diag", caps.cable_diag)] {
             assert!(!on, "{name} must not be claimed before it is implemented");
         }
     }
@@ -3032,6 +3462,15 @@ mod tests {
             trap_default_policer_set: None,
             set_sample_callback: None,
             sample_rate_set: None,
+            qos_dscp_tc_set: None,
+            qos_dscp_trust_set: None,
+            qos_dot1p_tc_set: None,
+            qos_default_tc_set: None,
+            qos_queue_sched_set: None,
+            qos_queue_shaper_set: None,
+            qos_port_shaper_set: None,
+            qos_queue_wred_set: None,
+            queue_counters_get: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -3179,6 +3618,15 @@ mod tests {
             "trap_default_policer_set",
             "set_sample_callback",
             "sample_rate_set",
+            "qos_dscp_tc_set",
+            "qos_dscp_trust_set",
+            "qos_dot1p_tc_set",
+            "qos_default_tc_set",
+            "qos_queue_sched_set",
+            "qos_queue_shaper_set",
+            "qos_port_shaper_set",
+            "qos_queue_wred_set",
+            "queue_counters_get",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -3299,6 +3747,15 @@ mod tests {
             std::mem::offset_of!(Api, trap_default_policer_set),
             std::mem::offset_of!(Api, set_sample_callback),
             std::mem::offset_of!(Api, sample_rate_set),
+            std::mem::offset_of!(Api, qos_dscp_tc_set),
+            std::mem::offset_of!(Api, qos_dscp_trust_set),
+            std::mem::offset_of!(Api, qos_dot1p_tc_set),
+            std::mem::offset_of!(Api, qos_default_tc_set),
+            std::mem::offset_of!(Api, qos_queue_sched_set),
+            std::mem::offset_of!(Api, qos_queue_shaper_set),
+            std::mem::offset_of!(Api, qos_port_shaper_set),
+            std::mem::offset_of!(Api, qos_queue_wred_set),
+            std::mem::offset_of!(Api, queue_counters_get),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -5149,5 +5606,277 @@ mod tests {
             .unwrap();
         assert_ne!(trap, acl_log_trap_oid());
         b.remove_hostif_trap(trap).unwrap();
+    }
+    // --- QoS ---------------------------------------------------------------
+
+    /// tc | (trust << 8), or -1.
+    fn stub_dscp_tc(b: &OpenBcmBackend, port: u32, codepoint: i32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *mut ShimSwitch,
+                    u32,
+                    std::os::raw::c_int,
+                ) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_dscp_tc\0").unwrap();
+            f(b.switch, port, codepoint)
+        }
+    }
+
+    fn stub_dot1p_tc(b: &OpenBcmBackend, port: u32, pri: i32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *mut ShimSwitch,
+                    u32,
+                    std::os::raw::c_int,
+                ) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_dot1p_tc\0").unwrap();
+            f(b.switch, port, pri)
+        }
+    }
+
+    /// (strict << 16) | weight, or -1.
+    fn stub_sched(b: &OpenBcmBackend, port: u32, queue: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_sched\0").unwrap();
+            f(b.switch, port, queue)
+        }
+    }
+
+    fn stub_queue_shaper(b: &OpenBcmBackend, port: u32, queue: u32) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> i64> =
+                b._library.get(b"hemlockbcm_stub_queue_shaper\0").unwrap();
+            f(b.switch, port, queue)
+        }
+    }
+
+    fn stub_port_shaper(b: &OpenBcmBackend, port: u32) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> i64> =
+                b._library.get(b"hemlockbcm_stub_port_shaper\0").unwrap();
+            f(b.switch, port)
+        }
+    }
+
+    /// (min << 32) | max, or -1.
+    fn stub_wred_range(b: &OpenBcmBackend, port: u32, queue: u32) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> i64> =
+                b._library.get(b"hemlockbcm_stub_wred_range\0").unwrap();
+            f(b.switch, port, queue)
+        }
+    }
+
+    /// enable | (ecn << 1) | (drop_probability << 8), or -1.
+    fn stub_wred_mode(b: &OpenBcmBackend, port: u32, queue: u32) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_wred_mode\0").unwrap();
+            f(b.switch, port, queue)
+        }
+    }
+
+    /// A live map edit reaches every bound port without rebinding, and
+    /// a port bound after the edit gets the edited table.
+    #[test]
+    fn qos_maps_program_bound_ports_and_follow_edits() {
+        let mut b = backend();
+        let map = b
+            .create_qos_map(QosMapType::DscpToTc, &[(46, 5), (0, 1)])
+            .unwrap();
+        b.set_port_qos_map_binding(PortId(1), QosMapType::DscpToTc, Some(map))
+            .unwrap();
+        assert_eq!(stub_dscp_tc(&b, 1, 46), 5 | (1 << 8), "mapped, trusted");
+        assert_eq!(stub_dscp_tc(&b, 1, 10), 1 << 8, "unmapped lands in TC 0");
+        assert_eq!(stub_dscp_tc(&b, 2, 46), 0, "unbound port untouched");
+
+        // Edit in place: port 1 follows without rebinding.
+        b.set_qos_map(map, &[(46, 7)]).unwrap();
+        assert_eq!(stub_dscp_tc(&b, 1, 46), 7 | (1 << 8));
+        // ...and a port bound afterwards gets the edited table.
+        b.set_port_qos_map_binding(PortId(2), QosMapType::DscpToTc, Some(map))
+            .unwrap();
+        assert_eq!(stub_dscp_tc(&b, 2, 46), 7 | (1 << 8));
+
+        // Unbinding drops trust; removal is refused while bound.
+        assert!(b.remove_qos_map(map).is_err());
+        b.set_port_qos_map_binding(PortId(1), QosMapType::DscpToTc, None)
+            .unwrap();
+        assert_eq!(stub_dscp_tc(&b, 1, 46), 7, "table kept, trust off");
+        b.set_port_qos_map_binding(PortId(2), QosMapType::DscpToTc, None)
+            .unwrap();
+        b.remove_qos_map(map).unwrap();
+    }
+
+    /// The 802.1p map, the egress refusals, and the entry validation.
+    #[test]
+    fn dot1p_maps_bind_and_egress_maps_are_refused() {
+        let mut b = backend();
+        let map = b
+            .create_qos_map(QosMapType::Dot1pToTc, &[(5, 5), (7, 6)])
+            .unwrap();
+        b.set_port_qos_map_binding(PortId(1), QosMapType::Dot1pToTc, Some(map))
+            .unwrap();
+        assert_eq!(stub_dot1p_tc(&b, 1, 5), 5);
+        assert_eq!(stub_dot1p_tc(&b, 1, 0), 0);
+        b.set_port_qos_map_binding(PortId(1), QosMapType::Dot1pToTc, None)
+            .unwrap();
+        assert_eq!(stub_dot1p_tc(&b, 1, 5), 0, "untrusted lands in TC 0");
+
+        assert!(b.create_qos_map(QosMapType::TcToDscp, &[(0, 0)]).is_err());
+        assert!(b.create_qos_map(QosMapType::TcToDot1p, &[(0, 0)]).is_err());
+        // Out-of-range entries never reach the datapath.
+        assert!(b.create_qos_map(QosMapType::Dot1pToTc, &[(8, 0)]).is_err());
+        assert!(b.create_qos_map(QosMapType::DscpToTc, &[(64, 0)]).is_err());
+        assert!(b.create_qos_map(QosMapType::DscpToTc, &[(0, 8)]).is_err());
+        // A DSCP map cannot be bound as a dot1p one.
+        let dscp = b.create_qos_map(QosMapType::DscpToTc, &[(0, 1)]).unwrap();
+        assert!(b
+            .set_port_qos_map_binding(PortId(1), QosMapType::Dot1pToTc, Some(dscp))
+            .is_err());
+    }
+
+    /// A scheduler profile is its spec: binding programs the queue,
+    /// unbinding restores the chip's reset state, and the ceiling
+    /// rounds up rather than vanishing.
+    #[test]
+    fn schedulers_are_their_spec() {
+        let mut b = backend();
+        let strict = b
+            .create_scheduler(SchedulerSpec {
+                strict: true,
+                weight: 0,
+                max_rate_bps: None,
+            })
+            .unwrap();
+        let dwrr = b
+            .create_scheduler(SchedulerSpec {
+                strict: false,
+                weight: 40,
+                max_rate_bps: Some(999),
+            })
+            .unwrap();
+        assert_ne!(strict, dwrr);
+        assert_eq!(
+            oid_scheduler(dwrr).unwrap(),
+            (false, 40, 1),
+            "999 bps rounds up to 1 kbit/s, not down to unshaped"
+        );
+
+        b.bind_queue_scheduler(PortId(1), 7, Some(strict)).unwrap();
+        assert_eq!(stub_sched(&b, 1, 7), 1 << 16);
+        b.bind_queue_scheduler(PortId(1), 0, Some(dwrr)).unwrap();
+        assert_eq!(stub_sched(&b, 1, 0), 40);
+        assert_eq!(stub_queue_shaper(&b, 1, 0), 1);
+
+        b.bind_queue_scheduler(PortId(1), 0, None).unwrap();
+        assert_eq!(stub_sched(&b, 1, 0), 1, "back to DWRR weight 1");
+        assert_eq!(stub_queue_shaper(&b, 1, 0), 0, "unshaped");
+
+        assert!(b
+            .create_scheduler(SchedulerSpec {
+                strict: false,
+                weight: 0,
+                max_rate_bps: None,
+            })
+            .is_err());
+        b.remove_scheduler(strict).unwrap();
+    }
+
+    #[test]
+    fn the_port_shaper_rounds_up_and_clears() {
+        let mut b = backend();
+        b.set_port_shaper(PortId(1), Some(10_000_000_000)).unwrap();
+        assert_eq!(stub_port_shaper(&b, 1), 10_000_000);
+        b.set_port_shaper(PortId(1), Some(1)).unwrap();
+        assert_eq!(stub_port_shaper(&b, 1), 1, "1 bps is not unshaped");
+        b.set_port_shaper(PortId(1), None).unwrap();
+        assert_eq!(stub_port_shaper(&b, 1), 0);
+        assert!(b.set_port_shaper(lag_port(1), Some(1000)).is_err());
+    }
+
+    /// The whole reason WRED ids are allocated: an in-place edit reaches
+    /// every holding queue while the id keeps naming the profile.
+    #[test]
+    fn wred_profiles_edit_in_place_across_their_queues() {
+        let mut b = backend();
+        let wred = b
+            .create_wred(WredSpec {
+                min_threshold_bytes: 100_000,
+                max_threshold_bytes: 400_000,
+                drop_probability: 10,
+                ecn: false,
+            })
+            .unwrap();
+        b.bind_queue_wred(PortId(1), 0, Some(wred)).unwrap();
+        b.bind_queue_wred(PortId(2), 3, Some(wred)).unwrap();
+        assert_eq!(stub_wred_range(&b, 1, 0), (100_000 << 32) | 400_000);
+        assert_eq!(stub_wred_mode(&b, 2, 3), 1 | (10 << 8));
+
+        b.set_wred(
+            wred,
+            WredSpec {
+                min_threshold_bytes: 50_000,
+                max_threshold_bytes: 200_000,
+                drop_probability: 50,
+                ecn: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(stub_wred_range(&b, 1, 0), (50_000 << 32) | 200_000);
+        assert_eq!(
+            stub_wred_mode(&b, 2, 3),
+            1 | 2 | (50 << 8),
+            "both queues, ECN on"
+        );
+
+        assert!(b.remove_wred(wred).is_err(), "still bound");
+        b.bind_queue_wred(PortId(1), 0, None).unwrap();
+        assert_eq!(stub_wred_mode(&b, 1, 0), 0, "disabled");
+        b.bind_queue_wred(PortId(2), 3, None).unwrap();
+        b.remove_wred(wred).unwrap();
+        assert!(b.remove_wred(wred).is_err(), "already gone");
+
+        // The invalid shapes are refused before the datapath.
+        assert!(b
+            .create_wred(WredSpec {
+                min_threshold_bytes: 2,
+                max_threshold_bytes: 1,
+                drop_probability: 10,
+                ecn: false,
+            })
+            .is_err());
+        assert!(b
+            .create_wred(WredSpec {
+                min_threshold_bytes: 1,
+                max_threshold_bytes: 2,
+                drop_probability: 101,
+                ecn: false,
+            })
+            .is_err());
+    }
+
+    /// Queue counters come from the chip, one row per unicast queue,
+    /// each row carrying its own queue's numbers.
+    #[test]
+    fn queue_counters_come_from_the_chip() {
+        let mut b = backend();
+        let queues = b.port_queue_counters(PortId(2)).unwrap();
+        assert_eq!(queues.len(), 8);
+        for (index, queue) in queues.iter().enumerate() {
+            assert!(queue.unicast);
+            assert_eq!(queue.index, index as u32);
+            // The stub synthesises port*1000 + queue*10, which proves
+            // the right queue's numbers land in the right row.
+            assert_eq!(queue.pkts, 2000 + index as u64 * 10);
+            assert_eq!(queue.dropped_pkts, index as u64);
+            assert_eq!(queue.wred_dropped, 0, "honestly absent");
+        }
+        assert!(b.port_queue_counters(lag_port(1)).is_err());
     }
 }
