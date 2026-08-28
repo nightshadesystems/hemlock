@@ -426,9 +426,11 @@ i2cget -y -f 0 0x30 0x07
 
 **If it cannot find the i2c root:** the manifest matches `cpld-bus` to
 the adapter named `iproc-smb0` and `mux-bus` to `iproc-smb1`. Those names
-were read off the box under ONIE 2016.05; if the ported 6.1 kernel's
-driver names them differently, correct `adapter` in
-`[[hardware.i2c.root]]`. Confirm with:
+were read off the box under ONIE 2016.05. The ported kernel WILL name
+them differently: mainline's i2c-bcm-iproc registers each adapter as
+`"Broadcom iProc (i2c@<addr>)"` from its DT node, so once the 6.1
+kernel boots, correct `adapter` in `[[hardware.i2c.root]]` to the two
+node-addressed names. Confirm with:
 
 ```sh
 for a in /sys/bus/i2c/devices/i2c-*; do echo "$a: $(cat $a/name)"; done

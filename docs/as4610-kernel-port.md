@@ -84,8 +84,68 @@ against what *this board's* device tree actually enables:
 | **Z. Droppable** | 68 | 22201 | see below |
 | | **138** | **29127** | |
 
-**The real port is A+B+C+D+F ≈ 4,900 added lines, or ≈ 6,900 with E.**
-Roughly **76% of the patch is dead weight for this board.**
+**The real port is A+B+C+D+F ≈ 4,900 added lines, or ≈ 6,900 with E**
+— *if the ONL patch is the starting point.* The section below, added
+after checking mainline v6.1 itself, shows it is not: mainline already
+carries the SoC family, and the port collapses to a device tree, a
+defconfig and packaging.
+
+## Mainline 6.1 already carries the SoC
+
+Checked against the actual v6.1 tree (sparse checkout, every claim
+below read from the source, not release notes): **Hurricane 2 —
+Helix4's XGS-iProc sibling, same CMICd-generation SoC complex — is in
+mainline**, and so is every peripheral this board needs:
+
+| What | Mainline 6.1 | Note |
+|---|---|---|
+| Machine | `mach-bcm/bcm_hr2.c` under `ARCH_BCM_HR2` | 15 lines; matches `"brcm,hr2"` |
+| SoC dtsi | `bcm-hr2.dtsi` | A9 mpcore @ 0x19000000, APB @ 0x18000000 |
+| Consoles | 2x `ns16550a` | |
+| Management GMAC | `bgmac-platform.c`: `"brcm,amac"` / `"brcm,nsp-amac"` | |
+| MDIO | `mdio-bcm-iproc.c`: `"brcm,iproc-mdio"` | |
+| i2c (both controllers) | `i2c-bcm-iproc.c`: `"brcm,iproc-i2c"` | see naming note |
+| SPI-NOR (U-Boot env) | `"brcm,spi-bcm-qspi"` | |
+| GPIO / PWM / RNG / WDT | `"brcm,iproc-gpio"`, `"brcm,iproc-pwm"`, `"brcm,bcm-nsp-rng"`, sp805 | |
+| ARM PLL | `clk-hr2.c` → generic `iproc_armpll_setup` | |
+| SMP | `CPU_METHOD_OF_DECLARE("brcm,bcm-nsp-smp")` | boot-register match is a bench question; `maxcpus=1` is the known-good fallback |
+
+The bucket verdicts, revised:
+
+- **A (SoC glue, 878 lines) — replaced by mainline.** Possibly zero
+  out-of-tree C: the board DTS can claim
+  `compatible = "accton,as4610", "brcm,hx4", "brcm,hr2"` and
+  `bcm_hr2.c` matches the last entry. If a distinct machine entry is
+  ever wanted, it is a 3-line `dt_compat` addition, not a port.
+- **B (DTS, 773 lines) — rewritten small, not ported.** A
+  `bcm-hx4.dtsi` modeled on `bcm-hr2.dtsi` with Helix4's addresses
+  (taken from ONL's `bcm-helix4.dtsi` and edgenos's DTS *as data*, per
+  the port's rule), plus the AS4610 board dts: `memory@60000000`, the
+  `iproc_cmicd@48000000` node for the BDE to claim, the two i2c
+  controllers with no children (pmon instantiates the topology).
+- **C (CMICd, 864 lines) — dropped entirely.** Hemlock never wanted a
+  kernel CMICd driver: the BDE claims the device, and the platform
+  quirk's unbind step exists precisely because ONL's kernel had one.
+  On a mainline-based kernel with no such driver, that unbind finds
+  nothing bound and moves on.
+- **D (board drivers, 2,239 lines) — mostly mainline** per the table
+  above. The one unverified entry is USB (the NOS storage is
+  USB-attached, so this is boot-critical): the hx4 dtsi needs the EHCI
+  node and whatever PHY glue ONL's DTS shows, checked at the bench.
+- **E (MDIO/SerDes, 1,987 lines) — dropped**, pending the same bench
+  answer as before, now phrased against mainline: does `eth0` link
+  with just `bgmac` + `iproc-mdio`?
+- **F — collapses into a defconfig.**
+
+One consequence for the platform manifest, found in the driver source:
+mainline names each i2c adapter `"Broadcom iProc (i2c@<addr>)"` from
+its DT node — not ONIE's `iproc-smb0`/`iproc-smb1`. When the DTS
+lands, `[[hardware.i2c.root]]`'s `adapter` values change with it; the
+two stay distinguishable by node address.
+
+Track 2 therefore becomes: mainline 6.1 LTS, a ~2-file device tree, a
+defconfig, and FIT packaging at `0x61008000` — with Track 1 (ONL's
+4.14, unmodified) still available as the datapath bench.
 
 ### D — drivers this board needs
 
@@ -239,10 +299,18 @@ memory map above is a durable, lineage-independent fact.
 
 ## Open questions
 
-1. Is the edgenos 6.1.175 iProc tree (or its patch series) available to
-   reuse? It would collapse Track 2 into a rebase.
-2. Bucket E: does `ma1` link with `MDIO_XGS_IPROC` and
-   `XGS_IPROC_SERDES` disabled? (Answerable on Track 1.)
-3. Does ONIE on this box expose the NAND as raw MTD, UBI volumes, or an
-   `ubiblock`? This decides both the installer strategy and which NAND
-   config symbols the kernel needs. (Shared with the main spec.)
+1. ~~Is the edgenos 6.1.175 iProc tree available to reuse?~~
+   **Answered by reading mainline v6.1 instead: unnecessary.** The SoC
+   family is upstream (see the mainline section above); there is no
+   patch series to rebase.
+2. Does `eth0` link with mainline `bgmac` + `iproc-mdio` alone — the
+   surviving form of the old bucket-E question. Bench.
+3. ~~NAND / UBI layout?~~ **Answered on the hardware: there is no
+   NAND.** 8 MB SPI-NOR only; the NOS storage is a USB-attached GPT
+   disk (see the main spec's answered list).
+4. The hx4 USB controller and PHY nodes for the dtsi — boot-critical,
+   since the rootfs is on USB. Read ONL's DTS as data, verify at the
+   bench.
+5. Does the `brcm,bcm-nsp-smp` secondary-boot register exist on Helix4?
+   If not, `maxcpus=1` (half of the vendor kernel's own
+   `maxcpus=2`) still boots the box.
