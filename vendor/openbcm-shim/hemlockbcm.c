@@ -24,13 +24,12 @@
  * ---------------------------------------------------------------------
  * NOT COMPILED BY CI. The SDK is not fetchable in CI and the target is
  * ARM; this file is built only by build-shim.sh in the cross container.
- * Every SDK symbol it uses was checked against sdk-6.5.16's headers
- * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
- * rate,knet,policer,field,l3,rx,pkt,cosq}.h,
- * include/soc/drv.h)
- * — but
- * "checked against the header" is not "compiled", so treat the first
- * build as a review step, not a formality.
+ * It IS compiled locally, though: check-shim.sh (next to this file)
+ * runs `gcc -fsyntax-only -Wall -Wextra` against a headers-only sparse
+ * fetch of sdk-6.5.16, so every signature, struct field, enum member
+ * and macro here has been through a real compiler against the real
+ * headers. Run it after touching this file. What it cannot prove is
+ * the link (the SDK libraries are absent) and ARM type widths.
  */
 
 #include "hemlockbcm.h"
@@ -39,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* OpenBCM. sal/types.h must come first: it defines the integer types and
  * the COMPILER_64_* family everything else is written in terms of. */
@@ -80,6 +80,18 @@ extern int sh_process_command(int unit, char *cmd);
 
 /* Hemlock drives one ASIC; a second would be a different platform. */
 #define HB_UNIT 0
+
+/*
+ * The widest ECMP group. The SDK has no call that reports the chip's
+ * limit, and the width has to be committed at create time -- a group
+ * created narrow cannot be widened in place, so every route pointing at
+ * it would have to be rewritten to grow it. Reserving the same width for
+ * every group trades table space for never having to do that.
+ *
+ * Confirm against the hardware: too high fails the create, too low
+ * refuses a member the chip would have taken.
+ */
+#define HB_ECMP_MAX_PATHS 32
 
 struct hemlockbcm_switch {
     int unit;
@@ -2442,17 +2454,6 @@ static int hb_route_via_nexthop(struct hemlockbcm_switch *sw, uint32_t prefix,
 
 /* --- ECMP groups (ABI 1.15) ------------------------------------------------ */
 
-/*
- * The widest ECMP group. The SDK has no call that reports the chip's
- * limit, and the width has to be committed at create time -- a group
- * created narrow cannot be widened in place, so every route pointing at
- * it would have to be rewritten to grow it. Reserving the same width for
- * every group trades table space for never having to do that.
- *
- * Confirm against the hardware: too high fails the create, too low
- * refuses a member the chip would have taken.
- */
-#define HB_ECMP_MAX_PATHS 32
 
 static int hb_ecmp_create(struct hemlockbcm_switch *sw, uint32_t *group)
 {
@@ -2831,9 +2832,12 @@ static bcm_rx_t hb_sample_rx(int unit, bcm_pkt_t *pkt, void *cookie)
     }
     if (pkt->pkt_data != NULL && pkt->pkt_data[0].data != NULL) {
         uint32_t length = pkt->pkt_len;
+        /* The block length is an int in the SDK's struct; clamp the
+         * delivered bytes to what the first block really holds. */
+        uint32_t block = pkt->pkt_data[0].len > 0 ? (uint32_t)pkt->pkt_data[0].len : 0;
 
-        if (length > pkt->pkt_data[0].len) {
-            length = pkt->pkt_data[0].len;
+        if (length > block) {
+            length = block;
         }
         sw->sample_cb(sw->sample_ctx, (uint32_t)pkt->src_port,
                       (uint32_t)pkt->tot_len, pkt->pkt_data[0].data, length);

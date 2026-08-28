@@ -10,7 +10,9 @@
 # NOT RUN BY CI, and it cannot be: it needs the OpenBCM tree (fetched, not
 # committed), an ARM cross toolchain, and kernel headers for KNET. Run it
 # in the cross-build container. CI's coverage of this boundary is the
-# committed ABI header plus the stub shim hemlock-sai builds from source.
+# committed ABI header plus the stub shim hemlock-sai builds from source;
+# check-shim.sh (same directory) additionally compiles hemlockbcm.c
+# against the real SDK headers without needing any of the above.
 #
 # Requirements:
 #   - vendor/fetch-vendor.sh accton-as4610-54 has staged the SDK
@@ -75,6 +77,11 @@ trap 'rm -rf "$WORK"' EXIT
 CFLAGS=(
     -O2 -fPIC -Wall
     -DINCLUDE_KNET
+    # Without this the SDK compiles the entire L3 API out of its own
+    # headers, and every router-interface, route, neighbour and ECMP
+    # call in the shim fails. The SDK libraries must be built with the
+    # same define. Found by the first header-true compile, not guessed.
+    -DINCLUDE_L3
     -DBCM_PLATFORM_STRING=\"$PLATFORM\"
     -I"$HEADER_DIR"
     -I"$SDK/include"
@@ -86,8 +93,8 @@ CFLAGS=(
 log "compiling hemlockbcm.c for $PLATFORM"
 "$CC" "${CFLAGS[@]}" -c "$HERE/hemlockbcm.c" -o "$WORK/hemlockbcm.o" \
     || die "compiling the shim failed
- (every SDK symbol was checked against sdk-6.5.16's headers, but this is
-  the first actual compile — read the errors as review feedback)"
+ (check-shim.sh passes against the same headers, so errors here are
+  about the cross toolchain or the SDK build, not the shim's syntax)"
 
 # --whole-archive around libbcm: the shim references a small part of the
 # API directly, but the SDK's chip drivers register themselves through
