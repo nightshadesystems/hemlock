@@ -3099,6 +3099,61 @@ static int hb_queue_counters_get(struct hemlockbcm_switch *sw, uint32_t logical_
     return HEMLOCKBCM_OK;
 }
 
+/* --- Copper cable diagnostics (ABI 1.19) ------------------------------------ */
+
+static int hb_cable_state(_shr_port_cable_state_t state)
+{
+    switch (state) {
+    case _SHR_PORT_CABLE_STATE_OK:
+        return HEMLOCKBCM_CABLE_OK;
+    case _SHR_PORT_CABLE_STATE_OPEN:
+        return HEMLOCKBCM_CABLE_OPEN;
+    case _SHR_PORT_CABLE_STATE_SHORT:
+    case _SHR_PORT_CABLE_STATE_OPENSHORT:
+        /* Open-short is a wiring fault, not an unclassifiable result. */
+        return HEMLOCKBCM_CABLE_SHORT;
+    case _SHR_PORT_CABLE_STATE_CROSSTALK:
+        return HEMLOCKBCM_CABLE_CROSSTALK;
+    default:
+        return HEMLOCKBCM_CABLE_UNKNOWN;
+    }
+}
+
+static int hb_cable_diag(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                         int pair_state[4], uint32_t pair_length_m[4], uint32_t *pairs)
+{
+    bcm_port_cable_diag_t result;
+    int count;
+    int i;
+    int status;
+
+    if (sw == NULL || pair_state == NULL || pair_length_m == NULL || pairs == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sal_memset(&result, 0, sizeof(result));
+    /* Blocking for as long as the PHY takes; the caller knew. On a
+     * fibre port the PHY driver answers "unavailable", which reaches
+     * the operator as unsupported -- the truth. */
+    status = HB_CALL(bcm_port_cable_diag(sw->unit, (bcm_port_t)logical_port, &result));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    count = result.npairs;
+    if (count > 4) {
+        count = 4;
+    }
+    if (count < 0) {
+        count = 0;
+    }
+    for (i = 0; i < count; i++) {
+        pair_state[i] = hb_cable_state(result.pair_state[i]);
+        /* A negative length is "not measured". */
+        pair_length_m[i] = result.pair_len[i] > 0 ? (uint32_t)result.pair_len[i] : 0;
+    }
+    *pairs = (uint32_t)count;
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -3195,6 +3250,7 @@ static const struct hemlockbcm_api HB_API = {
     hb_qos_port_shaper_set,
     hb_qos_queue_wred_set,
     hb_queue_counters_get,
+    hb_cable_diag,
     /* New slots are appended below this line, with the minor bumped. */
 };
 

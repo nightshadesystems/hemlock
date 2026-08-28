@@ -30,10 +30,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::{
-    AclAction, AclFamily, AclFields, AclPacketAction, AclStage, CablePair, FdbAction, IpPrefix,
-    Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QosMapType, QueueCounters, RouteTarget,
-    SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort, SchedulerSpec, StormClass,
-    StpPortState, SwitchInfo, TrapKind, WredSpec,
+    AclAction, AclFamily, AclFields, AclPacketAction, AclStage, CablePair, CablePairState,
+    FdbAction, IpPrefix, Oid, PolicerSpec, PolicerStats, PortCounters, PortId, QosMapType,
+    QueueCounters, RouteTarget, SaiBackend, SaiCapabilities, SaiError, SaiEvent, SaiPort,
+    SchedulerSpec, StormClass, StpPortState, SwitchInfo, TrapKind, WredSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -528,6 +528,10 @@ struct Api {
             *mut u64,
         ) -> Status,
     >,
+
+    // --- ABI 1.19: copper cable diagnostics --------------------------
+    cable_diag:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, u32, *mut i32, *mut u32, *mut u32) -> Status>,
 }
 
 impl Api {
@@ -1767,7 +1771,7 @@ impl SaiBackend for OpenBcmBackend {
             // per-queue wred/ecn stats stay honestly zero.
             wred_queue_stats: false,
             sflow: slot!(self, sample_rate_set, "sample_rate_set").is_ok(),
-            cable_diag: false,
+            cable_diag: slot!(self, cable_diag, "cable_diag").is_ok(),
         })
     }
 
@@ -2336,8 +2340,40 @@ impl SaiBackend for OpenBcmBackend {
         check("sample_rate_set", unsafe { f(sw, logical, rate) })
     }
 
-    fn run_cable_diag(&mut self, _port: PortId) -> Result<Vec<CablePair>, SaiError> {
-        unimplemented_slot("run_cable_diag")
+    fn run_cable_diag(&mut self, port: PortId) -> Result<Vec<CablePair>, SaiError> {
+        let f = slot!(self, cable_diag, "cable_diag")?;
+        let logical = self.logical_port(port)?;
+        let sw = self.switch()?;
+        let mut states = [0i32; 4];
+        let mut lengths = [0u32; 4];
+        let mut pairs: u32 = 0;
+        // Blocking for as long as the PHY takes -- the trait says so and
+        // both front-ends confirm with the operator first. A fibre port
+        // comes back unsupported, which is the truth: there is no
+        // copper PHY to sweep.
+        // SAFETY: three live out-buffers, written only on OK.
+        check("cable_diag", unsafe {
+            f(
+                sw,
+                logical,
+                states.as_mut_ptr(),
+                lengths.as_mut_ptr(),
+                &mut pairs,
+            )
+        })?;
+        let pairs = (pairs as usize).min(4);
+        Ok((0..pairs)
+            .map(|i| CablePair {
+                state: match states[i] {
+                    0 => CablePairState::Ok,
+                    1 => CablePairState::Open,
+                    2 => CablePairState::Short,
+                    3 => CablePairState::Crosstalk,
+                    _ => CablePairState::Unknown,
+                },
+                length_m: lengths[i],
+            })
+            .collect())
     }
 
     fn set_port_tpid(&mut self, port: PortId, tpid: u16) -> Result<(), SaiError> {
@@ -3265,17 +3301,6 @@ mod tests {
         assert!(err.to_string().contains("NOT_IMPLEMENTED"), "{err}");
     }
 
-    /// Everything phase 6 has not reached yet takes the same path.
-    /// VLANs, the FDB, LAGs and STP have left this list; the rest has
-    /// not.
-    #[test]
-    fn phase_six_families_are_unsupported() {
-        let mut b = backend();
-        // The one call left standing: copper TDR needs the PHY's cable
-        // diag, a future minor of its own.
-        assert!(b.run_cable_diag(PortId(1)).unwrap_err().is_unsupported());
-    }
-
     /// Capabilities must reflect the vtable, not optimism: a family
     /// reads as supported exactly when its slot is there. The stub
     /// implements the VLAN slots and nothing else of phase 6.
@@ -3308,10 +3333,13 @@ mod tests {
             "ABI 1.18"
         );
         assert!(!caps.qos_map_egress && !caps.wred_queue_stats);
+        assert!(caps.cable_diag, "ABI 1.19");
         assert!(caps.acl_entry_policer, "ABI 1.11");
-        for (name, on) in [("l2mc", caps.l2mc), ("cable_diag", caps.cable_diag)] {
-            assert!(!on, "{name} must not be claimed before it is implemented");
-        }
+        // The one family never in the phase-6 plan stays off.
+        assert!(
+            !caps.l2mc,
+            "l2mc must not be claimed before it is implemented"
+        );
     }
 
     #[test]
@@ -3471,6 +3499,7 @@ mod tests {
             qos_port_shaper_set: None,
             qos_queue_wred_set: None,
             queue_counters_get: None,
+            cable_diag: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -3627,6 +3656,7 @@ mod tests {
             "qos_port_shaper_set",
             "qos_queue_wred_set",
             "queue_counters_get",
+            "cable_diag",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -3756,6 +3786,7 @@ mod tests {
             std::mem::offset_of!(Api, qos_port_shaper_set),
             std::mem::offset_of!(Api, qos_queue_wred_set),
             std::mem::offset_of!(Api, queue_counters_get),
+            std::mem::offset_of!(Api, cable_diag),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -5878,5 +5909,29 @@ mod tests {
             assert_eq!(queue.wred_dropped, 0, "honestly absent");
         }
         assert!(b.port_queue_counters(lag_port(1)).is_err());
+    }
+    // --- Copper cable diagnostics ------------------------------------------
+
+    /// A copper sweep comes back as four classified pairs with their
+    /// lengths, in order; a fibre port reads as unsupported, because a
+    /// port with no copper PHY genuinely cannot answer.
+    #[test]
+    fn cable_diag_classifies_pairs_on_copper_and_refuses_fibre() {
+        let mut b = backend();
+        // Port 2 is copper on the stub; lengths are port*10 + pair.
+        let pairs = b.run_cable_diag(PortId(2)).unwrap();
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs[0].state, CablePairState::Ok);
+        assert_eq!(pairs[1].state, CablePairState::Open);
+        assert_eq!(pairs[2].state, CablePairState::Short);
+        assert_eq!(pairs[3].state, CablePairState::Crosstalk);
+        for (i, pair) in pairs.iter().enumerate() {
+            assert_eq!(pair.length_m, 20 + i as u32, "pair {i} length");
+        }
+
+        // Ports 3 and 4 are the stub's SFP+ pair: no copper PHY.
+        let err = b.run_cable_diag(PortId(3)).unwrap_err();
+        assert!(err.is_unsupported(), "{err:?}");
+        assert!(b.run_cable_diag(lag_port(1)).is_err());
     }
 }

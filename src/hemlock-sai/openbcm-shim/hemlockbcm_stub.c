@@ -2894,6 +2894,37 @@ HEMLOCKBCM_EXPORT int hemlockbcm_stub_wred_mode(struct hemlockbcm_switch *sw,
     return slot->enable | (slot->ecn << 1) | (slot->drop_probability << 8);
 }
 
+/* --- Copper cable diagnostics (ABI 1.19) ------------------------------------ */
+
+static int stub_cable_diag(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                           int pair_state[4], uint32_t pair_length_m[4],
+                           uint32_t *pairs)
+{
+    struct hemlockbcm_port *port;
+    int i;
+
+    if (sw == NULL || pair_state == NULL || pair_length_m == NULL || pairs == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* The stub's ports 3 and 4 are its SFP+ pair: no copper PHY, no
+     * sweep -- the same answer real fibre ports give. */
+    if (port->name[0] == 'x') {
+        return HEMLOCKBCM_ERR_NOT_SUPPORTED;
+    }
+    /* One pair per state, lengths derived from the port so a test can
+     * prove the right port's sweep landed in the right rows. */
+    for (i = 0; i < 4; i++) {
+        pair_state[i] = i;  /* OK, OPEN, SHORT, CROSSTALK */
+        pair_length_m[i] = logical_port * 10u + (uint32_t)i;
+    }
+    *pairs = 4;
+    return HEMLOCKBCM_OK;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2990,6 +3021,7 @@ static const struct hemlockbcm_api STUB_API = {
     stub_qos_port_shaper_set,
     stub_qos_queue_wred_set,
     stub_queue_counters_get,
+    stub_cable_diag,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)

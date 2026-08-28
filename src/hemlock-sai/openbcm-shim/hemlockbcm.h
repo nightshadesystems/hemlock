@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 18
+#define HEMLOCKBCM_ABI_MINOR 19
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -944,9 +944,36 @@ struct hemlockbcm_api {
                               uint32_t queue, uint64_t *pkts, uint64_t *bytes,
                               uint64_t *dropped_pkts, uint64_t *dropped_bytes);
 
+    /* --- Copper cable diagnostics (ABI 1.19) -------------------------- */
+
     /*
-     * Phase 6 is complete. New families append below this line with the
-     * minor bumped, as ever. Each lands as one slot appended here plus the
+     * One TDR sweep on a copper port's PHY. Interrupts the link for as
+     * long as the PHY takes; both front-ends warn and confirm before
+     * asking, so the shim just runs it.
+     *
+     * On return `*pairs` says how many of the four entries are valid;
+     * states are the HEMLOCKBCM_CABLE_* values, lengths are metres (the
+     * cable run for a terminated pair, the distance to the fault
+     * otherwise; 0 = the PHY did not measure one). The chip's
+     * "open-short" verdict is folded into SHORT: it names a wiring
+     * fault, which UNKNOWN -- the PHY declining to classify -- does not.
+     *
+     * A fibre port has no copper PHY to sweep; the SDK's "unavailable"
+     * passes through and reads as unsupported above, which is the
+     * truth.
+     */
+#define HEMLOCKBCM_CABLE_OK        0
+#define HEMLOCKBCM_CABLE_OPEN      1
+#define HEMLOCKBCM_CABLE_SHORT     2
+#define HEMLOCKBCM_CABLE_CROSSTALK 3
+#define HEMLOCKBCM_CABLE_UNKNOWN   4
+
+    int (*cable_diag)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                      int pair_state[4], uint32_t pair_length_m[4], uint32_t *pairs);
+
+    /*
+     * New families append below this line with the minor bumped, as
+     * ever. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.
