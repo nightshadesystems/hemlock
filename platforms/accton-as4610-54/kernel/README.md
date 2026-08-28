@@ -15,7 +15,11 @@ is what lives here.
 | `dts/arm-accton-as4610-54.dts` | The board: 2 GB at `0x60000000`, console `ttyS0`, the enabled subset, and the chain `"accton,as4610-54", "brcm,hx4", "brcm,hr2"` — the last entry is what lets a stock `ARCH_BCM_HR2` kernel boot it with **zero out-of-tree machine code** |
 | `check-dts.sh` | cpp + dtc against mainline v6.1's dt-bindings; run after touching `dts/` |
 | `hemlock.config` | Config fragment merged over `multi_v7_defconfig`; every symbol verified to exist in 6.1's Kconfig, and `build-kernel.sh` re-verifies each one survived `olddefconfig` |
-| `build-kernel.sh` | Fetches linux-6.1.y, drops the DTS in-tree (one appended `dtb-y` line, no patch), merges the fragment, cross-builds `bindeb-pkg`, and stages `vendor/kernel/linux-image-*-hemlock-iproc*_armhf.deb` — exactly what `build/mkimage.sh` looks for |
+| `build-kernel.sh` | Fetches linux-6.1.y, drops the DTS in-tree (one appended `dtb-y` line, no patch), merges the fragment, cross-builds `bindeb-pkg`, and stages the `linux-image` **and** `linux-headers` debs into `vendor/kernel/` — the image deb is what `build/mkimage.sh` boots, the headers deb is what it installs in the chroot so BDE/KNET build against this exact kernel |
+
+The image workflow's `full` mode runs this script on a hosted runner,
+cached on this directory's hash — a dts or config edit rebuilds
+(~40–60 min), anything else reuses the debs.
 
 ## Provenance
 

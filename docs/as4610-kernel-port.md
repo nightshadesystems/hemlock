@@ -163,11 +163,15 @@ over `multi_v7_defconfig` (all 30 symbols verified against 6.1's own
 Kconfig files, and the build script re-checks each one survived
 `olddefconfig` — a symbol that quietly falls out is an unbootable box
 found at sea). `build-kernel.sh` produces the
-`linux-image-*-hemlock-iproc*_armhf.deb` that `build/mkimage.sh` was
+`linux-image-*-hemlock-iproc*_armhf.deb` (plus the matching headers
+deb, which mkimage installs in the image chroot so the BDE/KNET
+modules build against this exact kernel) that `build/mkimage.sh` was
 already waiting for, and mkimage now takes the dtb from that deb
-instead of compiling the DTS itself. What remains before first boot is
-running `build-kernel.sh` on a Linux box with the cross toolchain, then
-`mkimage.sh accton-as4610-54` — and the bench.
+instead of compiling the DTS itself. The image workflow's `full` mode
+runs all of it — `build-kernel.sh` (cached on this directory's hash),
+the SDK userland + shim (cached on the ABI + build scripts), then
+`mkimage.sh accton-as4610-54`. What remains before first boot is the
+bench.
 
 ### D — drivers this board needs
 

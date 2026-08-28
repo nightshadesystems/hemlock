@@ -90,7 +90,16 @@ make -s -j"$JOBS" bindeb-pkg LOCALVERSION=-hemlock-iproc KDEB_PKGVERSION="$(make
 
 DEB="$(ls "$SRC"/../linux-image-*-hemlock-iproc*_armhf.deb 2>/dev/null | sort | tail -1)"
 [ -n "$DEB" ] || die "bindeb-pkg produced no linux-image deb"
+# The headers deb rides along: mkimage installs it in the chroot so the
+# BDE/KNET and platform modules build against this exact kernel — apt
+# has no headers for a kernel Debian never shipped.
+HDRS="$(ls "$SRC"/../linux-headers-*-hemlock-iproc*_armhf.deb 2>/dev/null | sort | tail -1)"
+[ -n "$HDRS" ] || die "bindeb-pkg produced no linux-headers deb"
 mkdir -p "$ROOT/vendor/kernel"
-cp "$DEB" "$ROOT/vendor/kernel/"
-log "staged $(basename "$DEB") into vendor/kernel/"
+# Stale debs from earlier versions would win mkimage's glob; only the
+# pair just built may be staged.
+rm -f "$ROOT/vendor/kernel"/linux-image-*-hemlock-iproc*.deb \
+    "$ROOT/vendor/kernel"/linux-headers-*-hemlock-iproc*.deb
+cp "$DEB" "$HDRS" "$ROOT/vendor/kernel/"
+log "staged $(basename "$DEB") + $(basename "$HDRS") into vendor/kernel/"
 log "next: build/mkimage.sh accton-as4610-54"

@@ -275,9 +275,25 @@ else
     log "building kernel modules for $KVER (BDE + platform drivers)"
     export DEBIAN_FRONTEND=noninteractive
     chroot "$ROOTFS" apt-get -qq update
-    chroot "$ROOTFS" apt-get -qq install --no-install-recommends -y \
-        "linux-headers-$KVER" build-essential bc \
-        || die "installing kernel build deps in the chroot failed"
+    # A platform kernel is not in Debian, so neither are its headers:
+    # bindeb-pkg produced a linux-headers deb alongside the image deb,
+    # and build-kernel.sh staged both. Debian kernels keep using apt.
+    HEADERS_DEB=""
+    [ -n "$KERNEL_DEB" ] && HEADERS_DEB="$(ls "$ROOT"/vendor/kernel/linux-headers-"$KVER"_*.deb 2>/dev/null | head -1 || true)"
+    if [ -n "$HEADERS_DEB" ]; then
+        log "installing platform kernel headers $(basename "$HEADERS_DEB")"
+        cp "$HEADERS_DEB" "$ROOTFS/tmp/"
+        chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$HEADERS_DEB")" \
+            || die "installing the platform kernel headers failed"
+        rm -f "$ROOTFS/tmp/$(basename "$HEADERS_DEB")"
+        chroot "$ROOTFS" apt-get -qq install --no-install-recommends -y \
+            build-essential bc \
+            || die "installing kernel build deps in the chroot failed"
+    else
+        chroot "$ROOTFS" apt-get -qq install --no-install-recommends -y \
+            "linux-headers-$KVER" build-essential bc \
+            || die "installing kernel build deps in the chroot failed"
+    fi
 
     KMOD_TMP="$ROOTFS/tmp/kmod"
     MODDEST="$ROOTFS/lib/modules/$KVER/updates/hemlock"

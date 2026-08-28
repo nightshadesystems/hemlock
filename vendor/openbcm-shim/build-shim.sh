@@ -60,7 +60,10 @@ LIBDIR="$SDK/build/unix-user/$PLATFORM"
 [ -d "$LIBDIR" ] || die "SDK libraries not built at $LIBDIR
  (build the SDK's own 'bcm' target for $PLATFORM first; see
   docs/as4610-54-port.md)"
-for lib in libbcm.a libsoc.a libsal.a; do
+# Spot-check the set (the full roster is ~100 archives: the SDK splits
+# soc per chip family and sal into core/appl — there is no libsoc.a or
+# libsal.a worth naming; the link below takes every archive built).
+for lib in libbcm.a libsal_core.a libsoc_esw.a; do
     [ -f "$LIBDIR/$lib" ] || die "$LIBDIR/$lib missing — SDK build incomplete"
 done
 
@@ -76,6 +79,12 @@ trap 'rm -rf "$WORK"' EXIT
 # INCLUDE_KNET the SDK builds a datapath with no CPU punt at all.
 CFLAGS=(
     -O2 -fPIC -Wall
+    # The same define set check-shim.sh validates on every unit: LINUX
+    # and LE_HOST shape sal/soc basic types, BCM_ESW_SUPPORT turns on
+    # the XGS switch API (without it soc/drv.h has no soc_mem_t and
+    # nothing compiles), INCLUDE_KNET the CPU punt path.
+    -DLINUX -DLE_HOST=1
+    -DBCM_ESW_SUPPORT
     -DINCLUDE_KNET
     # Without this the SDK compiles the entire L3 API out of its own
     # headers, and every router-interface, route, neighbour and ECMP
@@ -98,22 +107,39 @@ log "compiling hemlockbcm.c for $PLATFORM"
 
 # --whole-archive around libbcm: the shim references a small part of the
 # API directly, but the SDK's chip drivers register themselves through
-# constructors that a normal archive link would discard.
-log "linking $OUT"
+# constructors that a normal archive link would discard. Everything else
+# goes in one --start-group: the SDK's own bcm.user link names the same
+# archives, and the group absorbs their heavily circular dependencies.
+GROUP_LIBS=()
+for a in "$LIBDIR"/lib*.a; do
+    [ "$(basename "$a")" = "libbcm.a" ] && continue
+    GROUP_LIBS+=("$a")
+done
+[ "${#GROUP_LIBS[@]}" -gt 10 ] || die "only ${#GROUP_LIBS[@]} archives under $LIBDIR — SDK build incomplete"
+
+log "linking $OUT (libbcm.a whole-archive + ${#GROUP_LIBS[@]} grouped archives)"
 "$CC" -shared -o "$OUT" \
     -Wl,-soname,libhemlockbcm.so.1 \
     "$WORK/hemlockbcm.o" \
     -Wl,--whole-archive "$LIBDIR/libbcm.a" -Wl,--no-whole-archive \
-    "$LIBDIR/libsoc.a" "$LIBDIR/libsal.a" \
+    -Wl,--start-group "${GROUP_LIBS[@]}" -Wl,--end-group \
     -lpthread -lm -lrt \
     || die "linking the shim failed"
 
+# The debug info is most of the file (the whole-archive SDK carries -g
+# everywhere); --strip-unneeded keeps the dynamic symbol table dlopen
+# resolves against.
+if command -v "${CROSS_COMPILE}objcopy" >/dev/null; then
+    "${CROSS_COMPILE}objcopy" --strip-unneeded "$OUT"
+fi
+
 # The one symbol the ABI promises. A shim that loads but exports nothing
 # fails at dlopen time on the switch, which is a much worse place to find
-# out than here.
+# out than here. (grep -c, not -q: -q quits at the first match, nm dies
+# of SIGPIPE, and pipefail turns the pass into a fail.)
 if command -v "${CROSS_COMPILE}nm" >/dev/null; then
-    "${CROSS_COMPILE}nm" -D --defined-only "$OUT" | grep -q hemlockbcm_get_api \
-        || die "$OUT does not export hemlockbcm_get_api"
+    n="$("${CROSS_COMPILE}nm" -D --defined-only "$OUT" | grep -c hemlockbcm_get_api || true)"
+    [ "${n:-0}" -gt 0 ] || die "$OUT does not export hemlockbcm_get_api"
 fi
 
 log "built $OUT"
