@@ -27,7 +27,10 @@ log() { echo "build-kernel: $*"; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 
-SRC="${SRC:-$ROOT/vendor/kernel/linux-6.1.y}"
+# The source tree lives OUTSIDE vendor/kernel: that directory is the
+# staging area holding exactly two debs — it is what CI caches, and
+# what the stale-deb cleanup below sweeps.
+SRC="${SRC:-$ROOT/vendor/kernel-src/linux-6.1.y}"
 BRANCH="${BRANCH:-linux-6.1.y}"
 CROSS_COMPILE="${CROSS_COMPILE:-arm-linux-gnueabihf-}"
 JOBS="${JOBS:-$(nproc)}"
@@ -86,7 +89,9 @@ done < <(grep -E '^CONFIG_' "$HERE/hemlock.config")
 log "config fragment fully applied"
 
 log "building bindeb-pkg with -j$JOBS (this is the long part)"
-make -s -j"$JOBS" bindeb-pkg LOCALVERSION=-hemlock-iproc KDEB_PKGVERSION="$(make -s kernelversion)-1"
+# Not -s: on a hosted runner this stage is an hour-plus, and a silent
+# build is indistinguishable from a hung one in the live log.
+make -j"$JOBS" bindeb-pkg LOCALVERSION=-hemlock-iproc KDEB_PKGVERSION="$(make -s kernelversion)-1"
 
 DEB="$(ls "$SRC"/../linux-image-*-hemlock-iproc*_armhf.deb 2>/dev/null | sort | tail -1)"
 [ -n "$DEB" ] || die "bindeb-pkg produced no linux-image deb"
@@ -95,11 +100,21 @@ DEB="$(ls "$SRC"/../linux-image-*-hemlock-iproc*_armhf.deb 2>/dev/null | sort | 
 # has no headers for a kernel Debian never shipped.
 HDRS="$(ls "$SRC"/../linux-headers-*-hemlock-iproc*_armhf.deb 2>/dev/null | sort | tail -1)"
 [ -n "$HDRS" ] || die "bindeb-pkg produced no linux-headers deb"
-mkdir -p "$ROOT/vendor/kernel"
+DEST="$ROOT/vendor/kernel"
+mkdir -p "$DEST"
 # Stale debs from earlier versions would win mkimage's glob; only the
-# pair just built may be staged.
-rm -f "$ROOT/vendor/kernel"/linux-image-*-hemlock-iproc*.deb \
-    "$ROOT/vendor/kernel"/linux-headers-*-hemlock-iproc*.deb
-cp "$DEB" "$HDRS" "$ROOT/vendor/kernel/"
+# pair just built may be staged. The -ef guards keep this safe even
+# when someone points SRC inside DEST and the fresh debs already sit
+# there — deleting the files about to be staged is how the first CI
+# run died.
+for f in "$DEST"/linux-image-*-hemlock-iproc*.deb \
+    "$DEST"/linux-headers-*-hemlock-iproc*.deb; do
+    [ -e "$f" ] || continue
+    if ! [ "$f" -ef "$DEB" ] && ! [ "$f" -ef "$HDRS" ]; then
+        rm -f "$f"
+    fi
+done
+[ "$DEB" -ef "$DEST/$(basename "$DEB")" ] || cp "$DEB" "$DEST/"
+[ "$HDRS" -ef "$DEST/$(basename "$HDRS")" ] || cp "$HDRS" "$DEST/"
 log "staged $(basename "$DEB") + $(basename "$HDRS") into vendor/kernel/"
 log "next: build/mkimage.sh accton-as4610-54"

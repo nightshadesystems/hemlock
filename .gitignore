@@ -22,5 +22,7 @@ platforms/**/*.deb
 
 # OpenBCM SDK tree and the shim built from it (fetched, never committed).
 /vendor/openbcm/
-# The platform kernel deb build-kernel.sh stages (and its source tree).
+# The platform kernel debs build-kernel.sh stages, and the source tree
+# it builds them from (kept separate: vendor/kernel is what CI caches).
 /vendor/kernel/
+/vendor/kernel-src/
