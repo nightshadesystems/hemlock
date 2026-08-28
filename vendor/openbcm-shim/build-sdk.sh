@@ -67,11 +67,17 @@ log "building userland (iproc-4_4) with ${CROSS_COMPILE}gcc -j$JOBS"
 # effect of the kernel-module rules this build deliberately skips.
 mkdir -p "$SDK/build/linux/user/iproc-4_4"
 
+# The SDK whitelists make versions with a *substring* match ("4.4.1"
+# passes because it contains "4.1"; "4.3" fails). The build is proven
+# on make 4.4, so allow the running version alongside Broadcom's list.
+MAKE_VER="$(make --version | sed -n '1s/^GNU Make //p')"
+
 sdk_make() {
     make -C "$SDK/systems/linux/user/iproc-4_4" \
         SDK="$SDK" \
         CROSS_COMPILE="$CROSS_COMPILE" \
         TOOLCHAIN_BASE_DIR=/nonexistent \
+        ALLOWED_MAKE_VERSIONS="3.81 3.82 4.0 4.1 $MAKE_VER" \
         BCM_CFLAGS="-Wall -fno-strict-aliasing -fcommon" \
         LIBS="-pthread -lm -lrt" \
         BUILD_KNET=1 \
