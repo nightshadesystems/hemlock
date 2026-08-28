@@ -26,7 +26,7 @@
  * ARM; this file is built only by build-shim.sh in the cross container.
  * Every SDK symbol it uses was checked against sdk-6.5.16's headers
  * (include/bcm/{port,link,stat,error,vlan,l2,stack,trunk,stg,mirror,
- * rate,knet,policer,field,l3}.h,
+ * rate,knet,policer,field,l3,rx,pkt}.h,
  * include/soc/drv.h)
  * — but
  * "checked against the header" is not "compiled", so treat the first
@@ -35,6 +35,7 @@
 
 #include "hemlockbcm.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,10 +51,12 @@
 #include <bcm/knet.h>
 #include <bcm/l3.h>
 #include <bcm/l2.h>
+#include <bcm/pkt.h>
 #include <bcm/link.h>
 #include <bcm/mirror.h>
 #include <bcm/policer.h>
 #include <bcm/port.h>
+#include <bcm/rx.h>
 #include <bcm/rate.h>
 #include <bcm/stack.h>
 #include <bcm/stat.h>
@@ -87,6 +90,8 @@ struct hemlockbcm_switch {
     int modid;
     hemlockbcm_link_cb link_cb;
     void *link_ctx;
+    hemlockbcm_sample_cb sample_cb;
+    void *sample_ctx;
 };
 
 /* An all-zero MAC, for the match structures where the MAC is not part of
@@ -2799,6 +2804,118 @@ static int hb_trap_default_policer_set(struct hemlockbcm_switch *sw, uint32_t po
     return HEMLOCKBCM_OK;
 }
 
+/* --- Ingress sampling / sFlow (ABI 1.17) ------------------------------------ */
+
+/*
+ * Whether the sample delivery path (KNET filter + RX handler + RX
+ * thread) is installed. File-static like hb_switch, and lost with the
+ * process -- safely, because host_punt_setup's knet init wipes the
+ * kernel-side filter on restart too, and the first enabling
+ * sample_rate_set of the new run reinstalls both.
+ */
+static int hb_sample_delivery_up;
+
+static bcm_rx_t hb_sample_rx(int unit, bcm_pkt_t *pkt, void *cookie)
+{
+    struct hemlockbcm_switch *sw = hb_switch;
+
+    (void)unit;
+    (void)cookie;
+    if (sw == NULL || sw->sample_cb == NULL || pkt == NULL) {
+        return BCM_RX_NOT_HANDLED;
+    }
+    /* Only sampled packets; everything else keeps its normal path. */
+    if (!BCM_RX_REASON_GET(pkt->rx_reasons, bcmRxReasonSampleSource)) {
+        return BCM_RX_NOT_HANDLED;
+    }
+    if (pkt->pkt_data != NULL && pkt->pkt_data[0].data != NULL) {
+        uint32_t length = pkt->pkt_len;
+
+        if (length > pkt->pkt_data[0].len) {
+            length = pkt->pkt_data[0].len;
+        }
+        sw->sample_cb(sw->sample_ctx, (uint32_t)pkt->src_port,
+                      (uint32_t)pkt->tot_len, pkt->pkt_data[0].data, length);
+    }
+    return BCM_RX_HANDLED;
+}
+
+static int hb_sample_delivery_ensure(struct hemlockbcm_switch *sw)
+{
+    bcm_knet_filter_t filter;
+    int status;
+
+    if (hb_sample_delivery_up) {
+        return HEMLOCKBCM_OK;
+    }
+    /*
+     * Priority 0: above the per-port punt filters (priority 1), so a
+     * sampled copy goes to the RX API rather than up the ingress
+     * port's netdev -- where the kernel stack would mistake it for
+     * received traffic.
+     */
+    bcm_knet_filter_t_init(&filter);
+    filter.type = BCM_KNET_FILTER_T_RX_PKT;
+    filter.priority = 0;
+    filter.dest_type = BCM_KNET_DEST_T_BCM_RX_API;
+    filter.match_flags = BCM_KNET_FILTER_M_REASON;
+    BCM_RX_REASON_SET(filter.m_reason, bcmRxReasonSampleSource);
+    snprintf(filter.desc, sizeof(filter.desc), "hemlock-sflow");
+    status = HB_CALL(bcm_knet_filter_create(sw->unit, &filter));
+    if (status != HEMLOCKBCM_OK) {
+        return status;
+    }
+    status = HB_CALL(bcm_rx_register(sw->unit, "hemlock-sflow", hb_sample_rx,
+                                     100, NULL, BCM_RCO_F_ALL_COS));
+    if (status != HEMLOCKBCM_OK) {
+        (void)bcm_knet_filter_destroy(sw->unit, filter.id);
+        return status;
+    }
+    if (!bcm_rx_active(sw->unit)) {
+        /* NULL config = the SDK's defaults. */
+        status = HB_CALL(bcm_rx_start(sw->unit, NULL));
+        if (status != HEMLOCKBCM_OK) {
+            (void)bcm_rx_unregister(sw->unit, hb_sample_rx, 100);
+            (void)bcm_knet_filter_destroy(sw->unit, filter.id);
+            return status;
+        }
+    }
+    hb_sample_delivery_up = 1;
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_set_sample_callback(struct hemlockbcm_switch *sw,
+                                  hemlockbcm_sample_cb cb, void *context)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    /* Registration only; the delivery path waits for the first
+     * enabling sample_rate_set (see hb_sample_delivery_ensure). */
+    sw->sample_cb = cb;
+    sw->sample_ctx = context;
+    return HEMLOCKBCM_OK;
+}
+
+static int hb_sample_rate_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                              uint32_t rate)
+{
+    int status;
+
+    if (sw == NULL || rate > (uint32_t)INT_MAX) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    if (rate != 0) {
+        status = hb_sample_delivery_ensure(sw);
+        if (status != HEMLOCKBCM_OK) {
+            return status;
+        }
+    }
+    /* Ingress only; the egress rate stays off. */
+    return HB_CALL(bcm_port_sample_rate_set(sw->unit, (bcm_port_t)logical_port,
+                                            (int)rate, 0));
+}
+
 static const struct hemlockbcm_api HB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2884,6 +3001,8 @@ static const struct hemlockbcm_api HB_API = {
     hb_trap_set,
     hb_trap_clear,
     hb_trap_default_policer_set,
+    hb_set_sample_callback,
+    hb_sample_rate_set,
     /* Remaining phase 6 slots are appended below this line. */
 };
 

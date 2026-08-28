@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define HEMLOCKBCM_ABI_MAJOR 1
-#define HEMLOCKBCM_ABI_MINOR 16
+#define HEMLOCKBCM_ABI_MINOR 17
 
 /*
  * Symbol visibility. The real shim is an ELF .so, where the entry point
@@ -226,6 +226,12 @@ struct hemlockbcm_capabilities {
 
 /* Port oper-status change, delivered from the shim's own thread. */
 typedef void (*hemlockbcm_link_cb)(void *context, uint32_t logical_port, int up);
+
+/* One sampled packet, delivered from the shim's RX thread; see the
+ * sampling slots in the vtable (ABI 1.17). */
+typedef void (*hemlockbcm_sample_cb)(void *context, uint32_t logical_port,
+                                     uint32_t original_length,
+                                     const uint8_t *data, uint32_t length);
 
 /*
  * The vtable. Append-only: new slots go at the end and bump the minor.
@@ -851,8 +857,42 @@ struct hemlockbcm_api {
      * remember which kinds are installed. */
     int (*trap_default_policer_set)(struct hemlockbcm_switch *sw, uint32_t policer);
 
+    /* --- Ingress sampling / sFlow (ABI 1.17) -------------------------- */
+
     /*
-     * Everything below is the rest of phase 6: sFlow and QoS. Each lands as one slot appended here plus the
+     * Hardware 1-in-N ingress sampling, with the shim delivering the
+     * sampled packets itself. OpenBCM's knet-cb has no psample path, so
+     * the E1031's plumbing (psample -> hsflowd) does not exist here;
+     * instead a KNET filter steers packets whose reason is
+     * "sample source" to the SDK's RX API, and the shim's RX handler
+     * hands each one to the callback below with its ingress port and
+     * on-the-wire length.
+     *
+     * The filter and the RX thread are installed lazily by the first
+     * enabling sample_rate_set, NOT when the callback is registered:
+     * host_punt_setup's knet init wipes every KNET filter, and it runs
+     * after create_switch (where callbacks are registered) but before
+     * any sampling is enabled.
+     *
+     * `data` is valid only for the duration of the call; the callback
+     * copies what it keeps. `original_length` is the frame's length on
+     * the wire -- the delivered bytes may be fewer. The callback type
+     * is declared beside the link callback above; a typedef cannot
+     * live inside the struct.
+     */
+    /* Register the sampled-packet callback; NULL unregisters. Called
+     * from the shim's RX thread, like the link callback. */
+    int (*set_sample_callback)(struct hemlockbcm_switch *sw,
+                               hemlockbcm_sample_cb cb, void *context);
+
+    /* Sample 1 in `rate` ingress packets on the port; 0 disables.
+     * Egress sampling is deliberately not exposed -- the trait above
+     * this ABI never asks for it. */
+    int (*sample_rate_set)(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                           uint32_t rate);
+
+    /*
+     * Everything below is the rest of phase 6: QoS. Each lands as one slot appended here plus the
      * matching Rust method, with the minor bumped. Until then Rust
      * reports those families unsupported, which is the truth and which
      * both consoles already handle.

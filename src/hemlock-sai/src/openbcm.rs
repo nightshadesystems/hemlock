@@ -307,6 +307,7 @@ struct ShimSwitch {
 }
 
 type LinkCb = unsafe extern "C" fn(*mut c_void, u32, std::os::raw::c_int);
+type SampleCb = unsafe extern "C" fn(*mut c_void, u32, u32, *const u8, u32);
 
 type Status = std::os::raw::c_int;
 
@@ -488,6 +489,11 @@ struct Api {
         unsafe extern "C" fn(*mut ShimSwitch, std::os::raw::c_int, std::os::raw::c_int) -> Status,
     >,
     trap_default_policer_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32) -> Status>,
+
+    // --- ABI 1.17: ingress sampling ----------------------------------
+    set_sample_callback:
+        Option<unsafe extern "C" fn(*mut ShimSwitch, Option<SampleCb>, *mut c_void) -> Status>,
+    sample_rate_set: Option<unsafe extern "C" fn(*mut ShimSwitch, u32, u32) -> Status>,
 }
 
 impl Api {
@@ -761,15 +767,30 @@ fn trap_kind(kind: TrapKind) -> Result<std::os::raw::c_int, SaiError> {
         TrapKind::Ospf => 17,
         TrapKind::Bgp => 18,
         TrapKind::Vrrp => 19,
-        // Sampled packets are the sFlow family's to punt; until that
-        // lands there is no session for this trap to serve.
-        TrapKind::SamplePacket => return unimplemented_slot("samplepacket trap"),
+        // Handled before the mapping, like AclLog: the shim's sample
+        // delivery path is the punt, so there is no field entry to make.
+        TrapKind::SamplePacket => {
+            return Err(SaiError::Other(
+                "SamplePacket is handled before the kind mapping".into(),
+            ))
+        }
         TrapKind::AclLog => {
             return Err(SaiError::Other(
                 "AclLog is handled before the kind mapping".into(),
             ))
         }
     })
+}
+
+const OID_TAG_SAMPLE: u64 = 0x13;
+
+/// A samplepacket session is its rate; nothing is allocated.
+fn sample_oid(rate: u32) -> Oid {
+    Oid((OID_TAG_SAMPLE << 56) | u64::from(rate))
+}
+
+fn oid_sample_rate(oid: Oid) -> u32 {
+    oid.0 as u32
 }
 
 const OID_TAG_TRAP_GROUP: u64 = 0x11;
@@ -796,6 +817,12 @@ fn oid_trap(oid: Oid) -> (std::os::raw::c_int, bool) {
 /// The accepted-but-inert AclLog trap; 0xff is no real kind.
 fn acl_log_trap_oid() -> Oid {
     Oid((OID_TAG_TRAP << 56) | 0xff)
+}
+
+/// The SamplePacket trap: satisfied by the shim's own delivery path
+/// rather than a field entry, so it too installs nothing here.
+fn sample_trap_oid() -> Oid {
+    Oid((OID_TAG_TRAP << 56) | 0xfe)
 }
 
 /// Map a shim status onto the error type the rest of Hemlock understands.
@@ -840,6 +867,33 @@ unsafe extern "C" fn link_callback(context: *mut c_void, logical_port: u32, up: 
     let _ = ctx.tx.send(SaiEvent::PortOperStatus {
         port: PortId(logical_port as u64),
         up: up != 0,
+    });
+}
+
+unsafe extern "C" fn sample_callback(
+    context: *mut c_void,
+    logical_port: u32,
+    original_length: u32,
+    data: *const u8,
+    length: u32,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: same contract as link_callback -- `context` is the leaked
+    // Arc<EventContext>; `data` is valid for `length` bytes only during
+    // this call, so it is copied before the send.
+    let ctx = unsafe { &*(context as *const EventContext) };
+    let bytes = if data.is_null() || length == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the shim promises `data` covers `length` bytes.
+        unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec()
+    };
+    let _ = ctx.tx.send(SaiEvent::SampledPacket {
+        port: PortId(u64::from(logical_port)),
+        original_length,
+        bytes,
     });
 }
 
@@ -1234,6 +1288,13 @@ impl SaiBackend for OpenBcmBackend {
         } else {
             tracing::warn!("OpenBCM shim has no set_link_callback; link state will not update");
         }
+        if let Ok(set_cb) = slot!(self, set_sample_callback, "set_sample_callback") {
+            let ctx = Arc::as_ptr(&self.event_ctx) as *mut c_void;
+            // SAFETY: same lifetime argument as the link callback above.
+            check("set_sample_callback", unsafe {
+                set_cb(handle, Some(sample_callback), ctx)
+            })?;
+        }
 
         // The chip's LED processor. Purely cosmetic — without it the LED
         // latches power up driving every port LED solid on — so nothing
@@ -1436,7 +1497,7 @@ impl SaiBackend for OpenBcmBackend {
             ecn: false,
             queue_shaper: false,
             wred_queue_stats: false,
-            sflow: false,
+            sflow: slot!(self, sample_rate_set, "sample_rate_set").is_ok(),
             cable_diag: false,
         })
     }
@@ -1953,24 +2014,61 @@ impl SaiBackend for OpenBcmBackend {
         Ok(())
     }
 
-    fn create_samplepacket(&mut self, _rate: u32) -> Result<Oid, SaiError> {
-        unimplemented_slot("create_samplepacket")
+    // --- Ingress sampling / sFlow (ABI 1.17) --------------------------
+    //
+    // A samplepacket session carries exactly one fact -- its rate -- so
+    // its id is that fact and nothing is allocated, the same shape as a
+    // trap group. Delivery is the shim's own: a KNET filter steers
+    // sample-reason packets to the SDK RX path and the callback
+    // registered at create_switch turns each into a SampledPacket
+    // event.
+
+    fn create_samplepacket(&mut self, rate: u32) -> Result<Oid, SaiError> {
+        // The session must be usable later, so the checks live here:
+        // rate 0 would encode as "no session" and a rate past i32 would
+        // be refused by the SDK long after the session looked fine.
+        slot!(self, sample_rate_set, "sample_rate_set")?;
+        if rate == 0 || rate > i32::MAX as u32 {
+            return Err(SaiError::Other(format!(
+                "sample rate must be 1..={}, got {rate}",
+                i32::MAX
+            )));
+        }
+        Ok(sample_oid(rate))
     }
 
     fn remove_samplepacket(&mut self, _session: Oid) -> Result<(), SaiError> {
-        unimplemented_slot("remove_samplepacket")
-    }
-
-    fn run_cable_diag(&mut self, _port: PortId) -> Result<Vec<CablePair>, SaiError> {
-        unimplemented_slot("run_cable_diag")
+        // A name; nothing was allocated. Ports still bound to it keep
+        // sampling until they are unbound, which is the caller's
+        // sequencing to get right -- and it does, unbinding first.
+        Ok(())
     }
 
     fn set_port_sample_session(
         &mut self,
-        _port: PortId,
-        _session: Option<Oid>,
+        port: PortId,
+        session: Option<Oid>,
     ) -> Result<(), SaiError> {
-        unimplemented_slot("set_port_sample_session")
+        let f = slot!(self, sample_rate_set, "sample_rate_set")?;
+        let logical = self.logical_port(port)?;
+        let rate = match session {
+            Some(session) if oid_tag(session.0) == OID_TAG_SAMPLE => oid_sample_rate(session),
+            // A junk id would decode to a junk rate and quietly sample
+            // at it; refuse instead.
+            Some(session) => {
+                return Err(SaiError::Other(format!(
+                    "{session} is not a samplepacket session"
+                )))
+            }
+            None => 0,
+        };
+        let sw = self.switch()?;
+        // SAFETY: plain scalars over the ABI.
+        check("sample_rate_set", unsafe { f(sw, logical, rate) })
+    }
+
+    fn run_cable_diag(&mut self, _port: PortId) -> Result<Vec<CablePair>, SaiError> {
+        unimplemented_slot("run_cable_diag")
     }
 
     fn set_port_tpid(&mut self, port: PortId, tpid: u16) -> Result<(), SaiError> {
@@ -2401,6 +2499,16 @@ impl SaiBackend for OpenBcmBackend {
         if kind == TrapKind::AclLog {
             return Ok(acl_log_trap_oid());
         }
+        // The sample punt path is the KNET filter and RX handler the
+        // shim installs with sampling itself, so this trap's work is
+        // already done the moment sampling can be enabled at all.
+        // Accepting it (rather than refusing) also keeps the sFlow
+        // engine's "samples will not arrive" warning from firing when
+        // they in fact do.
+        if kind == TrapKind::SamplePacket {
+            slot!(self, sample_rate_set, "sample_rate_set")?;
+            return Ok(sample_trap_oid());
+        }
         let kind_id = trap_kind(kind)?;
         let f = slot!(self, trap_set, "trap_set")?;
         let is_default = group.0 == 0;
@@ -2428,8 +2536,8 @@ impl SaiBackend for OpenBcmBackend {
     }
 
     fn remove_hostif_trap(&mut self, trap: Oid) -> Result<(), SaiError> {
-        if trap == acl_log_trap_oid() {
-            return Ok(()); // nothing was installed
+        if trap == acl_log_trap_oid() || trap == sample_trap_oid() {
+            return Ok(()); // nothing to take back out
         }
         let f = slot!(self, trap_clear, "trap_clear")?;
         let (kind_id, is_default) = oid_trap(trap);
@@ -2733,7 +2841,6 @@ mod tests {
     #[test]
     fn phase_six_families_are_unsupported() {
         let mut b = backend();
-        assert!(b.create_samplepacket(1024).unwrap_err().is_unsupported());
         assert!(b.run_cable_diag(PortId(1)).unwrap_err().is_unsupported());
         // Queue counters are the one "absent" family with a defined
         // empty answer rather than an error.
@@ -2766,10 +2873,10 @@ mod tests {
         assert!(caps.storm_control, "ABI 1.7");
         assert!(caps.acl_ingress && caps.acl_egress, "ABI 1.10");
         assert!(caps.copp, "ABI 1.16");
+        assert!(caps.sflow, "ABI 1.17");
         assert!(caps.acl_entry_policer, "ABI 1.11");
         for (name, on) in [
             ("l2mc", caps.l2mc),
-            ("sflow", caps.sflow),
             ("cable_diag", caps.cable_diag),
             ("wred", caps.wred),
         ] {
@@ -2923,6 +3030,8 @@ mod tests {
             trap_set: None,
             trap_clear: None,
             trap_default_policer_set: None,
+            set_sample_callback: None,
+            sample_rate_set: None,
         };
         assert!(!one_zero.has(led), "a 1.0 shim must not expose a 1.1 slot");
         assert!(one_zero.has(std::mem::offset_of!(Api, capabilities)));
@@ -3068,6 +3177,8 @@ mod tests {
             "trap_set",
             "trap_clear",
             "trap_default_policer_set",
+            "set_sample_callback",
+            "sample_rate_set",
         ];
         assert_eq!(header_slots(), expected, "header slot order changed");
 
@@ -3186,6 +3297,8 @@ mod tests {
             std::mem::offset_of!(Api, trap_set),
             std::mem::offset_of!(Api, trap_clear),
             std::mem::offset_of!(Api, trap_default_policer_set),
+            std::mem::offset_of!(Api, set_sample_callback),
+            std::mem::offset_of!(Api, sample_rate_set),
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1], "vtable slots are out of order");
@@ -4870,10 +4983,12 @@ mod tests {
             b.create_hostif_trap(kind, false, group)
                 .unwrap_or_else(|e| panic!("{kind:?} must be accepted: {e}"));
         }
-        assert!(b
-            .create_hostif_trap(TrapKind::SamplePacket, false, group)
-            .unwrap_err()
-            .is_unsupported());
+        // SamplePacket is accepted too, satisfied by the shim's own
+        // delivery path rather than a field entry.
+        let sample = b
+            .create_hostif_trap(TrapKind::SamplePacket, true, Oid(0))
+            .unwrap();
+        b.remove_hostif_trap(sample).unwrap();
     }
 
     /// Default-group traps follow the default policer both ways: ones
@@ -4942,5 +5057,97 @@ mod tests {
             .create_hostif_trap(TrapKind::Stp, true, vlan_oid(100))
             .is_err());
         assert_eq!(stub_trap(&b, TRAP_STP, false), -1);
+    }
+    // --- Ingress sampling / sFlow ------------------------------------------
+
+    fn stub_sample_rate(b: &OpenBcmBackend, port: u32) -> i64 {
+        unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut ShimSwitch, u32) -> i64> =
+                b._library.get(b"hemlockbcm_stub_sample_rate\0").unwrap();
+            f(b.switch, port)
+        }
+    }
+
+    /// Deliver one fake sampled packet the way the shim's RX handler
+    /// would; 0 = delivered.
+    fn stub_fire_sample(b: &OpenBcmBackend, port: u32, original: u32, data: &[u8]) -> i32 {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *mut ShimSwitch,
+                    u32,
+                    u32,
+                    *const u8,
+                    u32,
+                ) -> std::os::raw::c_int,
+            > = b._library.get(b"hemlockbcm_stub_fire_sample\0").unwrap();
+            f(b.switch, port, original, data.as_ptr(), data.len() as u32)
+        }
+    }
+
+    /// A session is its rate: same rate, same session; removal frees
+    /// nothing. Binding programs the port's sampler, `None` stops it.
+    #[test]
+    fn sample_sessions_bind_their_rate_to_ports() {
+        let mut b = backend();
+        let session = b.create_samplepacket(1024).unwrap();
+        assert_eq!(b.create_samplepacket(1024).unwrap(), session);
+        assert_ne!(b.create_samplepacket(512).unwrap(), session);
+
+        b.set_port_sample_session(PortId(1), Some(session)).unwrap();
+        assert_eq!(stub_sample_rate(&b, 1), 1024);
+        assert_eq!(stub_sample_rate(&b, 2), 0, "other ports untouched");
+
+        b.set_port_sample_session(PortId(1), None).unwrap();
+        assert_eq!(stub_sample_rate(&b, 1), 0);
+        b.remove_samplepacket(session).unwrap();
+
+        // The invalid shapes are refused before the datapath.
+        assert!(b.create_samplepacket(0).is_err());
+        assert!(b.create_samplepacket(u32::MAX).is_err());
+        assert!(b
+            .set_port_sample_session(PortId(1), Some(vlan_oid(100)))
+            .is_err());
+        assert!(b
+            .set_port_sample_session(lag_port(1), Some(session))
+            .is_err());
+    }
+
+    /// The delivery path: a sampled packet arriving through the shim's
+    /// callback comes out of the event channel with its port, wire
+    /// length and bytes intact -- the bytes copied, since the shim's
+    /// buffer dies with the call.
+    #[test]
+    fn sampled_packets_arrive_as_events() {
+        let mut b = backend();
+        let mut events = b.take_events().unwrap();
+        let frame = [0xffu8, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x02, 0x00];
+
+        assert_eq!(stub_fire_sample(&b, 3, 128, &frame), 0);
+        match events.try_recv().expect("a sample event") {
+            SaiEvent::SampledPacket {
+                port,
+                original_length,
+                bytes,
+            } => {
+                assert_eq!(port, PortId(3));
+                assert_eq!(original_length, 128, "wire length, not delivered length");
+                assert_eq!(bytes, frame);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    /// The SamplePacket trap is satisfied by the delivery path itself,
+    /// so accepting it is what keeps the sFlow engine's "samples will
+    /// not arrive" warning truthful -- they do arrive.
+    #[test]
+    fn the_samplepacket_trap_is_satisfied_not_refused() {
+        let mut b = backend();
+        let trap = b
+            .create_hostif_trap(TrapKind::SamplePacket, true, Oid(0))
+            .unwrap();
+        assert_ne!(trap, acl_log_trap_oid());
+        b.remove_hostif_trap(trap).unwrap();
     }
 }

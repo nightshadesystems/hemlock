@@ -245,6 +245,9 @@ struct hemlockbcm_switch {
     int learn_limit[STUB_PORTS];
     hemlockbcm_link_cb link_cb;
     void *link_ctx;
+    hemlockbcm_sample_cb sample_cb;
+    void *sample_ctx;
+    uint32_t sample_rate[STUB_PORTS];
     int created;
 };
 
@@ -2583,6 +2586,63 @@ HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_trap(struct hemlockbcm_switch *sw,
     return ((int64_t)slot->policer << 8) | ((int64_t)slot->trap_only << 1) | 1;
 }
 
+/* --- Ingress sampling / sFlow (ABI 1.17) ------------------------------------ */
+
+static int stub_set_sample_callback(struct hemlockbcm_switch *sw,
+                                    hemlockbcm_sample_cb cb, void *context)
+{
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->sample_cb = cb;
+    sw->sample_ctx = context;
+    return HEMLOCKBCM_OK;
+}
+
+static int stub_sample_rate_set(struct hemlockbcm_switch *sw, uint32_t logical_port,
+                                uint32_t rate)
+{
+    struct hemlockbcm_port *port;
+
+    if (sw == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    port = find_port(sw, logical_port);
+    if (port == NULL) {
+        return HEMLOCKBCM_ERR_INVALID_PARAM;
+    }
+    sw->sample_rate[port - sw->ports] = rate;
+    return HEMLOCKBCM_OK;
+}
+
+/* Test hooks, not part of the ABI. */
+
+HEMLOCKBCM_EXPORT int64_t hemlockbcm_stub_sample_rate(struct hemlockbcm_switch *sw,
+                                                      uint32_t logical_port)
+{
+    struct hemlockbcm_port *port = find_port(sw, logical_port);
+
+    if (sw == NULL || port == NULL) {
+        return -1;
+    }
+    return (int64_t)sw->sample_rate[port - sw->ports];
+}
+
+/* Deliver one fake sampled packet through the registered callback, the
+ * way the real shim's RX handler would. Returns 0 if delivered. */
+HEMLOCKBCM_EXPORT int hemlockbcm_stub_fire_sample(struct hemlockbcm_switch *sw,
+                                                  uint32_t logical_port,
+                                                  uint32_t original_length,
+                                                  const uint8_t *data,
+                                                  uint32_t length)
+{
+    if (sw == NULL || sw->sample_cb == NULL) {
+        return -1;
+    }
+    sw->sample_cb(sw->sample_ctx, logical_port, original_length, data, length);
+    return 0;
+}
+
 static const struct hemlockbcm_api STUB_API = {
     sizeof(struct hemlockbcm_api),
     HEMLOCKBCM_ABI_MAJOR,
@@ -2668,6 +2728,8 @@ static const struct hemlockbcm_api STUB_API = {
     stub_trap_set,
     stub_trap_clear,
     stub_trap_default_policer_set,
+    stub_set_sample_callback,
+    stub_sample_rate_set,
 };
 
 HEMLOCKBCM_EXPORT const struct hemlockbcm_api *hemlockbcm_get_api(uint32_t want_major)
