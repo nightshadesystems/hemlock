@@ -147,6 +147,17 @@ Track 2 therefore becomes: mainline 6.1 LTS, a ~2-file device tree, a
 defconfig, and FIT packaging at `0x61008000` — with Track 1 (ONL's
 4.14, unmodified) still available as the datapath bench.
 
+**The device tree is written and compiles.**
+`platforms/accton-as4610-54/kernel/dts/` holds `bcm-hx4.dtsi` and the
+board file, structure from mainline's `bcm-hr2.dtsi`, facts from ONL's
+`bcm-helix4.dtsi` read as data; `check-dts.sh` next to them compiles
+both against mainline v6.1's dt-bindings (clean, no warnings). The
+board file's compatible chain ends in `"brcm,hr2"`, so a stock
+`ARCH_BCM_HR2` kernel boots it with zero out-of-tree machine code. The
+deliberate absences — SMP method, USB PHY, SPI-NOR partition offsets
+— are each recorded in that directory's README with the bench step
+that resolves them.
+
 ### D — drivers this board needs
 
 Every one is pinned to a `compatible` string that `bcm-helix4.dtsi` or

@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/*
+ * Broadcom Helix4 (BCM56340) SoC — the XGS-iProc complex only.
+ *
+ * Hemlock's own file, for a mainline 6.1 kernel. Structure follows
+ * mainline's bcm-hr2.dtsi (Hurricane 2, this SoC's sibling; BSD
+ * licensed); the Helix4 addresses, interrupt numbers and clock
+ * derivations are hardware facts taken from ONL's bcm-helix4.dtsi and
+ * the vendor kernel salvaged off the AS4610 — referenced as data, per
+ * the port's rule. docs/as4610-kernel-port.md is the reasoning.
+ *
+ * Everything here uses a MAINLINE driver's compatible where one exists;
+ * a node whose mainline driver is unverified on this SoC says so and
+ * starts disabled. There is deliberately no NAND node (the AS4610-54T
+ * has none), no PCIe (unused), and no CCA GPIO (its only consumer is
+ * the USB PHY's VBUS gpio; see the usbphy0 note).
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "brcm,hx4";
+	model = "Broadcom Helix4 SoC";
+	interrupt-parent = <&gic>;
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * Dual Cortex-A9. No enable-method yet: whether the
+		 * brcm,bcm-nsp-smp secondary-boot register exists on this
+		 * SoC is a bench question, and the vendor's own kernel
+		 * ran maxcpus=2 — so one CPU is a known-good starting
+		 * point, not a regression.
+		 */
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			next-level-cache = <&L2>;
+			reg = <0x0>;
+		};
+
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			next-level-cache = <&L2>;
+			reg = <0x1>;
+		};
+	};
+
+	pmu {
+		compatible = "arm,cortex-a9-pmu";
+		interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH
+			      GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-affinity = <&cpu0>, <&cpu1>;
+	};
+
+	mpcore@19000000 {
+		compatible = "simple-bus";
+		ranges = <0x00000000 0x19000000 0x00023000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		a9pll: arm_clk@0 {
+			#clock-cells = <0>;
+			/*
+			 * The same iProc ARM PLL block every XGS-iProc
+			 * carries; mainline's generic iproc_armpll_setup
+			 * is registered under the hr2 compatible.
+			 */
+			compatible = "brcm,hr2-armpll";
+			clocks = <&osc>;
+			reg = <0x0 0x1000>;
+		};
+
+		timer@20200 {
+			compatible = "arm,cortex-a9-global-timer";
+			reg = <0x20200 0x100>;
+			interrupts = <GIC_PPI 11 IRQ_TYPE_EDGE_RISING>;
+			clocks = <&periph_clk>;
+		};
+
+		twd-timer@20600 {
+			compatible = "arm,cortex-a9-twd-timer";
+			reg = <0x20600 0x20>;
+			interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(2) |
+						  IRQ_TYPE_EDGE_RISING)>;
+			clocks = <&periph_clk>;
+		};
+
+		twd-watchdog@20620 {
+			compatible = "arm,cortex-a9-twd-wdt";
+			reg = <0x20620 0x20>;
+			interrupts = <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(2) |
+						  IRQ_TYPE_EDGE_RISING)>;
+			clocks = <&periph_clk>;
+		};
+
+		gic: interrupt-controller@21000 {
+			compatible = "arm,cortex-a9-gic";
+			#interrupt-cells = <3>;
+			#address-cells = <0>;
+			interrupt-controller;
+			reg = <0x21000 0x1000>,
+			      <0x20100 0x100>;
+		};
+
+		L2: cache-controller@22000 {
+			compatible = "arm,pl310-cache";
+			reg = <0x22000 0x1000>;
+			cache-unified;
+			cache-level = <2>;
+			/* DRAM lives at 0x60000000 on this SoC. */
+			arm,filter-ranges = <0x60000000 0x80000000>;
+		};
+	};
+
+	clocks {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		osc: oscillator {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <25000000>;
+		};
+
+		periph_clk: periph_clk {
+			#clock-cells = <0>;
+			compatible = "fixed-factor-clock";
+			clocks = <&a9pll>;
+			clock-div = <2>;
+			clock-mult = <1>;
+		};
+
+		/*
+		 * The AXI clock block at 0x1803fc00 has no mainline
+		 * driver; the vendor tree computes the APB clock from
+		 * it. Both consumers here (uart0/1 and the QSPI/i2c APB
+		 * side) run from the fixed rates the vendor tree
+		 * resolves to, so fixed clocks stand in and the first
+		 * bench boot confirms the two frequencies below.
+		 */
+		iproc_apb_clk: iproc_apb_clk {
+			#clock-cells = <0>;
+			compatible = "fixed-clock";
+			clock-frequency = <100000000>;
+		};
+	};
+
+	axi@18000000 {
+		compatible = "simple-bus";
+		ranges = <0x00000000 0x18000000 0x00120000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* The console. 62.5 MHz per the vendor tree's uartclk. */
+		uart0: serial@300 {
+			compatible = "ns16550a";
+			reg = <0x300 0x100>;
+			interrupts = <GIC_SPI 91 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <62500000>;
+			status = "disabled";
+		};
+
+		uart1: serial@400 {
+			compatible = "ns16550a";
+			reg = <0x400 0x100>;
+			interrupts = <GIC_SPI 91 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <62500000>;
+			status = "disabled";
+		};
+
+		/*
+		 * Management ethernet: the iProc AMAC pair, driven by
+		 * mainline bgmac-platform. reg-names match what that
+		 * driver looks up. The PHY wiring (external BCM54616 on
+		 * the MDIO below) is the board file's business.
+		 */
+		gmac0: ethernet@22000 {
+			compatible = "brcm,amac";
+			reg = <0x22000 0x1000>,
+			      <0x110000 0x1000>;
+			reg-names = "amac_base", "idm_base";
+			interrupts = <GIC_SPI 202 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		gmac1: ethernet@23000 {
+			compatible = "brcm,amac";
+			reg = <0x23000 0x1000>,
+			      <0x111000 0x1000>;
+			reg-names = "amac_base", "idm_base";
+			interrupts = <GIC_SPI 203 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/*
+		 * The 8 MB SPI-NOR: U-Boot, its environment (fw_setenv),
+		 * and ONIE. Same block, same register offsets as HR2's,
+		 * driven by mainline spi-bcm-qspi.
+		 */
+		qspi: spi@27200 {
+			compatible = "brcm,spi-bcm-qspi";
+			reg = <0x27200 0x188>,
+			      <0x27000 0x124>,
+			      <0x11c408 0x004>,
+			      <0x273a0 0x01c>;
+			reg-names = "mspi", "bspi", "intr_regs",
+				    "intr_status_reg";
+			interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 80 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 81 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 82 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 84 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "spi_lr_fullness_reached",
+					  "spi_lr_session_aborted",
+					  "spi_lr_impatient",
+					  "spi_lr_session_done",
+					  "spi_lr_overread",
+					  "mspi_done",
+					  "mspi_halted";
+			num-cs = <2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
+		 * USB host — the NOS storage hangs off this, so it is
+		 * boot-critical. generic-ehci is mainline; the PHY is
+		 * not: ONL tunes it through a brcm,usb-phy-hx4 driver
+		 * that talks over the internal MDIO and drives VBUS via
+		 * a CCA GPIO. U-Boot has already brought the port up to
+		 * load the FIT, so the first bench experiment is
+		 * generic-ehci with no PHY node at all; ONL's PHY trio
+		 * gets ported (kmod-style, with provenance) only if
+		 * that fails. docs/as4610-kernel-port.md, open
+		 * questions.
+		 */
+		ehci0: usb@2a000 {
+			compatible = "generic-ehci";
+			reg = <0x2a000 0x1000>;
+			interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/*
+		 * The internal MDIO. Mainline mdio-bcm-iproc's register
+		 * interface is the same CCB MDIO block; whether its
+		 * layout matches at this base is a first-boot check.
+		 */
+		mdio: mdio@32000 {
+			compatible = "brcm,iproc-mdio";
+			reg = <0x32000 0x10>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+		};
+
+		i2c0: i2c@38000 {
+			compatible = "brcm,iproc-i2c";
+			reg = <0x38000 0x100>;
+			interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		wdt: watchdog@39000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x39000 0x1000>;
+			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&iproc_apb_clk>, <&iproc_apb_clk>;
+			clock-names = "wdog_clk", "apb_pclk";
+		};
+
+		i2c1: i2c@3b000 {
+			compatible = "brcm,iproc-i2c";
+			reg = <0x3b000 0x100>;
+			interrupts = <GIC_SPI 96 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * The CMICd — the switch datapath's host interface. No kernel
+	 * driver wanted or provided: Hemlock's BDE (linux-kernel-bde)
+	 * claims this device, and the platform quirk's unbind step
+	 * exists for kernels that do ship one.
+	 */
+	iproc_cmicd: cmicd@48000000 {
+		compatible = "brcm,iproc-cmicd";
+		reg = <0x48000000 0x40000>;
+		interrupts = <GIC_SPI 162 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};

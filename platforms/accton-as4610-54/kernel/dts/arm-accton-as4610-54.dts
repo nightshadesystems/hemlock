@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/*
+ * Edgecore AS4610-54T (Accton AS4610-54) — board device tree.
+ *
+ * Facts and their sources, per docs/as4610-kernel-port.md:
+ *   - DRAM at 0x60000000, kernel load/entry 0x61008000: the salvaged
+ *     vendor uImage's header and embedded config, three ways.
+ *   - Console ttyS0 @ 115200: read off the box under ONIE.
+ *   - The SoC layout: bcm-hx4.dtsi next to this file.
+ *
+ * The last compatible is load-bearing: mainline's mach-bcm matches
+ * "brcm,hr2", so this file boots a stock ARCH_BCM_HR2 kernel with no
+ * out-of-tree machine code at all.
+ */
+
+/dts-v1/;
+
+#include "bcm-hx4.dtsi"
+
+/ {
+	model = "Edgecore AS4610-54T";
+	compatible = "accton,as4610-54", "brcm,hx4", "brcm,hr2";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		ethernet0 = &gmac0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/*
+		 * U-Boot's bootargs override this; it exists so a bare
+		 * `bootm` with no arguments still lands on the console.
+		 * The vendor ran maxcpus=2; ours holds at 1 until the
+		 * SMP enable-method question is answered at the bench
+		 * (bcm-hx4.dtsi, cpus).
+		 */
+		bootargs = "console=ttyS0,115200n8 maxcpus=1";
+	};
+
+	/*
+	 * 2 GB. The vendor cmdline said mem=2000M — its SDK reserved the
+	 * top 48 MB for DMA outside the kernel. Hemlock's BDE allocates
+	 * its dmasize=8M through the kernel instead, so the full 2 GB is
+	 * the intended starting point; trim here if the first bench boot
+	 * says the vendor had a second reason.
+	 */
+	memory@60000000 {
+		device_type = "memory";
+		reg = <0x60000000 0x80000000>;
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&uart1 {
+	status = "okay";
+};
+
+/*
+ * Management port (Management1 / eth0): gmac0, SGMII to an external
+ * PHY on the internal MDIO. The PHY address is a first-boot fact —
+ * `mdiobus_scan` will say — so no phy-handle is pinned yet and bgmac
+ * falls back to its fixed-link/scan behaviour. Pin it once known.
+ */
+&gmac0 {
+	status = "okay";
+};
+
+/*
+ * The two SMBus roots the platform manifest hangs everything off.
+ * Deliberately childless: pmon instantiates the CPLD, mux and sensors
+ * from platform.toml at runtime, and the RTC stays out (dead battery
+ * wedges the bus; see the platform README).
+ *
+ * Mainline names these adapters "Broadcom iProc (i2c@38000)" and
+ * "(i2c@3b000)" — platform.toml's [[hardware.i2c.root]] adapter values
+ * must change to match when this kernel lands.
+ */
+&i2c0 {
+	status = "okay";
+};
+
+&i2c1 {
+	status = "okay";
+};
+
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <62500000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/*
+		 * ONIE's own layout: uboot, shmoo, uboot-env, onie.
+		 * Offsets to be copied from this box's /proc/mtd (gate 1
+		 * capture) before fw_setenv can find the environment —
+		 * partitions are deliberately absent until they are
+		 * facts, because guessing an offset for uboot-env means
+		 * fw_setenv writing into U-Boot itself.
+		 */
+	};
+};
+
+/* The NOS storage: a USB-attached disk. See the PHY note in the dtsi. */
+&ehci0 {
+	status = "okay";
+};
