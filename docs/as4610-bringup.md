@@ -304,6 +304,46 @@ sequence against `/proc/partitions` first — `sda` already carries a
 previous NOS's layout (256 MB + 128 MB + 7.1 GB) and the first step
 zaps it.
 
+**Confirm the target device before every install, dry-run or not.** This
+board exposes its SPI-NOR as `mtdblock0..3`, and `mtdblock0` is the
+`uboot` partition itself — 896 KB holding the bootloader that loads
+ONIE. Those nodes are non-removable with a nonzero size, so an early
+build of the disk picker offered them, and `mtdblock0` sorts *ahead of*
+`sda`, which made the bootloader flash the default highlighted entry.
+Accepting that default ran `sgdisk --zap-all /dev/mtdblock0`, which
+zeroes LBA 0–33 (bytes `0x0000`–`0x43FF`) and the last 33 sectors —
+destroying U-Boot's exception vectors and reset entry while leaving the
+rest of the image intact from `0x4400` up. The board keeps running
+(ONIE is already in RAM) and gives no sign of the damage until the next
+reset, at which point it does not boot.
+
+`install.rs`'s `never_a_target()` now filters `mtdblock`/`ubi` out of
+enumeration and `is_raw_flash()` refuses them even when named with
+`--disk`, so this cannot recur — but if you are on a build predating
+that, or on any other installer, check first:
+
+```sh
+cat /proc/mtd                   # mtd0 is "uboot" — never an install target
+dd if=/dev/mtd0 bs=512 count=1 2>/dev/null | hexdump -C | head -2
+```
+
+Real ARM code at offset 0 means U-Boot is intact. All-zero to `0x4400`
+with code resuming exactly there is the `sgdisk` signature. Read
+`/dev/mtd0` (the raw char device), not `/dev/mtdblock0` — the block
+layer caches a whole 64 KB erase block, so a cached read can show a
+write that never reached the flash, and vice versa.
+
+**If it happens: do not reboot.** ONIE is running from RAM and is the
+only repair environment you have without opening the box. Dump all four
+partitions (`for i in 0 1 2 3; do cat /dev/mtd$i > /tmp/mtd$i.bin; done`)
+and copy them off — `/tmp` is tmpfs and does not survive the reset —
+then reflash `mtd0` with `flash_erase` + `flashcp` from a `u-boot.bin`
+for `accton_as4610_54` (Edgecore's ONIE updater for
+`arm-accton_as4610_54-r0` carries one; the OCP ONIE tree builds one from
+`machine/accton/accton_as4610_54`). The lost 17 KB cannot be
+reconstructed from the surviving remainder. Failing that, it is a SOIC
+clip on the SPI-NOR.
+
 ---
 
 ### At the U-Boot prompt
