@@ -173,8 +173,16 @@ else
  None of this is needed for a structural check: build/mkimage.sh $PLATFORM --dummy-rootfs"
 
     log "debootstrap Debian trixie ($DEB_ARCH)"
+    # packages.list is written for the amd64 boards; its kernel and
+    # bootloader lines have no armhf counterpart (those boards install
+    # the platform kernel deb below and boot a FIT, not GRUB), and
+    # debootstrap treats one unknown deb as fatal.
+    PKG_LIST="$(grep -v '^#' "$ROOT/build/rootfs/packages.list" | grep -v '^$')"
+    if [ "$DEB_ARCH" != "amd64" ]; then
+        PKG_LIST="$(printf '%s\n' "$PKG_LIST" | grep -vE '^(linux-image-amd64|grub-pc)$')"
+    fi
     DEBOOTSTRAP_ARGS=(--variant=minbase --arch="$DEB_ARCH"
-        "--include=$(grep -v '^#' "$ROOT/build/rootfs/packages.list" | grep -v '^$' | paste -sd, -)")
+        "--include=$(printf '%s\n' "$PKG_LIST" | paste -sd, -)")
     if [ "$CROSS" = 1 ]; then
         # First stage unpacks only; the maintainer scripts run in the
         # second stage, under qemu, from inside the chroot.
