@@ -151,10 +151,12 @@ fn post_routes() -> Vec<(&'static str, MethodRouter<SharedState>)> {
         ("/api/reboot", post(reboot)),
         ("/api/reboot/cancel", post(reboot_cancel)),
         // Firmware images stream straight to disk; lift axum default
-        // 2 MB body cap for this one route.
+        // 2 MB body cap for this one route. 1 GiB, not 4: the limit is
+        // a usize, and the AS4610's Cortex-A9 makes that 32 bits —
+        // 4 GiB overflows. Images are a few hundred MB.
         (
             "/api/upgrade/upload",
-            post(upgrade_upload).layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)),
+            post(upgrade_upload).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
         ),
         ("/api/upgrade/apply", post(upgrade_apply)),
         ("/api/upgrade/discard", post(upgrade_discard)),
