@@ -115,6 +115,7 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
+#include <linux/version.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -849,7 +850,13 @@ static struct attribute_group optoe_attr_group = {
 	.attrs = optoe_attrs,
 };
 
-#ifdef LATEST_KERNEL
+/* The probe signature follows the kernel, not LATEST_KERNEL: the i2c
+ * core dropped the id argument from one-arg probe registration in 6.3
+ * and renamed .probe_new back to .probe in 6.6 (see the driver struct
+ * below). On older kernels the two-arg form is used as-is; the id
+ * parameter is simply unused there.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 static int optoe_probe(struct i2c_client *client)
 #else
 static int optoe_probe(struct i2c_client *client,
@@ -986,8 +993,10 @@ static struct i2c_driver optoe_driver = {
 		.name = "optoe",
 		.owner = THIS_MODULE,
 	},
-#ifdef LATEST_KERNEL
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	.probe = optoe_probe,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	.probe_new = optoe_probe,
 #else
 	.probe = optoe_probe,
 #endif
