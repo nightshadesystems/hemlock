@@ -70,7 +70,14 @@ armhf)
     DEB_ARCH="armhf"
     KERNEL_PKG=""                               # platform kernel; see below
     RUST_TARGET="armv7-unknown-linux-gnueabihf"
-    INSTALLER_TARGET="armv7-unknown-linux-musleabihf"
+    # Soft-float on purpose, unlike the daemons: the installer runs under
+    # the board's stock ONIE (2016.05, kernel 3.2.69), whose kernel does
+    # not enable VFP for userspace — a hard-float binary dies there with
+    # "Illegal instruction" before printing anything. Soft-float emits no
+    # VFP instructions at all, so it runs regardless of the rescue
+    # kernel's FPU config. The NOS itself stays armhf; only this one
+    # binary executes under ONIE's kernel.
+    INSTALLER_TARGET="armv7-unknown-linux-musleabi"
     BOOT_STYLE="fit"
     ;;
 *)
@@ -655,7 +662,7 @@ else
     # building the ARM installer needs no C cross-toolchain — which is
     # what keeps this step runnable in CI.
     if [ "$INSTALLER_TARGET" != "x86_64-unknown-linux-musl" ]; then
-        export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=rust-lld
+        export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABI_LINKER=rust-lld
     fi
     (cd "$ROOT" && cargo build --release -p hemlock-installer --target "$INSTALLER_TARGET")
     cp "$ROOT/target/$INSTALLER_TARGET/release/hemlock-installer" "$PAYLOAD/hemlock-installer"

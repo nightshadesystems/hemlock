@@ -92,6 +92,14 @@ if [ "$CPU_ARCH" = "armhf" ]; then
         "grep -q 'hemlock.rootfs=' '$WORK/boot/cmdline'"
     check "no GRUB artifacts in an ARM payload" \
         "[ ! -e '$WORK/boot/grub.cfg' ]"
+    # The installer executes under the board's stock ONIE (kernel 3.2.69),
+    # which does not enable VFP for userspace: a hard-float installer dies
+    # there with "Illegal instruction" before its first line of output.
+    # EF_ARM_ABI_FLOAT_HARD is bit 0x400 of e_flags (offset 36 in ELF32);
+    # a dummy image's shell-stub installer is exempt like the loader check.
+    check "installer uses the soft-float ABI" \
+        "! head -c4 '$WORK/hemlock-installer' | grep -aq 'ELF' \
+         || [ \$(( 0x\$(od -An -j36 -N4 -tx4 '$WORK/hemlock-installer' | tr -d ' ') & 0x400 )) -eq 0 ]"
     # A real FIT starts with the flattened-device-tree magic; the dummy
     # one is a placeholder, so only check when it is not.
     if ! is_dummy; then

@@ -89,9 +89,10 @@ jobs:
       - name: Add armhf Rust targets
         if: steps.arch.outputs.cpu_arch == 'armhf'
         # The daemons are gnueabihf (they link against the image's glibc);
-        # the installer is static musl. Neither needs a C cross-toolchain
+        # the installer is static soft-float musl (ONIE's rescue kernel
+        # has no VFP for userspace). Neither needs a C cross-toolchain
         # for the installer itself — mkimage links that with rust-lld.
-        run: rustup target add armv7-unknown-linux-gnueabihf armv7-unknown-linux-musleabihf
+        run: rustup target add armv7-unknown-linux-gnueabihf armv7-unknown-linux-musleabi
       - uses: Swatinem/rust-cache@v2
 
       # Release builds ship the plain VERSION; everything else gets a
