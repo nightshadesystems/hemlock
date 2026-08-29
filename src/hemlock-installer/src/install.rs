@@ -368,6 +368,28 @@ pub struct Disk {
     pub model: String,
 }
 
+/// Block-device names that are never install targets, whatever their
+/// size or removable flag: RAM disks, loopbacks, device-mapper nodes,
+/// optical/floppy — and above all raw flash. `mtdblockN`/`ubiN` are the
+/// block views of the SPI-NOR that holds U-Boot, its environment and
+/// ONIE itself (on the AS4610: uboot, shmoo, uboot-env, onie), and they
+/// sort ahead of `sda`, so before this filter the picker's default
+/// selection was the bootloader flash.
+fn never_a_target(name: &str) -> bool {
+    ["ram", "loop", "dm-", "mtdblock", "ubi", "zram", "md", "sr", "fd", "nbd"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Raw-flash device paths get refused even when named explicitly with
+/// `--disk`: the install plan speaks GPT + sgdisk, and running that
+/// against the SPI-NOR chews up the bootloader, not a NOS partition.
+pub fn is_raw_flash(disk: &Path) -> bool {
+    disk.file_name()
+        .map(|n| n.to_string_lossy().starts_with("mtdblock") || n.to_string_lossy().starts_with("ubi"))
+        .unwrap_or(false)
+}
+
 pub fn list_disks() -> Vec<Disk> {
     let Ok(entries) = std::fs::read_dir("/sys/block") else {
         return Vec::new();
@@ -375,7 +397,7 @@ pub fn list_disks() -> Vec<Disk> {
     let mut disks = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("ram") || name.starts_with("loop") || name.starts_with("dm-") {
+        if never_a_target(&name) {
             continue;
         }
         let sys = entry.path();
@@ -559,6 +581,24 @@ mod tests {
     #[test]
     fn disk_enumeration_is_safe_everywhere() {
         let _ = list_disks();
+    }
+
+    /// The SPI-NOR's block views must never be offered or accepted: on
+    /// the AS4610, mtdblock0 is the `uboot` partition itself, and it
+    /// sorts ahead of `sda` — before this filter it was the picker's
+    /// default selection.
+    #[test]
+    fn raw_flash_is_never_a_target() {
+        for name in ["mtdblock0", "mtdblock3", "ubi0", "ram0", "loop1", "dm-0", "sr0"] {
+            assert!(never_a_target(name), "{name} must be filtered out");
+        }
+        for name in ["sda", "sdb", "mmcblk0", "nvme0n1"] {
+            assert!(!never_a_target(name), "{name} must stay offered");
+        }
+        assert!(is_raw_flash(Path::new("/dev/mtdblock0")));
+        assert!(is_raw_flash(Path::new("/dev/ubi0")));
+        assert!(!is_raw_flash(Path::new("/dev/sda")));
+        assert!(!is_raw_flash(Path::new("/dev/mmcblk0")));
     }
 
     /// ...and the x86 install is unchanged by any of it.

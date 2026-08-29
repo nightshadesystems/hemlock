@@ -131,6 +131,16 @@ fn run() -> Result<()> {
         }
     };
 
+    // Belt and braces on top of list_disks' own filter: a typo'd --disk
+    // must not point sgdisk at the SPI-NOR that holds U-Boot and ONIE.
+    if install::is_raw_flash(&disk) {
+        bail!(
+            "{} is raw flash (SPI-NOR/UBI), which holds the bootloader and ONIE — \
+             not a NOS install target; pick a real block device (e.g. /dev/sda)",
+            disk.display()
+        );
+    }
+
     let plan = InstallPlan {
         disk,
         payload: args.payload.clone(),
