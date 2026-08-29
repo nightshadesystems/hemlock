@@ -294,8 +294,11 @@ else
         chroot "$ROOTFS" dpkg -i "/tmp/$(basename "$HEADERS_DEB")" \
             || die "installing the platform kernel headers failed"
         rm -f "$ROOTFS/tmp/$(basename "$HEADERS_DEB")"
+        # flex/bison: the cross-built headers' host tools get rebuilt
+        # natively in the chroot (build-bde-openbcm.sh), and kbuild may
+        # decide kconfig's syncconfig needs to run as part of that.
         chroot "$ROOTFS" apt-get -qq install --no-install-recommends -y \
-            build-essential bc \
+            build-essential bc flex bison \
             || die "installing kernel build deps in the chroot failed"
     else
         chroot "$ROOTFS" apt-get -qq install --no-install-recommends -y \
