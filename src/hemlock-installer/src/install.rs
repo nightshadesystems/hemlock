@@ -96,12 +96,13 @@ impl InstallPlan {
     ///   `onie-nos-mode`, and does not need one.
     ///
     /// Layout: two GPT partitions. A small **ext2** boot partition holds
-    /// the FIT, because U-Boot 2012.10's `ext2load` is what reads it and
-    /// whether that build also understands ext4 is untested — putting the
-    /// one file U-Boot must read on a filesystem it certainly handles
-    /// costs 64 MB and removes the question. The rest is ext4 and carries
-    /// the squashfs, the persist overlay and the platform directory,
-    /// exactly as on x86.
+    /// the FIT, because `ext2load` is what U-Boot reads it with. This is
+    /// now confirmed on the board rather than assumed: the flashed
+    /// bootloader exports `usbiddev`, `ext2load` and `bootm`, but has
+    /// **no `ext4load`**, so an ext4 boot partition would be unreadable
+    /// and the 64 MB spent here is mandatory, not caution. The rest is
+    /// ext4 and carries the squashfs, the persist overlay and the
+    /// platform directory, exactly as on x86.
     fn fit_steps(&self) -> Vec<Step> {
         let disk = self.disk.display().to_string();
         let boot = self.part(1);
@@ -194,7 +195,23 @@ impl InstallPlan {
                 commands: vec![
                     // The kernel command line rides inside the FIT
                     // (mkimage.sh renders it), so nothing here repeats it.
-                    cmd(["fw_setenv", "nos_bootcmd", nos_bootcmd]),
+                    //
+                    // -f is mandatory, not tidiness. This board's ONIE
+                    // ships BusyBox's fw_setenv, which asks "Proceed with
+                    // update [N/y]?", defaults to *no* when there is no
+                    // tty to answer — and still exits 0. Without -f the
+                    // step reports success, writes nothing, and the board
+                    // silently boots ONIE forever because nos_bootcmd is
+                    // still the stock no-op `true`.
+                    cmd(["fw_setenv", "-f", "nos_bootcmd", nos_bootcmd]),
+                    // ...and because a zero exit proved nothing above,
+                    // read it back. An install that cannot set the boot
+                    // command has not installed anything bootable.
+                    cmd([
+                        "sh",
+                        "-c",
+                        "fw_printenv nos_bootcmd | grep -q /boot/hemlock.itb",
+                    ]),
                 ],
             },
             Step {
@@ -563,7 +580,11 @@ mod tests {
             "mkfs.ext2 -F -L HEMLOCK-BOOT /dev/sda1",
             "mkfs.ext4 -F -L HEMLOCK /dev/sda2",
             "hemlock.itb",
-            "fw_setenv nos_bootcmd",
+            // -f: BusyBox fw_setenv prompts and defaults to "no" without a
+            // tty, yet exits 0 — so the unforced form silently no-ops.
+            "fw_setenv -f nos_bootcmd",
+            // The write is read back, because exit 0 does not prove it took.
+            "fw_printenv nos_bootcmd | grep -q /boot/hemlock.itb",
             "ext2load usb ${usbdev}:1 0x70000000 /boot/hemlock.itb",
         ] {
             assert!(
