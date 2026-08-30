@@ -49,6 +49,15 @@ pub struct InstallPlan {
     /// Platform id baked into the image (e.g. `cel-e1031`).
     pub platform_id: String,
     pub boot_style: BootStyle,
+    /// Kernel command line, read from the payload's `boot/cmdline`
+    /// (rendered by mkimage.sh). Empty on a Grub platform, where the
+    /// command line lives in `grub.cfg` instead.
+    ///
+    /// A FIT board has nowhere else to get this: U-Boot builds
+    /// `/chosen/bootargs` from its own `bootargs` environment variable,
+    /// and if that is unset the kernel starts with a NULL command line —
+    /// no console, no `root=`, no `hemlock.rootfs=` — and dies silently.
+    pub kernel_cmdline: String,
     pub dry_run: bool,
 }
 
@@ -113,9 +122,27 @@ impl InstallPlan {
         // uses the same idiom. The FIT is loaded to ONIE's scratch
         // address and bootm relocates the kernel to its own load address
         // (0x61008000, from the FIT that mkimage.sh built).
-        let nos_bootcmd = "usb start && usbiddev && \
-             ext2load usb ${usbdev}:1 0x70000000 /boot/hemlock.itb && \
-             bootm 0x70000000";
+        //
+        // The leading `setenv bootargs` is what hands the kernel its
+        // command line: U-Boot copies its `bootargs` variable into
+        // /chosen/bootargs at bootm time, and with no such variable the
+        // kernel boots with `commandline: <NULL>` — losing console=,
+        // root= and hemlock.rootfs= at once, which looks exactly like a
+        // hang because the console is gone too.
+        //
+        // It is set *inside* nos_bootcmd rather than as a standalone
+        // saved variable on purpose: ONIE's own onie_platformargs does
+        // `setenv bootargs $bootargs ...`, appending to whatever is
+        // already there, so a persistent Hemlock bootargs would leak
+        // root=/dev/ram0 into every ONIE boot.
+        let nos_bootcmd = format!(
+            "setenv bootargs {}; \
+             usb start && usbiddev && \
+             ext2load usb ${{usbdev}}:1 0x70000000 /boot/hemlock.itb && \
+             bootm 0x70000000",
+            self.kernel_cmdline
+        );
+        let nos_bootcmd = nos_bootcmd.as_str();
 
         vec![
             Step {
@@ -357,7 +384,11 @@ impl InstallPlan {
         // here beats finding it absent after the NAND has been erased.
         match self.boot_style {
             BootStyle::Grub => required.push(Path::new("boot/grub.cfg")),
-            BootStyle::Fit => required.push(Path::new("boot/hemlock.itb")),
+            BootStyle::Fit => {
+                required.push(Path::new("boot/hemlock.itb"));
+                // Without this the board boots to a NULL command line.
+                required.push(Path::new("boot/cmdline"));
+            }
         }
         for rel in required {
             let path = self.payload.join(rel);
@@ -467,6 +498,8 @@ mod tests {
             payload: "payload".into(),
             platform_id: "cel-e1031".into(),
             boot_style: BootStyle::Grub,
+            // x86 carries its command line in grub.cfg, not here.
+            kernel_cmdline: String::new(),
             dry_run: true,
         }
     }
@@ -477,6 +510,9 @@ mod tests {
             payload: "payload".into(),
             platform_id: "accton-as4610-54".into(),
             boot_style: BootStyle::Fit,
+            kernel_cmdline: "console=ttyS0,115200n8 root=/dev/ram0 \
+                 hemlock.rootfs=/hemlock/rootfs.squashfs rw net.ifnames=0"
+                .into(),
             dry_run: true,
         }
     }
@@ -559,6 +595,11 @@ mod tests {
         assert!(x86.validate_payload().is_err(), "no grub.cfg yet");
 
         std::fs::write(dir.path().join("boot/hemlock.itb"), b"fit").unwrap();
+        // A FIT alone is not enough: without boot/cmdline the kernel
+        // would start with a NULL command line and die with no console
+        // to say so, so the payload check refuses it here instead.
+        assert!(arm.validate_payload().is_err(), "FIT but no cmdline");
+        std::fs::write(dir.path().join("boot/cmdline"), b"console=ttyS0").unwrap();
         assert!(arm.validate_payload().is_ok());
         assert!(x86.validate_payload().is_err(), "a FIT is not a grub.cfg");
 
@@ -582,6 +623,11 @@ mod tests {
             "hemlock.itb",
             // -f: BusyBox fw_setenv prompts and defaults to "no" without a
             // tty, yet exits 0 — so the unforced form silently no-ops.
+            // Without this the kernel starts with `commandline: <NULL>`:
+            // no console, no root=, no hemlock.rootfs=. It looks like a
+            // hang, because losing console= also loses the evidence.
+            "setenv bootargs console=ttyS0,115200n8 root=/dev/ram0",
+            "hemlock.rootfs=/hemlock/rootfs.squashfs rw net.ifnames=0;",
             "fw_setenv -f nos_bootcmd",
             // The write is read back, because exit 0 does not prove it took.
             "fw_printenv nos_bootcmd | grep -q /boot/hemlock.itb",

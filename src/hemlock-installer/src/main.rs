@@ -141,8 +141,17 @@ fn run() -> Result<()> {
         );
     }
 
+    // The kernel command line mkimage.sh rendered for this platform. A
+    // FIT board has no bootloader config file to hold it, so it is
+    // carried in the payload and stamped into U-Boot's environment by
+    // the install; an absent one is caught by validate_payload below.
+    let kernel_cmdline = std::fs::read_to_string(args.payload.join("boot/cmdline"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
     let plan = InstallPlan {
         disk,
+        kernel_cmdline,
         payload: args.payload.clone(),
         platform_id,
         boot_style,

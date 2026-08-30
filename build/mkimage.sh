@@ -584,6 +584,23 @@ if [ "$BOOT_STYLE" = "fit" ]; then
             arch = "arm";
             os = "linux";
             compression = "none";
+            // load is MANDATORY here, not decorative. U-Boot 2012.10's
+            // boot_get_ramdisk() calls fit_image_get_load() on this node
+            // and aborts the whole boot with "Can't get ramdisk subimage
+            // load address! / Ramdisk image is corrupt or invalid" when
+            // it is absent — even though the CRC verifies and the data
+            // is perfectly good. Newer U-Boot infers "use it in place";
+            // this vintage does not.
+            //
+            // 0x66000000 is 96 MB into DRAM (which starts at
+            // 0x60000000), chosen to clear both neighbours: the kernel
+            // decompresses from 0x61008000 upwards, and the FIT itself
+            // is staged at 0x70000000 (its ~19 MB reaching into
+            // 0x7129xxxx). initrd_high=0xffffffff in this board's
+            // U-Boot environment means the ramdisk is used where it
+            // lands rather than relocated, so this address is the one
+            // the kernel actually sees.
+            load = <0x66000000>;
             hash-1 { algo = "crc32"; };
         };
     };
