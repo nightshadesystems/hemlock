@@ -542,10 +542,34 @@ if [ "$BOOT_STYLE" = "fit" ]; then
         # own build. The DTS source uses cpp includes, so a bare dtc
         # here could not compile it anyway — a platform kernel deb that
         # ships no dtb is a broken kernel build, not a fallback case.
-        DTB="$(ls "$ROOTFS"/usr/lib/linux-image-*/*.dtb 2>/dev/null | head -1 || true)"
-        [ -n "$DTB" ] || die "no .dtb under /usr/lib/linux-image-*/ in the rootfs
+        #
+        # Pick it BY NAME. `ls *.dtb | head -1` used to stand here, and
+        # an arm kernel package ships hundreds of boards' device trees:
+        # it silently selected alpine-db.dtb ("Annapurna Labs Alpine Dev
+        # Board"), which built a perfectly valid FIT that booted a
+        # kernel describing hardware this switch does not have. There is
+        # no console on a wrong device tree, so it failed completely
+        # silently — the worst possible way to be wrong.
+        DTS_COUNT="$(ls "$PDIR"/kernel/dts/*.dts 2>/dev/null | wc -l)"
+        [ "$DTS_COUNT" = 1 ] || die \
+            "expected exactly one .dts in $PDIR/kernel/dts/, found $DTS_COUNT
+ (the board device tree is chosen by name; disambiguate before building)"
+        DTB_NAME="$(basename "$(ls "$PDIR"/kernel/dts/*.dts)" .dts).dtb"
+        DTB="$(ls "$ROOTFS"/usr/lib/linux-image-*/"$DTB_NAME" 2>/dev/null | head -1 || true)"
+        [ -n "$DTB" ] || die "no $DTB_NAME under /usr/lib/linux-image-*/ in the rootfs
  (the platform kernel deb must ship the board device tree; see
   platforms/$PLATFORM/kernel/build-kernel.sh)"
+        # Belt and braces: the name matched, so prove the contents did
+        # too. The model string is a plain NUL-terminated string in the
+        # dtb, so grep sees it without needing dtc on the build host.
+        DTS_MODEL="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
+            "$PDIR"/kernel/dts/*.dts | head -1)"
+        if [ -n "$DTS_MODEL" ]; then
+            grep -aqF "$DTS_MODEL" "$DTB" || die \
+                "$DTB does not contain the board model \"$DTS_MODEL\"
+ (wrong device tree for $PLATFORM — this boots a silent kernel)"
+            log "device tree $DTB_NAME (model: $DTS_MODEL)"
+        fi
         cp "$DTB" "$FITDIR/board.dtb"
 
         # Load/entry 0x61008000: where U-Boot on this board expects the
