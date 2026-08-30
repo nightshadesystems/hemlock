@@ -376,9 +376,11 @@ pub struct Disk {
 /// sort ahead of `sda`, so before this filter the picker's default
 /// selection was the bootloader flash.
 fn never_a_target(name: &str) -> bool {
-    ["ram", "loop", "dm-", "mtdblock", "ubi", "zram", "md", "sr", "fd", "nbd"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+    [
+        "ram", "loop", "dm-", "mtdblock", "ubi", "zram", "md", "sr", "fd", "nbd",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// Raw-flash device paths get refused even when named explicitly with
@@ -386,7 +388,9 @@ fn never_a_target(name: &str) -> bool {
 /// against the SPI-NOR chews up the bootloader, not a NOS partition.
 pub fn is_raw_flash(disk: &Path) -> bool {
     disk.file_name()
-        .map(|n| n.to_string_lossy().starts_with("mtdblock") || n.to_string_lossy().starts_with("ubi"))
+        .map(|n| {
+            n.to_string_lossy().starts_with("mtdblock") || n.to_string_lossy().starts_with("ubi")
+        })
         .unwrap_or(false)
 }
 
@@ -589,7 +593,15 @@ mod tests {
     /// default selection.
     #[test]
     fn raw_flash_is_never_a_target() {
-        for name in ["mtdblock0", "mtdblock3", "ubi0", "ram0", "loop1", "dm-0", "sr0"] {
+        for name in [
+            "mtdblock0",
+            "mtdblock3",
+            "ubi0",
+            "ram0",
+            "loop1",
+            "dm-0",
+            "sr0",
+        ] {
             assert!(never_a_target(name), "{name} must be filtered out");
         }
         for name in ["sda", "sdb", "mmcblk0", "nvme0n1"] {
