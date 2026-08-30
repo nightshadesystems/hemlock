@@ -37,6 +37,16 @@ on:
         description: "Release build (clean version, no timestamp)"
         type: boolean
         default: false
+      # Debugging only. A board that dies before parse_early_param() has
+      # no console at all, so earlycon cannot reach it — DEBUG_LL writes
+      # straight to the UART from the decompressor and head.S, which is
+      # the only way to read such a failure instead of guessing at it.
+      # armhf only (it configures a specific UART address); ignored
+      # elsewhere because x86 builds no kernel.
+      kernel_debug:
+        description: "Kernel: DEBUG_LL early console (armhf debugging; never for release)"
+        type: boolean
+        default: false
 
 jobs:
   image:
@@ -101,10 +111,22 @@ jobs:
         id: ver
         run: |
           base="$(tr -d '[:space:]' < VERSION)"
+          # A DEBUG_LL kernel spews to the console from the decompressor
+          # onward and is a debugging tool, not a shippable artifact.
+          # Refuse to let one wear a clean release version.
+          if [ "${{ inputs.release }}" = "true" ] && [ "${{ inputs.kernel_debug }}" = "true" ]; then
+            echo "::error::release and kernel_debug are mutually exclusive: a DEBUG_LL kernel must never ship as a release image" >&2
+            exit 1
+          fi
           if [ "${{ inputs.release }}" = "true" ]; then
             echo "version=$base" >> "$GITHUB_OUTPUT"
           else
-            echo "version=$base-$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+            stamp="$base-$(date -u +%Y%m%d%H%M)"
+            # Stamp it in the version too, so a debug image is
+            # identifiable from its filename alone once it has been
+            # downloaded and the run page is out of sight.
+            [ "${{ inputs.kernel_debug }}" = "true" ] && stamp="$stamp-debugll"
+            echo "version=$stamp" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Fetch vendor artifacts
@@ -122,10 +144,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vendor/kernel
-          key: kernel-deb-${{ inputs.platform }}-${{ hashFiles(format('platforms/{0}/kernel/**', inputs.platform)) }}
+          # The -debugll suffix is load-bearing: without it a previously
+          # cached non-debug deb restores on a kernel_debug run, the
+          # build step is skipped, and the image ships a kernel with no
+          # DEBUG_LL while the run claims otherwise — a silent mismatch
+          # of exactly the kind this option exists to diagnose.
+          key: kernel-deb-${{ inputs.platform }}-${{ hashFiles(format('platforms/{0}/kernel/**', inputs.platform)) }}${{ inputs.kernel_debug && '-debugll' || '' }}
 
       - name: Build platform kernel
         if: inputs.mode == 'full' && steps.arch.outputs.cpu_arch == 'armhf' && steps.kernel-cache.outputs.cache-hit != 'true'
+        env:
+          HEMLOCK_KERNEL_EXTRA_CONFIG: ${{ inputs.kernel_debug && 'debug-ll.config' || '' }}
         run: |
           sudo apt-get install -y build-essential bc bison flex libssl-dev \
             libelf-dev kmod debhelper rsync cpio
