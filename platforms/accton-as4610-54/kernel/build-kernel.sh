@@ -68,9 +68,20 @@ grep -q "arm-accton-as4610-54" "$SRC/arch/arm/boot/dts/Makefile" || {
 cd "$SRC"
 export ARCH=arm CROSS_COMPILE
 
-log "multi_v7_defconfig + hemlock.config"
+# An optional extra fragment, for debugging kernels only (see
+# debug-ll.config). It is merged after hemlock.config and verified the
+# same way, so a debug build cannot silently lose the very symbols it
+# was built to add.
+EXTRA_CONFIG=""
+if [ -n "${HEMLOCK_KERNEL_EXTRA_CONFIG:-}" ]; then
+    EXTRA_CONFIG="$HERE/$HEMLOCK_KERNEL_EXTRA_CONFIG"
+    [ -f "$EXTRA_CONFIG" ] || die "no such extra config fragment: $EXTRA_CONFIG"
+fi
+
+log "multi_v7_defconfig + hemlock.config${EXTRA_CONFIG:+ + $(basename "$EXTRA_CONFIG")}"
 make -s multi_v7_defconfig
-./scripts/kconfig/merge_config.sh -m .config "$HERE/hemlock.config" >/dev/null
+# shellcheck disable=SC2086
+./scripts/kconfig/merge_config.sh -m .config "$HERE/hemlock.config" $EXTRA_CONFIG >/dev/null
 make -s olddefconfig
 
 # Every =y/=m in the fragment must have survived olddefconfig: a symbol
@@ -85,7 +96,7 @@ while IFS= read -r want; do
             || die "$name did not survive olddefconfig (asked: $want, got: $(grep "^$name=\|^# $name " .config || echo absent))"
         ;;
     esac
-done < <(grep -E '^CONFIG_' "$HERE/hemlock.config")
+done < <(grep -E '^CONFIG_' "$HERE/hemlock.config" ${EXTRA_CONFIG:+"$EXTRA_CONFIG"})
 log "config fragment fully applied"
 
 log "building bindeb-pkg with -j$JOBS (this is the long part)"
