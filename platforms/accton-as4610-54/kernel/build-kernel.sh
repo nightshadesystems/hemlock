@@ -96,7 +96,11 @@ while IFS= read -r want; do
             || die "$name did not survive olddefconfig (asked: $want, got: $(grep "^$name=\|^# $name " .config || echo absent))"
         ;;
     esac
-done < <(grep -E '^CONFIG_' "$HERE/hemlock.config" ${EXTRA_CONFIG:+"$EXTRA_CONFIG"})
+# -h is load-bearing with two files: grep prefixes each line with
+# "filename:" when given more than one, which makes every line fail the
+# CONFIG_* case below and silently checks nothing at all — turning this
+# guard into a no-op exactly when an extra fragment is in play.
+done < <(grep -hE '^CONFIG_' "$HERE/hemlock.config" ${EXTRA_CONFIG:+"$EXTRA_CONFIG"})
 log "config fragment fully applied"
 
 log "building bindeb-pkg with -j$JOBS (this is the long part)"
